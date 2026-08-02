@@ -1,0 +1,22 @@
+[package]
+name = "astroid-treasury"
+description = "Astroid Treasury contract: organizational fund custody with budget, policy, and multisig enforcement."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+astroid-shared = { workspace = true }
+astroid-interfaces = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

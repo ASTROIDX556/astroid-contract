@@ -1,0 +1,22 @@
+[package]
+name = "astroid-registry"
+description = "Astroid Registry contract: source of truth for organizations, module addresses, ownership and version lookups."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+astroid-shared = { workspace = true }
+astroid-interfaces = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

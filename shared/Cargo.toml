@@ -1,0 +1,16 @@
+[package]
+name = "astroid-shared"
+description = "Shared errors, events, types, math, validation and constants for Astroid Soroban contracts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

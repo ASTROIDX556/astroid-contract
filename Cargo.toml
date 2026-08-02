@@ -1,0 +1,59 @@
+# Astroid — Smart Contract Workspace (Soroban / Stellar)
+#
+# The blockchain / trust layer of the Astroid platform: a Financial Operating
+# System for autonomous AI agents on Stellar. See PRD Document 7 for the
+# authoritative smart-contract architecture.
+#
+# soroban-sdk is pinned once here (v21.x) and referenced by every member via
+# `soroban-sdk = { workspace = true }` so all crates build against one version.
+
+[workspace]
+resolver = "2"
+members = [
+    "shared",
+    "interfaces",
+    "contracts/registry",
+    "contracts/wallet",
+    "contracts/multisig",
+    "contracts/proposal",
+    "contracts/treasury",
+    "contracts/budget",
+    "contracts/policy",
+    "contracts/escrow",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Astroid <opensource@astroid.dev>"]
+repository = "https://github.com/AstroidHQ/astroid-contract"
+homepage = "https://astroid.dev"
+rust-version = "1.74"
+
+[workspace.dependencies]
+# Single, consistent Soroban SDK version for the whole workspace.
+soroban-sdk = "21.7.7"
+astroid-shared = { path = "shared" }
+astroid-interfaces = { path = "interfaces" }
+
+# ---------------------------------------------------------------------------
+# Release profile tuned for Soroban Wasm output (small, deterministic, safe).
+# overflow-checks stays ON even in release: financial arithmetic must never
+# silently wrap. All value math additionally goes through shared::math checked
+# helpers that return contract errors instead of panicking.
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+# Same as release but keeps debug assertions/logs — handy for local Wasm debugging.
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
