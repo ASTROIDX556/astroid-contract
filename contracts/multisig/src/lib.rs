@@ -51,7 +51,7 @@ enum DataKey {
 /// threshold is met. Actual value movement is delegated to the calling context
 /// (e.g. the Treasury) which checks `is_executed`.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MsProposal {
     pub proposer: Address,
     /// A short action tag, e.g. `payment`, `config`.

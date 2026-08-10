@@ -26,11 +26,11 @@ use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use astroid_interfaces::PolicyClient;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, String};
 
 /// Stored treasury record.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Treasury {
     pub org: String,
     pub admin: Address,
@@ -44,7 +44,7 @@ pub struct Treasury {
 
 /// Per-asset accounting within the treasury.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holding {
     pub asset: Address,
     pub total_in: i128,
@@ -131,10 +131,20 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Deposit assets into the treasury (any funder may authorize).
+    /// Deposit assets into the treasury (any funder may authorize). Moves real
+    /// SAC tokens from `from` into the treasury's custody, then credits the
+    /// internal per-asset accounting.
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
+        let t = Self::load(&env);
+        Self::require_active(&t)?;
+        // Pull tokens into the contract's own custody.
+        token::TokenClient::new(&env, &asset).transfer(
+            &from,
+            &env.current_contract_address(),
+            &amount,
+        );
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, amount)?;
         Self::store_holding(&env, &asset, &h);
@@ -197,13 +207,18 @@ impl TreasuryContract {
             );
         }
 
-        // 3. Debit the ledger.
+        // 3. Debit the internal ledger, then move real tokens out of custody.
         if holding.total_in < amount {
             return Err(Error::InsufficientFunds);
         }
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        token::TokenClient::new(&env, &asset).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         Ok(())
     }

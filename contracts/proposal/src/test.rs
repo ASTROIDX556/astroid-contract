@@ -134,7 +134,11 @@ fn expired_proposal_cannot_be_approved() {
     h.env.ledger().set_timestamp(6_000);
     let res = h.client.try_approve(&h.approvers[0], &id);
     assert_eq!(res, Err(Ok(Error::ProposalExpired)));
-    // State should now reflect expiry.
+    // The failed approval is rolled back by the host, so the proposal is still
+    // Pending on-chain. The terminal `Expired` transition is recorded only via
+    // the permissionless `expire()` path (see `explicit_expire_transition`).
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+    h.client.expire(&id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 

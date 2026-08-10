@@ -42,7 +42,7 @@ enum DataKey {
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalletData {
     pub owner: Address,
     pub state: ResourceState,

@@ -49,7 +49,7 @@ pub enum ProposalState {
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
 /// to approve; `threshold` approvals move it to `Approved`.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposal {
     pub proposer: Address,
     pub org: String,
@@ -155,7 +155,7 @@ impl ProposalContract {
     pub fn approve(env: Env, caller: Address, id: u64) -> Result<u32, Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::ensure_not_expired(&env, &mut proposal, id)?;
+        Self::ensure_not_expired(&env, &proposal)?;
         if proposal.state != ProposalState::Pending {
             return Err(Error::InvalidProposalState);
         }
@@ -247,7 +247,7 @@ impl ProposalContract {
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::ensure_not_expired(&env, &mut proposal, id)?;
+        Self::ensure_not_expired(&env, &proposal)?;
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
@@ -302,17 +302,13 @@ impl ProposalContract {
         Self::bump(env, id);
     }
 
-    /// If the proposal has a deadline that has passed, persist the `Expired`
-    /// state and surface [`Error::ProposalExpired`] so callers fail safely.
-    fn ensure_not_expired(env: &Env, proposal: &mut Proposal, id: u64) -> Result<(), Error> {
+    /// Surface [`Error::ProposalExpired`] when the deadline has passed so callers
+    /// fail safely. This deliberately does NOT persist the `Expired` state: on the
+    /// Soroban host, returning `Err` rolls back every storage write from the
+    /// invocation, so the terminal transition is recorded only through the
+    /// permissionless [`ProposalContract::expire`] entrypoint (which returns `Ok`).
+    fn ensure_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
         if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
-            if matches!(
-                proposal.state,
-                ProposalState::Pending | ProposalState::Approved
-            ) {
-                proposal.state = ProposalState::Expired;
-                Self::store(env, id, proposal);
-            }
             return Err(Error::ProposalExpired);
         }
         Ok(())

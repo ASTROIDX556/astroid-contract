@@ -6,7 +6,7 @@ use soroban_sdk::{
 use crate::{PolicyContract, PolicyContractClient};
 
 fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
-    let id = env.register(PolicyContract, ());
+    let id = env.register_contract(None, PolicyContract);
     let client = PolicyContractClient::new(env, &id);
     client.initialize();
     client.register_policy(
@@ -62,7 +62,7 @@ fn allowlist_recipient_enforced() {
     let allowed = Address::generate(&env);
     let blocked = Address::generate(&env);
     let asset = Address::generate(&env);
-    let id = env.register(PolicyContract, ());
+    let id = env.register_contract(None, PolicyContract);
     let client = PolicyContractClient::new(&env, &id);
     client.initialize();
     client.register_policy(

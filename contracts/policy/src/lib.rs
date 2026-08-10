@@ -26,7 +26,7 @@ use soroban_sdk::{
 
 /// On-chain representation of a registered policy.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Policy {
     /// Admin that controls this policy (typically the treasury/admin wallet).
     pub owner: Address,

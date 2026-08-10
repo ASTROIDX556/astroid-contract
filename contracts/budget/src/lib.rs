@@ -39,7 +39,7 @@ pub enum Period {
 
 /// Stored budget record.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Budget {
     pub owner: Address,
     pub limit: i128,
