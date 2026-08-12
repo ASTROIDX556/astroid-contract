@@ -1,64 +1,142 @@
 # astroid-contract
 
-> Soroban smart contracts — the **blockchain layer** of Astroid, the Financial Operating System for autonomous AI agents on Stellar.
+[![CI](https://github.com/ASTROIDX556/astroid-contract/actions/workflows/ci.yml/badge.svg)](https://github.com/ASTROIDX556/astroid-contract/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Stellar](https://img.shields.io/badge/Built%20on-Stellar%20Soroban-7C3AED)](https://stellar.org)
+[![Drips Wave](https://img.shields.io/badge/Drips-Stellar%20Wave-blue)](https://www.drips.network/wave/stellar)
 
-These contracts are the on-chain enforcement point for Astroid's financial governance. Humans define policies, budgets, and approval rules off-chain; these contracts make the constraints that reach Stellar deterministic, tamper-evident, and auditable. Every large transfer is gated by policy checks, budget limits, and — where required — multisignature approval before it ever settles.
+> Soroban smart contracts — the **on-chain backbone** of Astroid, the Financial Operating System for autonomous AI agents on Stellar. Built for the [Drips Stellar Wave Program](https://www.drips.network/wave/stellar).
+
+Eight production-grade Soroban contracts that form the protocol layer of Astroid: a system that lets AI agents spend real funds on-chain only within cryptographically-enforced governance rules set by human organizations.
+
+## Architecture
+
+```
+Registry ──► Wallet ──► Treasury
+    │             └──► Budget
+    │             └──► Policy
+    │             └──► Escrow
+    └──► Multisig ──► Proposal
+```
+
+**Deployment order:** `registry → wallet → treasury → multisig → proposal → budget → policy → escrow`
 
 ## Contracts
 
-| Contract | Responsibility |
-| --- | --- |
-| `registry` | Directory of agents, wallets, and contract addresses; the on-chain source of truth for identity. |
-| `wallet` | Per-agent smart wallet — balances, controlled transfers, freeze/archive lifecycle. |
-| `policy` | Hash-verified spending rules; cheap on-chain gates (`max_amount`, allowed recipient/asset, expiry). |
-| `budget` | Rolling spend limits with window accounting and enforcement. |
-| `multisig` | M-of-N approval quorum for sensitive operations. |
-| `proposal` | Proposal lifecycle (create → approve → execute / expire) with permissionless expiry. |
-| `escrow` | Conditional release / refund for AI-to-AI settlement. |
-| `treasury` | Organization-level custody and orchestrated payouts under policy + multisig. |
+| Contract | WASM | Responsibility |
+|---|---|---|
+| **Registry** | `astroid_registry.wasm` | Single source of truth. Stores org owners, module addresses, and the version upgrade map. |
+| **Wallet** | `astroid_wallet.wasm` | Per-org Stellar wallet. Holds funds, enforces policy before any transfer. |
+| **Treasury** | `astroid_treasury.wasm` | Organization treasury. Manages asset pools and allocation to wallets. |
+| **Multisig** | `astroid_multisig.wasm` | k-of-n threshold signing. Guards high-value transactions requiring multiple approvals. |
+| **Proposal** | `astroid_proposal.wasm` | Approval proposal lifecycle (create → approve/reject → execute/cancel/expire). |
+| **Budget** | `astroid_budget.wasm` | Spending limits per time period. Tracks consumption and blocks over-limit transfers. |
+| **Policy** | `astroid_policy.wasm` | Pluggable transfer rule engine. Checks every transfer against registered policy modules. |
+| **Escrow** | `astroid_escrow.wasm` | Time-locked or condition-based fund escrow with release/refund/expire paths. |
 
-Shared code lives in [`shared/`](shared) (error codes, storage helpers, types) and the cross-contract call surface in [`interfaces/`](interfaces).
+## Registry Contract — Public API
 
-## Layout
+| Function | Auth | Description |
+|---|---|---|
+| `initialize(admin)` | — | One-time initialization. Sets the protocol admin. |
+| `register_org(caller, org, owner)` | Admin | Register an organization and its owner. |
+| `set_org_owner(caller, org, new_owner)` | Org owner or admin | Transfer org ownership. |
+| `register_module(caller, org, kind, address)` | Org owner or admin | Record a module address for an org. |
+| `remove_module(caller, org, kind)` | Org owner or admin | Remove a module registration. |
+| `register_version(caller, kind, version, address)` | Admin | Record a contract version in the global upgrade map. |
+| `get_version(kind, version)` | — | Look up an implementation address by version. |
+| `get_latest(kind)` | — | Look up the latest implementation address for a module kind. |
+| `get_org_owner(org)` | — | Read the owner of an organization. |
+| `get_admin()` | — | Read the current protocol admin. |
+| `set_admin(caller, new_admin)` | Admin | Rotate the admin address. |
+| `lookup(org, kind)` | — | Interface method: resolve a module address for an org. |
+| `verify_owner(org, owner)` | — | Interface method: check if an address is the org owner. |
 
-```
-contracts/     one crate per contract (registry, wallet, policy, budget, multisig, proposal, escrow, treasury)
-shared/        astroid-shared — errors, storage keys, common types
-interfaces/    astroid-interfaces — trait definitions for cross-contract calls
-Cargo.toml     workspace manifest
-```
+## Tech Stack
 
-## Prerequisites
+| Layer | Technology |
+|---|---|
+| Language | Rust (edition 2021) |
+| SDK | soroban-sdk 21.7.7 |
+| Build target | `wasm32v1-none` |
+| Build tool | Stellar CLI |
+| Test runner | `cargo test` (Soroban test environment) |
 
-- Rust `1.97+` with the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
-- [Stellar CLI](https://developers.stellar.org/docs/tools/cli) `27.x` (`stellar contract …`) for deployment
-
-## Build & test
+## Quick Start
 
 ```bash
-# Run the full unit-test suite (native)
-cargo test
+# Prerequisites: Rust stable + Stellar CLI
+cargo install --locked stellar-cli --features opt
 
-# Build optimized, deployable WASM for every contract
-cargo build --target wasm32-unknown-unknown --release
-# → target/wasm32-unknown-unknown/release/astroid_*.wasm
+# Build all contracts
+stellar contract build
+
+# Run all tests
+cargo test --workspace
+
+# Format check
+cargo fmt --check
+
+# Lint
+cargo clippy --workspace -- -D warnings
 ```
 
-## Deploy (testnet)
+## Deployment (Testnet)
 
 ```bash
+# 1. Generate and fund a deployer identity
+stellar keys generate alice --network testnet
+stellar keys fund alice --network testnet
+
+# 2. Deploy the registry (deploy other contracts in dependency order)
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/astroid_wallet.wasm \
-  --network testnet \
-  --source <your-key>
+  --wasm target/wasm32v1-none/release/astroid_registry.wasm \
+  --source alice \
+  --network testnet
+# → Save the output Contract ID (C...)
 ```
 
-## Design notes
+**Deployed Registry (Testnet):** `CCUYI4DSYDNOQC377NFIU6K3GVRQ5VQ3MLTG2CUK5N2E7DUPCIJJC4H7`
 
-- **Errors roll back state.** Returning `Err` discards every storage write from that invocation. Terminal transitions that must persist (e.g. proposal expiry, escrow refund) are exposed as their own `Ok`-returning entrypoints rather than lazily applied on a failing read path.
-- **Error codes are a frozen ABI.** Variant *names* are not stored on-chain — only numeric codes, grouped by domain in [`shared/src/errors.rs`](shared/src/errors.rs). Tests assert typed errors via the generated `client.try_<method>(…)` surface, not panic-string matching.
-- **Policies are hash-verified.** The `policy` contract stores a SHA-256 hash of the human-readable rule JSON plus a few cheap scalar gates, keeping storage minimal and verification deterministic.
+## Workspace Structure
+
+```
+astroid-contract/
+├── contracts/
+│   ├── registry/     # Protocol source of truth
+│   ├── wallet/       # Per-org Stellar wallet
+│   ├── treasury/     # Asset pool management
+│   ├── multisig/     # k-of-n threshold signing
+│   ├── proposal/     # Approval lifecycle
+│   ├── budget/       # Spending limits
+│   ├── policy/       # Transfer rule engine
+│   └── escrow/       # Time-locked escrow
+├── interfaces/       # Shared contract interface traits
+└── shared/           # Shared types, errors, constants, validation
+```
+
+## Related Repositories
+
+| Repo | Description |
+|---|---|
+| [astroid-api](https://github.com/ASTROIDX556/astroid-api) | NestJS backend that calls these contracts |
+| [astroid-web](https://github.com/ASTROIDX556/astroid-web) | Next.js dashboard |
+| [astroid-sdk](https://github.com/ASTROIDX556/astroid-sdk) | TypeScript SDK and React hooks |
+
+## Maintainers
+
+| Name | GitHub | Contact |
+|---|---|---|
+| Astroid Team | [@ASTROIDX556](https://github.com/ASTROIDX556) | Open an issue or discussion |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). PRs require passing `cargo test`, `cargo fmt --check`, and `cargo clippy`.
+
+## Security
+
+These contracts are **unaudited**. Use on testnet only until a professional audit is completed. See [SECURITY.md](SECURITY.md) for the disclosure policy.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Part of the [Astroid](https://github.com/ASTROIDX556) open-source platform.
+MIT — see [LICENSE](LICENSE).
