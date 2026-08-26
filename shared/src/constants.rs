@@ -25,3 +25,11 @@ pub const MIN_THRESHOLD: u32 = 1;
 
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
+
+/// Upper bound on how many distinct assets a single escrow may hold (gas
+/// safety — every asset in the list is iterated on create/release/refund).
+pub const MAX_ESCROW_ASSETS: u32 = 10;
+
+/// Upper bound on how many override-release public keys an escrow may
+/// configure for its signature-based manual release path.
+pub const MAX_RELEASE_SIGNERS: u32 = 10;
