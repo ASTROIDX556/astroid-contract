@@ -17,9 +17,9 @@
 //!
 //! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
 
+use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
 use astroid_shared::validation::require_non_empty;
-use astroid_interfaces::PolicyInterface;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
@@ -49,6 +49,7 @@ pub struct Policy {
 enum DataKey {
     Policy(String),
     Count,
+    Blacklist(Address),
 }
 
 #[contract]
@@ -78,7 +79,11 @@ impl PolicyContract {
     ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&policy_id)?;
-        if env.storage().persistent().has(&DataKey::Policy(policy_id.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Policy(policy_id.clone()))
+        {
             return Err(Error::AlreadyExists);
         }
         let policy = Policy {
@@ -144,6 +149,54 @@ impl PolicyContract {
         Ok(())
     }
 
+    /// Add an address to the restricted blacklist (owner only).
+    pub fn add_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Blacklist(address.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &policy_id);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("blk_add")),
+            (policy_id, address),
+        );
+        Ok(())
+    }
+
+    /// Remove an address from the restricted blacklist (owner only).
+    pub fn remove_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Blacklist(address.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("blk_rem")),
+            (policy_id, address),
+        );
+        Ok(())
+    }
+
     // --- views ---
 
     pub fn get(env: Env, policy_id: String) -> Result<Policy, Error> {
@@ -197,17 +250,22 @@ impl PolicyInterface for PolicyContract {
                 return Err(Error::PolicyDenied);
             }
         }
+        // Check blacklist
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "blacklisted");
+            return Err(Error::PolicyRecipientRestricted);
+        }
         Ok(())
     }
 }
 
 /// Emit a `PolicyViolation` event with a stable reason symbol.
 fn events_policy_violation(env: &Env, policy_id: &String, reason: &str) {
-    astroid_shared::events::policy_violation(
-        env,
-        policy_id,
-        soroban_sdk::Symbol::new(env, reason),
-    );
+    astroid_shared::events::policy_violation(env, policy_id, soroban_sdk::Symbol::new(env, reason));
 }
 
 #[cfg(test)]
