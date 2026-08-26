@@ -61,7 +61,10 @@ fn time_validation() {
 
     // Expiry in the future is fine; in the past/now is expired.
     assert_eq!(require_not_expired(&env, 2_000), Ok(()));
-    assert_eq!(require_not_expired(&env, 1_000), Err(Error::ProposalExpired));
+    assert_eq!(
+        require_not_expired(&env, 1_000),
+        Err(Error::ProposalExpired)
+    );
     assert_eq!(require_not_expired(&env, 500), Err(Error::ProposalExpired));
 
     // Time lock: reached only once timestamp >= unlock_at.

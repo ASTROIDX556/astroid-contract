@@ -63,9 +63,12 @@ fn bad_threshold_rejected_on_init() {
 #[test]
 fn propose_approve_execute_happy_path() {
     let h = setup(3, 2);
-    let id = h
-        .client
-        .propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &0);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
     // proposer auto-approved (1); second signer approves -> 2 == threshold.
     let approvals = h.client.approve(&h.signers[1], &id);
     assert_eq!(approvals, 2);
@@ -76,9 +79,12 @@ fn propose_approve_execute_happy_path() {
 #[test]
 fn execute_below_threshold_fails() {
     let h = setup(3, 2);
-    let id = h
-        .client
-        .propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &0);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
     // Only proposer's approval (1) < threshold (2).
     let res = h.client.try_execute(&h.signers[0], &id);
     assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
@@ -97,9 +103,12 @@ fn non_signer_cannot_propose_or_approve() {
 #[test]
 fn double_approval_rejected() {
     let h = setup(3, 2);
-    let id = h
-        .client
-        .propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &0);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
     // Proposer already auto-approved.
     let res = h.client.try_approve(&h.signers[0], &id);
     assert_eq!(res, Err(Ok(Error::AlreadySigned)));
@@ -132,16 +141,22 @@ fn emergency_lock_blocks_actions() {
     let h = setup(2, 2);
     h.client.set_emergency_lock(&h.signers[0], &true);
     assert!(h.client.is_locked());
-    let res = h
-        .client
-        .try_propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &0);
+    let res = h.client.try_propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
     assert_eq!(res, Err(Ok(Error::EmergencyLock)));
 
     // Unlock and resume.
     h.client.set_emergency_lock(&h.signers[0], &false);
-    let id = h
-        .client
-        .propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &0);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
     h.client.approve(&h.signers[1], &id);
     h.client.execute(&h.signers[0], &id);
     assert!(h.client.get_proposal(&id).executed);

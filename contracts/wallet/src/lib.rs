@@ -23,9 +23,7 @@ use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
 
 #[contracttype]
 #[derive(Clone)]
@@ -312,8 +310,7 @@ impl WalletContract {
     }
 
     fn emit_state(env: &Env, id: u64, action: soroban_sdk::Symbol) {
-        env.events()
-            .publish((symbol_short!("wallet"), action), id);
+        env.events().publish((symbol_short!("wallet"), action), id);
     }
 
     fn bump_wallet(env: &Env, id: u64) {
