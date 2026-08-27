@@ -1,3 +1,4 @@
+use astroid_shared::errors::Error;
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
 use crate::{PolicyContract, PolicyContractClient};
@@ -11,6 +12,7 @@ fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
         &String::from_str(env, "max_txn"),
         &BytesN::from_array(env, &[42; 32]),
         &1_000_000,
+        &0,
         &None,
         &None,
         &0,
@@ -64,6 +66,7 @@ fn allowlist_recipient_enforced() {
         &String::from_str(&env, "vendor_list"),
         &BytesN::from_array(&env, &[7; 32]),
         &0,
+        &0,
         &Some(allowed.clone()),
         &None,
         &0,
@@ -96,4 +99,29 @@ fn disable_denies_everything() {
             &1,
         )
         .is_err());
+}
+
+#[test]
+fn test_evaluate_policy_fee_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &contract_id);
+    client.initialize();
+
+    let p_id = String::from_str(&env, "fee_policy");
+    client.register_policy(
+        &admin,
+        &p_id,
+        &BytesN::from_array(&env, &[0; 32]),
+        &0,
+        &1000, // max fee
+        &None,
+        &None,
+        &0,
+    );
+
+    assert_eq!(client.evaluate_policy(&p_id, &500), ());
+    assert_eq!(client.try_evaluate_policy(&p_id, &1500), Err(Ok(Error::FeeLimitExceeded)));
 }

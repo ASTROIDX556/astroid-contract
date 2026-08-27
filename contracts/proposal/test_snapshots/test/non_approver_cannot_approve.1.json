@@ -47,6 +47,13 @@
                 },
                 {
                   "u64": 5000
+                },
+                "void",
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
                 }
               ]
             }
@@ -132,11 +139,28 @@
                     },
                     {
                       "key": {
-                        "symbol": "expires_at"
+                        "symbol": "deadline"
                       },
                       "val": {
                         "u64": 5000
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit_amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit_asset"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -403,6 +427,13 @@
                 },
                 {
                   "u64": 5000
+                },
+                "void",
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
                 }
               ]
             }

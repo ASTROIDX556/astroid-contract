@@ -34,6 +34,8 @@ pub struct Policy {
     pub config_hash: BytesN<32>,
     /// Scalar gates baked in for cheap on-chain checks (so we don't need JSON).
     pub max_amount: i128,
+    /// Maximum acceptable transaction fee.
+    pub max_fee: i128,
     /// Allow-listed recipient (zero-length means "any" is allowed).
     pub allowed_recipient: Option<Address>,
     /// Asset contract address the spend must be in (None = any asset).
@@ -73,6 +75,7 @@ impl PolicyContract {
         policy_id: String,
         config_hash: BytesN<32>,
         max_amount: i128,
+        max_fee: i128,
         allowed_recipient: Option<Address>,
         allowed_asset: Option<Address>,
         expires_at: u64,
@@ -90,6 +93,7 @@ impl PolicyContract {
             owner,
             config_hash,
             max_amount,
+            max_fee,
             allowed_recipient,
             allowed_asset,
             expires_at,
@@ -112,6 +116,7 @@ impl PolicyContract {
         policy_id: String,
         new_hash: BytesN<32>,
         new_max: i128,
+        new_max_fee: i128,
     ) -> Result<(), Error> {
         caller.require_auth();
         let mut policy = Self::load(&env, &policy_id)?;
@@ -120,6 +125,7 @@ impl PolicyContract {
         }
         policy.config_hash = new_hash;
         policy.max_amount = new_max;
+        policy.max_fee = new_max_fee;
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
@@ -194,6 +200,23 @@ impl PolicyContract {
             (symbol_short!("policy"), symbol_short!("blk_rem")),
             (policy_id, address),
         );
+        Ok(())
+    }
+
+    pub fn evaluate_policy(
+        env: Env,
+        policy_id: String,
+        tx_fee: i128,
+    ) -> Result<(), Error> {
+        let policy = Self::load(&env, &policy_id)?;
+        if !policy.enabled {
+            events_policy_violation(&env, &policy_id, "disabled");
+            return Err(Error::PolicyDenied);
+        }
+        if policy.max_fee != 0 && tx_fee > policy.max_fee {
+            events_policy_violation(&env, &policy_id, "fee_high");
+            return Err(Error::FeeLimitExceeded);
+        }
         Ok(())
     }
 

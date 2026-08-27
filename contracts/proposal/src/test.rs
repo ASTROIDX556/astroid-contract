@@ -52,6 +52,8 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
         &approver_vec(h),
         &threshold,
         &expires_at,
+        &None,
+        &0,
     )
 }
 
@@ -138,19 +140,19 @@ fn expired_proposal_cannot_be_approved() {
     // Pending on-chain. The terminal `Expired` transition is recorded only via
     // the permissionless `expire()` path (see `explicit_expire_transition`).
     assert_eq!(h.client.state(&id), ProposalState::Pending);
-    h.client.expire(&id);
+    h.client.claim_expired_refund(&id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 
 #[test]
-fn explicit_expire_transition() {
+fn test_claim_expired_refund() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);
     // Cannot expire before deadline.
-    let early = h.client.try_expire(&id);
+    let early = h.client.try_claim_expired_refund(&id);
     assert_eq!(early, Err(Ok(Error::InvalidProposalState)));
     h.env.ledger().set_timestamp(6_000);
-    h.client.expire(&id);
+    h.client.claim_expired_refund(&id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 
@@ -167,6 +169,8 @@ fn create_with_bad_threshold_fails() {
         &approver_vec(&h),
         &3,
         &5_000,
+        &None,
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
@@ -183,6 +187,8 @@ fn create_with_past_expiry_fails() {
         &approver_vec(&h),
         &1,
         &500, // in the past (now = 1000)
+        &None,
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
 }
