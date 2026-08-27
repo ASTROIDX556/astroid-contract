@@ -166,7 +166,7 @@ fn emergency_lock_blocks_actions() {
 fn add_and_remove_signer() {
     let h = setup(3, 2);
     let new_signer = Address::generate(&h.env);
-    h.client.add_signer(&h.signers[0], &new_signer);
+    h.client.add_signer(&h.signers[0], &new_signer, &1);
     assert!(h.client.is_signer(&new_signer));
     assert_eq!(h.client.get_signers().len(), 4);
 
@@ -177,7 +177,7 @@ fn add_and_remove_signer() {
 #[test]
 fn cannot_add_duplicate_signer() {
     let h = setup(3, 2);
-    let res = h.client.try_add_signer(&h.signers[0], &h.signers[1]);
+    let res = h.client.try_add_signer(&h.signers[0], &h.signers[1], &1);
     assert_eq!(res, Err(Ok(Error::AlreadyExists)));
 }
 
@@ -206,11 +206,37 @@ fn non_signer_cannot_change_config() {
     let stranger = Address::generate(&h.env);
     let extra = Address::generate(&h.env);
     assert_eq!(
-        h.client.try_add_signer(&stranger, &extra),
+        h.client.try_add_signer(&stranger, &extra, &1),
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
         h.client.try_set_threshold(&stranger, &1),
         Err(Ok(Error::NotASigner))
     );
+}
+
+#[test]
+fn test_dynamic_weights_and_threshold() {
+    let h = setup(3, 3);
+    let s1 = &h.signers[0];
+    let s2 = &h.signers[1];
+    let s3 = &h.signers[2];
+    
+    // total weight is 3. Try to set threshold to 4, should fail.
+    assert_eq!(h.client.try_set_threshold(s1, &4), Err(Ok(Error::InvalidThreshold)));
+    
+    // Try to set threshold to 0, should fail.
+    assert_eq!(h.client.try_set_threshold(s1, &0), Err(Ok(Error::InvalidThreshold)));
+    
+    // update weight of s1 to 2. Total is 4.
+    h.client.update_weight(s1, s1, &2);
+    
+    // now we can set threshold to 4
+    h.client.set_threshold(s1, &4);
+    
+    // try to remove s3. weight would drop to 3, but threshold is 4.
+    assert_eq!(h.client.try_remove_signer(s1, s3), Err(Ok(Error::InvalidThreshold)));
+    
+    // Try to update s1 weight to 1. total drops to 3.
+    assert_eq!(h.client.try_update_weight(s1, s1, &1), Err(Ok(Error::InvalidThreshold)));
 }
