@@ -21,6 +21,7 @@ use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
+    Vec,
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
 
@@ -36,8 +37,12 @@ pub struct Policy {
     pub max_amount: i128,
     /// Allow-listed recipient (zero-length means "any" is allowed).
     pub allowed_recipient: Option<Address>,
-    /// Asset contract address the spend must be in (None = any asset).
-    pub allowed_asset: Option<Address>,
+    /// Asset contract addresses the spend must be in (empty = any asset).
+    pub allowed_assets: Vec<Address>,
+    /// Time window start (unix timestamp, 0 = no restriction).
+    pub time_window_start: u64,
+    /// Time window end (unix timestamp, 0 = no restriction).
+    pub time_window_end: u64,
     /// Unix timestamp the policy is active until (0 = no expiry).
     pub expires_at: u64,
     /// Whether the policy is currently enabled.
@@ -74,7 +79,9 @@ impl PolicyContract {
         config_hash: BytesN<32>,
         max_amount: i128,
         allowed_recipient: Option<Address>,
-        allowed_asset: Option<Address>,
+        allowed_assets: Vec<Address>,
+        time_window_start: u64,
+        time_window_end: u64,
         expires_at: u64,
     ) -> Result<(), Error> {
         owner.require_auth();
@@ -91,7 +98,9 @@ impl PolicyContract {
             config_hash,
             max_amount,
             allowed_recipient,
-            allowed_asset,
+            allowed_assets,
+            time_window_start,
+            time_window_end,
             expires_at,
             enabled: true,
         };
@@ -230,13 +239,24 @@ impl PolicyInterface for PolicyContract {
             events_policy_violation(&env, &policy_id, "disabled");
             return Err(Error::PolicyDenied);
         }
-        if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
+        let now = env.ledger().timestamp();
+        if policy.expires_at != 0 && now >= policy.expires_at {
             events_policy_violation(&env, &policy_id, "expired");
             return Err(Error::PolicyDenied);
         }
+        
+        if policy.time_window_start != 0 && now < policy.time_window_start {
+            events_policy_violation(&env, &policy_id, "too_early");
+            return Err(Error::OutOfWindow);
+        }
+        if policy.time_window_end != 0 && now > policy.time_window_end {
+            events_policy_violation(&env, &policy_id, "too_late");
+            return Err(Error::OutOfWindow);
+        }
+        
         if policy.max_amount != 0 && amount > policy.max_amount {
             events_policy_violation(&env, &policy_id, "above_max");
-            return Err(Error::PolicyDenied);
+            return Err(Error::LimitExceeded);
         }
         if let Some(allow_recip) = &policy.allowed_recipient {
             if allow_recip.clone() != recipient {
@@ -244,10 +264,17 @@ impl PolicyInterface for PolicyContract {
                 return Err(Error::PolicyDenied);
             }
         }
-        if let Some(allow_asset) = &policy.allowed_asset {
-            if allow_asset.clone() != asset {
+        if policy.allowed_assets.len() > 0 {
+            let mut found = false;
+            for a in policy.allowed_assets.iter() {
+                if a == asset {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
                 events_policy_violation(&env, &policy_id, "bad_asset");
-                return Err(Error::PolicyDenied);
+                return Err(Error::AssetRestricted);
             }
         }
         // Check blacklist
