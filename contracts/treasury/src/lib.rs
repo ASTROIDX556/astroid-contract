@@ -16,6 +16,7 @@
 //! Functions: `initialize`, `set_policy`, `set_budget`, `freeze`, `unfreeze`,
 //! `deposit`, `withdraw`, `allocate_budget`, `get`, `holding`.
 
+use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
@@ -25,8 +26,9 @@ use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
-use astroid_interfaces::PolicyClient;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
+};
 
 /// Stored treasury record.
 #[contracttype]
@@ -200,11 +202,8 @@ impl TreasuryContract {
         // 2. Budget consumption — aborts if the envelope lacks headroom.
         let mut holding = Self::load_holding(&env, &asset);
         if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
-            astroid_interfaces::BudgetClient::new(&env, budget_addr).consume(
-                &caller,
-                budget_id,
-                &amount,
-            );
+            astroid_interfaces::BudgetClient::new(&env, budget_addr)
+                .consume(&caller, budget_id, &amount);
         }
 
         // 3. Debit the internal ledger, then move real tokens out of custody.

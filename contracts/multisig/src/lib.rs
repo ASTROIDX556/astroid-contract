@@ -83,7 +83,9 @@ impl MultiSigContract {
         Self::assert_unique(&signers)?;
 
         env.storage().instance().set(&DataKey::Signers, &signers);
-        env.storage().instance().set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &threshold);
         env.storage()
             .instance()
             .set(&DataKey::EmergencyLock, &false);
@@ -134,7 +136,9 @@ impl MultiSigContract {
         Self::require_signer(&env, &caller)?;
         let signers = Self::signers(&env)?;
         Self::validate_threshold(threshold, signers.len())?;
-        env.storage().instance().set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &threshold);
         Self::bump_instance(&env);
         env.events().publish(
             (symbol_short!("threshold"), symbol_short!("changed")),
@@ -151,10 +155,8 @@ impl MultiSigContract {
             .instance()
             .set(&DataKey::EmergencyLock, &locked);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("emergency"), symbol_short!("lock")),
-            locked,
-        );
+        env.events()
+            .publish((symbol_short!("emergency"), symbol_short!("lock")), locked);
         Ok(())
     }
 
@@ -187,12 +189,16 @@ impl MultiSigContract {
             executed: false,
             unlock_at,
         };
-        env.storage().persistent().set(&DataKey::Proposal(id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), &proposal);
         env.storage()
             .persistent()
             .set(&DataKey::Approval(id, proposer.clone()), &true);
         Self::bump_proposal(&env, id);
-        env.storage().instance().set(&DataKey::ProposalCount, &count);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &count);
         Self::bump_instance(&env);
 
         env.events().publish(

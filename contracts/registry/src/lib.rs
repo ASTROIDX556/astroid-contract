@@ -19,9 +19,7 @@ use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRE
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -38,6 +36,8 @@ enum DataKey {
     Version(ModuleKind, u32),
     /// Latest known version number for a kind.
     LatestVersion(ModuleKind),
+    /// Emergency freeze status (instance).
+    Frozen,
 }
 
 #[contract]
@@ -63,7 +63,13 @@ impl RegistryContract {
     }
 
     /// Register an organization and its owner. Admin-gated.
-    pub fn register_org(env: Env, caller: Address, org: String, owner: Address) -> Result<(), Error> {
+    pub fn register_org(
+        env: Env,
+        caller: Address,
+        org: String,
+        owner: Address,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
         require_non_empty(&org)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::Org(org.clone());
@@ -87,6 +93,7 @@ impl RegistryContract {
         org: String,
         new_owner: Address,
     ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
         caller.require_auth();
         let key = DataKey::Org(org.clone());
         let current: Address = env
@@ -115,6 +122,7 @@ impl RegistryContract {
         kind: ModuleKind,
         address: Address,
     ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_admin_or_org_owner(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
@@ -134,6 +142,7 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_admin_or_org_owner(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
@@ -227,7 +236,54 @@ impl RegistryContract {
         Ok(())
     }
 
+    /// Emergency freeze - only registered org owners can freeze.
+    pub fn freeze(env: Env, caller: Address, org: String) -> Result<(), Error> {
+        caller.require_auth();
+        let owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Org(org.clone()))
+            .ok_or(Error::NotFound)?;
+        if owner != caller && !Self::is_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Frozen, &true);
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
+        Ok(())
+    }
+
+    /// Unfreeze - only registered org owners can unfreeze (works even when frozen).
+    pub fn unfreeze(env: Env, caller: Address, org: String) -> Result<(), Error> {
+        caller.require_auth();
+        // Bypass frozen check - unfreeze must work even when frozen
+        let owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Org(org.clone()))
+            .ok_or(Error::NotFound)?;
+        if owner != caller && !Self::is_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Frozen, &false);
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
+        Ok(())
+    }
+
     // --- internal helpers ---
+
+    fn check_frozen(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Frozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::RegistryFrozen);
+        }
+        Ok(())
+    }
 
     fn is_admin(env: &Env, who: &Address) -> bool {
         match env.storage().instance().get::<_, Address>(&DataKey::Admin) {
@@ -265,9 +321,11 @@ impl RegistryContract {
     }
 
     fn bump(env: &Env, key: &DataKey) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 }
 
@@ -278,6 +336,7 @@ impl RegistryContract {
 #[contractimpl]
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
+        Self::check_frozen(&env)?;
         env.storage()
             .persistent()
             .get(&DataKey::Module(org, kind))
@@ -285,6 +344,7 @@ impl RegistryInterface for RegistryContract {
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
+        Self::check_frozen(&env)?;
         let recorded: Address = env
             .storage()
             .persistent()

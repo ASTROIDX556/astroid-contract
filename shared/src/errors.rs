@@ -29,36 +29,42 @@ pub enum Error {
     PolicyDenied = 20,
     PolicyHashMismatch = 21,
     EmergencyLock = 22,
+    PolicyRecipientRestricted = 23,
 
-    // --- Budget (30-39) ---
-    BudgetExceeded = 30,
-    BudgetFrozen = 31,
-    BudgetArchived = 32,
+    // --- Registry (30-39) ---
+    RegistryFrozen = 30,
 
-    // --- Wallet (40-49) ---
-    WalletFrozen = 40,
-    WalletArchived = 41,
-    WalletPaused = 42,
-    InvalidState = 43,
+    // --- Budget (40-49) ---
+    BudgetExceeded = 40,
+    BudgetFrozen = 41,
+    BudgetArchived = 42,
+    AssetNotAuthorized = 43,
 
-    // --- Multisig / approvals (50-59) ---
-    InvalidSignature = 50,
-    ThresholdNotMet = 51,
-    AlreadySigned = 52,
-    NotASigner = 53,
-    InvalidThreshold = 54,
-    TimeLocked = 55,
-    TooManySigners = 56,
+    // --- Wallet (50-59) ---
+    WalletFrozen = 50,
+    WalletArchived = 51,
+    WalletPaused = 52,
+    InvalidState = 53,
 
-    // --- Proposal (60-69) ---
-    ProposalExpired = 60,
-    InvalidProposalState = 61,
-    ProposalNotApproved = 62,
-    NotAnApprover = 63,
+    // --- Multisig / approvals (60-69) ---
+    InvalidSignature = 60,
+    ThresholdNotMet = 61,
+    AlreadySigned = 62,
+    NotASigner = 63,
+    InvalidThreshold = 64,
+    TimeLocked = 65,
+    TooManySigners = 66,
 
-    // --- Escrow (70-79) ---
-    ConditionNotMet = 70,
-    EscrowNotFunded = 71,
-    EscrowExpired = 72,
-    InvalidCondition = 73,
+    // --- Proposal (70-79) ---
+    ProposalExpired = 70,
+    InvalidProposalState = 71,
+    ProposalNotApproved = 72,
+    NotAnApprover = 73,
+
+    // --- Escrow (80-89) ---
+    ConditionNotMet = 80,
+    EscrowNotFunded = 81,
+    EscrowExpired = 82,
+    InvalidCondition = 83,
+    TimeLockActive = 84,
 }

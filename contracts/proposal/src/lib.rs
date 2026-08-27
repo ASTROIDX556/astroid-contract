@@ -22,15 +22,13 @@
 //! `close`.
 
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 
 /// Proposal lifecycle state.
 #[contracttype]
@@ -136,9 +134,13 @@ impl ProposalContract {
             state: ProposalState::Pending,
             expires_at,
         };
-        env.storage().persistent().set(&DataKey::Proposal(id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), &proposal);
         Self::bump(&env, id);
-        env.storage().instance().set(&DataKey::ProposalCount, &count);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &count);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -215,10 +217,8 @@ impl ProposalContract {
         }
         proposal.state = ProposalState::Cancelled;
         Self::store(&env, id, &proposal);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("cancelled")),
-            id,
-        );
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("cancelled")), id);
         Ok(())
     }
 
@@ -298,7 +298,9 @@ impl ProposalContract {
     }
 
     fn store(env: &Env, id: u64, proposal: &Proposal) {
-        env.storage().persistent().set(&DataKey::Proposal(id), proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), proposal);
         Self::bump(env, id);
     }
 
