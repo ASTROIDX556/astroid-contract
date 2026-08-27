@@ -4,7 +4,7 @@ extern crate std;
 use crate::{MultiSigContract, MultiSigContractClient};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec};
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Map};
 
 struct Harness {
     env: Env,
@@ -12,20 +12,20 @@ struct Harness {
     signers: std::vec::Vec<Address>,
 }
 
-fn setup(n: u32, threshold: u32) -> Harness {
+fn setup(weights: std::vec::Vec<u32>, threshold: u32) -> Harness {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiSigContract);
     let client = MultiSigContractClient::new(&env, &contract_id);
 
     let mut signers = std::vec::Vec::new();
-    let mut sv = Vec::new(&env);
-    for _ in 0..n {
+    let mut sm = Map::new(&env);
+    for weight in weights {
         let a = Address::generate(&env);
-        sv.push_back(a.clone());
+        sm.set(a.clone(), weight);
         signers.push(a);
     }
-    client.initialize(&sv, &threshold);
+    client.initialize(&sm, &threshold);
     Harness {
         env,
         client,
@@ -39,9 +39,9 @@ fn payload(env: &Env) -> Bytes {
 
 #[test]
 fn initialize_state() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     assert_eq!(h.client.get_threshold(), 2);
-    assert_eq!(h.client.get_signers().len(), 3);
+    assert_eq!(h.client.get_signers().keys().len(), 3);
     assert!(h.client.is_signer(&h.signers[0]));
     assert!(!h.client.is_locked());
 }
@@ -52,17 +52,17 @@ fn bad_threshold_rejected_on_init() {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiSigContract);
     let client = MultiSigContractClient::new(&env, &contract_id);
-    let mut sv = Vec::new(&env);
-    sv.push_back(Address::generate(&env));
-    sv.push_back(Address::generate(&env));
+    let mut sm = Map::new(&env);
+    sm.set(Address::generate(&env), 1);
+    sm.set(Address::generate(&env), 1);
     // threshold 3 > 2 signers
-    let res = client.try_initialize(&sv, &3);
+    let res = client.try_initialize(&sm, &3);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
 
 #[test]
 fn propose_approve_execute_happy_path() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     let id = h.client.propose(
         &h.signers[0],
         &symbol_short!("payment"),
@@ -78,7 +78,7 @@ fn propose_approve_execute_happy_path() {
 
 #[test]
 fn execute_below_threshold_fails() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     let id = h.client.propose(
         &h.signers[0],
         &symbol_short!("payment"),
@@ -92,7 +92,7 @@ fn execute_below_threshold_fails() {
 
 #[test]
 fn non_signer_cannot_propose_or_approve() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     let stranger = Address::generate(&h.env);
     let res = h
         .client
@@ -102,7 +102,7 @@ fn non_signer_cannot_propose_or_approve() {
 
 #[test]
 fn double_approval_rejected() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     let id = h.client.propose(
         &h.signers[0],
         &symbol_short!("payment"),
@@ -116,7 +116,7 @@ fn double_approval_rejected() {
 
 #[test]
 fn time_lock_blocks_early_execution() {
-    let h = setup(2, 2);
+    let h = setup(std::vec![1, 1], 2);
     h.env.ledger().set_timestamp(1_000);
     let unlock = 5_000u64;
     let id = h.client.propose(
@@ -138,7 +138,7 @@ fn time_lock_blocks_early_execution() {
 
 #[test]
 fn emergency_lock_blocks_actions() {
-    let h = setup(2, 2);
+    let h = setup(std::vec![1, 1], 2);
     h.client.set_emergency_lock(&h.signers[0], &true);
     assert!(h.client.is_locked());
     let res = h.client.try_propose(
@@ -164,11 +164,11 @@ fn emergency_lock_blocks_actions() {
 
 #[test]
 fn add_and_remove_signer() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     let new_signer = Address::generate(&h.env);
-    h.client.add_signer(&h.signers[0], &new_signer);
+    h.client.add_signer(&h.signers[0], &new_signer, &1);
     assert!(h.client.is_signer(&new_signer));
-    assert_eq!(h.client.get_signers().len(), 4);
+    assert_eq!(h.client.get_signers().keys().len(), 4);
 
     h.client.remove_signer(&h.signers[0], &new_signer);
     assert!(!h.client.is_signer(&new_signer));
@@ -176,14 +176,14 @@ fn add_and_remove_signer() {
 
 #[test]
 fn cannot_add_duplicate_signer() {
-    let h = setup(3, 2);
-    let res = h.client.try_add_signer(&h.signers[0], &h.signers[1]);
+    let h = setup(std::vec![1, 1, 1], 2);
+    let res = h.client.try_add_signer(&h.signers[0], &h.signers[1], &1);
     assert_eq!(res, Err(Ok(Error::AlreadyExists)));
 }
 
 #[test]
 fn cannot_remove_below_threshold() {
-    let h = setup(2, 2);
+    let h = setup(std::vec![1, 1], 2);
     // Removing any signer would make it impossible to reach threshold 2.
     let res = h.client.try_remove_signer(&h.signers[0], &h.signers[1]);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
@@ -191,7 +191,7 @@ fn cannot_remove_below_threshold() {
 
 #[test]
 fn set_threshold_bounds_enforced() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     // Threshold larger than signer count is rejected.
     let res = h.client.try_set_threshold(&h.signers[0], &4);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
@@ -202,15 +202,40 @@ fn set_threshold_bounds_enforced() {
 
 #[test]
 fn non_signer_cannot_change_config() {
-    let h = setup(3, 2);
+    let h = setup(std::vec![1, 1, 1], 2);
     let stranger = Address::generate(&h.env);
     let extra = Address::generate(&h.env);
     assert_eq!(
-        h.client.try_add_signer(&stranger, &extra),
+        h.client.try_add_signer(&stranger, &extra, &1),
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
         h.client.try_set_threshold(&stranger, &1),
         Err(Ok(Error::NotASigner))
     );
+}
+
+#[test]
+fn execute_dynamic_weights() {
+    let h = setup(std::vec![50, 30, 30], 80);
+    // Signer 0 has 50 weight. Signer 1 has 30 weight. Signer 2 has 30 weight.
+    let id = h.client.propose(
+        &h.signers[1], // weight 30
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    // Only proposer's approval (30) < threshold (80).
+    let res = h.client.try_execute(&h.signers[1], &id);
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+
+    h.client.approve(&h.signers[2], &id);
+    // 30 + 30 = 60 < 80
+    let res2 = h.client.try_execute(&h.signers[1], &id);
+    assert_eq!(res2, Err(Ok(Error::ThresholdNotMet)));
+
+    h.client.approve(&h.signers[0], &id);
+    // 60 + 50 = 110 >= 80 -> succeeds!
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
 }

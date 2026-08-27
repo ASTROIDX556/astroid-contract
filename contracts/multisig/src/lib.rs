@@ -26,7 +26,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_time_reached;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol, Vec, Map,
 };
 
 #[contracttype]
@@ -71,7 +71,7 @@ pub struct MultiSigContract;
 impl MultiSigContract {
     /// Initialize with an initial signer set and threshold. `threshold` must be
     /// within `[MIN_THRESHOLD, signers.len()]` and signers within `MAX_SIGNERS`.
-    pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32) -> Result<(), Error> {
+    pub fn initialize(env: Env, signers: Map<Address, u32>, threshold: u32) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Threshold) {
             return Err(Error::AlreadyInitialized);
         }
@@ -79,8 +79,12 @@ impl MultiSigContract {
         if n == 0 || n > MAX_SIGNERS {
             return Err(Error::InvalidInput);
         }
-        Self::validate_threshold(threshold, n)?;
-        Self::assert_unique(&signers)?;
+        
+        let mut total_weight: u32 = 0;
+        for (_addr, weight) in signers.iter() {
+            total_weight = total_weight.saturating_add(weight);
+        }
+        Self::validate_threshold(threshold, total_weight)?;
 
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage()
@@ -95,16 +99,16 @@ impl MultiSigContract {
     }
 
     /// Add a signer. Signer-gated. Rejects duplicates and over-capacity sets.
-    pub fn add_signer(env: Env, caller: Address, signer: Address) -> Result<(), Error> {
+    pub fn add_signer(env: Env, caller: Address, signer: Address, weight: u32) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         let mut signers = Self::signers(&env)?;
-        if signers.contains(&signer) {
+        if signers.contains_key(signer.clone()) {
             return Err(Error::AlreadyExists);
         }
         if signers.len() >= MAX_SIGNERS {
             return Err(Error::TooManySigners);
         }
-        signers.push_back(signer.clone());
+        signers.set(signer.clone(), weight);
         env.storage().instance().set(&DataKey::Signers, &signers);
         Self::bump_instance(&env);
         env.events()
@@ -118,11 +122,17 @@ impl MultiSigContract {
         Self::require_signer(&env, &caller)?;
         let mut signers = Self::signers(&env)?;
         let threshold = Self::threshold(&env)?;
-        let idx = signers.first_index_of(&signer).ok_or(Error::NotASigner)?;
-        if signers.len() - 1 < threshold {
+        if !signers.contains_key(signer.clone()) {
+            return Err(Error::NotASigner);
+        }
+        signers.remove(signer.clone());
+        let mut total_weight: u32 = 0;
+        for (_addr, weight) in signers.iter() {
+            total_weight = total_weight.saturating_add(weight);
+        }
+        if total_weight < threshold {
             return Err(Error::InvalidThreshold);
         }
-        signers.remove(idx);
         env.storage().instance().set(&DataKey::Signers, &signers);
         Self::bump_instance(&env);
         env.events()
@@ -135,7 +145,11 @@ impl MultiSigContract {
     pub fn set_threshold(env: Env, caller: Address, threshold: u32) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         let signers = Self::signers(&env)?;
-        Self::validate_threshold(threshold, signers.len())?;
+        let mut total_weight: u32 = 0;
+        for (_addr, weight) in signers.iter() {
+            total_weight = total_weight.saturating_add(weight);
+        }
+        Self::validate_threshold(threshold, total_weight)?;
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -245,7 +259,15 @@ impl MultiSigContract {
             return Err(Error::InvalidProposalState);
         }
         let threshold = Self::threshold(&env)?;
-        if proposal.approvals < threshold {
+        let signers = Self::signers(&env)?;
+        let mut total_weight: u32 = 0;
+        for (addr, weight) in signers.iter() {
+            let akey = DataKey::Approval(proposal_id, addr.clone());
+            if env.storage().persistent().get(&akey).unwrap_or(false) {
+                total_weight = total_weight.saturating_add(weight);
+            }
+        }
+        if total_weight < threshold {
             return Err(Error::ThresholdNotMet);
         }
         if proposal.unlock_at != 0 {
@@ -269,7 +291,7 @@ impl MultiSigContract {
         Self::load_proposal(&env, proposal_id)
     }
 
-    pub fn get_signers(env: Env) -> Result<Vec<Address>, Error> {
+    pub fn get_signers(env: Env) -> Result<Map<Address, u32>, Error> {
         Self::signers(&env)
     }
 
@@ -279,7 +301,7 @@ impl MultiSigContract {
 
     pub fn is_signer(env: Env, who: Address) -> bool {
         Self::signers(&env)
-            .map(|s| s.contains(&who))
+            .map(|s| s.contains_key(who.clone()))
             .unwrap_or(false)
     }
 
@@ -292,7 +314,7 @@ impl MultiSigContract {
 
     // --- internal helpers ---
 
-    fn signers(env: &Env) -> Result<Vec<Address>, Error> {
+    fn signers(env: &Env) -> Result<Map<Address, u32>, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Signers)
@@ -316,7 +338,7 @@ impl MultiSigContract {
     fn require_signer(env: &Env, caller: &Address) -> Result<(), Error> {
         caller.require_auth();
         let signers = Self::signers(env)?;
-        if !signers.contains(caller) {
+        if !signers.contains_key(caller.clone()) {
             return Err(Error::NotASigner);
         }
         Ok(())
@@ -337,23 +359,6 @@ impl MultiSigContract {
     fn validate_threshold(threshold: u32, n: u32) -> Result<(), Error> {
         if threshold < MIN_THRESHOLD || threshold > n {
             return Err(Error::InvalidThreshold);
-        }
-        Ok(())
-    }
-
-    fn assert_unique(signers: &Vec<Address>) -> Result<(), Error> {
-        let len = signers.len();
-        let mut i = 0;
-        while i < len {
-            let a = signers.get(i).unwrap();
-            let mut j = i + 1;
-            while j < len {
-                if a == signers.get(j).unwrap() {
-                    return Err(Error::InvalidInput);
-                }
-                j += 1;
-            }
-            i += 1;
         }
         Ok(())
     }
