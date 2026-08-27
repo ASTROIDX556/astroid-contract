@@ -120,3 +120,43 @@ fn prepare_holds_state() {
     let state = h.client.get();
     assert_eq!(state.org, String::from_str(&h.env, "vault"));
 }
+
+#[test]
+fn test_milestone_releases() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &contract_id);
+    client.initialize(&soroban_sdk::String::from_str(&env, "org"), &admin);
+    
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    let token_client = token::TokenClient::new(&env, &token);
+    
+    let to = Address::generate(&env);
+    
+    let mid = client.init_milestone_disbursement(&admin, &token, &to, &1000, &3);
+    assert_eq!(mid, 1);
+    
+    // Deposit 1000 into treasury so we have funds
+    token_admin.mint(&admin, &1000);
+    client.deposit(&admin, &token, &1000);
+    
+    // release milestone 1
+    client.release_next_milestone(&admin, &mid);
+    assert_eq!(token_client.balance(&to), 333); // 1000 / 3
+    
+    // release milestone 2
+    client.release_next_milestone(&admin, &mid);
+    assert_eq!(token_client.balance(&to), 666);
+    
+    // release milestone 3 (final, catches remainder)
+    client.release_next_milestone(&admin, &mid);
+    assert_eq!(token_client.balance(&to), 1000);
+    
+    // releasing beyond fails
+    let res = client.try_release_next_milestone(&admin, &mid);
+    assert!(res.is_err());
+}

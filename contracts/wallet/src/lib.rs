@@ -19,6 +19,7 @@
 
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
+use astroid_shared::ensure;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
@@ -97,9 +98,7 @@ impl WalletContract {
         from.require_auth();
         let wallet = Self::load_wallet(&env, wallet_id)?;
         // Deposits are refused into archived wallets; other states may receive.
-        if wallet.state == ResourceState::Archived {
-            return Err(Error::WalletArchived);
-        }
+        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
         // Move real tokens into the contract's custody, then credit internally.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -165,9 +164,7 @@ impl WalletContract {
     /// Freeze a wallet (owner or admin). Blocks all outbound movement.
     pub fn freeze(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner_or_admin(&env, wallet_id, &caller)?;
-        if wallet.state == ResourceState::Archived {
-            return Err(Error::WalletArchived);
-        }
+        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
         wallet.state = ResourceState::Frozen;
         Self::store_wallet(&env, wallet_id, &wallet);
         events::wallet_frozen(&env, wallet_id, &caller);
@@ -177,9 +174,7 @@ impl WalletContract {
     /// Unfreeze a wallet back to `Active` (owner or admin).
     pub fn unfreeze(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner_or_admin(&env, wallet_id, &caller)?;
-        if wallet.state != ResourceState::Frozen {
-            return Err(Error::InvalidState);
-        }
+        ensure!(wallet.state == ResourceState::Frozen, Error::InvalidState);
         wallet.state = ResourceState::Active;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("unfrozen"));
@@ -189,9 +184,7 @@ impl WalletContract {
     /// Pause a wallet (owner only). Temporarily blocks outbound movement.
     pub fn pause(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
-        if wallet.state != ResourceState::Active {
-            return Err(Error::InvalidState);
-        }
+        ensure!(wallet.state == ResourceState::Active, Error::InvalidState);
         wallet.state = ResourceState::Paused;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("paused"));
@@ -201,9 +194,7 @@ impl WalletContract {
     /// Resume a paused wallet (owner only).
     pub fn unpause(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
-        if wallet.state != ResourceState::Paused {
-            return Err(Error::InvalidState);
-        }
+        ensure!(wallet.state == ResourceState::Paused, Error::InvalidState);
         wallet.state = ResourceState::Active;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("unpaused"));
@@ -213,9 +204,7 @@ impl WalletContract {
     /// Archive a wallet (owner only). Terminal state; no further transactions.
     pub fn archive(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
-        if wallet.state == ResourceState::Archived {
-            return Err(Error::WalletArchived);
-        }
+        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
         wallet.state = ResourceState::Archived;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("archived"));
@@ -254,9 +243,7 @@ impl WalletContract {
     fn require_owner(env: &Env, id: u64, caller: &Address) -> Result<WalletData, Error> {
         caller.require_auth();
         let wallet = Self::load_wallet(env, id)?;
-        if &wallet.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(&wallet.owner == caller, Error::Unauthorized);
         Ok(wallet)
     }
 
@@ -265,19 +252,15 @@ impl WalletContract {
         let wallet = Self::load_wallet(env, id)?;
         let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         let is_admin = admin.map(|a| &a == caller).unwrap_or(false);
-        if &wallet.owner != caller && !is_admin {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(&wallet.owner == caller || is_admin, Error::Unauthorized);
         Ok(wallet)
     }
 
     fn require_active(wallet: &WalletData) -> Result<(), Error> {
-        match wallet.state {
-            ResourceState::Active => Ok(()),
-            ResourceState::Frozen => Err(Error::WalletFrozen),
-            ResourceState::Paused => Err(Error::WalletPaused),
-            ResourceState::Archived => Err(Error::WalletArchived),
-        }
+        ensure!(wallet.state != ResourceState::Frozen, Error::WalletFrozen);
+        ensure!(wallet.state != ResourceState::Paused, Error::WalletPaused);
+        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
+        Ok(())
     }
 
     fn credit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
@@ -296,9 +279,7 @@ impl WalletContract {
     fn debit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
         let key = DataKey::Balance(id, asset.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if current < amount {
-            return Err(Error::InsufficientFunds);
-        }
+        ensure!(current >= amount, Error::InsufficientFunds);
         let updated = checked_sub(current, amount)?;
         env.storage().persistent().set(&key, &updated);
         env.storage().persistent().extend_ttl(
