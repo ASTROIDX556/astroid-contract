@@ -79,8 +79,8 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &owner);
         Self::bump(&env, &key);
         env.events().publish(
-            (symbol_short!("org"), symbol_short!("register")),
-            (org, owner),
+            (symbol_short!("org"), symbol_short!("register"), org.clone()),
+            owner,
         );
         Ok(())
     }
@@ -107,8 +107,8 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &new_owner);
         Self::bump(&env, &key);
         env.events().publish(
-            (symbol_short!("org"), symbol_short!("owner")),
-            (org, new_owner),
+            (symbol_short!("org"), symbol_short!("owner"), org.clone()),
+            new_owner,
         );
         Ok(())
     }
@@ -129,8 +129,8 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
         env.events().publish(
-            (symbol_short!("module"), symbol_short!("register")),
-            (org, kind, address),
+            (symbol_short!("module"), symbol_short!("register"), org.clone(), kind.clone()),
+            address,
         );
         Ok(())
     }
@@ -151,8 +151,8 @@ impl RegistryContract {
         }
         env.storage().persistent().remove(&key);
         env.events().publish(
-            (symbol_short!("module"), symbol_short!("remove")),
-            (org, kind),
+            (symbol_short!("module"), symbol_short!("remove"), org.clone(), kind.clone()),
+            (),
         );
         Ok(())
     }
@@ -182,36 +182,34 @@ impl RegistryContract {
             Self::bump(&env, &lkey);
         }
         env.events().publish(
-            (symbol_short!("version"), symbol_short!("register")),
-            (kind, version, address),
+            (symbol_short!("version"), symbol_short!("register"), kind.clone(), version),
+            address,
         );
         Ok(())
     }
 
     /// Look up a specific implementation version.
     pub fn get_version(env: Env, kind: ModuleKind, version: u32) -> Result<Address, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Version(kind, version))
-            .ok_or(Error::NotFound)
+        let key = DataKey::Version(kind, version);
+        let val = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
     }
 
     /// Look up the latest implementation address for a kind.
     pub fn get_latest(env: Env, kind: ModuleKind) -> Result<Address, Error> {
-        let latest: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LatestVersion(kind))
-            .ok_or(Error::NotFound)?;
+        let key = DataKey::LatestVersion(kind.clone());
+        let latest: u32 = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
         Self::get_version(env, kind, latest)
     }
 
     /// Read the recorded owner of an organization.
     pub fn get_org_owner(env: Env, org: String) -> Result<Address, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Org(org))
-            .ok_or(Error::NotFound)
+        let key = DataKey::Org(org);
+        let val = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
     }
 
     /// Read the current admin.
@@ -337,19 +335,17 @@ impl RegistryContract {
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
-        env.storage()
-            .persistent()
-            .get(&DataKey::Module(org, kind))
-            .ok_or(Error::NotFound)
+        let key = DataKey::Module(org, kind);
+        let val = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
         Self::check_frozen(&env)?;
-        let recorded: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Org(org))
-            .ok_or(Error::NotFound)?;
+        let key = DataKey::Org(org);
+        let recorded: Address = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
         Ok(recorded == owner)
     }
 }
