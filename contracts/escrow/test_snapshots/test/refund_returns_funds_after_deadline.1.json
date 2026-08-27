@@ -68,13 +68,19 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                 },
                 {
-                  "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 5000
-                  }
+                  "map": [
+                    {
+                      "key": {
+                        "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 5000
+                        }
+                      }
+                    }
+                  ]
                 },
                 {
                   "u64": 1100
@@ -249,17 +255,6 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 5000
-                        }
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "arbiter"
                       },
                       "val": {
@@ -268,10 +263,22 @@
                     },
                     {
                       "key": {
-                        "symbol": "asset"
+                        "symbol": "balances"
                       },
                       "val": {
-                        "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                        "map": [
+                          {
+                            "key": {
+                              "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                            },
+                            "val": {
+                              "i128": {
+                                "hi": 0,
+                                "lo": 5000
+                              }
+                            }
+                          }
+                        ]
                       }
                     },
                     {
@@ -280,17 +287,6 @@
                       },
                       "val": {
                         "u64": 1100
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "funded_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 5000
-                        }
                       }
                     },
                     {
@@ -1044,13 +1040,19 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                 },
                 {
-                  "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 5000
-                  }
+                  "map": [
+                    {
+                      "key": {
+                        "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 5000
+                        }
+                      }
+                    }
+                  ]
                 },
                 {
                   "u64": 1100
@@ -1182,15 +1184,6 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 5000
-                  }
                 }
               ]
             }
@@ -1443,17 +1436,6 @@
               "map": [
                 {
                   "key": {
-                    "symbol": "amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 5000
-                    }
-                  }
-                },
-                {
-                  "key": {
                     "symbol": "arbiter"
                   },
                   "val": {
@@ -1462,10 +1444,22 @@
                 },
                 {
                   "key": {
-                    "symbol": "asset"
+                    "symbol": "balances"
                   },
                   "val": {
-                    "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                    "map": [
+                      {
+                        "key": {
+                          "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 5000
+                          }
+                        }
+                      }
+                    ]
                   }
                 },
                 {
@@ -1474,17 +1468,6 @@
                   },
                   "val": {
                     "u64": 1100
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "funded_amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 5000
-                    }
                   }
                 },
                 {

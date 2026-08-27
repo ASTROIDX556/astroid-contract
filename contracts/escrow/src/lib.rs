@@ -29,7 +29,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_positive_amount;
-use soroban_sdk::{
+use soroban_sdk::{Map, 
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
 };
 
@@ -50,11 +50,9 @@ pub struct Escrow {
     pub sender: Address,
     pub recipient: Address,
     pub arbiter: Address,
-    pub asset: Address,
-    pub amount: i128,
+    pub balances: Map<Address, i128>,
     pub state: EscrowState,
     pub deadline: u64,
-    pub funded_amount: i128,
     pub memo: String,
 }
 
@@ -91,45 +89,43 @@ impl EscrowContract {
         sender: Address,
         recipient: Address,
         arbiter: Address,
-        asset: Address,
-        amount: i128,
+        balances: Map<Address, i128>,
         deadline: u64,
         memo: String,
     ) -> Result<u64, Error> {
-        // `sender` commits the funds.
         sender.require_auth();
-        require_positive_amount(amount)?;
         if recipient == sender {
             return Err(Error::InvalidInput);
         }
-        // A live release window is required — a past/zero deadline would make the
-        // escrow un-releasable and instantly refundable.
         if deadline <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
+        }
+        if balances.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        for (_, amount) in balances.iter() {
+            require_positive_amount(amount)?;
         }
 
         let mut count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
         count = checked_add(count as i128, 1)? as u64;
         let id = count;
 
-        // Pull the funds into the escrow's own custody. If the sender lacks the
-        // balance this panics and the whole invocation (including the id bump)
-        // rolls back.
-        token::TokenClient::new(&env, &asset).transfer(
-            &sender,
-            &env.current_contract_address(),
-            &amount,
-        );
+        for (asset, amount) in balances.iter() {
+            token::TokenClient::new(&env, &asset).transfer(
+                &sender,
+                &env.current_contract_address(),
+                &amount,
+            );
+        }
 
         let escrow = Escrow {
             sender: sender.clone(),
             recipient: recipient.clone(),
             arbiter,
-            asset: asset.clone(),
-            amount,
+            balances,
             state: EscrowState::Funded,
             deadline,
-            funded_amount: amount,
             memo,
         };
         env.storage()
@@ -140,7 +136,7 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, sender, recipient, asset, amount),
+            (id, sender, recipient),
         );
         Ok(id)
     }
@@ -152,18 +148,22 @@ impl EscrowContract {
         sender: Address,
         recipient: Address,
         arbiter: Address,
-        asset: Address,
-        amount: i128,
+        balances: Map<Address, i128>,
         unlock_time: u64,
         memo: String,
     ) -> Result<u64, Error> {
         sender.require_auth();
-        require_positive_amount(amount)?;
         if recipient == sender {
             return Err(Error::InvalidInput);
         }
         if unlock_time <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
+        }
+        if balances.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        for (_, amount) in balances.iter() {
+            require_positive_amount(amount)?;
         }
 
         let mut count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
@@ -174,11 +174,9 @@ impl EscrowContract {
             sender: sender.clone(),
             recipient: recipient.clone(),
             arbiter,
-            asset: asset.clone(),
-            amount,
+            balances,
             state: EscrowState::Created,
             deadline: unlock_time,
-            funded_amount: 0,
             memo,
         };
         env.storage()
@@ -189,7 +187,7 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("init_tl")),
-            (id, sender, recipient, asset, amount, unlock_time),
+            (id, sender, recipient, unlock_time),
         );
         Ok(id)
     }
@@ -210,18 +208,20 @@ impl EscrowContract {
 
         escrow.state = EscrowState::Released;
         Self::store(&env, id, &escrow);
-        token::TokenClient::new(&env, &escrow.asset).transfer(
-            &env.current_contract_address(),
-            &escrow.recipient,
-            &escrow.amount,
-        );
-        events::transfer_executed(
-            &env,
-            &escrow.sender,
-            &escrow.recipient,
-            &escrow.asset,
-            escrow.amount,
-        );
+        for (asset, amount) in escrow.balances.iter() {
+            token::TokenClient::new(&env, &asset).transfer(
+                &env.current_contract_address(),
+                &escrow.recipient,
+                &amount,
+            );
+            events::transfer_executed(
+                &env,
+                &escrow.sender,
+                &escrow.recipient,
+                &asset,
+                amount,
+            );
+        }
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("claimed")),
             (id, caller),
@@ -250,19 +250,20 @@ impl EscrowContract {
 
         escrow.state = EscrowState::Released;
         Self::store(&env, id, &escrow);
-        // Move the real tokens out of custody to the recipient.
-        token::TokenClient::new(&env, &escrow.asset).transfer(
-            &env.current_contract_address(),
-            &escrow.recipient,
-            &escrow.funded_amount,
-        );
-        events::transfer_executed(
-            &env,
-            &escrow.sender,
-            &escrow.recipient,
-            &escrow.asset,
-            escrow.funded_amount,
-        );
+        for (asset, amount) in escrow.balances.iter() {
+            token::TokenClient::new(&env, &asset).transfer(
+                &env.current_contract_address(),
+                &escrow.recipient,
+                &amount,
+            );
+            events::transfer_executed(
+                &env,
+                &escrow.sender,
+                &escrow.recipient,
+                &asset,
+                amount,
+            );
+        }
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("released")),
             (id, arbiter),
@@ -304,12 +305,13 @@ impl EscrowContract {
         }
         escrow.state = EscrowState::Refunded;
         Self::store(&env, id, &escrow);
-        // Return the real tokens to the sender.
-        token::TokenClient::new(&env, &escrow.asset).transfer(
-            &env.current_contract_address(),
-            &escrow.sender,
-            &escrow.funded_amount,
-        );
+        for (asset, amount) in escrow.balances.iter() {
+            token::TokenClient::new(&env, &asset).transfer(
+                &env.current_contract_address(),
+                &escrow.sender,
+                &amount,
+            );
+        }
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("refunded")),
             (id, caller),

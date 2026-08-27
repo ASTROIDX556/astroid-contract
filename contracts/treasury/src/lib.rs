@@ -60,6 +60,7 @@ pub struct Holding {
 enum DataKey {
     Treasury,
     Holding(Address),
+    ReentrancyLock,
 }
 
 #[contract]
@@ -141,19 +142,21 @@ impl TreasuryContract {
         from.require_auth();
         let t = Self::load(&env);
         Self::require_active(&t)?;
+        Self::lock(&env)?;
+        let mut h = Self::load_holding(&env, &asset);
+        h.total_in = checked_add(h.total_in, amount)?;
+        Self::store_holding(&env, &asset, &h);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("deposited")),
+            (asset.clone(), amount),
+        );
         // Pull tokens into the contract's own custody.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
             &env.current_contract_address(),
             &amount,
         );
-        let mut h = Self::load_holding(&env, &asset);
-        h.total_in = checked_add(h.total_in, amount)?;
-        Self::store_holding(&env, &asset, &h);
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("deposited")),
-            (asset, amount),
-        );
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -207,18 +210,21 @@ impl TreasuryContract {
         }
 
         // 3. Debit the internal ledger, then move real tokens out of custody.
+        Self::lock(&env)?;
         if holding.total_in < amount {
+            Self::unlock(&env);
             return Err(Error::InsufficientFunds);
         }
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
             &to,
             &amount,
         );
-        events::transfer_executed(&env, &t.admin, &to, &asset, amount);
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -262,6 +268,19 @@ impl TreasuryContract {
             ResourceState::Active => Ok(()),
             _ => Err(Error::InvalidState),
         }
+    }
+
+    fn lock(env: &Env) -> Result<(), Error> {
+        let is_locked: bool = env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false);
+        if is_locked {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+        Ok(())
+    }
+
+    fn unlock(env: &Env) {
+        env.storage().instance().set(&DataKey::ReentrancyLock, &false);
     }
 
     fn load_holding(env: &Env, asset: &Address) -> Holding {

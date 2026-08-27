@@ -1,4 +1,4 @@
-use soroban_sdk::{
+use soroban_sdk::{Map, 
     testutils::{Address as _, Ledger},
     token, Address, Env, String,
 };
@@ -56,12 +56,13 @@ fn balance(h: &Harness, who: &Address) -> i128 {
 }
 
 fn create(h: &Harness, amount: i128, deadline: u64) -> u64 {
+    let mut balances = Map::new(&h.env);
+    balances.set(h.asset.clone(), amount);
     h.client.create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &h.asset,
-        &amount,
+        &balances,
         &deadline,
         &String::from_str(&h.env, "payment"),
     )
@@ -190,13 +191,15 @@ fn cannot_close_while_expired() {
 #[test]
 fn create_rejects_bad_input() {
     let h = setup(5_000);
+    let mut balances = Map::new(&h.env);
+    balances.set(h.asset.clone(), 5_000);
+    
     // recipient == sender
     let r1 = h.client.try_create(
         &h.sender,
         &h.sender,
         &h.arbiter,
-        &h.asset,
-        &1_000,
+        &balances,
         &(START + 100),
         &String::from_str(&h.env, "x"),
     );
@@ -206,19 +209,19 @@ fn create_rejects_bad_input() {
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &h.asset,
-        &1_000,
+        &balances,
         &(START - 500),
         &String::from_str(&h.env, "x"),
     );
     assert_eq!(r2, Err(Ok(Error::InvalidInput)));
     // non-positive amount
+    let mut bad_balances = Map::new(&h.env);
+    bad_balances.set(h.asset.clone(), 0);
     let r3 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &h.asset,
-        &0,
+        &bad_balances,
         &(START + 100),
         &String::from_str(&h.env, "x"),
     );
