@@ -33,7 +33,8 @@ pub fn transfer_executed(env: &Env, from: &Address, to: &Address, asset: &Addres
 /// `ProposalCreated` — topic `("proposal", "created")`.
 pub fn proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
     let topics = (symbol_short!("proposal"), symbol_short!("created"));
-    env.events().publish(topics, (proposal_id, proposer.clone()));
+    env.events()
+        .publish(topics, (proposal_id, proposer.clone()));
 }
 
 /// `ProposalApproved` — topic `("proposal", "approved")`.

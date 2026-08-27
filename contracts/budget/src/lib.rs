@@ -23,7 +23,9 @@ use astroid_shared::constants::{
 use astroid_shared::errors::Error;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
-use astroid_shared::validation::{require_non_empty, require_non_negative_amount, require_positive_amount};
+use astroid_shared::validation::{
+    require_non_empty, require_non_negative_amount, require_positive_amount,
+};
 use astroid_shared::{constants, events};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 
@@ -50,11 +52,21 @@ pub struct Budget {
     pub state: ResourceState,
 }
 
+/// Per-asset budget tracking.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetBudget {
+    pub limit: i128,
+    pub spent: i128,
+    pub window_start: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Admin,
     Budget(String),
+    AssetBudget(String, Address),
 }
 
 #[contract]
@@ -114,10 +126,8 @@ impl BudgetContract {
         budget.spent = 0;
         budget.window_start = env.ledger().timestamp();
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("reset")),
-            budget_id,
-        );
+        env.events()
+            .publish((symbol_short!("budget"), symbol_short!("reset")), budget_id);
         Ok(())
     }
 
@@ -223,6 +233,69 @@ impl BudgetContract {
         Ok(())
     }
 
+    /// Set budget limit for a specific token (owner-gated).
+    pub fn set_budget_limit(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        token: Address,
+        limit: i128,
+        _window_seconds: u64,
+    ) -> Result<(), Error> {
+        let budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+        require_non_negative_amount(limit)?;
+
+        let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
+        let asset_budget = AssetBudget {
+            limit,
+            spent: 0,
+            window_start: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &asset_budget);
+        Self::bump_asset(&env, &budget_id, &token);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("set_ast")),
+            (budget_id, token, limit),
+        );
+        Ok(())
+    }
+
+    /// Check and record spend for a specific token.
+    pub fn check_and_record_spend(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+
+        let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
+        let mut asset_budget: AssetBudget = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::AssetNotAuthorized)?;
+
+        // Check if within limit
+        let new_spent = checked_add(asset_budget.spent, amount)?;
+        if new_spent > asset_budget.limit {
+            return Err(Error::BudgetExceeded);
+        }
+
+        asset_budget.spent = new_spent;
+        env.storage().persistent().set(&key, &asset_budget);
+        Self::bump_asset(&env, &budget_id, &token);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("ast_spend")),
+            (budget_id, token, amount),
+        );
+        Ok(())
+    }
+
     // --- views ---
 
     pub fn get(env: Env, budget_id: String) -> Result<Budget, Error> {
@@ -286,6 +359,14 @@ impl BudgetContract {
             PERSISTENT_BUMP_AMOUNT,
         );
     }
+
+    fn bump_asset(env: &Env, budget_id: &String, token: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::AssetBudget(budget_id.clone(), token.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,12 +376,7 @@ impl BudgetContract {
 impl BudgetInterface for BudgetContract {
     /// Debit `amount` from the budget. Applies any pending auto-reset first,
     /// then enforces `spent + amount <= limit`, else [`Error::BudgetExceeded`].
-    fn consume(
-        env: Env,
-        caller: Address,
-        budget_id: String,
-        amount: i128,
-    ) -> Result<i128, Error> {
+    fn consume(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;

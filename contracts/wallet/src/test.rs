@@ -98,7 +98,9 @@ fn transfer_more_than_balance_fails() {
     mint(&h, &owner, 100);
     h.client.deposit(&id, &owner, &h.token, &100);
 
-    let res = h.client.try_transfer(&owner, &id, &recipient, &h.token, &500);
+    let res = h
+        .client
+        .try_transfer(&owner, &id, &recipient, &h.token, &500);
     assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
 }
 
@@ -130,7 +132,9 @@ fn transfer_while_frozen_fails_wallet_frozen() {
     h.client.freeze(&owner, &id);
     assert_eq!(h.client.get_wallet(&id).state, ResourceState::Frozen);
 
-    let res = h.client.try_transfer(&owner, &id, &recipient, &h.token, &10);
+    let res = h
+        .client
+        .try_transfer(&owner, &id, &recipient, &h.token, &10);
     assert_eq!(res, Err(Ok(Error::WalletFrozen)));
 }
 
@@ -156,7 +160,9 @@ fn transfer_while_paused_fails() {
     h.client.deposit(&id, &owner, &h.token, &100);
 
     h.client.pause(&owner, &id);
-    let res = h.client.try_transfer(&owner, &id, &recipient, &h.token, &10);
+    let res = h
+        .client
+        .try_transfer(&owner, &id, &recipient, &h.token, &10);
     assert_eq!(res, Err(Ok(Error::WalletPaused)));
 
     h.client.unpause(&owner, &id);
@@ -177,7 +183,8 @@ fn archived_wallet_rejects_transfer_and_deposit() {
     assert_eq!(h.client.get_wallet(&id).state, ResourceState::Archived);
 
     assert_eq!(
-        h.client.try_transfer(&owner, &id, &recipient, &h.token, &10),
+        h.client
+            .try_transfer(&owner, &id, &recipient, &h.token, &10),
         Err(Ok(Error::WalletArchived))
     );
     mint(&h, &owner, 100);

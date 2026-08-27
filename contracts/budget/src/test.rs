@@ -46,9 +46,9 @@ fn duplicate_allocation_fails() {
     let h = setup();
     h.client
         .allocate(&h.owner, &id(&h.env, "eng"), &1_000, &Period::None);
-    let res =
-        h.client
-            .try_allocate(&h.owner, &id(&h.env, "eng"), &2_000, &Period::None);
+    let res = h
+        .client
+        .try_allocate(&h.owner, &id(&h.env, "eng"), &2_000, &Period::None);
     assert_eq!(res, Err(Ok(Error::AlreadyExists)));
 }
 
@@ -168,12 +168,8 @@ fn transfer_allocation_moves_unspent_limit() {
         .allocate(&h.owner, &id(&h.env, "eng"), &1_000, &Period::None);
     h.client
         .allocate(&h.owner, &id(&h.env, "ops"), &500, &Period::None);
-    h.client.transfer_allocation(
-        &h.owner,
-        &id(&h.env, "eng"),
-        &id(&h.env, "ops"),
-        &300,
-    );
+    h.client
+        .transfer_allocation(&h.owner, &id(&h.env, "eng"), &id(&h.env, "ops"), &300);
     assert_eq!(h.client.remaining(&id(&h.env, "eng")), 700);
     assert_eq!(h.client.remaining(&id(&h.env, "ops")), 800);
 }
@@ -187,12 +183,9 @@ fn transfer_allocation_over_available_fails() {
         .allocate(&h.owner, &id(&h.env, "ops"), &500, &Period::None);
     h.client.consume(&h.owner, &id(&h.env, "eng"), &900);
     // Only 100 unspent remains in "eng".
-    let res = h.client.try_transfer_allocation(
-        &h.owner,
-        &id(&h.env, "eng"),
-        &id(&h.env, "ops"),
-        &200,
-    );
+    let res =
+        h.client
+            .try_transfer_allocation(&h.owner, &id(&h.env, "eng"), &id(&h.env, "ops"), &200);
     assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
 }
 

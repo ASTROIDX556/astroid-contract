@@ -48,8 +48,7 @@ use astroid_shared::math::checked_add;
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env,
-    String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
 };
 
 #[contracttype]
@@ -189,7 +188,9 @@ impl EscrowContract {
             release_signers,
             release_threshold,
         };
-        env.storage().persistent().set(&DataKey::Escrow(id), &escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(id), &escrow);
         Self::bump(&env, id);
         env.storage().instance().set(&DataKey::Count, &count);
 
@@ -200,7 +201,91 @@ impl EscrowContract {
         Ok(id)
     }
 
-    /// Release the escrowed assets to the recipient. Only the arbiter may call,
+    /// Initialize an escrow with time-lock (unfunded version).
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_timelock(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        asset: Address,
+        amount: i128,
+        unlock_time: u64,
+        memo: String,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        require_positive_amount(amount)?;
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        if unlock_time <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
+
+        let mut count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+        count = checked_add(count as i128, 1)? as u64;
+        let id = count;
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            asset: asset.clone(),
+            amount,
+            state: EscrowState::Created,
+            deadline: unlock_time,
+            funded_amount: 0,
+            memo,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(id), &escrow);
+        Self::bump(&env, id);
+        env.storage().instance().set(&DataKey::Count, &count);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("init_tl")),
+            (id, sender, recipient, asset, amount, unlock_time),
+        );
+        Ok(id)
+    }
+
+    /// Claim funds from time-locked escrow after unlock_time.
+    pub fn claim(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if escrow.recipient != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::TimeLockActive);
+        }
+
+        escrow.state = EscrowState::Released;
+        Self::store(&env, id, &escrow);
+        token::TokenClient::new(&env, &escrow.asset).transfer(
+            &env.current_contract_address(),
+            &escrow.recipient,
+            &escrow.amount,
+        );
+        events::transfer_executed(
+            &env,
+            &escrow.sender,
+            &escrow.recipient,
+            &escrow.asset,
+            escrow.amount,
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("claimed")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Release the escrowed funds to the recipient. Only the arbiter may call,
     /// and only before the deadline — afterward the sender reclaims via `refund`.
     pub fn release(env: Env, arbiter: Address, id: u64) -> Result<(), Error> {
         arbiter.require_auth();
@@ -341,6 +426,29 @@ impl EscrowContract {
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("refunded")),
             (id, caller, escrow.assets.clone()),
+        );
+        Ok(())
+    }
+
+    /// Refund time-locked escrow after unlock_time has elapsed.
+    pub fn refund_timelock(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::TimeLockActive);
+        }
+
+        escrow.state = EscrowState::Refunded;
+        Self::store(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ref_tl")),
+            (id, caller),
         );
         Ok(())
     }

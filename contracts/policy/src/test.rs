@@ -1,7 +1,4 @@
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, BytesN, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
 use crate::{PolicyContract, PolicyContractClient};
 
@@ -29,12 +26,9 @@ fn allows_spend_below_max() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
-    assert!(p.try_check_transfer(
-        &String::from_str(&env, "max_txn"),
-        &asset,
-        &recip,
-        &999_999,
-    ).is_ok());
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &999_999,)
+        .is_ok());
 }
 
 #[test]
@@ -76,20 +70,14 @@ fn allowlist_recipient_enforced() {
     );
 
     // Allowed recipient passes
-    assert!(client.try_check_transfer(
-        &String::from_str(&env, "vendor_list"),
-        &asset,
-        &allowed,
-        &1,
-    ).is_ok());
+    assert!(client
+        .try_check_transfer(&String::from_str(&env, "vendor_list"), &asset, &allowed, &1,)
+        .is_ok());
 
     // Other recipient denied
-    assert!(client.try_check_transfer(
-        &String::from_str(&env, "vendor_list"),
-        &asset,
-        &blocked,
-        &1,
-    ).is_err());
+    assert!(client
+        .try_check_transfer(&String::from_str(&env, "vendor_list"), &asset, &blocked, &1,)
+        .is_err());
 }
 
 #[test]
@@ -100,10 +88,12 @@ fn disable_denies_everything() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
     p.set_enabled(&owner, &String::from_str(&env, "max_txn"), &false);
-    assert!(p.try_check_transfer(
-        &String::from_str(&env, "max_txn"),
-        &asset,
-        &Address::generate(&env),
-        &1,
-    ).is_err());
+    assert!(p
+        .try_check_transfer(
+            &String::from_str(&env, "max_txn"),
+            &asset,
+            &Address::generate(&env),
+            &1,
+        )
+        .is_err());
 }
