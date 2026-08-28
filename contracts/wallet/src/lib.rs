@@ -82,10 +82,13 @@ impl WalletContract {
         env.storage().instance().set(&DataKey::WalletCount, &count);
         Self::bump_instance(&env);
         events::wallet_created(&env, id, &owner);
-        env.events().publish(events::ContractEvent::WalletCreated {
-            wallet_id: id,
-            owner: owner.clone(),
-        });
+        events::publish(
+            env,
+            events::ContractEvent::WalletCreated {
+                wallet_id: id,
+                owner: owner.clone(),
+            },
+        );
         Ok(id)
     }
 

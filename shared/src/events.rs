@@ -21,7 +21,7 @@
 //! existing nor new consumers break.
 
 use crate::types::ModuleKind;
-use soroban_sdk::{contractevent, symbol_short, Address, Env, String, Symbol};
+use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -30,7 +30,7 @@ use soroban_sdk::{contractevent, symbol_short, Address, Env, String, Symbol};
 /// payload, giving off-chain indexers one stable schema to track state changes
 /// such as module updates, wallet/registry state changes, treasury
 /// configuration, budget allocations and policy violations.
-#[contractevent]
+#[contracttype]
 #[derive(Clone)]
 pub enum ContractEvent {
     /// A module was registered or updated in the registry.
@@ -67,8 +67,58 @@ pub enum ContractEvent {
 }
 
 /// Publish a [`ContractEvent`] using the canonical schema.
+///
+/// Each variant is emitted under a single topic equal to the variant symbol
+/// (e.g. `WalletCreated`) carrying the variant's fields as a typed payload, so
+/// off-chain indexers get one stable, self-describing schema per event.
 pub fn publish(env: &Env, event: ContractEvent) {
-    env.events().publish(event);
+    match event {
+        ContractEvent::RegistryModuleUpdated { org, kind, address } => {
+            env.events()
+                .publish(symbol_short!("RegistryModuleUpdated"), (org, kind, address));
+        }
+        ContractEvent::OrgOwnerChanged { org, new_owner } => {
+            env.events()
+                .publish(symbol_short!("OrgOwnerChanged"), (org, new_owner));
+        }
+        ContractEvent::RegistryFrozen { org, frozen } => {
+            env.events()
+                .publish(symbol_short!("RegistryFrozen"), (org, frozen));
+        }
+        ContractEvent::WalletCreated { wallet_id, owner } => {
+            env.events()
+                .publish(symbol_short!("WalletCreated"), (wallet_id, owner));
+        }
+        ContractEvent::WalletStateChanged { wallet_id, state } => {
+            env.events()
+                .publish(symbol_short!("WalletStateChanged"), (wallet_id, state));
+        }
+        ContractEvent::TransferExecuted {
+            from,
+            to,
+            asset,
+            amount,
+        } => {
+            env.events()
+                .publish(symbol_short!("TransferExecuted"), (from, to, asset, amount));
+        }
+        ContractEvent::TreasuryConfigUpdated { org, action } => {
+            env.events()
+                .publish(symbol_short!("TreasuryConfigUpdated"), (org, action));
+        }
+        ContractEvent::BudgetUpdated {
+            budget_id,
+            action,
+            amount,
+        } => {
+            env.events()
+                .publish(symbol_short!("BudgetUpdated"), (budget_id, action, amount));
+        }
+        ContractEvent::PolicyViolation { policy_id, reason } => {
+            env.events()
+                .publish(symbol_short!("PolicyViolation"), (policy_id, reason));
+        }
+    }
 }
 
 /// `WalletCreated` — topic `("wallet", "created")`.

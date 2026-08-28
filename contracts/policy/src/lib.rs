@@ -270,10 +270,13 @@ impl PolicyInterface for PolicyContract {
 fn events_policy_violation(env: &Env, policy_id: &String, reason: &str) {
     let r = soroban_sdk::Symbol::new(env, reason);
     astroid_shared::events::policy_violation(env, policy_id, r.clone());
-    env.events().publish(ContractEvent::PolicyViolation {
-        policy_id: policy_id.clone(),
-        reason: r,
-    });
+    astroid_shared::events::publish(
+        env,
+        ContractEvent::PolicyViolation {
+            policy_id: policy_id.clone(),
+            reason: r,
+        },
+    );
 }
 
 #[cfg(test)]
