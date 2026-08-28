@@ -271,7 +271,7 @@ fn events_policy_violation(env: &Env, policy_id: &String, reason: &str) {
     let r = soroban_sdk::Symbol::new(env, reason);
     astroid_shared::events::policy_violation(env, policy_id, r.clone());
     astroid_shared::events::publish(
-        &env,
+        env,
         ContractEvent::PolicyViolation {
             policy_id: policy_id.clone(),
             reason: r,

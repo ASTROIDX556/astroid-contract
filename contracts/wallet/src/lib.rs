@@ -330,7 +330,7 @@ impl WalletContract {
             env,
             events::ContractEvent::WalletStateChanged {
                 wallet_id: id,
-                state: action,
+                state: action.clone(),
             },
         );
     }
