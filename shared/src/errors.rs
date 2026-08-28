@@ -67,4 +67,9 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+
+    // --- Treasury / allowance (90-99) ---
+    AllowanceExceeded = 90,
+    AllowanceExpired = 91,
+    AllowanceNotFound = 92,
 }
