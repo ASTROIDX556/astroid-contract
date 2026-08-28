@@ -230,7 +230,9 @@ fn add_and_remove_signer_with_weight() {
     h.client.add_signer(&h.signers[0], &new_signer, &3);
     assert!(h.client.is_signer(&new_signer));
     let stored = h.client.get_signers();
-    assert!(stored.iter().any(|s| s.address == new_signer && s.weight == 3));
+    assert!(stored
+        .iter()
+        .any(|s| s.address == new_signer && s.weight == 3));
 
     h.client.remove_signer(&h.signers[0], &new_signer);
     assert!(!h.client.is_signer(&new_signer));
@@ -258,7 +260,9 @@ fn update_signer_weight_and_reach_threshold() {
     // Bump signer[0] to weight 5; must keep total >= threshold (ok).
     h.client.set_signer_weight(&h.signers[1], &h.signers[0], &5);
     let stored = h.client.get_signers();
-    assert!(stored.iter().any(|s| s.address == h.signers[0] && s.weight == 5));
+    assert!(stored
+        .iter()
+        .any(|s| s.address == h.signers[0] && s.weight == 5));
 
     // A proposal from signer[0] now meets threshold alone.
     let id = h.client.propose(
@@ -280,7 +284,9 @@ fn cannot_drop_total_weight_below_threshold() {
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 
     // Lowering signer[0] weight to 1 would drop total to 2 < 3 -> rejected.
-    let res = h.client.try_set_signer_weight(&h.signers[1], &h.signers[0], &1);
+    let res = h
+        .client
+        .try_set_signer_weight(&h.signers[1], &h.signers[0], &1);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
 

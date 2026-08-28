@@ -90,11 +90,7 @@ impl MultiSigContract {
     /// Initialize with an initial weighted signer set and a weight threshold.
     /// `threshold` must be within `[MIN_THRESHOLD, total_weight]` and the signer
     /// set within `MAX_SIGNERS`, with all weights positive and addresses unique.
-    pub fn initialize(
-        env: Env,
-        signers: Vec<SignerWeight>,
-        threshold: u32,
-    ) -> Result<(), Error> {
+    pub fn initialize(env: Env, signers: Vec<SignerWeight>, threshold: u32) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Threshold) {
             return Err(Error::AlreadyInitialized);
         }
