@@ -18,15 +18,15 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 },
                 {
-                  "string": "max_txn"
+                  "string": "wl_empty"
                 },
                 {
-                  "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+                  "bytes": "0909090909090909090909090909090909090909090909090909090909090909"
                 },
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000
+                    "lo": 0
                   }
                 },
                 "void",
@@ -48,16 +48,16 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "function_name": "set_enabled",
+              "function_name": "set_whitelist_enabled",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 },
                 {
-                  "string": "max_txn"
+                  "string": "wl_empty"
                 },
                 {
-                  "bool": false
+                  "bool": true
                 }
               ]
             }
@@ -154,7 +154,7 @@
                   "symbol": "Policy"
                 },
                 {
-                  "string": "max_txn"
+                  "string": "wl_empty"
                 }
               ]
             },
@@ -174,7 +174,7 @@
                       "symbol": "Policy"
                     },
                     {
-                      "string": "max_txn"
+                      "string": "wl_empty"
                     }
                   ]
                 },
@@ -198,7 +198,7 @@
                         "symbol": "config_hash"
                       },
                       "val": {
-                        "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+                        "bytes": "0909090909090909090909090909090909090909090909090909090909090909"
                       }
                     },
                     {
@@ -206,7 +206,7 @@
                         "symbol": "enabled"
                       },
                       "val": {
-                        "bool": false
+                        "bool": true
                       }
                     },
                     {
@@ -224,7 +224,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 1000000
+                          "lo": 0
                         }
                       }
                     },
@@ -241,7 +241,7 @@
                         "symbol": "whitelist_enabled"
                       },
                       "val": {
-                        "bool": false
+                        "bool": true
                       }
                     }
                   ]
@@ -391,15 +391,15 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 },
                 {
-                  "string": "max_txn"
+                  "string": "wl_empty"
                 },
                 {
-                  "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+                  "bytes": "0909090909090909090909090909090909090909090909090909090909090909"
                 },
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000
+                    "lo": 0
                   }
                 },
                 "void",
@@ -430,7 +430,7 @@
               }
             ],
             "data": {
-              "string": "max_txn"
+              "string": "wl_empty"
             }
           }
         }
@@ -473,7 +473,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
               },
               {
-                "symbol": "set_enabled"
+                "symbol": "set_whitelist_enabled"
               }
             ],
             "data": {
@@ -482,10 +482,40 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 },
                 {
-                  "string": "max_txn"
+                  "string": "wl_empty"
                 },
                 {
-                  "bool": false
+                  "bool": true
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "policy"
+              },
+              {
+                "symbol": "wl_mode"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "wl_empty"
+                },
+                {
+                  "bool": true
                 }
               ]
             }
@@ -506,7 +536,7 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "set_enabled"
+                "symbol": "set_whitelist_enabled"
               }
             ],
             "data": "void"
@@ -536,7 +566,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "max_txn"
+                  "string": "wl_empty"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -575,10 +605,10 @@
             "data": {
               "vec": [
                 {
-                  "string": "max_txn"
+                  "string": "wl_empty"
                 },
                 {
-                  "symbol": "disabled"
+                  "symbol": "not_whitelisted"
                 }
               ]
             }
@@ -604,7 +634,7 @@
             ],
             "data": {
               "error": {
-                "contract": 20
+                "contract": 23
               }
             }
           }
@@ -625,7 +655,7 @@
               },
               {
                 "error": {
-                  "contract": 20
+                  "contract": 23
                 }
               }
             ],
@@ -650,7 +680,7 @@
               },
               {
                 "error": {
-                  "contract": 20
+                  "contract": 23
                 }
               }
             ],
@@ -665,7 +695,7 @@
                 {
                   "vec": [
                     {
-                      "string": "max_txn"
+                      "string": "wl_empty"
                     },
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
