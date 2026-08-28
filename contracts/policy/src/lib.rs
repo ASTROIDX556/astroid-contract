@@ -569,7 +569,7 @@ impl PolicyInterface for PolicyContract {
         // Emergency pause: block all policy evaluations while active.
         if Self::paused(env.clone()) {
             events_policy_violation(&env, &policy_id, "paused");
-            return Err(Error::PolicyPaused);
+            return Err(Error::EmergencyLock);
         }
         let policy = Self::load(&env, &policy_id)?;
         // Disabled policies deny every spend.
