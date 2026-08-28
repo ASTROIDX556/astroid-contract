@@ -12,14 +12,20 @@
 //! only leave through one of two settlement paths:
 //!
 //! ```text
-//! Funded ──(arbiter, before deadline)──▶ Released ─▶ recipient ─▶ Closed
-//! Funded ──(after deadline)────────────▶ Refunded ─▶ sender    ─▶ Closed
-//!    └────(after deadline, marker)─────▶ Expired ──(refund)──▶ Refunded
+//! Funded ──(arbiter, before deadline+grace)──▶ Released ─▶ recipient ─▶ Closed
+//! Funded ──(cancel, before deadline)──────────▶ Refunded ─▶ sender    ─▶ Closed
+//! Funded ──(after grace, no release)───────────▶ reclaim  ─▶ sender    ─▶ Closed
+//!    └────(after grace, marker)────────────────▶ Expired ──(refund)──▶ Refunded
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
 //! deadline passes); funds stay in custody until `refund` returns them to the
 //! sender, so no escrow can be `Closed` with money still locked.
+//!
+//! A `grace_period` extends the settlement window past the `deadline`: the
+//! counterparty (arbiter) may still release during the grace, but the sender may
+//! only `reclaim` the funds once the grace has fully elapsed without fulfillment.
+//! Either party (sender or arbiter) may `cancel` the escrow before the deadline.
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
@@ -54,6 +60,9 @@ pub struct Escrow {
     pub amount: i128,
     pub state: EscrowState,
     pub deadline: u64,
+    /// Extra time after `deadline` during which the arbiter may still release and
+    /// before the sender may `reclaim`. 0 means no grace beyond the deadline.
+    pub grace_period: u64,
     pub funded_amount: i128,
     pub memo: String,
 }
@@ -84,7 +93,9 @@ impl EscrowContract {
     /// Create + fund an escrow in one call. `sender` locks `amount` of `asset`
     /// until `deadline` and names a `recipient` and an `arbiter`. The real tokens
     /// are moved into the contract's custody here — the escrow always reflects
-    /// funds actually held.
+    /// funds actually held. `grace_period` extends the settlement window past the
+    /// deadline during which the arbiter may still release and the sender must
+    /// wait before reclaiming.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         env: Env,
@@ -94,6 +105,7 @@ impl EscrowContract {
         asset: Address,
         amount: i128,
         deadline: u64,
+        grace_period: u64,
         memo: String,
     ) -> Result<u64, Error> {
         // `sender` commits the funds.
@@ -129,6 +141,7 @@ impl EscrowContract {
             amount,
             state: EscrowState::Funded,
             deadline,
+            grace_period,
             funded_amount: amount,
             memo,
         };
@@ -155,6 +168,7 @@ impl EscrowContract {
         asset: Address,
         amount: i128,
         unlock_time: u64,
+        grace_period: u64,
         memo: String,
     ) -> Result<u64, Error> {
         sender.require_auth();
@@ -178,6 +192,7 @@ impl EscrowContract {
             amount,
             state: EscrowState::Created,
             deadline: unlock_time,
+            grace_period,
             funded_amount: 0,
             memo,
         };
@@ -204,7 +219,7 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Created) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline {
+        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
             return Err(Error::TimeLockActive);
         }
 
@@ -240,11 +255,11 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() >= escrow.deadline {
-            // Past the deadline the arbiter can no longer release. We do NOT persist
-            // an `Expired` transition here: returning `Err` rolls back every storage
-            // write, so the marker is set through the permissionless `expire`
-            // entrypoint and the funds are reclaimed via `refund`.
+        if env.ledger().timestamp() >= escrow.deadline + escrow.grace_period {
+            // Past the grace window the arbiter can no longer release. We do NOT
+            // persist an `Expired` transition here: returning `Err` rolls back every
+            // storage write, so the marker is set through the permissionless `expire`
+            // entrypoint and the funds are reclaimed via `refund` / `reclaim`.
             return Err(Error::EscrowExpired);
         }
 
@@ -279,7 +294,9 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline {
+        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+            // The grace window is still open — the arbiter may still release, so the
+            // escrow cannot be marked expired yet.
             return Err(Error::InvalidState);
         }
         escrow.state = EscrowState::Expired;
@@ -300,7 +317,13 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
         if env.ledger().timestamp() < escrow.deadline {
+            // Before the fulfillment deadline the escrow is still live.
             return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+            // During the grace window the counterparty may still fulfill, so funds
+            // may not yet be reclaimed via refund. Use `reclaim` after grace expiry.
+            return Err(Error::GraceActive);
         }
         escrow.state = EscrowState::Refunded;
         Self::store(&env, id, &escrow);
@@ -327,7 +350,7 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Created) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline {
+        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
             return Err(Error::TimeLockActive);
         }
 
@@ -335,6 +358,81 @@ impl EscrowContract {
         Self::store(&env, id, &escrow);
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("ref_tl")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Cancel an escrow before its fulfillment `deadline` and return any held
+    /// funds to the sender. Either the `sender` or the `arbiter` may cancel, but
+    /// only while the escrow is still `Funded`/`Created` and before the deadline
+    /// has been reached — this is the pre-fulfillment dispute exit.
+    pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if escrow.sender != caller && escrow.arbiter != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
+        // Cancellation is only permitted before the fulfillment deadline.
+        if env.ledger().timestamp() >= escrow.deadline {
+            return Err(Error::InvalidState);
+        }
+
+        let funded = escrow.funded_amount;
+        if funded > 0 {
+            token::TokenClient::new(&env, &escrow.asset).transfer(
+                &env.current_contract_address(),
+                &escrow.sender,
+                &funded,
+            );
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &escrow.asset, funded);
+        }
+        escrow.state = EscrowState::Refunded;
+        Self::store(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("cancelled")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Reclaim the escrowed funds to the sender after the grace period has fully
+    /// elapsed without counterparty fulfillment. Only the `sender` may reclaim,
+    /// and only once `now >= deadline + grace_period`. This is the post-dispute
+    /// safe-settlement path that guarantees funds cannot be stranded or
+    /// double-spent while a dispute is unresolved.
+    pub fn reclaim(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        // Only the sender may reclaim post-grace.
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+        // The grace window must have fully elapsed without fulfillment.
+        let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
+        if env.ledger().timestamp() < grace_end {
+            return Err(Error::GraceActive);
+        }
+
+        let funded = escrow.funded_amount;
+        escrow.state = EscrowState::Refunded;
+        Self::store(&env, id, &escrow);
+        if funded > 0 {
+            token::TokenClient::new(&env, &escrow.asset).transfer(
+                &env.current_contract_address(),
+                &escrow.sender,
+                &funded,
+            );
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &escrow.asset, funded);
+        }
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("reclaimed")),
             (id, caller),
         );
         Ok(())

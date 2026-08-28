@@ -80,6 +80,9 @@
                   "u64": 87400
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 }
               ]
@@ -317,6 +320,14 @@
                           "hi": 0,
                           "lo": 10000
                         }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     },
                     {
@@ -1188,6 +1199,9 @@
                   "u64": 87400
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 }
               ]
@@ -1549,6 +1563,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -1892,6 +1914,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -2174,6 +2204,14 @@
                       "hi": 0,
                       "lo": 10000
                     }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {
