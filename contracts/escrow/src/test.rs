@@ -1,11 +1,11 @@
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env, String,
+    token, vec, Address, Env, String,
 };
 
 use astroid_shared::errors::Error;
 
-use crate::{EscrowContract, EscrowContractClient, EscrowState};
+use crate::{EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec};
 
 const START: u64 = 1_000;
 
@@ -225,4 +225,138 @@ fn create_rejects_bad_input() {
     assert_eq!(r3, Err(Ok(Error::InvalidAmount)));
     // No successful escrow was created, so the sender keeps every token.
     assert_eq!(balance(&h, &h.sender), 5_000);
+}
+
+fn milestone_spec(env: &Env, description: &str, bps: u32) -> MilestoneSpec {
+    MilestoneSpec {
+        description: String::from_str(env, description),
+        release_bps: bps,
+    }
+}
+
+#[test]
+fn milestone_partial_then_full_release() {
+    let h = setup(10_000);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 4_000),
+        milestone_spec(&h.env, "build", 6_000),
+    ];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "project"),
+        &specs,
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.client.address), 10_000);
+
+    // Arbiter releases the first milestone (40% = 4000).
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    let set = h.client.milestones(&id);
+    assert!(set.milestones.get(0).unwrap().released);
+    assert_eq!(set.released_amount, 4_000);
+    assert_eq!(balance(&h, &h.recipient), 4_000);
+    // Escrow still Funded — not all milestones done.
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+
+    // Arbiter releases the final milestone; remainder (6000) disbursed, escrow
+    // transitions to Released.
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(balance(&h, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+
+    // Terminal close succeeds once fully released.
+    h.client.close(&h.arbiter, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Closed);
+}
+
+#[test]
+fn milestone_unauthorized_approval_rejected() {
+    let h = setup(10_000);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    // Sender (not the arbiter) cannot approve a milestone.
+    let res = h.client.try_release_milestone(&h.sender, &id, &0);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.recipient), 0);
+    assert_eq!(balance(&h, &h.client.address), 10_000);
+}
+
+#[test]
+fn milestone_double_release_rejected() {
+    let h = setup(10_000);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    // Re-releasing the same milestone is refused.
+    let res = h.client.try_release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.recipient), 10_000);
+}
+
+#[test]
+fn milestone_bps_must_total_100() {
+    let h = setup(10_000);
+    // 40% + 50% != 100% → rejected at creation.
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 4_000),
+        milestone_spec(&h.env, "b", 5_000),
+    ];
+    let res = h.client.try_deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(balance(&h, &h.sender), 10_000);
+}
+
+#[test]
+fn plain_release_blocked_on_milestone_escrow() {
+    let h = setup(10_000);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    // The full `release` entrypoint must not bypass milestone settlement.
+    let res = h.client.try_release(&h.arbiter, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.recipient), 0);
 }

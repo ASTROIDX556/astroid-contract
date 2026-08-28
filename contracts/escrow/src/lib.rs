@@ -27,10 +27,10 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::checked_add;
+use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
 use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
 };
 
 #[contracttype]
@@ -58,11 +58,41 @@ pub struct Escrow {
     pub memo: String,
 }
 
+/// A single milestone within a milestone-based escrow. `release_bps` is the
+/// proportion of the total escrow amount (in basis points, 10_000 = 100%) that
+/// is disbursed to the recipient when this milestone is approved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub index: u32,
+    pub description: String,
+    pub release_bps: u32,
+    pub released: bool,
+}
+
+/// Input describing a milestone when the escrow is created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSpec {
+    pub description: String,
+    pub release_bps: u32,
+}
+
+/// Aggregate milestone state for an escrow: the ordered milestones and the total
+/// amount disbursed so far (used to compute the final, dust-free payout).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSet {
+    pub milestones: Vec<Milestone>,
+    pub released_amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Count,
     Escrow(u64),
+    Milestones(u64),
 }
 
 #[contract]
@@ -240,6 +270,10 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
+        // Milestone-based escrows must be settled via `release_milestone`.
+        if env.storage().persistent().has(&DataKey::Milestones(id)) {
+            return Err(Error::InvalidState);
+        }
         if env.ledger().timestamp() >= escrow.deadline {
             // Past the deadline the arbiter can no longer release. We do NOT persist
             // an `Expired` transition here: returning `Err` rolls back every storage
@@ -268,6 +302,199 @@ impl EscrowContract {
             (id, arbiter),
         );
         Ok(())
+    }
+
+    /// Create + fund a milestone-based escrow in one call. Unlike `create`, the
+    /// locked `amount` is disbursed progressively as the named `arbiter` approves
+    /// each milestone via `release_milestone`. `milestones` must sum to exactly
+    /// 10_000 basis points (100%). The real tokens are pulled into custody here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deposit_with_milestones(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        asset: Address,
+        amount: i128,
+        deadline: u64,
+        memo: String,
+        milestones: Vec<MilestoneSpec>,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        require_positive_amount(amount)?;
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        if deadline <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
+        if milestones.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+
+        // Basis points across all milestones must total exactly 100%.
+        let mut total_bps: u32 = 0;
+        for spec in milestones.iter() {
+            total_bps = total_bps
+                .checked_add(spec.release_bps)
+                .ok_or(Error::Overflow)?;
+        }
+        if total_bps != 10_000 {
+            return Err(Error::InvalidInput);
+        }
+
+        let mut count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+        count = checked_add(count as i128, 1)? as u64;
+        let id = count;
+
+        // Pull the funds into the escrow's own custody.
+        token::TokenClient::new(&env, &asset).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let mut items: Vec<Milestone> = Vec::new(&env);
+        for (i, spec) in milestones.iter().enumerate() {
+            items.push_back(Milestone {
+                index: i as u32,
+                description: spec.description.clone(),
+                release_bps: spec.release_bps,
+                released: false,
+            });
+        }
+        let set = MilestoneSet {
+            milestones: items,
+            released_amount: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            asset: asset.clone(),
+            amount,
+            state: EscrowState::Funded,
+            deadline,
+            funded_amount: amount,
+            memo,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Milestones(id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Self::bump(&env, id);
+        env.storage().instance().set(&DataKey::Count, &count);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("milestone")),
+            (id, sender, recipient, asset, amount),
+        );
+        Ok(id)
+    }
+
+    /// Approve and release a single milestone's proportional payout to the
+    /// recipient. Only the `arbiter` may approve (unauthorized approvals are
+    /// rejected). When the final milestone is approved, the escrow transitions
+    /// to `Released`. Checked math prevents over/under-disbursement.
+    pub fn release_milestone(env: Env, caller: Address, id: u64, index: u32) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if escrow.arbiter != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Released) {
+            return Err(Error::InvalidState);
+        }
+
+        let mut set: MilestoneSet = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)?;
+
+        // Locate the requested milestone and ensure it is still pending.
+        let mut found_idx: usize = 0;
+        let mut target: Option<Milestone> = None;
+        for (i, m) in set.milestones.iter().enumerate() {
+            if m.index == index {
+                found_idx = i;
+                target = Some(m.clone());
+            }
+        }
+        let milestone = target.ok_or(Error::InvalidInput)?;
+        if milestone.released {
+            return Err(Error::InvalidState);
+        }
+
+        // Only one milestone still unreleased → pay the dust-free remainder so the
+        // recipient receives the full escrow amount despite basis-point rounding.
+        let mut unreleased: u32 = 0;
+        for m in set.milestones.iter() {
+            if !m.released {
+                unreleased = unreleased.saturating_add(1);
+            }
+        }
+        let gross = checked_div(
+            checked_mul(escrow.amount, milestone.release_bps as i128)?,
+            10_000,
+        )?;
+        let remaining = checked_sub(escrow.amount, set.released_amount)?;
+        let payout = if unreleased == 1 { remaining } else { gross };
+
+        // Move the milestone's portion out of custody to the recipient.
+        token::TokenClient::new(&env, &escrow.asset).transfer(
+            &env.current_contract_address(),
+            &escrow.recipient,
+            &payout,
+        );
+        events::transfer_executed(
+            &env,
+            &escrow.sender,
+            &escrow.recipient,
+            &escrow.asset,
+            payout,
+        );
+
+        set.released_amount = checked_add(set.released_amount, payout)?;
+        let updated = Milestone {
+            index: milestone.index,
+            description: milestone.description,
+            release_bps: milestone.release_bps,
+            released: true,
+        };
+        set.milestones.set(found_idx as u32, updated);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+
+        // When every milestone is released, the escrow is fully settled.
+        let all_released = set.milestones.iter().all(|m| m.released);
+        if all_released {
+            escrow.state = EscrowState::Released;
+            Self::store(&env, id, &escrow);
+        }
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ms_rel")),
+            (id, caller, index, payout),
+        );
+        Ok(())
+    }
+
+    /// Read the milestone state for an escrow.
+    pub fn milestones(env: Env, id: u64) -> Result<MilestoneSet, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)
     }
 
     /// Mark a timed-out escrow `Expired` once its deadline has passed.
