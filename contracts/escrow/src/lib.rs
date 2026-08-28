@@ -138,10 +138,7 @@ impl EscrowContract {
         Self::bump(&env, id);
         env.storage().instance().set(&DataKey::Count, &count);
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, sender, recipient, asset, amount),
-        );
+        events::escrow_funded(&env, id, &sender, &recipient, &asset, amount);
         Ok(id)
     }
 
@@ -222,10 +219,7 @@ impl EscrowContract {
             &escrow.asset,
             escrow.amount,
         );
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("claimed")),
-            (id, caller),
-        );
+        events::escrow_claimed(&env, id, &caller);
         Ok(())
     }
 
@@ -263,10 +257,7 @@ impl EscrowContract {
             &escrow.asset,
             escrow.funded_amount,
         );
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("released")),
-            (id, arbiter),
-        );
+        events::escrow_released(&env, id, &arbiter);
         Ok(())
     }
 
@@ -284,8 +275,7 @@ impl EscrowContract {
         }
         escrow.state = EscrowState::Expired;
         Self::store(&env, id, &escrow);
-        env.events()
-            .publish((symbol_short!("escrow"), symbol_short!("expired")), id);
+        events::escrow_expired(&env, id);
         Ok(())
     }
 
@@ -310,10 +300,48 @@ impl EscrowContract {
             &escrow.sender,
             &escrow.funded_amount,
         );
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("refunded")),
-            (id, caller),
+        events::escrow_refunded(&env, id, &escrow.sender);
+        Ok(())
+    }
+
+    /// Auto-cancellation: after the expiration deadline has passed, any caller may
+    /// cancel the escrow on behalf of the network. The escrow is first marked
+    /// `Expired` (if it is still `Funded`) and the locked funds are then
+    /// automatically returned to the original depositor (the `sender`) without
+    /// requiring the arbiter or any multi-party signature.
+    ///
+    /// This is the permissionless, time-based cancellation path that guarantees
+    /// locked funds never strand: once `deadline` elapses, a keeper, the sender,
+    /// or any third party can reclaim the deposit for the treasury/sender.
+    pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+        // Time-based gate: cancellation is only available once the deadline has
+        // passed. Attempts before the deadline fail with `InvalidState`.
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::InvalidState);
+        }
+        // Auto-expire a still-funded escrow before refunding.
+        if matches!(escrow.state, EscrowState::Funded) {
+            escrow.state = EscrowState::Expired;
+            Self::store(&env, id, &escrow);
+            events::escrow_expired(&env, id);
+        }
+        let sender = escrow.sender.clone();
+        // Checked math: never refund a non-positive (already drained) balance.
+        require_positive_amount(escrow.funded_amount)?;
+        escrow.state = EscrowState::Refunded;
+        Self::store(&env, id, &escrow);
+        // Return the real tokens to the original depositor.
+        token::TokenClient::new(&env, &escrow.asset).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &escrow.funded_amount,
         );
+        events::escrow_refunded(&env, id, &sender);
         Ok(())
     }
 

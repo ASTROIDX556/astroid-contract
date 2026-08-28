@@ -30,6 +30,57 @@ pub fn transfer_executed(env: &Env, from: &Address, to: &Address, asset: &Addres
         .publish(topics, (from.clone(), to.clone(), asset.clone(), amount));
 }
 
+// --- Escrow-specific events -------------------------------------------------
+//
+// These mirror the standardized shared-event convention (`(category, action)`)
+// so the Astroid backend can subscribe to escrow lifecycle transitions with the
+// same topic schema used everywhere else in the protocol.
+
+/// `EscrowFunded` — topic `("escrow", "funded")`. Emitted when an escrow is
+/// created and the funds are pulled into the contract's custody.
+pub fn escrow_funded(
+    env: &Env,
+    id: u64,
+    sender: &Address,
+    recipient: &Address,
+    asset: &Address,
+    amount: i128,
+) {
+    let topics = (symbol_short!("escrow"), symbol_short!("funded"));
+    env.events().publish(
+        topics,
+        (id, sender.clone(), recipient.clone(), asset.clone(), amount),
+    );
+}
+
+/// `EscrowReleased` — topic `("escrow", "released")`. Emitted when the arbiter
+/// releases the escrowed funds to the recipient (fulfillment).
+pub fn escrow_released(env: &Env, id: u64, by: &Address) {
+    let topics = (symbol_short!("escrow"), symbol_short!("released"));
+    env.events().publish(topics, (id, by.clone()));
+}
+
+/// `EscrowClaimed` — topic `("escrow", "claimed")`. Emitted when a recipient
+/// claims from a time-locked escrow after the unlock time (fulfillment).
+pub fn escrow_claimed(env: &Env, id: u64, by: &Address) {
+    let topics = (symbol_short!("escrow"), symbol_short!("claimed"));
+    env.events().publish(topics, (id, by.clone()));
+}
+
+/// `EscrowExpired` — topic `("escrow", "expired")`. Emitted when an escrow's
+/// deadline passes and it is marked expired (auto-cancellation marker).
+pub fn escrow_expired(env: &Env, id: u64) {
+    let topics = (symbol_short!("escrow"), symbol_short!("expired"));
+    env.events().publish(topics, id);
+}
+
+/// `EscrowRefunded` — topic `("escrow", "refunded")`. Emitted when expired (or
+/// cancelled) escrow funds are returned to the original depositor.
+pub fn escrow_refunded(env: &Env, id: u64, to: &Address) {
+    let topics = (symbol_short!("escrow"), symbol_short!("refunded"));
+    env.events().publish(topics, (id, to.clone()));
+}
+
 /// `ProposalCreated` — topic `("proposal", "created")`.
 pub fn proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
     let topics = (symbol_short!("proposal"), symbol_short!("created"));

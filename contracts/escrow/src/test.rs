@@ -1,6 +1,6 @@
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Address, Env, String,
+    testutils::{Address as _, Events as _, Ledger},
+    token, Address, Env, String, Symbol, TryIntoVal,
 };
 
 use astroid_shared::errors::Error;
@@ -225,4 +225,128 @@ fn create_rejects_bad_input() {
     assert_eq!(r3, Err(Ok(Error::InvalidAmount)));
     // No successful escrow was created, so the sender keeps every token.
     assert_eq!(balance(&h, &h.sender), 5_000);
+}
+
+#[test]
+fn create_accepts_and_stores_expiration() {
+    let h = setup(5_000);
+    let deadline = START + 86_400;
+    let id = create(&h, 5_000, deadline);
+    let escrow = h.client.get(&id);
+    // The expiration parameter is persisted verbatim on the escrow record.
+    assert_eq!(escrow.deadline, deadline);
+    assert_eq!(escrow.state, EscrowState::Funded);
+}
+
+#[test]
+fn release_post_expiration_returns_escrow_expired() {
+    let h = setup(7_000);
+    let id = create(&h, 7_000, START + 100);
+    // Advance the ledger beyond the deadline.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
+    // A release attempt after expiration must deterministically fail with
+    // `EscrowExpired` and must NOT move any funds.
+    let res = h.client.try_release(&h.arbiter, &id);
+    assert_eq!(res, Err(Ok(Error::EscrowExpired)));
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.client.address), 7_000);
+    assert_eq!(balance(&h, &h.recipient), 0);
+}
+
+#[test]
+fn expire_before_deadline_rejected() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    // Cannot mark expired while still inside the release window.
+    let early = h.client.try_expire(&id);
+    assert_eq!(early, Err(Ok(Error::InvalidState)));
+    // Still funded, funds untouched.
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.client.address), 5_000);
+}
+
+#[test]
+fn cancel_before_deadline_rejected() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    // Auto-cancellation is gated by the deadline.
+    let res = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.sender), 0);
+}
+
+#[test]
+fn cancel_after_deadline_refunds_depositor() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+
+    // Permissionless: any caller may cancel once expired.
+    let third_party = Address::generate(&h.env);
+    h.client.cancel(&third_party, &id);
+
+    // Auto-cancellation marks the escrow Refunded and returns the locked funds
+    // to the original depositor (the sender), emptying custody.
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.recipient), 0);
+}
+
+#[test]
+fn cancel_after_expire_refunds_depositor() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+
+    // Mark expired first, then cancel — both paths converge on a refund.
+    h.client.expire(&id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
+    h.client.cancel(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn escrow_creation_emits_structured_event() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    // A structured contract event ("escrow", "funded") must have been emitted.
+    assert!(
+        has_escrow_event(&h, "escrow", "funded"),
+        "expected an escrow `funded` creation event for id {id}"
+    );
+}
+
+#[test]
+fn expired_refund_emits_structured_event() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    h.client.refund(&h.sender, &id);
+
+    assert!(
+        has_escrow_event(&h, "escrow", "refunded"),
+        "expected an escrow `refunded` event for id {id}"
+    );
+}
+
+/// Returns true if any contract event with the given `(category, action)` topic
+/// pair was emitted during the test so far.
+fn has_escrow_event(h: &Harness, category: &str, action: &str) -> bool {
+    let cat = Symbol::new(&h.env, category);
+    let act = Symbol::new(&h.env, action);
+    h.env.events().all().iter().any(|(_addr, topics, _data)| {
+        let topic0: Symbol = topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&h.env).ok())
+            .unwrap_or_else(|| Symbol::new(&h.env, ""));
+        let topic1: Symbol = topics
+            .get(1)
+            .and_then(|v| v.try_into_val(&h.env).ok())
+            .unwrap_or_else(|| Symbol::new(&h.env, ""));
+        topic0 == cat && topic1 == act
+    })
 }
