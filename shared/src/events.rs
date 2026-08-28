@@ -74,25 +74,27 @@ pub fn publish(env: &Env, event: ContractEvent) {
     match event {
         ContractEvent::RegistryModuleUpdated { org, kind, address } => {
             env.events().publish(
-                Symbol::new(env, "RegistryModuleUpdated"),
+                (Symbol::new(env, "RegistryModuleUpdated"),),
                 (org, kind, address),
             );
         }
         ContractEvent::OrgOwnerChanged { org, new_owner } => {
             env.events()
-                .publish(Symbol::new(env, "OrgOwnerChanged"), (org, new_owner));
+                .publish((Symbol::new(env, "OrgOwnerChanged"),), (org, new_owner));
         }
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
-                .publish(Symbol::new(env, "RegistryFrozen"), (org, frozen));
+                .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
-                .publish(Symbol::new(env, "WalletCreated"), (wallet_id, owner));
+                .publish((Symbol::new(env, "WalletCreated"),), (wallet_id, owner));
         }
         ContractEvent::WalletStateChanged { wallet_id, state } => {
-            env.events()
-                .publish(Symbol::new(env, "WalletStateChanged"), (wallet_id, state));
+            env.events().publish(
+                (Symbol::new(env, "WalletStateChanged"),),
+                (wallet_id, state),
+            );
         }
         ContractEvent::TransferExecuted {
             from,
@@ -101,13 +103,13 @@ pub fn publish(env: &Env, event: ContractEvent) {
             amount,
         } => {
             env.events().publish(
-                Symbol::new(env, "TransferExecuted"),
+                (Symbol::new(env, "TransferExecuted"),),
                 (from, to, asset, amount),
             );
         }
         ContractEvent::TreasuryConfigUpdated { org, action } => {
             env.events()
-                .publish(Symbol::new(env, "TreasuryConfigUpdated"), (org, action));
+                .publish((Symbol::new(env, "TreasuryConfigUpdated"),), (org, action));
         }
         ContractEvent::BudgetUpdated {
             budget_id,
@@ -115,13 +117,13 @@ pub fn publish(env: &Env, event: ContractEvent) {
             amount,
         } => {
             env.events().publish(
-                Symbol::new(env, "BudgetUpdated"),
+                (Symbol::new(env, "BudgetUpdated"),),
                 (budget_id, action, amount),
             );
         }
         ContractEvent::PolicyViolation { policy_id, reason } => {
             env.events()
-                .publish(Symbol::new(env, "PolicyViolation"), (policy_id, reason));
+                .publish((Symbol::new(env, "PolicyViolation"),), (policy_id, reason));
         }
     }
 }
