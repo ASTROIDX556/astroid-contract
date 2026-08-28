@@ -6,13 +6,13 @@
 //! schema and identical, overflow-safe math across the whole protocol.
 //!
 //! Modules:
-//! - [`errors`]     — the canonical `#[contracterror]` code table.
-//! - [`events`]     — helpers that publish the standardized cross-cutting events
-//!                    the Astroid backend subscribes to.
-//! - [`types`]      — `#[contracttype]` values reused by multiple contracts.
-//! - [`math`]       — checked `i128` arithmetic (never wraps, returns errors).
+//! - [`errors`] — the canonical `#[contracterror]` code table.
+//! - [`events`] — helpers that publish the standardized cross-cutting events
+//!   the Astroid backend subscribes to.
+//! - [`types`] — `#[contracttype]` values reused by multiple contracts.
+//! - [`math`] — checked `i128` arithmetic (never wraps, returns errors).
 //! - [`validation`] — small guard helpers (positive amounts, time windows, ...).
-//! - [`constants`]  — protocol-wide constants (time units, storage TTLs, limits).
+//! - [`constants`] — protocol-wide constants (time units, storage TTLs, limits).
 
 pub mod constants;
 pub mod errors;

@@ -45,6 +45,7 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    ReserveViolation = 54,
 
     // --- Multisig / approvals (60-69) ---
     InvalidSignature = 60,
@@ -67,4 +68,6 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+    EscrowNotExpired = 85,
+    EscrowAlreadySettled = 86,
 }
