@@ -99,6 +99,11 @@ impl MultiSigContract {
         if n == 0 || n > MAX_SIGNERS {
             return Err(Error::InvalidInput);
         }
+        for s in signers.iter() {
+            if s.weight == 0 {
+                return Err(Error::InvalidSignerWeight);
+            }
+        }
         let total = Self::total_weight(&signers)?;
         Self::validate_threshold(threshold, total)?;
         Self::assert_unique(&signers)?;
