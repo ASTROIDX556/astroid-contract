@@ -69,4 +69,7 @@ pub enum Error {
     TimeLockActive = 84,
     AlreadyRevoked = 85,
     EscrowAlreadyReleased = 86,
+
+    // --- Allowance (90-99) ---
+    InsufficientAllowance = 90,
 }

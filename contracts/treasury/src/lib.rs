@@ -25,7 +25,9 @@ use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
-use astroid_shared::validation::{require_non_empty, require_positive_amount};
+use astroid_shared::validation::{
+    require_non_empty, require_non_negative_amount, require_positive_amount,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
 };
@@ -55,11 +57,24 @@ pub struct Holding {
     pub budget_id: Option<String>,
 }
 
+/// Per-agent, per-asset spending allowance within the treasury.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Allowance {
+    pub agent: Address,
+    pub asset: Address,
+    /// Maximum amount the agent may spend on this asset.
+    pub limit: i128,
+    /// Amount already consumed from the allowance.
+    pub consumed: i128,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Treasury,
     Holding(Address),
+    Allowance(Address, Address),
 }
 
 #[contract]
@@ -222,6 +237,54 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Set or update a per-agent, per-asset spending allowance. Only the admin
+    /// may call. A zero limit effectively revokes the allowance.
+    pub fn set_allowance(
+        env: Env,
+        caller: Address,
+        agent: Address,
+        asset: Address,
+        limit: i128,
+    ) -> Result<(), Error> {
+        require_non_negative_amount(limit)?;
+        let _t = Self::require_admin(&env, &caller)?;
+        let mut a = Self::load_allowance(&env, &agent, &asset);
+        a.limit = limit;
+        // Reset consumed when the limit is changed so the agent can spend up
+        // to the new limit immediately.
+        a.consumed = 0;
+        Self::store_allowance(&env, &agent, &asset, &a);
+        events::allowance_set(&env, &agent, &asset, limit);
+        Ok(())
+    }
+
+    /// Read the current allowance for a given agent and asset.
+    pub fn get_allowance(env: Env, agent: Address, asset: Address) -> Allowance {
+        Self::load_allowance(&env, &agent, &asset)
+    }
+
+    /// Consume `amount` from the agent's per-asset allowance. The agent must
+    /// authorize the call. Returns an error when the remaining allowance is
+    /// insufficient.
+    pub fn consume_allowance(
+        env: Env,
+        agent: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        agent.require_auth();
+        let mut a = Self::load_allowance(&env, &agent, &asset);
+        let remaining = checked_sub(a.limit, a.consumed)?;
+        if amount > remaining {
+            return Err(Error::InsufficientAllowance);
+        }
+        a.consumed = checked_add(a.consumed, amount)?;
+        Self::store_allowance(&env, &agent, &asset, &a);
+        events::allowance_consumed(&env, &agent, &asset, amount);
+        Ok(())
+    }
+
     // --- views ---
 
     pub fn get(env: Env) -> Treasury {
@@ -275,13 +338,35 @@ impl TreasuryContract {
                 budget_id: None,
             })
     }
-
     fn store_holding(env: &Env, asset: &Address, h: &Holding) {
         env.storage()
             .persistent()
             .set(&DataKey::Holding(asset.clone()), h);
         env.storage().persistent().extend_ttl(
             &DataKey::Holding(asset.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn load_allowance(env: &Env, agent: &Address, asset: &Address) -> Allowance {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(agent.clone(), asset.clone()))
+            .unwrap_or(Allowance {
+                agent: agent.clone(),
+                asset: asset.clone(),
+                limit: 0,
+                consumed: 0,
+            })
+    }
+
+    fn store_allowance(env: &Env, agent: &Address, asset: &Address, a: &Allowance) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(agent.clone(), asset.clone()), a);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(agent.clone(), asset.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );

@@ -253,12 +253,7 @@ impl EscrowContract {
     /// must not exceed `funded_amount`. A full release transitions the escrow to
     /// `Released`; a partial release keeps the escrow in `Funded` so that more
     /// can be released later or the remaining balance can be revoked.
-    pub fn release(
-        env: Env,
-        arbiter: Address,
-        id: u64,
-        release_amount: i128,
-    ) -> Result<(), Error> {
+    pub fn release(env: Env, arbiter: Address, id: u64, release_amount: i128) -> Result<(), Error> {
         arbiter.require_auth();
         require_positive_amount(release_amount)?;
         let mut escrow = Self::load(&env, id)?;

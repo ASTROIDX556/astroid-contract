@@ -120,3 +120,145 @@ fn prepare_holds_state() {
     let state = h.client.get();
     assert_eq!(state.org, String::from_str(&h.env, "vault"));
 }
+
+// --- Allowance tests ---
+
+#[test]
+fn set_and_get_allowance() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &500);
+    let a = h.client.get_allowance(&agent, &h.asset);
+    assert_eq!(a.limit, 500);
+    assert_eq!(a.consumed, 0);
+}
+
+#[test]
+fn consume_allowance_decrements() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &500);
+
+    h.client.consume_allowance(&agent, &h.asset, &200);
+    let a = h.client.get_allowance(&agent, &h.asset);
+    assert_eq!(a.limit, 500);
+    assert_eq!(a.consumed, 200);
+}
+
+#[test]
+fn consume_allowance_insufficient() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &100);
+
+    let res = h.client.try_consume_allowance(&agent, &h.asset, &150);
+    assert_eq!(res, Err(Ok(Error::InsufficientAllowance)));
+    // Consumed must remain unchanged.
+    let a = h.client.get_allowance(&agent, &h.asset);
+    assert_eq!(a.consumed, 0);
+}
+
+#[test]
+fn consume_exact_allowance() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &300);
+
+    h.client.consume_allowance(&agent, &h.asset, &300);
+    let a = h.client.get_allowance(&agent, &h.asset);
+    assert_eq!(a.consumed, 300);
+
+    // No headroom left — must fail.
+    let res = h.client.try_consume_allowance(&agent, &h.asset, &1);
+    assert_eq!(res, Err(Ok(Error::InsufficientAllowance)));
+}
+
+#[test]
+fn multi_asset_allowance_isolation() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    let token_admin = Address::generate(&h.env);
+    let asset_b = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &200);
+    h.client.set_allowance(&h.admin, &agent, &asset_b, &400);
+
+    h.client.consume_allowance(&agent, &h.asset, &200);
+
+    // Asset B must be unaffected.
+    let a = h.client.get_allowance(&agent, &asset_b);
+    assert_eq!(a.consumed, 0);
+    assert_eq!(a.limit, 400);
+}
+
+#[test]
+fn set_allowance_resets_consumed() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &500);
+    h.client.consume_allowance(&agent, &h.asset, &300);
+
+    // Update the limit — consumed must reset.
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &100);
+    let a = h.client.get_allowance(&agent, &h.asset);
+    assert_eq!(a.limit, 100);
+    assert_eq!(a.consumed, 0);
+}
+
+#[test]
+fn set_allowance_zero_effectively_revokes() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &500);
+    h.client.consume_allowance(&agent, &h.asset, &200);
+
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &0);
+    let a = h.client.get_allowance(&agent, &h.asset);
+    assert_eq!(a.limit, 0);
+    assert_eq!(a.consumed, 0);
+
+    // Any spending attempt must fail.
+    let res = h.client.try_consume_allowance(&agent, &h.asset, &1);
+    assert_eq!(res, Err(Ok(Error::InsufficientAllowance)));
+}
+
+#[test]
+fn set_allowance_rejected_for_non_admin() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    let intruder = Address::generate(&h.env);
+
+    let res = h
+        .client
+        .try_set_allowance(&intruder, &agent, &h.asset, &100);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    // No allowance should have been stored.
+    let a = h.client.get_allowance(&agent, &h.asset);
+    assert_eq!(a.limit, 0);
+}
+
+#[test]
+fn consume_allowance_rejected_for_wrong_agent() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    let other = Address::generate(&h.env);
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &500);
+
+    // `other` tries to consume from `agent`'s allowance — should fail.
+    let res = h.client.try_consume_allowance(&other, &h.asset, &100);
+    assert_eq!(res, Err(Ok(Error::InsufficientAllowance)));
+}
+
+#[test]
+fn consume_negative_amount_rejected() {
+    let h = setup("vault", 0);
+    let agent = Address::generate(&h.env);
+    h.client.set_allowance(&h.admin, &agent, &h.asset, &500);
+
+    let res = h.client.try_consume_allowance(&agent, &h.asset, &-10);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}

@@ -63,6 +63,20 @@ pub fn treasury_created(env: &Env, org: &String, admin: &Address) {
     env.events().publish(topics, (org.clone(), admin.clone()));
 }
 
+/// `AllowanceSet` — topic `("treasury", "allow_set")`.
+pub fn allowance_set(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_set"));
+    env.events()
+        .publish(topics, (agent.clone(), asset.clone(), amount));
+}
+
+/// `AllowanceConsumed` — topic `("treasury", "allow_use")`.
+pub fn allowance_consumed(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_use"));
+    env.events()
+        .publish(topics, (agent.clone(), asset.clone(), amount));
+}
+
 /// Construct a `Symbol` reason code from a static name (used as event payloads
 /// for policy/budget violations) so all call sites share one construction path.
 pub fn reason(env: &Env, name: &str) -> Symbol {
