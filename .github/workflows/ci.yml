@@ -16,8 +16,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # Pin stellar-cli: the `opt` feature was removed after the 21.x line
+      # (renamed to the default `additional-libs` feature), so an unpinned
+      # `--features opt` install fails on current releases. 28.x compiles on
+      # current stable Rust and builds protocol-21 contracts out of the box.
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli --features opt
+        run: cargo install --locked stellar-cli --version 28.0.0
       - name: Build contracts
         run: stellar contract build
 
