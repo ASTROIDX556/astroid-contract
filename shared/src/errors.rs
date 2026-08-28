@@ -67,4 +67,10 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+
+    // --- Allowance / reserve (110-119) ---
+    AllowanceExceeded = 110,
+    ReserveNotFound = 111,
+    AllowanceNotFound = 112,
+    AllowanceAlreadyExists = 113,
 }
