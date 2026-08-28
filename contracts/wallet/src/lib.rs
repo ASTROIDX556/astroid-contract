@@ -19,7 +19,7 @@
 
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
-use astroid_shared::math::{checked_add, checked_sub};
+use astroid_shared::math::{checked_add, checked_mul, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
@@ -36,6 +36,8 @@ enum DataKey {
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
+    /// Minimum collateral reserve ratio in basis points: (id, asset) -> u32.
+    MinReserve(u64, Address),
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -45,6 +47,9 @@ pub struct WalletData {
     pub owner: Address,
     pub state: ResourceState,
 }
+
+/// Maximum enforceable collateral reserve ratio, in basis points (10000 = 100%).
+pub const MAX_RESERVE_RATIO_BPS: u32 = 10_000;
 
 #[contract]
 pub struct WalletContract;
@@ -127,6 +132,7 @@ impl WalletContract {
         require_positive_amount(amount)?;
         let wallet = Self::require_owner(&env, wallet_id, &caller)?;
         Self::require_active(&wallet)?;
+        Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -149,6 +155,7 @@ impl WalletContract {
         require_positive_amount(amount)?;
         let wallet = Self::require_owner(&env, wallet_id, &caller)?;
         Self::require_active(&wallet)?;
+        Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -210,6 +217,40 @@ impl WalletContract {
         Ok(())
     }
 
+    /// Set the minimum collateral reserve ratio for a wallet/asset pair (owner
+    /// only). `ratio_bps` is in basis points (0..=10000); 0 disables the check.
+    /// Once set, every outbound transfer/withdrawal must leave at least
+    /// `ratio_bps/10000` of the current balance behind, so organizations can
+    /// enforce a mandatory backing ratio before high-risk agent transactions.
+    pub fn set_reserve_ratio(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        asset: Address,
+        ratio_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_owner(&env, wallet_id, &caller)?;
+        if ratio_bps > MAX_RESERVE_RATIO_BPS {
+            return Err(Error::InvalidInput);
+        }
+        let key = DataKey::MinReserve(wallet_id, asset.clone());
+        if ratio_bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &ratio_bps);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::PERSISTENT_LIFETIME_THRESHOLD,
+                constants::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("resv_set")),
+            (wallet_id, asset, ratio_bps),
+        );
+        Ok(())
+    }
+
     /// Archive a wallet (owner only). Terminal state; no further transactions.
     pub fn archive(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
@@ -234,6 +275,15 @@ impl WalletContract {
         env.storage()
             .persistent()
             .get(&DataKey::Balance(wallet_id, asset))
+            .unwrap_or(0)
+    }
+
+    /// Read the configured minimum reserve ratio for a wallet/asset pair in
+    /// basis points (0 when no reserve requirement is set).
+    pub fn reserve_ratio(env: Env, wallet_id: u64, asset: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinReserve(wallet_id, asset))
             .unwrap_or(0)
     }
 
@@ -290,6 +340,36 @@ impl WalletContract {
             constants::PERSISTENT_LIFETIME_THRESHOLD,
             constants::PERSISTENT_BUMP_AMOUNT,
         );
+        Ok(())
+    }
+
+    /// Pre-execution reserve hook: verify that a planned outbound movement keeps
+    /// the wallet's remaining balance at or above the configured minimum reserve
+    /// ratio. Uses cross-multiplication (`projected * 10000 >= current * bps`)
+    /// so no division is ever performed — division-by-zero is impossible even
+    /// when the current balance is zero. Emits a precise event on failure.
+    fn require_reserve_ok(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
+        let key = DataKey::MinReserve(id, asset.clone());
+        let ratio_bps: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if ratio_bps == 0 {
+            return Ok(());
+        }
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(id, asset.clone()))
+            .unwrap_or(0);
+        if current < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        let projected = checked_sub(current, amount)?;
+        if checked_mul(projected, 10_000)? < checked_mul(current, ratio_bps as i128)? {
+            env.events().publish(
+                (symbol_short!("wallet"), symbol_short!("resv_fail")),
+                (id, asset.clone(), amount, ratio_bps),
+            );
+            return Err(Error::ReserveViolation);
+        }
         Ok(())
     }
 
