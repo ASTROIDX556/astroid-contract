@@ -9,13 +9,13 @@
 //! Two layers are provided:
 //!
 //! 1. **Typed [`ContractEvent`]** — a single `ContractEvent` enum that is the
-//!   canonical, structured schema consumed by off-chain indexers. Each variant
-//!   publishes under one topic equal to the variant symbol (e.g. `WalletCreated`)
-//!   with a strongly-typed payload, so consumers get stable, self-describing
-//!   events across every contract.
+//!    canonical, structured schema consumed by off-chain indexers. Each variant
+//!    publishes under one topic equal to the variant symbol (e.g. `WalletCreated`)
+//!    with a strongly-typed payload, so consumers get stable, self-describing
+//!    events across every contract.
 //! 2. **Tuple-topic helpers** — convenience functions publishing the legacy
-//!   `(Symbol category, Symbol action)` tuple topics, retained for backwards
-//!   compatibility with existing dashboards.
+//!    `(Symbol category, Symbol action)` tuple topics, retained for backwards
+//!    compatibility with existing dashboards.
 //!
 //! The two layers are emitted together on key state transitions so neither
 //! existing nor new consumers break.
