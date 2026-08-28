@@ -33,6 +33,7 @@ pub enum Error {
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
+    ModuleDeprecated = 31,
 
     // --- Budget (40-49) ---
     BudgetExceeded = 40,
