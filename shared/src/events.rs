@@ -8,7 +8,7 @@
 //!
 //! Two layers are provided:
 //!
-//! 1. **Typed [`ContractEvent`]** — a single `#[contractevent]` enum that is the
+//! 1. **Typed [`ContractEvent`]** — a single `ContractEvent` enum that is the
 //!   canonical, structured schema consumed by off-chain indexers. Each variant
 //!   publishes under one topic equal to the variant symbol (e.g. `WalletCreated`)
 //!   with a strongly-typed payload, so consumers get stable, self-describing
@@ -25,12 +25,11 @@ use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
-/// Publish with `env.events().publish(ContractEvent::Variant { .. })`. Each
+/// Publish with `events::publish(env, ContractEvent::Variant { .. })`. Each
 /// variant becomes a single-topic event (the variant symbol) carrying a typed
 /// payload, giving off-chain indexers one stable schema to track state changes
 /// such as module updates, wallet/registry state changes, treasury
 /// configuration, budget allocations and policy violations.
-#[contracttype]
 #[derive(Clone)]
 pub enum ContractEvent {
     /// A module was registered or updated in the registry.
@@ -74,24 +73,26 @@ pub enum ContractEvent {
 pub fn publish(env: &Env, event: ContractEvent) {
     match event {
         ContractEvent::RegistryModuleUpdated { org, kind, address } => {
-            env.events()
-                .publish(symbol_short!("RegistryModuleUpdated"), (org, kind, address));
+            env.events().publish(
+                Symbol::new(env, "RegistryModuleUpdated"),
+                (org, kind, address),
+            );
         }
         ContractEvent::OrgOwnerChanged { org, new_owner } => {
             env.events()
-                .publish(symbol_short!("OrgOwnerChanged"), (org, new_owner));
+                .publish(Symbol::new(env, "OrgOwnerChanged"), (org, new_owner));
         }
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
-                .publish(symbol_short!("RegistryFrozen"), (org, frozen));
+                .publish(Symbol::new(env, "RegistryFrozen"), (org, frozen));
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
-                .publish(symbol_short!("WalletCreated"), (wallet_id, owner));
+                .publish(Symbol::new(env, "WalletCreated"), (wallet_id, owner));
         }
         ContractEvent::WalletStateChanged { wallet_id, state } => {
             env.events()
-                .publish(symbol_short!("WalletStateChanged"), (wallet_id, state));
+                .publish(Symbol::new(env, "WalletStateChanged"), (wallet_id, state));
         }
         ContractEvent::TransferExecuted {
             from,
@@ -99,24 +100,28 @@ pub fn publish(env: &Env, event: ContractEvent) {
             asset,
             amount,
         } => {
-            env.events()
-                .publish(symbol_short!("TransferExecuted"), (from, to, asset, amount));
+            env.events().publish(
+                Symbol::new(env, "TransferExecuted"),
+                (from, to, asset, amount),
+            );
         }
         ContractEvent::TreasuryConfigUpdated { org, action } => {
             env.events()
-                .publish(symbol_short!("TreasuryConfigUpdated"), (org, action));
+                .publish(Symbol::new(env, "TreasuryConfigUpdated"), (org, action));
         }
         ContractEvent::BudgetUpdated {
             budget_id,
             action,
             amount,
         } => {
-            env.events()
-                .publish(symbol_short!("BudgetUpdated"), (budget_id, action, amount));
+            env.events().publish(
+                Symbol::new(env, "BudgetUpdated"),
+                (budget_id, action, amount),
+            );
         }
         ContractEvent::PolicyViolation { policy_id, reason } => {
             env.events()
-                .publish(symbol_short!("PolicyViolation"), (policy_id, reason));
+                .publish(Symbol::new(env, "PolicyViolation"), (policy_id, reason));
         }
     }
 }
