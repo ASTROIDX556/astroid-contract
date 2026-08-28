@@ -9,17 +9,22 @@
 //! trustless while the richer policy logic lives off-chain.
 //!
 //! On `create` the sender's funds are pulled into the contract's own custody and
-//! only leave through one of two settlement paths:
+//! only leave through one of three settlement paths:
 //!
 //! ```text
 //! Funded ──(arbiter, before deadline)──▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(after deadline)────────────▶ Refunded ─▶ sender    ─▶ Closed
+//! Funded ──(sender, before deadline)───▶ Revoked  ─▶ sender    ─▶ Closed
 //!    └────(after deadline, marker)─────▶ Expired ──(refund)──▶ Refunded
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
 //! deadline passes); funds stay in custody until `refund` returns them to the
 //! sender, so no escrow can be `Closed` with money still locked.
+//!
+//! `Revoked` enables the sender (or designated revoker) to claw back unreleased
+//! or partially released funds before the escrow reaches a terminal state. The
+//! remaining custody balance is returned to the sender.
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
@@ -42,6 +47,7 @@ pub enum EscrowState {
     Refunded = 3,
     Expired = 4,
     Closed = 5,
+    Revoked = 6,
 }
 
 #[contracttype]
@@ -56,6 +62,11 @@ pub struct Escrow {
     pub deadline: u64,
     pub funded_amount: i128,
     pub memo: String,
+    /// The address authorized to revoke this escrow (typically the sender).
+    pub revoker: Address,
+    /// Cumulative amount already released to the recipient (supports partial
+    /// claims before a revocation or final settlement).
+    pub released_amount: i128,
 }
 
 #[contracttype]
@@ -131,6 +142,8 @@ impl EscrowContract {
             deadline,
             funded_amount: amount,
             memo,
+            revoker: sender.clone(),
+            released_amount: 0,
         };
         env.storage()
             .persistent()
@@ -180,6 +193,8 @@ impl EscrowContract {
             deadline: unlock_time,
             funded_amount: 0,
             memo,
+            revoker: sender.clone(),
+            released_amount: 0,
         };
         env.storage()
             .persistent()
@@ -209,6 +224,7 @@ impl EscrowContract {
         }
 
         escrow.state = EscrowState::Released;
+        escrow.released_amount = escrow.amount;
         Self::store(&env, id, &escrow);
         token::TokenClient::new(&env, &escrow.asset).transfer(
             &env.current_contract_address(),
@@ -229,10 +245,22 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Release the escrowed funds to the recipient. Only the arbiter may call,
+    /// Release escrowed funds to the recipient. Only the arbiter may call,
     /// and only before the deadline — afterward the sender reclaims via `refund`.
-    pub fn release(env: Env, arbiter: Address, id: u64) -> Result<(), Error> {
+    ///
+    /// `release_amount` is the amount to release this call. Partial releases are
+    /// supported: the cumulative `released_amount` is tracked on the escrow and
+    /// must not exceed `funded_amount`. A full release transitions the escrow to
+    /// `Released`; a partial release keeps the escrow in `Funded` so that more
+    /// can be released later or the remaining balance can be revoked.
+    pub fn release(
+        env: Env,
+        arbiter: Address,
+        id: u64,
+        release_amount: i128,
+    ) -> Result<(), Error> {
         arbiter.require_auth();
+        require_positive_amount(release_amount)?;
         let mut escrow = Self::load(&env, id)?;
         if escrow.arbiter != arbiter {
             return Err(Error::Unauthorized);
@@ -247,27 +275,100 @@ impl EscrowContract {
             // entrypoint and the funds are reclaimed via `refund`.
             return Err(Error::EscrowExpired);
         }
+        let remaining = escrow
+            .funded_amount
+            .checked_sub(escrow.released_amount)
+            .ok_or(Error::Overflow)?;
+        if release_amount > remaining {
+            return Err(Error::InvalidAmount);
+        }
 
-        escrow.state = EscrowState::Released;
+        let new_released = checked_add(escrow.released_amount, release_amount)?;
+        escrow.released_amount = new_released;
+        // Full release: transition to Released. Partial release: stay in Funded.
+        if new_released >= escrow.funded_amount {
+            escrow.state = EscrowState::Released;
+        }
         Self::store(&env, id, &escrow);
         // Move the real tokens out of custody to the recipient.
         token::TokenClient::new(&env, &escrow.asset).transfer(
             &env.current_contract_address(),
             &escrow.recipient,
-            &escrow.funded_amount,
+            &release_amount,
         );
         events::transfer_executed(
             &env,
             &escrow.sender,
             &escrow.recipient,
             &escrow.asset,
-            escrow.funded_amount,
+            release_amount,
         );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("released")),
-            (id, arbiter),
+            (id, arbiter, release_amount),
         );
         Ok(())
+    }
+
+    /// Revoke an escrow and return remaining unreleased funds to the sender.
+    /// Only the designated revoker (typically the sender/depositor) may call.
+    ///
+    /// Allowed states:
+    /// - `Funded` — return the full or remaining custody balance.
+    /// - `Created` (time-lock, unfunded) — no real tokens to move; just mark revoked.
+    ///
+    /// Rejected states:
+    /// - `Released` / `Revoked` / `Closed` — already settled, deterministic error.
+    pub fn revoke(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if escrow.revoker != caller {
+            return Err(Error::Unauthorized);
+        }
+        match escrow.state {
+            EscrowState::Funded => {
+                // Return the remaining custody balance (funded_amount minus
+                // whatever has already been released) to the sender.
+                let remaining = escrow
+                    .funded_amount
+                    .checked_sub(escrow.released_amount)
+                    .ok_or(Error::Overflow)?;
+                escrow.state = EscrowState::Revoked;
+                Self::store(&env, id, &escrow);
+                if remaining > 0 {
+                    token::TokenClient::new(&env, &escrow.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &remaining,
+                    );
+                    events::transfer_executed(
+                        &env,
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &escrow.asset,
+                        remaining,
+                    );
+                }
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("revoked")),
+                    (id, caller, remaining),
+                );
+                Ok(())
+            }
+            EscrowState::Created => {
+                // Time-lock escrow, unfunded — no tokens in custody, just mark.
+                escrow.state = EscrowState::Revoked;
+                Self::store(&env, id, &escrow);
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("revoked")),
+                    (id, caller, 0i128),
+                );
+                Ok(())
+            }
+            EscrowState::Released => Err(Error::EscrowAlreadyReleased),
+            EscrowState::Revoked => Err(Error::AlreadyRevoked),
+            _ => Err(Error::InvalidState),
+        }
     }
 
     /// Mark a timed-out escrow `Expired` once its deadline has passed.
@@ -304,11 +405,15 @@ impl EscrowContract {
         }
         escrow.state = EscrowState::Refunded;
         Self::store(&env, id, &escrow);
-        // Return the real tokens to the sender.
+        // Return the remaining custody balance to the sender.
+        let remaining = escrow
+            .funded_amount
+            .checked_sub(escrow.released_amount)
+            .ok_or(Error::Overflow)?;
         token::TokenClient::new(&env, &escrow.asset).transfer(
             &env.current_contract_address(),
             &escrow.sender,
-            &escrow.funded_amount,
+            &remaining,
         );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("refunded")),
@@ -347,7 +452,10 @@ impl EscrowContract {
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = Self::load(&env, id)?;
-        if !matches!(escrow.state, EscrowState::Released | EscrowState::Refunded) {
+        if !matches!(
+            escrow.state,
+            EscrowState::Released | EscrowState::Refunded | EscrowState::Revoked
+        ) {
             return Err(Error::InvalidState);
         }
         if caller != escrow.sender && caller != escrow.recipient && caller != escrow.arbiter {

@@ -67,4 +67,6 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+    AlreadyRevoked = 85,
+    EscrowAlreadyReleased = 86,
 }
