@@ -5,7 +5,7 @@ use soroban_sdk::{
 
 use astroid_shared::errors::Error;
 
-use crate::{EscrowContract, EscrowContractClient, EscrowState};
+use crate::{EscrowContract, EscrowContractClient, EscrowState, ReleaseSchedule, ReleaseType};
 
 const START: u64 = 1_000;
 
@@ -225,4 +225,295 @@ fn create_rejects_bad_input() {
     assert_eq!(r3, Err(Ok(Error::InvalidAmount)));
     // No successful escrow was created, so the sender keeps every token.
     assert_eq!(balance(&h, &h.sender), 5_000);
+}
+
+#[test]
+fn timelock_cliff_rejects_early_withdraw_and_claims_post_maturity() {
+    let h = setup(10_000);
+    let unlock_time = START + 1_000;
+
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &10_000,
+        &unlock_time,
+        &String::from_str(&h.env, "timelock cliff"),
+    );
+    assert_eq!(id, 1);
+    assert_eq!(balance(&h, &h.sender), 0);
+    assert_eq!(balance(&h, &h.client.address), 10_000);
+
+    // Pre-maturity check: withdrawal and claim must fail with EscrowLocked
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+    assert_eq!(h.client.get_vested_amount(&id), 0);
+
+    let early_claim = h.client.try_claim(&h.recipient, &id);
+    assert_eq!(early_claim, Err(Ok(Error::EscrowLocked)));
+
+    let early_withdraw = h.client.try_withdraw(&h.recipient, &id, &5_000);
+    assert_eq!(early_withdraw, Err(Ok(Error::EscrowLocked)));
+
+    // Post-maturity check: claim succeeds
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert_eq!(h.client.get_claimable_amount(&id), 10_000);
+    assert_eq!(h.client.get_vested_amount(&id), 10_000);
+
+    let claimed = h.client.claim(&h.recipient, &id);
+    assert_eq!(claimed, 10_000);
+    assert_eq!(balance(&h, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+}
+
+#[test]
+fn timelock_linear_release_gradual_withdrawals() {
+    let h = setup(10_000);
+    let start_time = START;
+    let cliff_time = START + 200;
+    let end_time = START + 1_000;
+
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time,
+        cliff_time,
+        end_time,
+    };
+
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &10_000,
+        &schedule,
+        &end_time,
+        &String::from_str(&h.env, "linear schedule"),
+    );
+
+    // 1. Before cliff (timestamp = START + 100): locked
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+    assert_eq!(h.client.get_vested_amount(&id), 0);
+    let res = h.client.try_withdraw(&h.recipient, &id, &1_000);
+    assert_eq!(res, Err(Ok(Error::EscrowLocked)));
+
+    // 2. At 50% time (timestamp = START + 500, past cliff):
+    // 50% of 10,000 = 5,000 vested.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_vested_amount(&id), 5_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 5_000);
+
+    // Partial withdrawal of 3,000
+    let total_released = h.client.withdraw(&h.recipient, &id, &3_000);
+    assert_eq!(total_released, 3_000);
+    assert_eq!(balance(&h, &h.recipient), 3_000);
+    assert_eq!(balance(&h, &h.client.address), 7_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 2_000);
+
+    // Attempt to withdraw more than currently claimable (3,000 > 2,000)
+    let over_withdraw = h.client.try_withdraw(&h.recipient, &id, &3_000);
+    assert_eq!(over_withdraw, Err(Ok(Error::InsufficientFunds)));
+
+    // 3. At 80% time (timestamp = START + 800):
+    // 80% of 10,000 = 8,000 vested; already released 3,000 => claimable = 5,000.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 800);
+    assert_eq!(h.client.get_vested_amount(&id), 8_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 5_000);
+
+    let next_released = h.client.withdraw(&h.recipient, &id, &5_000);
+    assert_eq!(next_released, 8_000);
+    assert_eq!(balance(&h, &h.recipient), 8_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+
+    // 4. At 100% maturity (timestamp = START + 1_000):
+    // Total vested = 10,000; claimable = 2,000.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
+    assert_eq!(h.client.get_vested_amount(&id), 10_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 2_000);
+
+    let claimed = h.client.claim(&h.recipient, &id);
+    assert_eq!(claimed, 2_000);
+    assert_eq!(balance(&h, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+}
+
+#[test]
+fn scheduled_escrow_rejects_bad_schedule_inputs() {
+    let h = setup(10_000);
+
+    // start_time > cliff_time
+    let s1 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START + 500,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let r1 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &1_000,
+        &s1,
+        &(START + 1_000),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r1, Err(Ok(Error::InvalidInput)));
+
+    // cliff_time > end_time
+    let s2 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 1_200,
+        end_time: START + 1_000,
+    };
+    let r2 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &1_000,
+        &s2,
+        &(START + 1_000),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r2, Err(Ok(Error::InvalidInput)));
+
+    // end_time <= start_time
+    let s3 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START + 500,
+        cliff_time: START + 500,
+        end_time: START + 500,
+    };
+    let r3 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &1_000,
+        &s3,
+        &(START + 500),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r3, Err(Ok(Error::InvalidInput)));
+
+    // deadline < end_time
+    let s4 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 100,
+        end_time: START + 1_000,
+    };
+    let r4 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &1_000,
+        &s4,
+        &(START + 500),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r4, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn timelock_unauthorized_claim_and_withdraw() {
+    let h = setup(5_000);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &5_000,
+        &(START + 500),
+        &String::from_str(&h.env, "timelock"),
+    );
+
+    let intruder = Address::generate(&h.env);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
+
+    let r1 = h.client.try_withdraw(&intruder, &id, &1_000);
+    assert_eq!(r1, Err(Ok(Error::Unauthorized)));
+
+    let r2 = h.client.try_claim(&intruder, &id);
+    assert_eq!(r2, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn timelock_refund_rules() {
+    let h = setup(5_000);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &5_000,
+        &(START + 500),
+        &String::from_str(&h.env, "timelock"),
+    );
+
+    // Pre-deadline refund attempt fails
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    let early = h.client.try_refund_timelock(&h.sender, &id);
+    assert_eq!(early, Err(Ok(Error::EscrowLocked)));
+
+    // Non-sender cannot refund
+    let intruder = Address::generate(&h.env);
+    let unauth = h.client.try_refund_timelock(&intruder, &id);
+    assert_eq!(unauth, Err(Ok(Error::Unauthorized)));
+
+    // Post-deadline refund succeeds
+    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
+    h.client.refund_timelock(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn initialize_and_fund_timelock_lifecycle() {
+    let h = setup(5_000);
+    let id = h.client.initialize_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset,
+        &5_000,
+        &(START + 500),
+        &String::from_str(&h.env, "unfunded"),
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Created);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+
+    // Intruder cannot fund
+    let intruder = Address::generate(&h.env);
+    let unauth_fund = h.client.try_fund(&intruder, &id);
+    assert_eq!(unauth_fund, Err(Ok(Error::Unauthorized)));
+
+    // Sender funds
+    h.client.fund(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.sender), 0);
+    assert_eq!(balance(&h, &h.client.address), 5_000);
+
+    // Pre-maturity claim fails
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    let early = h.client.try_claim(&h.recipient, &id);
+    assert_eq!(early, Err(Ok(Error::EscrowLocked)));
+
+    // Post-maturity claim succeeds
+    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
+    let claimed = h.client.claim(&h.recipient, &id);
+    assert_eq!(claimed, 5_000);
+    assert_eq!(balance(&h, &h.recipient), 5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
 }

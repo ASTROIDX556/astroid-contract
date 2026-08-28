@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 6,
+    "address": 7,
     "nonce": 0
   },
   "auth": [
@@ -39,7 +39,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 }
               ]
@@ -56,7 +56,7 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "create",
+              "function_name": "initialize_timelock",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -73,14 +73,40 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 },
                 {
-                  "u64": 87400
+                  "u64": 1500
                 },
                 {
-                  "string": "payment"
+                  "string": "unfunded"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
+    [],
+    [],
+    [],
+    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "fund",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": 1
                 }
               ]
             }
@@ -101,7 +127,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 10000
+                        "lo": 5000
                       }
                     }
                   ]
@@ -116,17 +142,18 @@
     [],
     [],
     [],
+    [],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "release",
+              "function_name": "claim",
               "args": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
                   "u64": 1
@@ -139,36 +166,12 @@
       ]
     ],
     [],
-    [],
-    [],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "close",
-              "args": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "u64": 1
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
     []
   ],
   "ledger": {
     "protocol_version": 21,
     "sequence_number": 0,
-    "timestamp": 1000,
+    "timestamp": 1600,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
@@ -280,7 +283,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000
+                          "lo": 5000
                         }
                       }
                     },
@@ -305,7 +308,7 @@
                         "symbol": "deadline"
                       },
                       "val": {
-                        "u64": 87400
+                        "u64": 1500
                       }
                     },
                     {
@@ -315,7 +318,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000
+                          "lo": 5000
                         }
                       }
                     },
@@ -324,7 +327,7 @@
                         "symbol": "memo"
                       },
                       "val": {
-                        "string": "payment"
+                        "string": "unfunded"
                       }
                     },
                     {
@@ -342,7 +345,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000
+                          "lo": 5000
                         }
                       }
                     },
@@ -357,7 +360,7 @@
                               "symbol": "cliff_time"
                             },
                             "val": {
-                              "u64": 0
+                              "u64": 1500
                             }
                           },
                           {
@@ -365,7 +368,7 @@
                               "symbol": "end_time"
                             },
                             "val": {
-                              "u64": 0
+                              "u64": 1500
                             }
                           },
                           {
@@ -373,7 +376,7 @@
                               "symbol": "release_type"
                             },
                             "val": {
-                              "u32": 0
+                              "u32": 1
                             }
                           },
                           {
@@ -381,7 +384,7 @@
                               "symbol": "start_time"
                             },
                             "val": {
-                              "u64": 0
+                              "u64": 1000
                             }
                           }
                         ]
@@ -400,7 +403,7 @@
                         "symbol": "state"
                       },
                       "val": {
-                        "u32": 5
+                        "u32": 2
                       }
                     }
                   ]
@@ -559,10 +562,10 @@
       [
         {
           "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
             "key": {
               "ledger_key_nonce": {
-                "nonce": 4837995959683129791
+                "nonce": 8370022561469687789
               }
             },
             "durability": "temporary"
@@ -574,10 +577,10 @@
             "data": {
               "contract_data": {
                 "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
                 "key": {
                   "ledger_key_nonce": {
-                    "nonce": 4837995959683129791
+                    "nonce": 8370022561469687789
                   }
                 },
                 "durability": "temporary",
@@ -779,7 +782,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000
+                          "lo": 5000
                         }
                       }
                     },
@@ -1135,7 +1138,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 }
               ]
@@ -1169,7 +1172,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 10000
+                "lo": 5000
               }
             }
           }
@@ -1213,7 +1216,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "create"
+                "symbol": "initialize_timelock"
               }
             ],
             "data": {
@@ -1233,14 +1236,524 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 },
                 {
-                  "u64": 87400
+                  "u64": 1500
                 },
                 {
-                  "string": "payment"
+                  "string": "unfunded"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "escrow"
+              },
+              {
+                "symbol": "init_tl"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "u64": 1
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                },
+                {
+                  "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 5000
+                  }
+                },
+                {
+                  "u64": 1500
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "initialize_timelock"
+              }
+            ],
+            "data": {
+              "u64": 1
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
+              },
+              {
+                "symbol": "get"
+              }
+            ],
+            "data": {
+              "u64": 1
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "get"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "arbiter"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "asset"
+                  },
+                  "val": {
+                    "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "deadline"
+                  },
+                  "val": {
+                    "u64": 1500
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "funded_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "memo"
+                  },
+                  "val": {
+                    "string": "unfunded"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "recipient"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "released_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "schedule"
+                  },
+                  "val": {
+                    "map": [
+                      {
+                        "key": {
+                          "symbol": "cliff_time"
+                        },
+                        "val": {
+                          "u64": 1500
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "end_time"
+                        },
+                        "val": {
+                          "u64": 1500
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "release_type"
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "start_time"
+                        },
+                        "val": {
+                          "u64": 1000
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "sender"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "state"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 5000
+              }
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 0
+              }
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
+              },
+              {
+                "symbol": "fund"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                },
+                {
+                  "u64": 1
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "fund"
+              }
+            ],
+            "data": {
+              "error": {
+                "contract": 3
+              }
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 3
+                }
+              }
+            ],
+            "data": {
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 3
+                }
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "contract try_call failed"
+                },
+                {
+                  "symbol": "fund"
+                },
+                {
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                    },
+                    {
+                      "u64": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
+              },
+              {
+                "symbol": "fund"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": 1
                 }
               ]
             }
@@ -1278,7 +1791,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 }
               ]
@@ -1312,7 +1825,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 10000
+                "lo": 5000
               }
             }
           }
@@ -1373,7 +1886,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 }
               ]
@@ -1395,11 +1908,189 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "create"
+                "symbol": "fund"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
+              },
+              {
+                "symbol": "get"
               }
             ],
             "data": {
               "u64": 1
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "get"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "arbiter"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "asset"
+                  },
+                  "val": {
+                    "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "deadline"
+                  },
+                  "val": {
+                    "u64": 1500
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "funded_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "memo"
+                  },
+                  "val": {
+                    "string": "unfunded"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "recipient"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "released_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "schedule"
+                  },
+                  "val": {
+                    "map": [
+                      {
+                        "key": {
+                          "symbol": "cliff_time"
+                        },
+                        "val": {
+                          "u64": 1500
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "end_time"
+                        },
+                        "val": {
+                          "u64": 1500
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "release_type"
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "start_time"
+                        },
+                        "val": {
+                          "u64": 1000
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "sender"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "state"
+                  },
+                  "val": {
+                    "u32": 1
+                  }
+                }
+              ]
             }
           }
         }
@@ -1502,7 +2193,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 10000
+                "lo": 5000
               }
             }
           }
@@ -1525,11 +2216,18 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "get"
+                "symbol": "claim"
               }
             ],
             "data": {
-              "u64": 1
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                },
+                {
+                  "u64": 1
+                }
+              ]
             }
           }
         }
@@ -1548,140 +2246,78 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "get"
+                "symbol": "claim"
               }
             ],
             "data": {
-              "map": [
+              "error": {
+                "contract": 85
+              }
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 85
+                }
+              }
+            ],
+            "data": {
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 85
+                }
+              }
+            ],
+            "data": {
+              "vec": [
                 {
-                  "key": {
-                    "symbol": "amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 10000
+                  "string": "contract try_call failed"
+                },
+                {
+                  "symbol": "claim"
+                },
+                {
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    },
+                    {
+                      "u64": 1
                     }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "arbiter"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "asset"
-                  },
-                  "val": {
-                    "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "deadline"
-                  },
-                  "val": {
-                    "u64": 87400
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "funded_amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 10000
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "memo"
-                  },
-                  "val": {
-                    "string": "payment"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "recipient"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "released_amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 0
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "schedule"
-                  },
-                  "val": {
-                    "map": [
-                      {
-                        "key": {
-                          "symbol": "cliff_time"
-                        },
-                        "val": {
-                          "u64": 0
-                        }
-                      },
-                      {
-                        "key": {
-                          "symbol": "end_time"
-                        },
-                        "val": {
-                          "u64": 0
-                        }
-                      },
-                      {
-                        "key": {
-                          "symbol": "release_type"
-                        },
-                        "val": {
-                          "u32": 0
-                        }
-                      },
-                      {
-                        "key": {
-                          "symbol": "start_time"
-                        },
-                        "val": {
-                          "u64": 0
-                        }
-                      }
-                    ]
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "sender"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "state"
-                  },
-                  "val": {
-                    "u32": 1
-                  }
+                  ]
                 }
               ]
             }
@@ -1705,13 +2341,13 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "release"
+                "symbol": "claim"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
                   "u64": 1
@@ -1752,7 +2388,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 }
               ]
@@ -1786,7 +2422,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 10000
+                "lo": 5000
               }
             }
           }
@@ -1844,7 +2480,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000
+                    "lo": 5000
                   }
                 }
               ]
@@ -1866,7 +2502,7 @@
                 "symbol": "escrow"
               },
               {
-                "symbol": "released"
+                "symbol": "claimed"
               }
             ],
             "data": {
@@ -1875,7 +2511,13 @@
                   "u64": 1
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 5000
+                  }
                 }
               ]
             }
@@ -1896,189 +2538,14 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "release"
-              }
-            ],
-            "data": "void"
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
-              },
-              {
-                "symbol": "get"
+                "symbol": "claim"
               }
             ],
             "data": {
-              "u64": 1
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "get"
+              "i128": {
+                "hi": 0,
+                "lo": 5000
               }
-            ],
-            "data": {
-              "map": [
-                {
-                  "key": {
-                    "symbol": "amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 10000
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "arbiter"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "asset"
-                  },
-                  "val": {
-                    "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "deadline"
-                  },
-                  "val": {
-                    "u64": 87400
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "funded_amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 10000
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "memo"
-                  },
-                  "val": {
-                    "string": "payment"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "recipient"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "released_amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 10000
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "schedule"
-                  },
-                  "val": {
-                    "map": [
-                      {
-                        "key": {
-                          "symbol": "cliff_time"
-                        },
-                        "val": {
-                          "u64": 0
-                        }
-                      },
-                      {
-                        "key": {
-                          "symbol": "end_time"
-                        },
-                        "val": {
-                          "u64": 0
-                        }
-                      },
-                      {
-                        "key": {
-                          "symbol": "release_type"
-                        },
-                        "val": {
-                          "u32": 0
-                        }
-                      },
-                      {
-                        "key": {
-                          "symbol": "start_time"
-                        },
-                        "val": {
-                          "u64": 0
-                        }
-                      }
-                    ]
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "sender"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "state"
-                  },
-                  "val": {
-                    "u32": 2
-                  }
-                }
-              ]
             }
           }
         }
@@ -2129,115 +2596,9 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 10000
+                "lo": 5000
               }
             }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 0
-              }
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
-              },
-              {
-                "symbol": "close"
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "u64": 1
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "close"
-              }
-            ],
-            "data": "void"
           }
         }
       },
@@ -2293,7 +2654,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 10000
+                      "lo": 5000
                     }
                   }
                 },
@@ -2318,7 +2679,7 @@
                     "symbol": "deadline"
                   },
                   "val": {
-                    "u64": 87400
+                    "u64": 1500
                   }
                 },
                 {
@@ -2328,7 +2689,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 10000
+                      "lo": 5000
                     }
                   }
                 },
@@ -2337,7 +2698,7 @@
                     "symbol": "memo"
                   },
                   "val": {
-                    "string": "payment"
+                    "string": "unfunded"
                   }
                 },
                 {
@@ -2355,7 +2716,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 10000
+                      "lo": 5000
                     }
                   }
                 },
@@ -2370,7 +2731,7 @@
                           "symbol": "cliff_time"
                         },
                         "val": {
-                          "u64": 0
+                          "u64": 1500
                         }
                       },
                       {
@@ -2378,7 +2739,7 @@
                           "symbol": "end_time"
                         },
                         "val": {
-                          "u64": 0
+                          "u64": 1500
                         }
                       },
                       {
@@ -2386,7 +2747,7 @@
                           "symbol": "release_type"
                         },
                         "val": {
-                          "u32": 0
+                          "u32": 1
                         }
                       },
                       {
@@ -2394,7 +2755,7 @@
                           "symbol": "start_time"
                         },
                         "val": {
-                          "u64": 0
+                          "u64": 1000
                         }
                       }
                     ]
@@ -2413,7 +2774,7 @@
                     "symbol": "state"
                   },
                   "val": {
-                    "u32": 5
+                    "u32": 2
                   }
                 }
               ]
