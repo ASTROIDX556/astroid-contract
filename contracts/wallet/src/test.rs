@@ -5,17 +5,17 @@ use crate::{WalletContract, WalletContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{token, Address, Env, Symbol, Val};
+use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
 fn assert_event(env: &Env, variant: &str) {
-    let want: Val = Symbol::new(env, variant).into();
+    let want: Val = Symbol::new(env, variant).into_val(env);
     let found = env
         .events()
         .all()
         .iter()
-        .any(|(topics, _data)| topics.iter().any(|t| *t == want));
+        .any(|(_contract_id, topics, _data)| topics.iter().any(|t| *t == want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
