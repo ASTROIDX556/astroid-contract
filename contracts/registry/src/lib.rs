@@ -109,7 +109,7 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &new_owner);
         Self::bump(&env, &key);
         astroid_shared::events::publish(
-            env,
+            &env,
             ContractEvent::OrgOwnerChanged {
                 org: org.clone(),
                 new_owner: new_owner.clone(),
@@ -138,7 +138,7 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
         astroid_shared::events::publish(
-            env,
+            &env,
             ContractEvent::RegistryModuleUpdated {
                 org: org.clone(),
                 kind,
@@ -266,7 +266,7 @@ impl RegistryContract {
         }
         env.storage().instance().set(&DataKey::Frozen, &true);
         astroid_shared::events::publish(
-            env,
+            &env,
             ContractEvent::RegistryFrozen {
                 org: org.clone(),
                 frozen: true,
@@ -291,7 +291,7 @@ impl RegistryContract {
         }
         env.storage().instance().set(&DataKey::Frozen, &false);
         astroid_shared::events::publish(
-            env,
+            &env,
             ContractEvent::RegistryFrozen {
                 org: org.clone(),
                 frozen: false,

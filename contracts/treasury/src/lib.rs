@@ -97,7 +97,7 @@ impl TreasuryContract {
         t.policy = Some(policy);
         Self::store(&env, &t);
         events::publish(
-            env,
+            &env,
             events::ContractEvent::TreasuryConfigUpdated {
                 org: t.org.clone(),
                 action: symbol_short!("policy"),
@@ -114,7 +114,7 @@ impl TreasuryContract {
         t.budget = Some(budget);
         Self::store(&env, &t);
         events::publish(
-            env,
+            &env,
             events::ContractEvent::TreasuryConfigUpdated {
                 org: t.org.clone(),
                 action: symbol_short!("budget"),
@@ -131,7 +131,7 @@ impl TreasuryContract {
         t.state = ResourceState::Frozen;
         Self::store(&env, &t);
         events::publish(
-            env,
+            &env,
             events::ContractEvent::TreasuryConfigUpdated {
                 org: t.org.clone(),
                 action: symbol_short!("frozen"),
@@ -151,7 +151,7 @@ impl TreasuryContract {
         t.state = ResourceState::Active;
         Self::store(&env, &t);
         events::publish(
-            env,
+            &env,
             events::ContractEvent::TreasuryConfigUpdated {
                 org: t.org.clone(),
                 action: symbol_short!("unfrozen"),
@@ -249,7 +249,7 @@ impl TreasuryContract {
         );
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         events::publish(
-            env,
+            &env,
             events::ContractEvent::TransferExecuted {
                 from: t.admin.clone(),
                 to: to.clone(),
