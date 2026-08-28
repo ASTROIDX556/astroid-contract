@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 //! # astroid-shared
 //!
 //! Common building blocks shared by every Astroid Soroban contract. Keeping
