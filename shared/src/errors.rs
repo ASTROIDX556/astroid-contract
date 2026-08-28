@@ -54,6 +54,8 @@ pub enum Error {
     InvalidThreshold = 64,
     TimeLocked = 65,
     TooManySigners = 66,
+    InsufficientWeight = 67,
+    InvalidSignerWeight = 68,
 
     // --- Proposal (70-79) ---
     ProposalExpired = 70,
