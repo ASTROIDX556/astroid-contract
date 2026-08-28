@@ -1,8 +1,18 @@
-use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, token, Address, Env, String, Symbol, Val};
 
 use astroid_shared::errors::Error;
 
 use crate::{TreasuryContract, TreasuryContractClient};
+
+/// Assert that the canonical `ContractEvent` with the given variant symbol was
+/// published during the test (single-topic event = the variant name).
+fn assert_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into();
+    let found = env.events().all().iter().any(|(topics, _data)| {
+        topics.iter().any(|t| *t == want)
+    });
+    assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
 
 struct Harness<'a> {
     env: Env,
@@ -119,4 +129,17 @@ fn prepare_holds_state() {
     let h = setup("vault", 0);
     let state = h.client.get();
     assert_eq!(state.org, String::from_str(&h.env, "vault"));
+}
+
+#[test]
+fn standard_events_emitted() {
+    let h = setup("vault", 1_000);
+    h.client.set_policy(&h.admin, &h.admin);
+    assert_event(&h.env, "TreasuryConfigUpdated");
+    h.client.set_budget(&h.admin, &h.admin);
+    assert_event(&h.env, "TreasuryConfigUpdated");
+
+    let recipient = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_event(&h.env, "TransferExecuted");
 }

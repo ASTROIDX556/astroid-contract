@@ -6,10 +6,70 @@
 //! identically. Contracts may also publish additional, contract-specific events
 //! directly; these are the shared "standard" set.
 //!
-//! Topic convention: `(Symbol category, Symbol action)` with a tuple data
-//! payload. Symbols use [`symbol_short!`] (<= 9 chars) or [`Symbol::new`].
+//! Two layers are provided:
+//!
+//! 1. **Typed [`ContractEvent`]** — a single `#[contractevent]` enum that is the
+//!    canonical, structured schema consumed by off-chain indexers. Each variant
+//!    publishes under one topic equal to the variant symbol (e.g. `WalletCreated`)
+//!    with a strongly-typed payload, so consumers get stable, self-describing
+//!    events across every contract.
+//! 2. **Tuple-topic helpers** — convenience functions publishing the legacy
+//!    `(Symbol category, Symbol action)` tuple topics, retained for backwards
+//!    compatibility with existing dashboards.
+//!
+//! The two layers are emitted together on key state transitions so neither
+//! existing nor new consumers break.
 
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
+use crate::types::ModuleKind;
+use soroban_sdk::{contractevent, symbol_short, Address, Env, String, Symbol};
+
+/// Canonical, structured event schema emitted by every Astroid contract.
+///
+/// Publish with `env.events().publish(ContractEvent::Variant { .. })`. Each
+/// variant becomes a single-topic event (the variant symbol) carrying a typed
+/// payload, giving off-chain indexers one stable schema to track state changes
+/// such as module updates, wallet/registry state changes, treasury
+/// configuration, budget allocations and policy violations.
+#[contractevent]
+#[derive(Clone)]
+pub enum ContractEvent {
+    /// A module was registered or updated in the registry.
+    RegistryModuleUpdated {
+        org: String,
+        kind: ModuleKind,
+        address: Address,
+    },
+    /// An organization's owner changed.
+    OrgOwnerChanged { org: String, new_owner: Address },
+    /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
+    RegistryFrozen { org: String, frozen: bool },
+    /// A wallet was created.
+    WalletCreated { wallet_id: u64, owner: Address },
+    /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
+    WalletStateChanged { wallet_id: u64, state: Symbol },
+    /// Value moved out of a contract to a recipient.
+    TransferExecuted {
+        from: Address,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    },
+    /// A treasury configuration field was updated (`action` is e.g. `policy`).
+    TreasuryConfigUpdated { org: String, action: Symbol },
+    /// A budget was allocated, consumed or rolled over (`action` describes which).
+    BudgetUpdated {
+        budget_id: String,
+        action: Symbol,
+        amount: i128,
+    },
+    /// A policy rejected a transfer.
+    PolicyViolation { policy_id: String, reason: Symbol },
+}
+
+/// Publish a [`ContractEvent`] using the canonical schema.
+pub fn publish(env: &Env, event: ContractEvent) {
+    env.events().publish(event);
+}
 
 /// `WalletCreated` — topic `("wallet", "created")`.
 pub fn wallet_created(env: &Env, wallet_id: u64, owner: &Address) {
