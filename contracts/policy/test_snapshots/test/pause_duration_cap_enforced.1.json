@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 4,
+    "address": 2,
     "nonce": 0
   },
   "auth": [
@@ -59,6 +59,7 @@
         }
       ]
     ],
+    [],
     []
   ],
   "ledger": {
@@ -484,25 +485,16 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
               },
               {
-                "symbol": "check_transfer"
+                "symbol": "pause"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "string": "max_txn"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000001
-                  }
+                  "u64": 2592001
                 }
               ]
             }
@@ -510,36 +502,6 @@
         }
       },
       "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
-        "type_": "contract",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "policy"
-              },
-              {
-                "symbol": "violation"
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "string": "max_txn"
-                },
-                {
-                  "symbol": "above_max"
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": true
     },
     {
       "event": {
@@ -553,12 +515,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "check_transfer"
+                "symbol": "pause"
               }
             ],
             "data": {
               "error": {
-                "contract": 20
+                "contract": 25
               }
             }
           }
@@ -579,7 +541,7 @@
               },
               {
                 "error": {
-                  "contract": 20
+                  "contract": 25
                 }
               }
             ],
@@ -604,7 +566,7 @@
               },
               {
                 "error": {
-                  "contract": 20
+                  "contract": 25
                 }
               }
             ],
@@ -614,28 +576,66 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "check_transfer"
+                  "symbol": "pause"
                 },
                 {
                   "vec": [
                     {
-                      "string": "max_txn"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                     },
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                    },
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 1000001
-                      }
+                      "u64": 2592001
                     }
                   ]
                 }
               ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
+              },
+              {
+                "symbol": "paused"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "paused"
+              }
+            ],
+            "data": {
+              "bool": false
             }
           }
         }

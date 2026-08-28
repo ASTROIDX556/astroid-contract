@@ -25,3 +25,8 @@ pub const MIN_THRESHOLD: u32 = 1;
 
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
+
+/// Maximum duration (seconds) allowed for a single temporary emergency pause.
+/// Caps `pause(duration)` so an authorized admin cannot lock policy evaluation
+/// indefinitely; indefinite pauses must go through `unpause` explicitly.
+pub const MAX_PAUSE_DURATION: u64 = SECONDS_PER_MONTH;
