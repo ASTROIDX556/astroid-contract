@@ -8,9 +8,11 @@ use crate::{TreasuryContract, TreasuryContractClient};
 /// published during the test (single-topic event = the variant name).
 fn assert_event(env: &Env, variant: &str) {
     let want: Val = Symbol::new(env, variant).into();
-    let found = env.events().all().iter().any(|(topics, _data)| {
-        topics.iter().any(|t| *t == want)
-    });
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(topics, _data)| topics.iter().any(|t| *t == want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
