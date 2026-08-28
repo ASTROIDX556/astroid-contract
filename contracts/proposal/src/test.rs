@@ -55,6 +55,20 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
     )
 }
 
+fn create_with_quorum(h: &Harness, threshold: u32, quorum: u32, expires_at: u64) -> u64 {
+    h.client.create_with_quorum(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &String::from_str(&h.env, "tx-ref-1"),
+        &approver_vec(h),
+        &threshold,
+        &quorum,
+        &expires_at,
+    )
+}
+
 #[test]
 fn create_starts_pending() {
     let h = setup(3);
@@ -76,6 +90,57 @@ fn full_lifecycle_to_closed() {
 
     h.client.close(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Closed);
+}
+
+#[test]
+fn majority_vote_without_quorum_cannot_execute() {
+    let h = setup(3);
+    let id = create_with_quorum(&h, 2, 3, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::QuorumNotMet)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn quorum_allows_execution_when_reached() {
+    let h = setup(3);
+    let id = create_with_quorum(&h, 2, 3, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.approve(&h.approvers[2], &id);
+
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn zero_quorum_is_rejected() {
+    let h = setup(3);
+    let res = h.client.try_create_with_quorum(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &String::from_str(&h.env, "tx-ref-1"),
+        &approver_vec(&h),
+        &1,
+        &0,
+        &5_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+}
+
+#[test]
+fn zero_participation_cannot_execute() {
+    let h = setup(3);
+    let id = create_with_quorum(&h, 1, 2, 5_000);
+
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::ProposalNotApproved)));
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
 }
 
 #[test]

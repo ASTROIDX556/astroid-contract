@@ -45,7 +45,8 @@ pub enum ProposalState {
 }
 
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
-/// to approve; `threshold` approvals move it to `Approved`.
+/// to approve; `threshold` approvals move it to `Approved`. Execution also
+/// requires `quorum` participating approvers.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposal {
@@ -57,6 +58,7 @@ pub struct Proposal {
     pub tx_ref: String,
     pub approvers: Vec<Address>,
     pub threshold: u32,
+    pub quorum: u32,
     pub approvals: u32,
     pub state: ProposalState,
     pub expires_at: u64,
@@ -101,6 +103,63 @@ impl ProposalContract {
         threshold: u32,
         expires_at: u64,
     ) -> Result<u64, Error> {
+        Self::create_proposal(
+            env,
+            proposer,
+            org,
+            wallet,
+            policy,
+            tx_ref,
+            approvers,
+            threshold,
+            threshold,
+            expires_at,
+        )
+    }
+
+    /// Create a proposal with separate approval and participation thresholds.
+    /// Quorum is the minimum number of eligible approvers that must participate
+    /// before an approved proposal can execute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_quorum(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        tx_ref: String,
+        approvers: Vec<Address>,
+        threshold: u32,
+        quorum: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        Self::create_proposal(
+            env,
+            proposer,
+            org,
+            wallet,
+            policy,
+            tx_ref,
+            approvers,
+            threshold,
+            quorum,
+            expires_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_proposal(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        tx_ref: String,
+        approvers: Vec<Address>,
+        threshold: u32,
+        quorum: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
         proposer.require_auth();
         require_non_empty(&org)?;
         let n = approvers.len();
@@ -108,6 +167,9 @@ impl ProposalContract {
             return Err(Error::InvalidInput);
         }
         if threshold == 0 || threshold > n {
+            return Err(Error::InvalidThreshold);
+        }
+        if quorum == 0 || quorum > n {
             return Err(Error::InvalidThreshold);
         }
         if expires_at != 0 && expires_at <= env.ledger().timestamp() {
@@ -130,6 +192,7 @@ impl ProposalContract {
             tx_ref,
             approvers,
             threshold,
+            quorum,
             approvals: 0,
             state: ProposalState::Pending,
             expires_at,
@@ -253,6 +316,9 @@ impl ProposalContract {
         }
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
+        }
+        if proposal.approvals < proposal.quorum {
+            return Err(Error::QuorumNotMet);
         }
         proposal.state = ProposalState::Executed;
         Self::store(&env, id, &proposal);
