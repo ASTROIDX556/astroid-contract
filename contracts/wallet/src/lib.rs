@@ -325,12 +325,13 @@ impl WalletContract {
     }
 
     fn emit_state(env: &Env, id: u64, action: soroban_sdk::Symbol) {
-        env.events().publish((symbol_short!("wallet"), action), id);
+        env.events()
+            .publish((symbol_short!("wallet"), action.clone()), id);
         events::publish(
             env,
             events::ContractEvent::WalletStateChanged {
                 wallet_id: id,
-                state: action.clone(),
+                state: action,
             },
         );
     }
