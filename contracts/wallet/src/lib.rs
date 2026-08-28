@@ -12,7 +12,7 @@
 //! wallet; every other state fails safely with a specific error.
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `batch_execute`.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted` (shared schema)
 //! plus wallet-scoped state-change events.
@@ -23,7 +23,7 @@ use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone)]
@@ -36,6 +36,19 @@ enum DataKey {
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
+}
+
+/// A single sub-call to be executed as part of a batch. `contract_addr` is the
+/// target contract, `fn_name` is the entry-point symbol, and `args` are the
+/// serialized arguments. The batch executor invokes each sub-call sequentially;
+/// if any fails the entire transaction is atomically reverted by the Soroban
+/// runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractCall {
+    pub contract_addr: Address,
+    pub fn_name: Symbol,
+    pub args: soroban_sdk::Vec<soroban_sdk::RawVal>,
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -219,6 +232,35 @@ impl WalletContract {
         wallet.state = ResourceState::Archived;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("archived"));
+        Ok(())
+    }
+
+    /// Execute a batch of sub-calls atomically. If any sub-call returns an
+    /// error the Soroban runtime rolls back all state changes made during the
+    /// entire batch, guaranteeing atomicity. The `caller` is used for
+    /// authorization checks inside individual sub-calls.
+    pub fn batch_execute(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        calls: Vec<ContractCall>,
+    ) -> Result<(), Error> {
+        // Ensure the caller owns the wallet (authorizes the batch).
+        Self::require_owner(&env, wallet_id, &caller)?;
+
+        if calls.is_empty() {
+            return Err(Error::BatchEmpty);
+        }
+
+        for call in calls.iter() {
+            env.invoke_contract(
+                &call.contract_addr,
+                &call.fn_name,
+                &call.args,
+            );
+        }
+
+        events::wallet_batch_executed(&env, wallet_id, calls.len());
         Ok(())
     }
 

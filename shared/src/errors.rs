@@ -67,4 +67,8 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+
+    // --- Batch execution (100-109) ---
+    BatchEmpty = 100,
+    BatchExecutionFailed = 101,
 }

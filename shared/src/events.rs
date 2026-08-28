@@ -68,3 +68,9 @@ pub fn treasury_created(env: &Env, org: &String, admin: &Address) {
 pub fn reason(env: &Env, name: &str) -> Symbol {
     Symbol::new(env, name)
 }
+
+/// `WalletBatchExecuted` — topic `("wallet", "batch")`.
+pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
+    let topics = (symbol_short!("wallet"), symbol_short!("batch"));
+    env.events().publish(topics, (wallet_id, call_count));
+}
