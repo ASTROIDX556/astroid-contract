@@ -480,8 +480,11 @@ impl BudgetInterface for BudgetContract {
     /// Read remaining allocation, accounting for a pending period transition.
     fn remaining(env: Env, budget_id: String) -> Result<i128, Error> {
         let mut budget = Self::load(&env, &budget_id)?;
-        // Don't emit events from a read-only view; just reflect the transition.
-        if Self::window_transition(&env, &mut budget, &budget_id, false).is_err() {
+        // Don't emit events from a read-only view, but persist the period
+        // transition so the rolled-over state is observable via `get`.
+        if Self::window_transition(&env, &mut budget, &budget_id, false).is_ok() {
+            Self::store(&env, &budget_id, &budget);
+        } else {
             return Ok(0);
         }
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
