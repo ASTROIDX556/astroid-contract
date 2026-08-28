@@ -15,11 +15,15 @@
 //! Funded ──(arbiter, before deadline)──▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(after deadline)────────────▶ Refunded ─▶ sender    ─▶ Closed
 //!    └────(after deadline, marker)─────▶ Expired ──(refund)──▶ Refunded
+//!    └────(after deadline, sender)─────▶ Cancelled ───────────▶ Closed
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
 //! deadline passes); funds stay in custody until `refund` returns them to the
-//! sender, so no escrow can be `Closed` with money still locked.
+//! sender, so no escrow can be `Closed` with money still locked. `Cancelled` is
+//! the sender-initiated clawback path: once the deadline has passed and the
+//! escrow is still unclaimed, the depositor may `cancel` to have the locked
+//! assets returned exclusively to them.
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
@@ -42,6 +46,7 @@ pub enum EscrowState {
     Refunded = 3,
     Expired = 4,
     Closed = 5,
+    Cancelled = 6,
 }
 
 #[contracttype]
@@ -340,14 +345,68 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Clawback: let the depositor reclaim the locked funds once the escrow has
+    /// expired and the funds remain unclaimed. Only the original `sender` may
+    /// cancel, only after `deadline`, and only while the escrow still holds the
+    /// funds (`Funded`, `Expired`, or an unfunded timelock `Created`). Returns
+    /// every locked token exclusively to the depositor and marks the escrow
+    /// `Cancelled` so no other settlement path can double-spend it.
+    pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        // Cancellation is only permitted after the expiration window — clawing
+        // funds back before the deadline would break the arbiter's release path.
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::EscrowNotExpired);
+        }
+        // Funds must still be in custody (unclaimed). Released / Refunded /
+        // Closed / Cancelled escrows have already settled.
+        if !matches!(
+            escrow.state,
+            EscrowState::Funded | EscrowState::Expired | EscrowState::Created
+        ) {
+            return Err(Error::EscrowAlreadySettled);
+        }
+
+        escrow.state = EscrowState::Cancelled;
+        Self::store(&env, id, &escrow);
+        // Return the locked assets exclusively to the original depositor.
+        if escrow.funded_amount > 0 {
+            token::TokenClient::new(&env, &escrow.asset).transfer(
+                &env.current_contract_address(),
+                &escrow.sender,
+                &escrow.funded_amount,
+            );
+            events::transfer_executed(
+                &env,
+                &env.current_contract_address(),
+                &escrow.sender,
+                &escrow.asset,
+                escrow.funded_amount,
+            );
+        }
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("canceled")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
     /// Close a settled escrow (terminal). Callable only once the funds have
-    /// actually moved — i.e. from `Released` or `Refunded`. An `Expired` escrow
-    /// must be `refund`ed first so custody is emptied before it can be closed;
-    /// this prevents closing over still-locked funds.
+    /// actually moved — i.e. from `Released`, `Refunded` or `Cancelled`. An
+    /// `Expired` escrow must be `refund`ed or `cancel`led first so custody is
+    /// emptied before it can be closed; this prevents closing over still-locked
+    /// funds.
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = Self::load(&env, id)?;
-        if !matches!(escrow.state, EscrowState::Released | EscrowState::Refunded) {
+        if !matches!(
+            escrow.state,
+            EscrowState::Released | EscrowState::Refunded | EscrowState::Cancelled
+        ) {
             return Err(Error::InvalidState);
         }
         if caller != escrow.sender && caller != escrow.recipient && caller != escrow.arbiter {
