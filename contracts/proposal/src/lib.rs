@@ -88,7 +88,7 @@ impl ProposalContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
-        let delegation_map: Map<Address, Address> = Map::new(&env);
+        let delegation_map: Map<Address, Address> = Map::new(env);
         env.storage()
             .instance()
             .set(&DataKey::DelegationMap, &delegation_map);
@@ -313,7 +313,7 @@ impl ProposalContract {
             .storage()
             .instance()
             .get(&DataKey::DelegationMap)
-            .unwrap_or_else(|| Map::new(&env));
+            .unwrap_or_else(|| Map::new(env));
         delegation_map.set(caller.clone(), delegatee.clone());
         env.storage()
             .instance()
@@ -336,7 +336,7 @@ impl ProposalContract {
             .storage()
             .instance()
             .get(&DataKey::DelegationMap)
-            .unwrap_or_else(|| Map::new(&env));
+            .unwrap_or_else(|| Map::new(env));
         if !delegation_map.contains_key(caller.clone()) {
             return Err(Error::NotFound);
         }
@@ -357,7 +357,7 @@ impl ProposalContract {
             .storage()
             .instance()
             .get(&DataKey::DelegationMap)
-            .unwrap_or_else(|| Map::new(&env));
+            .unwrap_or_else(|| Map::new(env));
         delegation_map.get(delegator)
     }
 
