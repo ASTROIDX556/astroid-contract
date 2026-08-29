@@ -30,6 +30,8 @@ pub enum Error {
     PolicyHashMismatch = 21,
     EmergencyLock = 22,
     PolicyRecipientRestricted = 23,
+    PolicyMerchantBlocked = 24,
+    PolicyCategoryRestricted = 25,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
