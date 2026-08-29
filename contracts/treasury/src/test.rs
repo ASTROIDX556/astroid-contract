@@ -137,13 +137,21 @@ fn prepare_holds_state() {
 
 #[test]
 fn standard_events_emitted() {
-    let h = setup("vault", 1_000);
+    // Configuration changes publish a TreasuryConfigUpdated event. Setting a
+    // (here placeholder) policy/budget address is enough to exercise the emit
+    // path; we avoid a subsequent withdraw on this env because a real policy
+    // gate is not wired up.
+    let h = setup("vault", 0);
     h.client.set_policy(&h.admin, &h.admin);
     assert_event(&h.env, "TreasuryConfigUpdated");
     h.client.set_budget(&h.admin, &h.admin);
     assert_event(&h.env, "TreasuryConfigUpdated");
 
-    let recipient = Address::generate(&h.env);
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_event(&h.env, "TransferExecuted");
+    // A successful withdraw (no policy/budget gates configured) publishes a
+    // TransferExecuted event.
+    let h2 = setup("vault", 1_000);
+    let recipient = Address::generate(&h2.env);
+    h2.client.deposit(&h2.admin, &h2.asset, &1_000);
+    h2.client.withdraw(&h2.admin, &h2.asset, &recipient, &100);
+    assert_event(&h2.env, "TransferExecuted");
 }
