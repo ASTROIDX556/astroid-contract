@@ -28,8 +28,8 @@
 //! Execution below threshold is rejected with [`Error::ThresholdNotMet`].
 
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS, MAX_SIGNERS,
-    MIN_THRESHOLD, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS, MAX_SIGNERS, MIN_THRESHOLD,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
@@ -115,7 +115,9 @@ impl MultiSigContract {
             .instance()
             .set(&DataKey::EmergencyLock, &false);
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
-        env.storage().instance().set(&DataKey::LastBatchNonce, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastBatchNonce, &0u64);
         Self::bump_instance(&env);
         Ok(())
     }
@@ -355,10 +357,10 @@ impl MultiSigContract {
         seen.push_back(caller.clone());
         caller.require_auth_for_args(payload.clone());
         for approver in approvers.iter() {
-            if !signers.contains(approver) {
+            if !signers.contains(&approver) {
                 return Err(Error::NotASigner);
             }
-            if seen.contains(approver) {
+            if seen.contains(&approver) {
                 continue;
             }
             seen.push_back(approver.clone());

@@ -29,10 +29,7 @@ impl BatchHelper {
     }
 
     pub fn get(env: Env, key: u64) -> u64 {
-        env.storage()
-            .instance()
-            .get(&HKey::Value(key))
-            .unwrap_or(0)
+        env.storage().instance().get(&HKey::Value(key)).unwrap_or(0)
     }
 
     /// Always fails with a contract error (atomic rollback + error propagation).
@@ -294,7 +291,7 @@ fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
 }
 
 /// Build a `Vec<Address>` from indices into the harness signer list.
-fn approvers(env: &Env, signers: &std::vec::Vec<Address>, idx: &[usize]) -> Vec<Address> {
+fn approvers(env: &Env, signers: &[Address], idx: &[usize]) -> Vec<Address> {
     let mut v = Vec::new(env);
     for i in idx {
         v.push_back(signers[*i].clone());
@@ -335,7 +332,12 @@ fn batch_executes_all_calls_under_single_threshold_check() {
         store_call(&h.env, &h.helper, 2, 200),
     ];
     // Caller (s0) plus one approver (s1) reach threshold 2.
-    h.client.execute_batch(&h.signers[0], &1, &calls, &approvers(&h.env, &h.signers, &[1]));
+    h.client.execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
     assert_eq!(h.helper_client.get(&1), 100);
     assert_eq!(h.helper_client.get(&2), 200);
     assert_eq!(h.client.get_last_batch_nonce(), 1);
@@ -507,12 +509,9 @@ fn batch_requires_signer_caller() {
     let h = setup_batch(3, 2);
     let stranger = Address::generate(&h.env);
     let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
-    let res = h.client.try_execute_batch(
-        &stranger,
-        &1,
-        &calls,
-        &approvers(&h.env, &h.signers, &[1]),
-    );
+    let res =
+        h.client
+            .try_execute_batch(&stranger, &1, &calls, &approvers(&h.env, &h.signers, &[1]));
     assert_eq!(res, Err(Ok(Error::NotASigner)));
 }
 
