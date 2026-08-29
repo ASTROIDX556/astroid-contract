@@ -34,12 +34,25 @@ enum DataKey {
     Org(String),
     /// Module address: (org slug, kind) -> contract address.
     Module(String, ModuleKind),
+    /// Deprecation flag: (org slug, kind) -> bool (true = deprecated).
+    Deprecated(String, ModuleKind),
+    /// Migration target: (org slug, kind) -> successor contract address.
+    Migration(String, ModuleKind),
     /// Version table: (kind, version) -> contract address (global upgrade map).
     Version(ModuleKind, u32),
     /// Latest known version number for a kind.
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+}
+
+/// Stored module record with deprecation metadata.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleRecord {
+    pub address: Address,
+    pub deprecated: bool,
+    pub migration_target: Option<Address>,
 }
 
 #[contract]
@@ -124,6 +137,7 @@ impl RegistryContract {
 
     /// Register (or update) a module address for an organization. Callable by
     /// the admin or the organization owner.
+    /// Rejects new bindings if the module slot has been marked deprecated.
     pub fn register_module(
         env: Env,
         caller: Address,
@@ -134,6 +148,16 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        // Reject new bindings to deprecated modules.
+        let dep_key = DataKey::Deprecated(org.clone(), kind);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&dep_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidState);
+        }
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
@@ -167,11 +191,147 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
+        // Clean up deprecation metadata if present.
+        let dep_key = DataKey::Deprecated(org.clone(), kind);
+        if env.storage().persistent().has(&dep_key) {
+            env.storage().persistent().remove(&dep_key);
+        }
+        let mig_key = DataKey::Migration(org.clone(), kind);
+        if env.storage().persistent().has(&mig_key) {
+            env.storage().persistent().remove(&mig_key);
+        }
         env.events().publish(
             (symbol_short!("module"), symbol_short!("remove")),
             (org, kind),
         );
         Ok(())
+    }
+
+    /// Mark a registered module as deprecated. Admin or org owner.
+    /// Emits on-chain events for deprecation and blocks future `register_module` bindings.
+    pub fn deprecate_module(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let mod_key = DataKey::Module(org.clone(), kind);
+        if !env.storage().persistent().has(&mod_key) {
+            return Err(Error::NotFound);
+        }
+        let dep_key = DataKey::Deprecated(org.clone(), kind);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&dep_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&dep_key, &true);
+        Self::bump(&env, &dep_key);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryModuleUpdated {
+                org: org.clone(),
+                kind,
+                address: env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&mod_key)
+                    .unwrap(),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("module"), symbol_short!("deprecate")),
+            (org.clone(), kind),
+        );
+        env.events().publish(
+            (symbol_short!("registry"), symbol_short!("deprecate")),
+            (org, kind),
+        );
+        Ok(())
+    }
+
+    /// Link a deprecated module to its successor address. Admin or org owner.
+    /// Requires the module to already be deprecated.
+    pub fn set_migration_target(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        new_address: Address,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let mod_key = DataKey::Module(org.clone(), kind);
+        if !env.storage().persistent().has(&mod_key) {
+            return Err(Error::NotFound);
+        }
+        let dep_key = DataKey::Deprecated(org.clone(), kind);
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&dep_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidState);
+        }
+        let mig_key = DataKey::Migration(org.clone(), kind);
+        env.storage().persistent().set(&mig_key, &new_address);
+        Self::bump(&env, &mig_key);
+        env.events().publish(
+            (symbol_short!("module"), symbol_short!("migrate")),
+            (org.clone(), kind, new_address.clone()),
+        );
+        env.events().publish(
+            (symbol_short!("registry"), symbol_short!("migrate")),
+            (org, kind, new_address),
+        );
+        Ok(())
+    }
+
+    /// Check if a module is marked deprecated.
+    pub fn is_deprecated(env: Env, org: String, kind: ModuleKind) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Deprecated(org, kind))
+            .unwrap_or(false)
+    }
+
+    /// Get the migration target for a deprecated module, if set.
+    pub fn get_migration_target(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Migration(org, kind))
+            .ok_or(Error::NotFound)
+    }
+
+    /// Get full module record including deprecation status and migration pointer.
+    pub fn get_module(env: Env, org: String, kind: ModuleKind) -> Result<ModuleRecord, Error> {
+        let address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Module(org.clone(), kind))
+            .ok_or(Error::NotFound)?;
+        let deprecated = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Deprecated(org.clone(), kind))
+            .unwrap_or(false);
+        let migration_target = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Migration(org, kind));
+        Ok(ModuleRecord {
+            address,
+            deprecated,
+            migration_target,
+        })
     }
 
     /// Record a contract implementation address for a `(kind, version)` pair and
@@ -368,6 +528,23 @@ impl RegistryContract {
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
+        // If module is deprecated and has a migration target, return the
+        // successor address to guide clients to the up-to-date implementation.
+        let dep_key = DataKey::Deprecated(org.clone(), kind);
+        let is_deprecated = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&dep_key)
+            .unwrap_or(false);
+        if is_deprecated {
+            if let Some(target) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::Migration(org.clone(), kind))
+            {
+                return Ok(target);
+            }
+        }
         env.storage()
             .persistent()
             .get(&DataKey::Module(org, kind))

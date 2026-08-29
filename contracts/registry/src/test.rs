@@ -183,3 +183,211 @@ fn standard_events_emitted() {
     client.freeze(&new_owner, &org);
     assert_event(&env, "RegistryFrozen");
 }
+
+// ── Deprecation and migration ──────────────────────────────────────────
+
+#[test]
+fn deprecate_module_marks_deprecated_and_blocks_new_bindings() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let v1 = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Policy, &v1);
+    assert!(!client.is_deprecated(&org, &ModuleKind::Policy));
+    assert_eq!(client.lookup(&org, &ModuleKind::Policy), v1);
+
+    // Deprecate via admin (also works via owner).
+    client.deprecate_module(&admin, &org, &ModuleKind::Policy);
+    assert!(client.is_deprecated(&org, &ModuleKind::Policy));
+    // Direct reads still succeed (orderly read).
+    assert_eq!(client.get_module(&org, &ModuleKind::Policy).address, v1);
+    assert_eq!(
+        client.get_module(&org, &ModuleKind::Policy).deprecated,
+        true
+    );
+
+    // New bindings to same slot are rejected.
+    let v2 = Address::generate(&env);
+    let res = client.try_register_module(&owner, &org, &ModuleKind::Policy, &v2);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    // Even admin cannot re-bind.
+    let res = client.try_register_module(&admin, &org, &ModuleKind::Policy, &v2);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+
+    // Lookup still returns original until migration is set (graceful).
+    assert_eq!(client.lookup(&org, &ModuleKind::Policy), v1);
+}
+
+#[test]
+fn deprecation_emits_events() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+
+    client.deprecate_module(&owner, &org, &ModuleKind::Wallet);
+    // Should emit RegistryModuleUpdated + module/deprecate + registry/deprecate
+    assert_event(&env, "RegistryModuleUpdated");
+    let want: Val = Symbol::new(&env, "deprecate").into_val(&env);
+    let has_deprecate = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_id, topics, _data)| topics.contains(&want));
+    assert!(has_deprecate, "expected deprecate event");
+}
+
+#[test]
+fn set_migration_target_and_lookup_returns_migration() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let old = Address::generate(&env);
+    let new = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Budget, &old);
+    client.deprecate_module(&admin, &org, &ModuleKind::Budget);
+    // Before migration, lookup returns original.
+    assert_eq!(client.lookup(&org, &ModuleKind::Budget), old);
+
+    client.set_migration_target(&owner, &org, &ModuleKind::Budget, &new);
+    assert_eq!(client.get_migration_target(&org, &ModuleKind::Budget), new);
+    let rec = client.get_module(&org, &ModuleKind::Budget);
+    assert_eq!(rec.migration_target, Some(new.clone()));
+
+    // After migration, lookup is guided to successor.
+    assert_eq!(client.lookup(&org, &ModuleKind::Budget), new);
+
+    // Migration event emitted.
+    let want: Val = Symbol::new(&env, "migrate").into_val(&env);
+    let has_migrate = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_id, topics, _data)| topics.contains(&want));
+    assert!(has_migrate, "expected migrate event");
+}
+
+#[test]
+fn deprecate_requires_existing_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let res = client.try_deprecate_module(&admin, &org, &ModuleKind::Escrow);
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn cannot_deprecate_twice() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let w = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &w);
+    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
+    let res = client.try_deprecate_module(&admin, &org, &ModuleKind::Wallet);
+    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
+}
+
+#[test]
+fn set_migration_requires_deprecated() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let w = Address::generate(&env);
+    let new = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &w);
+    // Not yet deprecated -> InvalidState.
+    let res = client.try_set_migration_target(&admin, &org, &ModuleKind::Wallet, &new);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+}
+
+#[test]
+fn migration_target_not_found_when_unset() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let w = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &w);
+    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
+    let res = client.try_get_migration_target(&org, &ModuleKind::Wallet);
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn non_admin_cannot_deprecate_or_migrate() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let w = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &w);
+
+    let res = client.try_deprecate_module(&stranger, &org, &ModuleKind::Wallet);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+    client.deprecate_module(&owner, &org, &ModuleKind::Wallet);
+    let new = Address::generate(&env);
+    let res = client.try_set_migration_target(&stranger, &org, &ModuleKind::Wallet, &new);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn remove_cleans_deprecation_and_migration() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let old = Address::generate(&env);
+    let new = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Policy, &old);
+    client.deprecate_module(&admin, &org, &ModuleKind::Policy);
+    client.set_migration_target(&admin, &org, &ModuleKind::Policy, &new);
+    assert!(client.is_deprecated(&org, &ModuleKind::Policy));
+
+    client.remove_module(&owner, &org, &ModuleKind::Policy);
+    assert!(!client.is_deprecated(&org, &ModuleKind::Policy));
+    assert_eq!(
+        client.try_get_migration_target(&org, &ModuleKind::Policy),
+        Err(Ok(Error::NotFound))
+    );
+    // Re-register after removal is allowed (slot no longer deprecated).
+    let fresh = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Policy, &fresh);
+    assert_eq!(client.lookup(&org, &ModuleKind::Policy), fresh);
+    assert!(!client.is_deprecated(&org, &ModuleKind::Policy));
+}
+
+#[test]
+fn get_module_returns_full_record() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let addr = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Treasury, &addr);
+
+    let rec = client.get_module(&org, &ModuleKind::Treasury);
+    assert_eq!(rec.address, addr);
+    assert!(!rec.deprecated);
+    assert_eq!(rec.migration_target, None);
+
+    client.deprecate_module(&admin, &org, &ModuleKind::Treasury);
+    let new = Address::generate(&env);
+    client.set_migration_target(&admin, &org, &ModuleKind::Treasury, &new);
+
+    let rec2 = client.get_module(&org, &ModuleKind::Treasury);
+    assert_eq!(rec2.address, addr);
+    assert!(rec2.deprecated);
+    assert_eq!(rec2.migration_target, Some(new));
+}
