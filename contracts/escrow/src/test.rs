@@ -226,3 +226,89 @@ fn create_rejects_bad_input() {
     // No successful escrow was created, so the sender keeps every token.
     assert_eq!(balance(&h, &h.sender), 5_000);
 }
+
+#[test]
+fn cancel_before_deadline_rejected() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    // Premature cancellation before deadline is rejected.
+    let res = h.client.try_cancel_escrow(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.client.address), 5_000);
+}
+
+#[test]
+fn cancel_after_deadline_succeeds_and_claim_refund() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    h.client.cancel_escrow(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
+    // Funds still in custody until claim.
+    assert_eq!(balance(&h, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.sender), 0);
+
+    h.client.claim_refund(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+    h.client.close(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Closed);
+}
+
+#[test]
+fn double_cancel_and_double_claim_guarded() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    h.client.cancel_escrow(&h.sender, &id);
+    let res = h.client.try_cancel_escrow(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+
+    h.client.claim_refund(&h.sender, &id);
+    let res2 = h.client.try_claim_refund(&h.sender, &id);
+    assert_eq!(res2, Err(Ok(Error::InvalidState)));
+    // Double-refund via old refund path also blocked.
+    let res3 = h.client.try_refund(&h.sender, &id);
+    assert_eq!(res3, Err(Ok(Error::InvalidState)));
+}
+
+#[test]
+fn claim_without_cancel_rejected() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    let res = h.client.try_claim_refund(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+}
+
+#[test]
+fn cancel_requires_sender_auth() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_cancel_escrow(&stranger, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    // Claim without cancel and with stranger fails auth first.
+    let res2 = h.client.try_claim_refund(&stranger, &id);
+    assert_eq!(res2, Err(Ok(Error::Unauthorized)));
+    // After cancel, only sender may claim.
+    h.client.cancel_escrow(&h.sender, &id);
+    let res3 = h.client.try_claim_refund(&stranger, &id);
+    assert_eq!(res3, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn cancel_after_expired_also_works() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    h.client.expire(&id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
+    h.client.cancel_escrow(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
+    h.client.claim_refund(&h.sender, &id);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+}
