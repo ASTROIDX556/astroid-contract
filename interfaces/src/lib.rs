@@ -15,6 +15,8 @@
 //! and `Treasury → {Policy, Budget}` — without any contract crate depending on
 //! another contract crate at compile time.
 
+pub mod version;
+
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::{contractclient, Address, Env, String};
