@@ -76,4 +76,9 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+
+    // --- Interface versioning (95-99) ---
+    /// The remote contract's interface version is older than the minimum
+    /// required by the caller, or otherwise incompatible.
+    InterfaceVersionMismatch = 95,
 }
