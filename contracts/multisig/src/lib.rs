@@ -410,7 +410,7 @@ impl MultiSigContract {
         Self::require_not_locked(&env)?;
         let signers = Self::signers(&env)?;
         let threshold = Self::threshold(&env)?;
-        if !signers.contains(&caller) {
+        if !signers.iter().any(|s| &s.address == caller) {
             return Err(Error::NotASigner);
         }
 
@@ -442,7 +442,7 @@ impl MultiSigContract {
         seen.push_back(caller.clone());
         caller.require_auth_for_args(payload.clone());
         for approver in approvers.iter() {
-            if !signers.contains(&approver) {
+            if !signers.iter().any(|s| &s.address == approver) {
                 return Err(Error::NotASigner);
             }
             if seen.contains(&approver) {
@@ -489,7 +489,10 @@ impl MultiSigContract {
     }
 
     pub fn get_signers(env: Env) -> Result<Vec<Address>, Error> {
-        Self::signers(&env)
+        Ok(Self::signers(&env)?
+            .iter()
+            .map(|s| s.address.clone())
+            .collect())
     }
 
     pub fn get_threshold(env: Env) -> Result<u32, Error> {
