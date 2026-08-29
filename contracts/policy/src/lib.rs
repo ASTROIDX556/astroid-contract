@@ -22,8 +22,7 @@ use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
-    Vec,
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Vec,
 };
 
 /// On-chain representation of a registered policy.
@@ -73,6 +72,7 @@ impl PolicyContract {
 
     /// Register a policy. `owner` gates subsequent rotations. Cheap scalar gates
     /// are stored on-chain; the full configuration is hashed for tamper-evidence.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_policy(
         env: Env,
         owner: Address,
@@ -245,7 +245,7 @@ impl PolicyInterface for PolicyContract {
             events_policy_violation(&env, &policy_id, "expired");
             return Err(Error::PolicyDenied);
         }
-        
+
         if policy.time_window_start != 0 && now < policy.time_window_start {
             events_policy_violation(&env, &policy_id, "too_early");
             return Err(Error::OutOfWindow);
@@ -254,7 +254,7 @@ impl PolicyInterface for PolicyContract {
             events_policy_violation(&env, &policy_id, "too_late");
             return Err(Error::OutOfWindow);
         }
-        
+
         if policy.max_amount != 0 && amount > policy.max_amount {
             events_policy_violation(&env, &policy_id, "above_max");
             return Err(Error::LimitExceeded);

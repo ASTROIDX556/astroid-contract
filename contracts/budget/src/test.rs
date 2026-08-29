@@ -407,18 +407,18 @@ fn test_rollback_budget() {
     let owner = Address::generate(&env);
     let contract_id = env.register_contract(None, BudgetContract);
     let client = BudgetContractClient::new(&env, &contract_id);
-    
+
     let b_id = String::from_str(&env, "rb1");
-    client.allocate(&owner, &b_id, &1000, &crate::Period::None);
-    
+    client.allocate(&owner, &b_id, &1000, &crate::Period::None, &false, &0);
+
     // consume 400
     let rem = client.consume(&owner, &b_id, &400);
     assert_eq!(rem, 600);
-    
+
     // rollback 200
     let rem2 = client.release(&owner, &b_id, &200);
     assert_eq!(rem2, 800);
-    
+
     // rollback more than spent fails
     let res = client.try_release(&owner, &b_id, &300);
     assert_eq!(res, Err(Ok(Error::Underflow)));

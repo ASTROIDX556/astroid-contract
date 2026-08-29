@@ -478,6 +478,23 @@ impl BudgetInterface for BudgetContract {
     }
 
     /// Read remaining allocation, accounting for a pending period transition.
+
+
+
+    fn release(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
+        require_positive_amount(amount)?;
+        let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+        let _ = Self::window_transition(&env, &mut budget, &budget_id, true);
+        if amount > budget.spent {
+            return Err(Error::Underflow);
+        }
+        budget.spent = astroid_shared::math::checked_sub(budget.spent, amount)?;
+        Self::store(&env, &budget_id, &budget);
+        let capacity = astroid_shared::math::checked_add(budget.limit, budget.rollover_credit)?;
+        astroid_shared::math::checked_sub(capacity, budget.spent)
+    }
+
     fn remaining(env: Env, budget_id: String) -> Result<i128, Error> {
         let mut budget = Self::load(&env, &budget_id)?;
         // Don't emit events from a read-only view, but persist the period

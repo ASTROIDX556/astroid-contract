@@ -1,5 +1,5 @@
-use soroban_sdk::testutils::Ledger;
 use astroid_shared::errors::Error;
+use soroban_sdk::testutils::Ledger;
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
 use crate::{PolicyContract, PolicyContractClient};
@@ -118,7 +118,7 @@ fn test_asset_and_window_restrictions() {
     let p_id = String::from_str(&env, "p2");
     let asset1 = Address::generate(&env);
     let asset2 = Address::generate(&env);
-    
+
     // time window: 100 to 200
     client.register_policy(
         &admin,
@@ -156,5 +156,8 @@ fn test_asset_and_window_restrictions() {
     );
 
     // Correct asset and in window
-    assert_eq!(client.try_check_transfer(&p_id, &asset1, &recipient, &100), Ok(Ok(())));
+    assert_eq!(
+        client.try_check_transfer(&p_id, &asset1, &recipient, &100),
+        Ok(Ok(()))
+    );
 }
