@@ -19,9 +19,11 @@
 //! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
 
 use astroid_interfaces::PolicyInterface;
+use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
-use astroid_shared::validation::require_non_empty;
+use astroid_shared::math::checked_sub;
+use astroid_shared::validation::{require_non_empty, require_non_negative_amount};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
@@ -52,6 +54,7 @@ enum DataKey {
     Policy(String),
     Count,
     Blacklist(Address),
+    Allowance(String, Address),
 }
 
 #[contract]
@@ -199,6 +202,97 @@ impl PolicyContract {
         Ok(())
     }
 
+    /// Set per-asset allowance for a policy (owner only). Minimal storage write.
+    pub fn set_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        require_non_negative_amount(amount)?;
+        let key = DataKey::Allowance(policy_id.clone(), asset.clone());
+        env.storage().persistent().set(&key, &amount);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("allow_set")),
+            (policy_id, asset, amount),
+        );
+        Ok(())
+    }
+
+    /// Check if `amount` of `asset` is within the remaining allowance for `policy_id`.
+    /// Returns `PolicyAllowanceExceeded` if breached, else `Ok(())`. Minimal read, no write.
+    pub fn check_allowance(
+        env: Env,
+        policy_id: String,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let key = DataKey::Allowance(policy_id.clone(), asset.clone());
+        if env.storage().persistent().has(&key) {
+            let remaining: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            if amount > remaining {
+                events_policy_violation(&env, &policy_id, "allowance");
+                return Err(Error::PolicyAllowanceExceeded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically consume `amount` from the per-asset allowance. Owner-gated, uses checked math.
+    pub fn update_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let key = DataKey::Allowance(policy_id.clone(), asset.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount > current {
+            events_policy_violation(&env, &policy_id, "allowance");
+            return Err(Error::PolicyAllowanceExceeded);
+        }
+        let new = checked_sub(current, amount)?;
+        env.storage().persistent().set(&key, &new);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("allow_upd")),
+            (policy_id, asset, amount, new),
+        );
+        Ok(())
+    }
+
+    /// Get remaining allowance for an asset under a policy. Returns 0 if not set.
+    pub fn get_allowance(env: Env, policy_id: String, asset: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(policy_id, asset))
+            .unwrap_or(0)
+    }
+
     // --- views ---
 
     pub fn get(env: Env, policy_id: String) -> Result<Policy, Error> {
@@ -260,6 +354,15 @@ impl PolicyInterface for PolicyContract {
         {
             events_policy_violation(&env, &policy_id, "blacklisted");
             return Err(Error::PolicyRecipientRestricted);
+        }
+        // Multi-token per-asset allowance check
+        let allowance_key = DataKey::Allowance(policy_id.clone(), asset.clone());
+        if env.storage().persistent().has(&allowance_key) {
+            let remaining: i128 = env.storage().persistent().get(&allowance_key).unwrap_or(0);
+            if amount > remaining {
+                events_policy_violation(&env, &policy_id, "allowance");
+                return Err(Error::PolicyAllowanceExceeded);
+            }
         }
         Ok(())
     }
