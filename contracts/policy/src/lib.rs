@@ -16,7 +16,10 @@
 //! This contract answers: "may `amount` of `asset` flow to `recipient`
 //! right now?" with a deterministic [`Error`] when it may not.
 //!
-//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
+//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`,
+//! `add_rule`, `remove_rule`, `get_rules`.
+
+pub mod policy_rules;
 
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
@@ -25,6 +28,8 @@ use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
+
+pub use policy_rules::{PolicyRule, RuleMatch, RuleTarget};
 
 /// On-chain representation of a registered policy.
 #[contracttype]
@@ -205,7 +210,54 @@ impl PolicyContract {
         Self::load(&env, &policy_id)
     }
 
-    // --- internels ---
+    /// Return the conditional rules registered for `policy_id`.
+    pub fn get_rules(env: Env, policy_id: String) -> soroban_sdk::Vec<PolicyRule> {
+        policy_rules::load_rules(&env, &policy_id)
+    }
+
+    // --- rule management ---
+
+    /// Append a conditional rule to a policy (owner only).
+    pub fn add_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        rule: PolicyRule,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        policy_rules::add_rule(&env, &policy_id, rule)?;
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_add")),
+            policy_id,
+        );
+        Ok(())
+    }
+
+    /// Remove a conditional rule by id (owner only).
+    pub fn remove_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        rule_id: String,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        policy_rules::remove_rule(&env, &policy_id, &rule_id)?;
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_rm")),
+            (policy_id, rule_id),
+        );
+        Ok(())
+    }
+
+    // --- internals ---
 
     fn load(env: &Env, id: &String) -> Result<Policy, Error> {
         env.storage()
@@ -251,6 +303,11 @@ impl PolicyInterface for PolicyContract {
                 events_policy_violation(&env, &policy_id, "bad_asset");
                 return Err(Error::PolicyDenied);
             }
+        }
+        // Evaluate conditional rules (first-match-wins).
+        if let Err(e) = policy_rules::evaluate_rules(&env, &policy_id, &recipient, &asset) {
+            events_policy_violation(&env, &policy_id, "rule_denied");
+            return Err(e);
         }
         // Check blacklist
         if env
