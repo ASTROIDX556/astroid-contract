@@ -488,13 +488,8 @@ impl MultiSigContract {
             .unwrap_or(0)
     }
 
-    pub fn get_signers(env: Env) -> Result<Vec<Address>, Error> {
-        let signers = Self::signers(&env)?;
-        let mut out = Vec::new(&env);
-        for s in signers.iter() {
-            out.push_back(s.address.clone());
-        }
-        Ok(out)
+    pub fn get_signers(env: Env) -> Vec<SignerWeight> {
+        Self::signers(&env).unwrap_or_else(|_| Vec::new(&env))
     }
 
     pub fn get_threshold(env: Env) -> Result<u32, Error> {

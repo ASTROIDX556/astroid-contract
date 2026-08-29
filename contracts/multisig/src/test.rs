@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{BatchCall, MultiSigContract, MultiSigContractClient};
+use crate::{BatchCall, MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_shared::constants::MAX_BATCH_CALLS;
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Ledger};
@@ -383,7 +383,10 @@ fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
     let mut sv = Vec::new(&env);
     for _ in 0..n {
         let a = Address::generate(&env);
-        sv.push_back(a.clone());
+        sv.push_back(SignerWeight {
+            address: a.clone(),
+            weight: 1,
+        });
         signers.push(a);
     }
     client.initialize(&sv, &threshold);
