@@ -71,6 +71,9 @@ pub enum Error {
     InvalidProposalState = 71,
     ProposalNotApproved = 72,
     NotAnApprover = 73,
+    CancellationWindowClosed = 74,
+    MathOverflow = 75,
+    DivisionByZero = 76,
 
     // --- Escrow (80-89) ---
     ConditionNotMet = 80,
