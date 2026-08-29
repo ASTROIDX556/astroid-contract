@@ -11,6 +11,14 @@
 //! new contract versions (e.g. Wallet v1 → v2 → v3) can be introduced without
 //! breaking consumers (PRD Doc 7 §Upgrade Strategy).
 //!
+//! The version map also records the **approved Wasm hash** of each version.
+//! Member contracts consult it through [`RegistryInterface::is_upgrade_approved`]
+//! before replacing their own code, so an implementation must exist in this
+//! table before any contract can upgrade to it; anything else is refused with
+//! [`Error::UnauthorizedUpgrade`]. Registering and revoking hashes is
+//! admin-gated, which makes the registry the single authorization point for the
+//! whole protocol's upgradeability.
+//!
 //! Security model (PRD Doc 10): validate caller → ownership → inputs →
 //! permissions → fail safely → emit events. All mutating calls are admin- or
 //! owner-gated and require Soroban auth.
@@ -21,7 +29,9 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -38,6 +48,11 @@ enum DataKey {
     Version(ModuleKind, u32),
     /// Latest known version number for a kind.
     LatestVersion(ModuleKind),
+    /// Approved implementation hash: (kind, version) -> Wasm hash.
+    WasmHash(ModuleKind, u32),
+    /// Reverse index of the above: (kind, Wasm hash) -> version. Lets an
+    /// upgrade check resolve a hash in one read instead of scanning versions.
+    ApprovedWasm(ModuleKind, BytesN<32>),
     /// Emergency freeze status (instance).
     Frozen,
 }
@@ -203,6 +218,87 @@ impl RegistryContract {
             (kind, version, address),
         );
         Ok(())
+    }
+
+    /// Approve a Wasm hash as the implementation of `(kind, version)`.
+    /// Admin-gated. This is the only way an upgrade path enters the protocol:
+    /// a member contract will not swap to a hash that is not recorded here.
+    ///
+    /// Re-registering a version replaces its hash and revokes the previous one,
+    /// so a superseded implementation stops being an allowed upgrade target.
+    pub fn register_wasm_hash(
+        env: Env,
+        caller: Address,
+        kind: ModuleKind,
+        version: u32,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        if version == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let hkey = DataKey::WasmHash(kind, version);
+        if let Some(previous) = env.storage().persistent().get::<_, BytesN<32>>(&hkey) {
+            if previous == wasm_hash {
+                return Err(Error::AlreadyExists);
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ApprovedWasm(kind, previous));
+        }
+        env.storage().persistent().set(&hkey, &wasm_hash);
+        Self::bump(&env, &hkey);
+        let akey = DataKey::ApprovedWasm(kind, wasm_hash.clone());
+        env.storage().persistent().set(&akey, &version);
+        Self::bump(&env, &akey);
+
+        let lkey = DataKey::LatestVersion(kind);
+        let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
+        if version > latest {
+            env.storage().persistent().set(&lkey, &version);
+            Self::bump(&env, &lkey);
+        }
+        env.events().publish(
+            (symbol_short!("wasm"), symbol_short!("approved")),
+            (kind, version, wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Revoke an approved implementation hash. Admin-gated. Once revoked no
+    /// contract can upgrade to that code any more; contracts already running it
+    /// are unaffected.
+    pub fn revoke_wasm_hash(
+        env: Env,
+        caller: Address,
+        kind: ModuleKind,
+        version: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let hkey = DataKey::WasmHash(kind, version);
+        let wasm_hash: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&hkey)
+            .ok_or(Error::NotFound)?;
+        env.storage().persistent().remove(&hkey);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ApprovedWasm(kind, wasm_hash.clone()));
+        env.events().publish(
+            (symbol_short!("wasm"), symbol_short!("revoked")),
+            (kind, version, wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Read the approved Wasm hash of `(kind, version)`.
+    pub fn get_wasm_hash(env: Env, kind: ModuleKind, version: u32) -> Result<BytesN<32>, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WasmHash(kind, version))
+            .ok_or(Error::NotFound)
     }
 
     /// Look up a specific implementation version.
@@ -382,6 +478,23 @@ impl RegistryInterface for RegistryContract {
             .get(&DataKey::Org(org))
             .ok_or(Error::NotFound)?;
         Ok(recorded == owner)
+    }
+
+    /// Resolve `wasm_hash` in the version map for `kind`, returning the version
+    /// it is approved as. An unknown or revoked hash is refused with
+    /// [`Error::UnauthorizedUpgrade`], and while the registry is frozen no
+    /// upgrade is authorized at all, which makes the emergency freeze an
+    /// effective protocol-wide upgrade halt.
+    fn is_upgrade_approved(
+        env: Env,
+        kind: ModuleKind,
+        wasm_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        Self::check_frozen(&env)?;
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovedWasm(kind, wasm_hash))
+            .ok_or(Error::UnauthorizedUpgrade)
     }
 }
 

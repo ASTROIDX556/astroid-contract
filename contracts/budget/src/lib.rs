@@ -17,7 +17,16 @@
 //!
 //! Functions: `allocate`, `consume`, `reset`, `freeze`, `unfreeze`, `archive`,
 //! `transfer_allocation`.
+//!
+//! ## Upgradeability
+//!
+//! Code upgrades are gated twice: the caller must be this contract's recorded
+//! upgrade admin, and the new Wasm hash must be approved for
+//! [`ModuleKind::Budget`] in the registry's version map. See
+//! [`astroid_interfaces::upgrade`]; anything else is refused with
+//! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
 
+use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 use astroid_interfaces::BudgetInterface;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
@@ -25,12 +34,14 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::{checked_add, checked_sub};
-use astroid_shared::types::ResourceState;
+use astroid_shared::types::{ModuleKind, ResourceState};
 use astroid_shared::validation::{
     require_non_empty, require_non_negative_amount, require_positive_amount,
 };
 use astroid_shared::{constants, events};
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+};
 
 /// Reset period for a recurring budget. `None` means one-shot (no auto-reset).
 #[contracttype]
@@ -325,6 +336,46 @@ impl BudgetContract {
             (budget_id, token, amount),
         );
         Ok(())
+    }
+
+    // --- upgradeability (registry-authorized) ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. The first call bootstraps the authority and is
+    /// meant to run in the same transaction as `initialize`; afterwards only
+    /// the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(env: Env) -> Result<UpgradeAuthority, Error> {
+        upgrade::get_authority(&env)
+    }
+
+    /// Validate an upgrade without performing it: the caller must be the
+    /// upgrade admin and `new_wasm_hash` must be an approved implementation of
+    /// [`ModuleKind::Budget`] in the registry's version map. Returns the
+    /// approved version, or [`Error::UnauthorizedUpgrade`].
+    pub fn check_upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        upgrade::check(&env, &caller, ModuleKind::Budget, &new_wasm_hash)
+    }
+
+    /// Replace this contract's code with `new_wasm_hash` after the registry has
+    /// authorized it. An unauthorized caller or an unregistered hash aborts
+    /// before any code is swapped, so the contract keeps running its current
+    /// implementation.
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<u32, Error> {
+        upgrade::perform(&env, &caller, ModuleKind::Budget, new_wasm_hash)
     }
 
     // --- views ---

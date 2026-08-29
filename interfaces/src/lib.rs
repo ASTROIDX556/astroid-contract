@@ -17,7 +17,9 @@
 
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
-use soroban_sdk::{contractclient, Address, Env, String};
+use soroban_sdk::{contractclient, Address, BytesN, Env, String};
+
+pub mod upgrade;
 
 /// Registry lookup surface. The registry is the protocol's source of truth for
 /// where each module/contract lives and who owns it (PRD Doc 7 §Registry).
@@ -28,6 +30,16 @@ pub trait RegistryInterface {
 
     /// Verify that `owner` is the recorded owner of `org`.
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error>;
+
+    /// Resolve `wasm_hash` in the registry's version map for `kind`.
+    ///
+    /// Returns the version the hash is registered under, or
+    /// [`Error::UnauthorizedUpgrade`] when the hash is not an approved
+    /// implementation of that module. Member contracts call this before
+    /// swapping their own code, so an upgrade path exists on-chain before any
+    /// contract can take it.
+    fn is_upgrade_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>)
+        -> Result<u32, Error>;
 }
 
 /// Policy verification surface. Contracts call `check_transfer` to have a spend

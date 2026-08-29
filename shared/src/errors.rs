@@ -33,6 +33,9 @@ pub enum Error {
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
+    /// The Wasm hash is not registered/approved in the registry version map, or
+    /// the caller is not allowed to upgrade this contract.
+    UnauthorizedUpgrade = 31,
 
     // --- Budget (40-49) ---
     BudgetExceeded = 40,
