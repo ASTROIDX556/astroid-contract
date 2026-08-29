@@ -1,7 +1,4 @@
 #![no_std]
-// Contract ABI functions are dictated by the on-chain interface and may
-// legitimately exceed clippy's default argument-count threshold; the lint only
-// fires on the `#[contractimpl]`-generated wrappers, not on our own code.
 #![allow(clippy::too_many_arguments)]
 //! # Astroid Policy Contract
 //!

@@ -40,6 +40,7 @@ pub enum Error {
     BudgetFrozen = 41,
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
+    BudgetExpired = 44,
 
     // --- Wallet (50-59) ---
     WalletFrozen = 50,
