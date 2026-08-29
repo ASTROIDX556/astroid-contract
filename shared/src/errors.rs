@@ -63,6 +63,11 @@ pub enum Error {
     InvalidSignerWeight = 69,
     /// Accumulated approval weight is below the configured threshold.
     InsufficientWeight = 90,
+    /// A timelocked governance change was executed before its delay elapsed.
+    TimelockNotExpired = 91,
+    /// A caller without governance rights attempted to modify signers,
+    /// weights or the threshold.
+    UnauthorizedModification = 92,
 
     // --- Proposal (70-79) ---
     ProposalExpired = 70,

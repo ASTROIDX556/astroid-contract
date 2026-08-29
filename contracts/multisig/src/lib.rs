@@ -21,22 +21,44 @@
 //! fails the whole batch reverts with [`Error::BatchCallFailed`] or the callee's
 //! error.
 //!
-//! Events: `SignerAdded`, `SignerRemoved`, `ThresholdChanged`,
-//! `ProposalApproved`, `ProposalExecuted`, `BatchExecuted`, `EmergencyLock`.
+//! ## Timelocked governance
 //!
-//! Events: `SignerAdded`, `SignerRemoved`, `SignerWeightUpdated`,
-//! `ThresholdChanged`, `ProposalApproved`, `ProposalExecuted`,
-//! `EmergencyLock`.
+//! Changing who can sign, how much a signer's vote is worth, or the threshold
+//! itself is the most security-sensitive operation the contract exposes: a
+//! single compromised key that could apply such a change instantly would own
+//! the multisig. Every one of those modifications therefore goes through a
+//! two-step, timelocked flow instead of taking effect immediately:
+//!
+//! ```text
+//! propose_* → (>= timelock delay elapses) → execute_threshold_change
+//!                   ↘ cancel_threshold_change (any signer, any time)
+//! ```
+//!
+//! The pending change is stored with the `eta` computed at proposal time, so
+//! shortening the delay later can never accelerate an in-flight change. A
+//! matured change stays executable for [`GOVERNANCE_GRACE_PERIOD`] and then
+//! expires, so stale proposals cannot lie dormant and fire much later. The
+//! delay itself is governed the same way (`propose_timelock_delay_change`) and
+//! is clamped to `[MIN_TIMELOCK_DELAY, MAX_TIMELOCK_DELAY]`, so no single
+//! signer can shrink the review window to nothing.
+//!
+//! Events: `signer/added`, `signer/removed`, `signer/weight`,
+//! `threshold/changed`, `timelock/changed`, `govchange/proposed`,
+//! `govchange/executed`, `govchange/cancelled`, `proposal/approved`,
+//! `proposal/executed`, `batch/executed`, `emergency/lock`.
 //!
 //! Execution below the weight threshold is rejected with
-//! [`Error::InsufficientWeight`].
+//! [`Error::InsufficientWeight`]; premature governance execution with
+//! [`Error::TimelockNotExpired`]; governance calls from a non-signer with
+//! [`Error::UnauthorizedModification`].
 
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS, MAX_SIGNERS, MIN_THRESHOLD,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS,
+    MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_THRESHOLD, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
-use astroid_shared::math::checked_add;
+use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::validation::require_time_reached;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
@@ -60,6 +82,12 @@ enum DataKey {
     Approval(u64, Address),
     /// State: last used batch nonce (instance); batches must use a greater one.
     LastBatchNonce,
+    /// Config: timelock delay applied to governance changes (instance, seconds).
+    TimelockDelay,
+    /// State: monotonic governance-change id counter (instance).
+    ChangeCount,
+    /// State: pending governance change by id (persistent).
+    Change(u64),
 }
 
 /// A registered signer and its positive voting weight.
@@ -88,6 +116,45 @@ pub struct MsProposal {
     pub executed: bool,
     /// Earliest timestamp at which execution is allowed (time lock; 0 = none).
     pub unlock_at: u64,
+}
+
+/// A governance modification awaiting the timelock. Each variant carries the
+/// exact post-state it will apply, so what was proposed is what executes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovernanceChange {
+    /// Set the approval weight threshold to the given value.
+    Threshold(u32),
+    /// Set an existing signer's voting weight.
+    SignerWeight(Address, u32),
+    /// Admit a new signer with the given positive weight.
+    AddSigner(Address, u32),
+    /// Drop an existing signer.
+    RemoveSigner(Address),
+    /// Change the timelock delay applied to future governance proposals.
+    TimelockDelay(u64),
+}
+
+/// A proposed governance change parked behind the timelock.
+///
+/// `eta` is fixed at proposal time and is the earliest timestamp at which
+/// [`MultiSigContract::execute_threshold_change`] will apply the change;
+/// `expires_at` bounds how long the matured change stays executable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingChange {
+    /// Signer that raised the change.
+    pub proposer: Address,
+    /// The modification that will be applied on execution.
+    pub change: GovernanceChange,
+    /// Ledger timestamp at which the change was proposed.
+    pub proposed_at: u64,
+    /// Earliest timestamp at which execution is permitted.
+    pub eta: u64,
+    /// Timestamp at (and after) which the change can no longer be executed.
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
 }
 
 /// A single discrete contract call inside a batch. `args` are raw Soroban
@@ -139,118 +206,151 @@ impl MultiSigContract {
         env.storage()
             .instance()
             .set(&DataKey::LastBatchNonce, &0u64);
-        Self::bump_instance(&env);
-        Ok(())
-    }
-
-    /// Add a signer with a positive weight. Signer-gated. Rejects duplicates and
-    /// over-capacity sets, and weights below 1.
-    pub fn add_signer(
-        env: Env,
-        caller: Address,
-        signer: Address,
-        weight: u32,
-    ) -> Result<(), Error> {
-        Self::require_signer(&env, &caller)?;
-        if weight == 0 {
-            return Err(Error::InvalidSignerWeight);
-        }
-        let mut signers = Self::signers(&env)?;
-        if signers.iter().any(|s| s.address == signer) {
-            return Err(Error::AlreadyExists);
-        }
-        if signers.len() >= MAX_SIGNERS {
-            return Err(Error::TooManySigners);
-        }
-        signers.push_back(SignerWeight {
-            address: signer.clone(),
-            weight,
-        });
-        env.storage().instance().set(&DataKey::Signers, &signers);
-        Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("signer"), symbol_short!("added")),
-            (signer, weight),
-        );
-        Ok(())
-    }
-
-    /// Remove a signer. Signer-gated. Refuses to drop the remaining total weight
-    /// below the threshold, so the multisig can never become unusable.
-    pub fn remove_signer(env: Env, caller: Address, signer: Address) -> Result<(), Error> {
-        Self::require_signer(&env, &caller)?;
-        let mut signers = Self::signers(&env)?;
-        let idx: u32 = signers
-            .iter()
-            .position(|s| s.address == signer)
-            .ok_or(Error::NotASigner)? as u32;
-        let removed_weight = signers.get(idx).unwrap().weight;
-        let remaining = checked_add(
-            Self::total_weight(&signers)? as i128 - removed_weight as i128,
-            0,
-        )? as u32;
-        let threshold = Self::threshold(&env)?;
-        if remaining < threshold {
-            return Err(Error::InvalidThreshold);
-        }
-        signers.remove(idx);
-        env.storage().instance().set(&DataKey::Signers, &signers);
-        Self::bump_instance(&env);
-        env.events()
-            .publish((symbol_short!("signer"), symbol_short!("removed")), signer);
-        Ok(())
-    }
-
-    /// Update the voting weight of an existing signer. Signer-gated. The new
-    /// weight must keep the total at or above the configured threshold; weights
-    /// of 0 are rejected.
-    pub fn set_signer_weight(
-        env: Env,
-        caller: Address,
-        signer: Address,
-        weight: u32,
-    ) -> Result<(), Error> {
-        Self::require_signer(&env, &caller)?;
-        if weight == 0 {
-            return Err(Error::InvalidSignerWeight);
-        }
-        let mut signers = Self::signers(&env)?;
-        let idx: u32 = signers
-            .iter()
-            .position(|s| s.address == signer)
-            .ok_or(Error::NotASigner)? as u32;
-        let old_weight = signers.get(idx).unwrap().weight;
-        let total = Self::total_weight(&signers)?;
-        let new_total = checked_add(total as i128 - old_weight as i128 + weight as i128, 0)? as u32;
-        let threshold = Self::threshold(&env)?;
-        if new_total < threshold {
-            return Err(Error::InvalidThreshold);
-        }
-        let mut updated = signers.get(idx).unwrap();
-        updated.weight = weight;
-        signers.set(idx, updated);
-        env.storage().instance().set(&DataKey::Signers, &signers);
-        Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("signer"), symbol_short!("weight")),
-            (signer, weight),
-        );
-        Ok(())
-    }
-
-    /// Update the approval weight threshold. Signer-gated. Must stay within
-    /// `[MIN_THRESHOLD, total_weight]`.
-    pub fn set_threshold(env: Env, caller: Address, threshold: u32) -> Result<(), Error> {
-        Self::require_signer(&env, &caller)?;
-        let signers = Self::signers(&env)?;
-        Self::validate_threshold(threshold, Self::total_weight(&signers)?)?;
+        env.storage().instance().set(&DataKey::ChangeCount, &0u64);
         env.storage()
             .instance()
-            .set(&DataKey::Threshold, &threshold);
+            .set(&DataKey::TimelockDelay, &MIN_TIMELOCK_DELAY);
         Self::bump_instance(&env);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Timelocked governance: signer set, voting weights and the threshold.
+    //
+    // None of these take effect immediately. `propose_*` parks the change with
+    // an `eta`; `execute_threshold_change` applies it once the delay elapsed;
+    // `cancel_threshold_change` lets any signer veto it during the window.
+    // -----------------------------------------------------------------------
+
+    /// Propose raising or lowering the approval weight threshold.
+    ///
+    /// Signer-gated. The value is validated against the current total signer
+    /// weight up front so an unsatisfiable threshold is never parked, and
+    /// re-validated on execution in case the signer set moved meanwhile.
+    /// Returns the id used to execute or cancel the change.
+    pub fn propose_threshold_change(
+        env: Env,
+        caller: Address,
+        new_threshold: u32,
+    ) -> Result<u64, Error> {
+        Self::propose_change(&env, &caller, GovernanceChange::Threshold(new_threshold))
+    }
+
+    /// Propose changing an existing signer's voting weight. Signer-gated. The
+    /// resulting total weight must stay at or above the threshold.
+    pub fn propose_weight_change(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        new_weight: u32,
+    ) -> Result<u64, Error> {
+        Self::propose_change(
+            &env,
+            &caller,
+            GovernanceChange::SignerWeight(signer, new_weight),
+        )
+    }
+
+    /// Propose admitting a new signer with a positive weight. Signer-gated.
+    /// Rejects duplicates, zero weights and over-capacity signer sets.
+    pub fn propose_signer_addition(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        weight: u32,
+    ) -> Result<u64, Error> {
+        Self::propose_change(&env, &caller, GovernanceChange::AddSigner(signer, weight))
+    }
+
+    /// Propose removing a signer. Signer-gated. Refuses to drop the remaining
+    /// total weight below the threshold, so the multisig can never be bricked.
+    pub fn propose_signer_removal(
+        env: Env,
+        caller: Address,
+        signer: Address,
+    ) -> Result<u64, Error> {
+        Self::propose_change(&env, &caller, GovernanceChange::RemoveSigner(signer))
+    }
+
+    /// Propose a new timelock delay for *future* governance proposals.
+    ///
+    /// Signer-gated and itself timelocked, so the review window cannot be
+    /// shortened without first surviving the current one. The value is clamped
+    /// to `[MIN_TIMELOCK_DELAY, MAX_TIMELOCK_DELAY]`.
+    pub fn propose_timelock_delay_change(
+        env: Env,
+        caller: Address,
+        new_delay: u64,
+    ) -> Result<u64, Error> {
+        Self::propose_change(&env, &caller, GovernanceChange::TimelockDelay(new_delay))
+    }
+
+    /// Execute a pending governance change once its timelock has elapsed.
+    ///
+    /// Signer-gated. Fails with [`Error::TimelockNotExpired`] before `eta`,
+    /// [`Error::ProposalExpired`] once the grace period lapsed, and
+    /// [`Error::InvalidProposalState`] if the change was already executed or
+    /// cancelled. The change is re-validated against live state immediately
+    /// before it is applied.
+    pub fn execute_threshold_change(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_locked(&env)?;
+        Self::require_governor(&env, &caller)?;
+        let mut pending = Self::load_change(&env, proposal_id)?;
+        Self::require_change_open(&pending)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.eta {
+            return Err(Error::TimelockNotExpired);
+        }
+        if now >= pending.expires_at {
+            return Err(Error::ProposalExpired);
+        }
+
+        // The signer set may have moved since the proposal was raised; only
+        // apply a change that is still valid against live state.
+        Self::validate_change(&env, &pending.change)?;
+        Self::apply_change(&env, &pending.change)?;
+
+        pending.executed = true;
+        let kind = Self::change_kind(&pending.change);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Change(proposal_id), &pending);
+        Self::bump_change(&env, proposal_id);
         env.events().publish(
-            (symbol_short!("threshold"), symbol_short!("changed")),
-            threshold,
+            (symbol_short!("govchange"), symbol_short!("executed")),
+            (proposal_id, caller, kind),
+        );
+        Ok(())
+    }
+
+    /// Veto a pending governance change. Any signer may cancel, which is the
+    /// point of the timelock: honest key holders get a window to stop a
+    /// malicious modification raised by a compromised key.
+    ///
+    /// Deliberately callable while the emergency lock is engaged — freezing the
+    /// multisig must not also freeze the ability to withdraw a hostile change.
+    pub fn cancel_threshold_change(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_governor(&env, &caller)?;
+        let mut pending = Self::load_change(&env, proposal_id)?;
+        Self::require_change_open(&pending)?;
+        pending.cancelled = true;
+        let kind = Self::change_kind(&pending.change);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Change(proposal_id), &pending);
+        Self::bump_change(&env, proposal_id);
+        env.events().publish(
+            (symbol_short!("govchange"), symbol_short!("cancelled")),
+            (proposal_id, caller, kind),
         );
         Ok(())
     }
@@ -509,6 +609,25 @@ impl MultiSigContract {
             .unwrap_or(false)
     }
 
+    /// Read a pending (or already executed/cancelled) governance change.
+    pub fn get_pending_change(env: Env, proposal_id: u64) -> Result<PendingChange, Error> {
+        Self::load_change(&env, proposal_id)
+    }
+
+    /// The timelock delay currently applied to newly proposed governance
+    /// changes, in seconds.
+    pub fn get_timelock_delay(env: Env) -> u64 {
+        Self::timelock_delay(&env)
+    }
+
+    /// Number of governance changes ever proposed; ids run `1..=count`.
+    pub fn get_change_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ChangeCount)
+            .unwrap_or(0)
+    }
+
     // --- internal helpers ---
 
     fn signers(env: &Env) -> Result<Vec<SignerWeight>, Error> {
@@ -526,6 +645,14 @@ impl MultiSigContract {
             let w = signers.get(i).unwrap().weight;
             total = checked_add(total, w as i128)?;
             i += 1;
+        }
+        Self::to_weight(total)
+    }
+
+    /// Narrow an accumulated `i128` weight back to `u32`, refusing to truncate.
+    fn to_weight(total: i128) -> Result<u32, Error> {
+        if total > u32::MAX as i128 {
+            return Err(Error::Overflow);
         }
         Ok(total as u32)
     }
@@ -598,6 +725,227 @@ impl MultiSigContract {
             // System-level failure (panic / abort / unknown error code).
             Err(Err(_)) => Err(Error::BatchCallFailed),
         }
+    }
+
+    /// Shared proposal path for every governance change: authorize, validate
+    /// against live state, then park the change behind the timelock.
+    fn propose_change(env: &Env, caller: &Address, change: GovernanceChange) -> Result<u64, Error> {
+        Self::require_not_locked(env)?;
+        Self::require_governor(env, caller)?;
+        // Fail fast: a change that could not apply today is never parked.
+        Self::validate_change(env, &change)?;
+
+        let mut count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ChangeCount)
+            .unwrap_or(0);
+        count = checked_add(count as i128, 1)? as u64;
+        let id = count;
+
+        let now = env.ledger().timestamp();
+        let eta = now
+            .checked_add(Self::timelock_delay(env))
+            .ok_or(Error::Overflow)?;
+        let expires_at = eta
+            .checked_add(GOVERNANCE_GRACE_PERIOD)
+            .ok_or(Error::Overflow)?;
+        let kind = Self::change_kind(&change);
+        let pending = PendingChange {
+            proposer: caller.clone(),
+            change,
+            proposed_at: now,
+            eta,
+            expires_at,
+            executed: false,
+            cancelled: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Change(id), &pending);
+        Self::bump_change(env, id);
+        env.storage().instance().set(&DataKey::ChangeCount, &count);
+        Self::bump_instance(env);
+
+        env.events().publish(
+            (symbol_short!("govchange"), symbol_short!("proposed")),
+            (id, caller.clone(), kind, eta),
+        );
+        Ok(id)
+    }
+
+    /// Check a governance change against the live signer set and threshold.
+    /// Run both at proposal time and immediately before execution.
+    fn validate_change(env: &Env, change: &GovernanceChange) -> Result<(), Error> {
+        let signers = Self::signers(env)?;
+        let threshold = Self::threshold(env)?;
+        let total = Self::total_weight(&signers)? as i128;
+        match change {
+            GovernanceChange::Threshold(new_threshold) => {
+                Self::validate_threshold(*new_threshold, Self::to_weight(total)?)
+            }
+            GovernanceChange::SignerWeight(signer, weight) => {
+                if *weight == 0 {
+                    return Err(Error::InvalidSignerWeight);
+                }
+                let current = Self::weight_of(env, signer)?;
+                let new_total = checked_add(checked_sub(total, current as i128)?, *weight as i128)?;
+                Self::to_weight(new_total)?;
+                if new_total < threshold as i128 {
+                    return Err(Error::InvalidThreshold);
+                }
+                Ok(())
+            }
+            GovernanceChange::AddSigner(signer, weight) => {
+                if *weight == 0 {
+                    return Err(Error::InvalidSignerWeight);
+                }
+                if signers.iter().any(|s| &s.address == signer) {
+                    return Err(Error::AlreadyExists);
+                }
+                if signers.len() >= MAX_SIGNERS {
+                    return Err(Error::TooManySigners);
+                }
+                // Total weight only grows here, so the threshold stays
+                // satisfiable; the check is purely an overflow guard.
+                Self::to_weight(checked_add(total, *weight as i128)?)?;
+                Ok(())
+            }
+            GovernanceChange::RemoveSigner(signer) => {
+                let removed = Self::weight_of(env, signer)?;
+                if checked_sub(total, removed as i128)? < threshold as i128 {
+                    return Err(Error::InvalidThreshold);
+                }
+                Ok(())
+            }
+            GovernanceChange::TimelockDelay(delay) => {
+                if *delay < MIN_TIMELOCK_DELAY || *delay > MAX_TIMELOCK_DELAY {
+                    return Err(Error::InvalidInput);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Commit a validated governance change and emit the matching effect event,
+    /// so consumers of the pre-timelock events keep working unchanged.
+    fn apply_change(env: &Env, change: &GovernanceChange) -> Result<(), Error> {
+        match change {
+            GovernanceChange::Threshold(new_threshold) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Threshold, new_threshold);
+                env.events().publish(
+                    (symbol_short!("threshold"), symbol_short!("changed")),
+                    *new_threshold,
+                );
+            }
+            GovernanceChange::SignerWeight(signer, weight) => {
+                let mut signers = Self::signers(env)?;
+                let idx = Self::index_of(&signers, signer)?;
+                let mut updated = signers.get(idx).unwrap();
+                updated.weight = *weight;
+                signers.set(idx, updated);
+                env.storage().instance().set(&DataKey::Signers, &signers);
+                env.events().publish(
+                    (symbol_short!("signer"), symbol_short!("weight")),
+                    (signer.clone(), *weight),
+                );
+            }
+            GovernanceChange::AddSigner(signer, weight) => {
+                let mut signers = Self::signers(env)?;
+                signers.push_back(SignerWeight {
+                    address: signer.clone(),
+                    weight: *weight,
+                });
+                env.storage().instance().set(&DataKey::Signers, &signers);
+                env.events().publish(
+                    (symbol_short!("signer"), symbol_short!("added")),
+                    (signer.clone(), *weight),
+                );
+            }
+            GovernanceChange::RemoveSigner(signer) => {
+                let mut signers = Self::signers(env)?;
+                let idx = Self::index_of(&signers, signer)?;
+                signers.remove(idx);
+                env.storage().instance().set(&DataKey::Signers, &signers);
+                env.events().publish(
+                    (symbol_short!("signer"), symbol_short!("removed")),
+                    signer.clone(),
+                );
+            }
+            GovernanceChange::TimelockDelay(delay) => {
+                env.storage().instance().set(&DataKey::TimelockDelay, delay);
+                env.events().publish(
+                    (symbol_short!("timelock"), symbol_short!("changed")),
+                    *delay,
+                );
+            }
+        }
+        Self::bump_instance(env);
+        Ok(())
+    }
+
+    /// Short symbol describing a change, published with every governance event
+    /// so indexers can filter without decoding the payload.
+    fn change_kind(change: &GovernanceChange) -> Symbol {
+        match change {
+            GovernanceChange::Threshold(_) => symbol_short!("threshold"),
+            GovernanceChange::SignerWeight(_, _) => symbol_short!("weight"),
+            GovernanceChange::AddSigner(_, _) => symbol_short!("addsigner"),
+            GovernanceChange::RemoveSigner(_) => symbol_short!("rmsigner"),
+            GovernanceChange::TimelockDelay(_) => symbol_short!("timelock"),
+        }
+    }
+
+    fn index_of(signers: &Vec<SignerWeight>, signer: &Address) -> Result<u32, Error> {
+        signers
+            .iter()
+            .position(|s| &s.address == signer)
+            .map(|i| i as u32)
+            .ok_or(Error::NotASigner)
+    }
+
+    fn load_change(env: &Env, id: u64) -> Result<PendingChange, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Change(id))
+            .ok_or(Error::NotFound)
+    }
+
+    /// A change may only be executed or cancelled once.
+    fn require_change_open(pending: &PendingChange) -> Result<(), Error> {
+        if pending.executed || pending.cancelled {
+            return Err(Error::InvalidProposalState);
+        }
+        Ok(())
+    }
+
+    fn timelock_delay(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TimelockDelay)
+            .unwrap_or(MIN_TIMELOCK_DELAY)
+    }
+
+    /// Authorize a governance caller. Distinct from [`Self::require_signer`] so
+    /// governance denials surface the dedicated
+    /// [`Error::UnauthorizedModification`] code.
+    fn require_governor(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let signers = Self::signers(env)?;
+        if !signers.iter().any(|s| &s.address == caller) {
+            return Err(Error::UnauthorizedModification);
+        }
+        Ok(())
+    }
+
+    fn bump_change(env: &Env, id: u64) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Change(id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn validate_threshold(threshold: u32, n: u32) -> Result<(), Error> {
