@@ -51,8 +51,8 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
         &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(h),
         &threshold,
+        &soroban_sdk::vec![&h.env],
         &expires_at,
-        &None,
         &0,
     )
 }
@@ -140,19 +140,19 @@ fn expired_proposal_cannot_be_approved() {
     // Pending on-chain. The terminal `Expired` transition is recorded only via
     // the permissionless `expire()` path (see `explicit_expire_transition`).
     assert_eq!(h.client.state(&id), ProposalState::Pending);
-    h.client.claim_expired_refund(&id);
+    h.client.expire(&id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 
 #[test]
-fn test_claim_expired_refund() {
+fn explicit_expire_transition() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);
     // Cannot expire before deadline.
-    let early = h.client.try_claim_expired_refund(&id);
+    let early = h.client.try_expire(&id);
     assert_eq!(early, Err(Ok(Error::InvalidProposalState)));
     h.env.ledger().set_timestamp(6_000);
-    h.client.claim_expired_refund(&id);
+    h.client.expire(&id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 
@@ -168,8 +168,8 @@ fn create_with_bad_threshold_fails() {
         &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(&h),
         &3,
+        &soroban_sdk::vec![&h.env],
         &5_000,
-        &None,
         &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
@@ -186,9 +186,53 @@ fn create_with_past_expiry_fails() {
         &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(&h),
         &1,
+        &soroban_sdk::vec![&h.env],
         &500, // in the past (now = 1000)
-        &None,
         &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn test_cancellation_grace_window() {
+    let h = setup(3);
+    h.env.ledger().set_timestamp(100);
+    let id = h.client.create(
+        &h.proposer,
+        &String::from_str(&h.env, "org"),
+        &String::from_str(&h.env, "w1"),
+        &String::from_str(&h.env, "p1"),
+        &String::from_str(&h.env, "tx1"),
+        &approver_vec(&h),
+        &2,
+        &soroban_sdk::vec![&h.env],
+        &0,
+        &50, // 50 seconds grace period
+    );
+
+    // Fast forward 51 seconds
+    h.env.ledger().set_timestamp(151);
+
+    // Cancel should fail
+    let res = h.client.try_cancel(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::CancellationWindowClosed)));
+
+    // Create a new one and cancel inside window
+    let id2 = h.client.create(
+        &h.proposer,
+        &String::from_str(&h.env, "org"),
+        &String::from_str(&h.env, "w1"),
+        &String::from_str(&h.env, "p1"),
+        &String::from_str(&h.env, "tx1"),
+        &approver_vec(&h),
+        &2,
+        &soroban_sdk::vec![&h.env],
+        &0,
+        &50,
+    );
+
+    h.env.ledger().set_timestamp(160);
+    h.client.cancel(&h.proposer, &id2); // works since 160 < 151 + 50 (created at 151)
+
+    assert_eq!(h.client.state(&id2), crate::ProposalState::Cancelled);
 }

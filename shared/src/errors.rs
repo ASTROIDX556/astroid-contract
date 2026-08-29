@@ -20,52 +20,61 @@ pub enum Error {
     AlreadyInitialized = 6,
 
     // --- Value / arithmetic (10-19) ---
-    InsufficientFunds = 10,
-    Overflow = 11,
-    Underflow = 12,
-    InvalidAmount = 13,
+    InsufficientFunds = 7,
+    Overflow = 8,
+    Underflow = 9,
+    InvalidAmount = 10,
 
     // --- Policy (20-29) ---
-    PolicyDenied = 20,
-    PolicyHashMismatch = 21,
-    EmergencyLock = 22,
-    PolicyRecipientRestricted = 23,
-    FeeLimitExceeded = 24,
+    PolicyDenied = 11,
+    EmergencyLock = 12,
+    PolicyRecipientRestricted = 13,
+    FeeLimitExceeded = 14,
+    PolicyMerchantBlocked = 15,
+    PolicyCategoryRestricted = 16,
 
     // --- Registry (30-39) ---
-    RegistryFrozen = 30,
+    RegistryFrozen = 17,
 
     // --- Budget (40-49) ---
-    BudgetExceeded = 40,
-    BudgetFrozen = 41,
-    BudgetArchived = 42,
-    AssetNotAuthorized = 43,
+    BudgetExceeded = 18,
+    BudgetFrozen = 19,
+    BudgetArchived = 20,
+    AssetNotAuthorized = 21,
+    BudgetExpired = 22,
 
     // --- Wallet (50-59) ---
-    WalletFrozen = 50,
-    WalletArchived = 51,
-    WalletPaused = 52,
-    InvalidState = 53,
+    WalletFrozen = 23,
+    WalletArchived = 24,
+    WalletPaused = 25,
+    InvalidState = 26,
 
     // --- Multisig / approvals (60-69) ---
-    InvalidSignature = 60,
-    ThresholdNotMet = 61,
-    AlreadySigned = 62,
-    NotASigner = 63,
-    InvalidThreshold = 64,
-    TimeLocked = 65,
-    TooManySigners = 66,
+    ThresholdNotMet = 27,
+    AlreadySigned = 28,
+    NotASigner = 29,
+    InvalidThreshold = 30,
+    TimeLocked = 31,
+    TooManySigners = 32,
+    /// A sub-call within a batch failed; the entire batch reverted atomically.
+    BatchCallFailed = 33,
+    /// Batch nonce is not strictly greater than the last used nonce (replay).
+    InvalidNonce = 34,
+    /// A signer with zero (or otherwise invalid) voting weight was supplied.
+    InvalidSignerWeight = 35,
+    /// Accumulated approval weight is below the configured threshold.
+    InsufficientWeight = 36,
 
     // --- Proposal (70-79) ---
-    ProposalExpired = 70,
-    InvalidProposalState = 71,
-    ProposalNotApproved = 72,
-    NotAnApprover = 73,
+    ProposalExpired = 37,
+    InvalidProposalState = 38,
+    ProposalNotApproved = 39,
+    NotAnApprover = 40,
+    CancellationWindowClosed = 41,
+    MathOverflow = 42,
+    DivisionByZero = 43,
 
     // --- Escrow (80-89) ---
-    ConditionNotMet = 80,
-    EscrowNotFunded = 81,
-    EscrowExpired = 82,
-    InvalidCondition = 83,
-    TimeLockActive = 84,
+    EscrowExpired = 44,
+    TimeLockActive = 45,
 }

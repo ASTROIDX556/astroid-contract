@@ -1,92 +1,76 @@
 import re
 
 with open("contracts/proposal/src/lib.rs", "r") as f:
-    text = f.read()
+    c = f.read()
 
-if "token::TokenClient" not in text:
-    text = text.replace("use soroban_sdk::{", "use soroban_sdk::{token::TokenClient, ")
+c = c.replace("use soroban_sdk::{", "use astroid_shared::types::AssetAmount;\nuse soroban_sdk::{")
 
-text = text.replace("pub expires_at: u64,", "pub deadline: u64,\n    pub deposit_asset: Option<Address>,\n    pub deposit_amount: i128,")
-text = text.replace("expires_at: u64,", "deadline: u64,\n        deposit_asset: Option<Address>,\n        deposit_amount: i128,")
-text = text.replace("if expires_at != 0 && expires_at <= env.ledger().timestamp() {", """if deadline != 0 && deadline <= env.ledger().timestamp() {
-            return Err(Error::InvalidInput);
-        }
-        if let Some(asset) = &deposit_asset {
-            if deposit_amount <= 0 { return Err(Error::InvalidAmount); }
-            TokenClient::new(&env, asset).transfer(&proposer, &env.current_contract_address(), &deposit_amount);
-        }
-        if false {""")
+c = c.replace("    pub expires_at: u64,", "    pub deposit: Option<AssetAmount>,\n    pub expires_at: u64,")
 
-text = text.replace("expires_at,", "deadline,\n            deposit_asset,\n            deposit_amount,")
+c = c.replace("        threshold: u32,", "        threshold: u32,\n        deposit: Option<AssetAmount>,")
 
-# execute
-text = text.replace("""        proposal.state = ProposalState::Executed;
-        Self::store(&env, id, &proposal);""", """        proposal.state = ProposalState::Executed;
-        if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
+c = c.replace("        if expires_at != 0 && expires_at <= env.ledger().timestamp() {", """        if let Some(dep) = &deposit {
+            if dep.amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            TokenClient::new(&env, &dep.asset).transfer(
+                &proposer,
+                &env.current_contract_address(),
+                &dep.amount,
+            );
         }
-        Self::store(&env, id, &proposal);""")
+        if expires_at != 0 && expires_at <= env.ledger().timestamp() {""")
 
-# reject
-text = text.replace("""        proposal.state = ProposalState::Rejected;
-        Self::store(&env, id, &proposal);""", """        proposal.state = ProposalState::Rejected;
-        if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
-        }
-        Self::store(&env, id, &proposal);""")
+c = c.replace("            state: ProposalState::Pending,", "            deposit,\n            state: ProposalState::Pending,")
 
-# cancel
-text = text.replace("""        proposal.state = ProposalState::Cancelled;
-        Self::store(&env, id, &proposal);""", """        proposal.state = ProposalState::Cancelled;
-        if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
-        }
-        Self::store(&env, id, &proposal);""")
+c = c.replace("        proposal.state = ProposalState::Rejected;", """        proposal.state = ProposalState::Rejected;
+        if let Some(dep) = &proposal.deposit {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }""")
 
-# claim_expired_refund
-expire_method = """    /// Mark a proposal expired if its deadline has passed. Permissionless
-    /// (anyone may trigger the transition; state gate protects correctness).
-    pub fn expire(env: Env, id: u64) -> Result<(), Error> {
-        let mut proposal = Self::load(&env, id)?;
-        if !matches!(
-            proposal.state,
-            ProposalState::Pending | ProposalState::Approved
-        ) {
-            return Err(Error::InvalidProposalState);
-        }
-        if proposal.expires_at == 0 || env.ledger().timestamp() < proposal.expires_at {
-            return Err(Error::InvalidProposalState);
-        }
-        proposal.state = ProposalState::Expired;
-        Self::store(&env, id, &proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("expired")), id);
-        Ok(())
-    }"""
-new_claim = """    /// Mark a proposal expired and claim refund.
-    pub fn claim_expired_refund(env: Env, proposal_id: u64) -> Result<(), Error> {
-        let mut proposal = Self::load(&env, proposal_id)?;
-        if !matches!(
-            proposal.state,
-            ProposalState::Pending | ProposalState::Approved
-        ) {
-            return Err(Error::InvalidProposalState);
-        }
-        if proposal.deadline == 0 || env.ledger().timestamp() < proposal.deadline {
-            return Err(Error::InvalidProposalState);
-        }
-        proposal.state = ProposalState::Expired;
-        if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
-        }
-        Self::store(&env, proposal_id, &proposal);
-        env.events().publish((symbol_short!("proposal"), symbol_short!("refunded")), proposal_id);
-        Ok(())
-    }"""
-text = text.replace(expire_method, new_claim)
+c = c.replace("        proposal.state = ProposalState::Cancelled;", """        proposal.state = ProposalState::Cancelled;
+        if let Some(dep) = &proposal.deposit {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }""")
 
-text = text.replace("proposal.expires_at", "proposal.deadline")
-text = text.replace("expire(", "claim_expired_refund(")
+c = c.replace("        proposal.state = ProposalState::Expired;", """        proposal.state = ProposalState::Expired;
+        if let Some(dep) = &proposal.deposit {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }""")
+
+c = c.replace("        proposal.state = ProposalState::Executed;", """        proposal.state = ProposalState::Executed;
+        if let Some(dep) = &proposal.deposit {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }""")
 
 with open("contracts/proposal/src/lib.rs", "w") as f:
-    f.write(text)
+    f.write(c)
+
+with open("contracts/proposal/src/test.rs", "r") as f:
+    t = f.read()
+
+t = re.sub(r"        &threshold,\n        &expires_at,\n        &expires_at,", r"        &threshold,\n        &None,\n        &expires_at,\n        &expires_at,", t)
+t = re.sub(r"        &3,\n        &5_000,\n        &expires_at,", r"        &3,\n        &None,\n        &5_000,\n        &expires_at,", t)
+t = re.sub(r"        &1,\n        &500, // in the past \(now = 1000\)\n        &expires_at,", r"        &1,\n        &None,\n        &500, // in the past (now = 1000)\n        &expires_at,", t)
+t = re.sub(r"        &2,\n        &expires_at,\n        &0,\n        &50,", r"        &2,\n        &None,\n        &expires_at,\n        &0,\n        &50,", t)
+t = re.sub(r"        &2,\n        &0,\n        &50,", r"        &2,\n        &None,\n        &0,\n        &50,", t)
+
+with open("contracts/proposal/src/test.rs", "w") as f:
+    f.write(t)
+
