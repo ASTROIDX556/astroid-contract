@@ -15,7 +15,8 @@
 //! [`astroid_interfaces`], keeping the graph acyclic: `Treasury → {Policy, Budget}`.
 //!
 //! Functions: `initialize`, `set_policy`, `set_budget`, `freeze`, `unfreeze`,
-//! `deposit`, `withdraw`, `allocate_budget`, `get`, `holding`.
+//! `deposit`, `withdraw`, `allocate_budget`, `get`, `holding`, `set_allowance`,
+//! `get_allowance` — with per-beneficiary withdrawal allowance tracking.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -26,7 +27,9 @@ use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
-use astroid_shared::validation::{require_non_empty, require_positive_amount};
+use astroid_shared::validation::{
+    require_non_empty, require_non_negative_amount, require_positive_amount,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
 };
@@ -61,6 +64,7 @@ pub struct Holding {
 enum DataKey {
     Treasury,
     Holding(Address),
+    Allowance(Address),
 }
 
 #[contract]
@@ -201,8 +205,54 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Set the withdrawal allowance for a beneficiary. Only the admin may call.
+    /// The allowance caps the total amount the beneficiary can receive via
+    /// `withdraw`. Uses persistent storage keyed by the beneficiary address and
+    /// checked math to prevent overflows. Setting to 0 blocks further withdrawals
+    /// to that beneficiary until raised.
+    pub fn set_allowance(
+        env: Env,
+        caller: Address,
+        beneficiary: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        require_non_negative_amount(amount)?;
+        let key = DataKey::Allowance(beneficiary.clone());
+        env.storage().persistent().set(&key, &amount);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("allowance")),
+            (beneficiary, amount),
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("allowance"),
+            },
+        );
+        Ok(())
+    }
+
+    /// Get the remaining withdrawal allowance for a beneficiary. Returns 0 if no
+    /// allowance has been set for that address.
+    pub fn get_allowance(env: Env, beneficiary: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(beneficiary))
+            .unwrap_or(0)
+    }
+
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
     /// must clear policy and budget gates before the ledger is debited.
+    /// If an allowance has been set for the recipient, the amount is checked
+    /// against the remaining allowance and atomically decremented; exceeding the
+    /// allowance returns `AllowanceExceeded` or `InsufficientAllowance`.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -233,6 +283,28 @@ impl TreasuryContract {
         if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
             astroid_interfaces::BudgetClient::new(&env, budget_addr)
                 .consume(&caller, budget_id, &amount);
+        }
+
+        // 2b. Allowance enforcement — check and atomically decrement remaining
+        // allowance for the beneficiary. Uses persistent storage keyed by the
+        // recipient address and checked math. If no allowance has been set for
+        // the beneficiary, the check is skipped (unlimited). Otherwise the spend
+        // must satisfy amount <= remaining allowance, else AllowanceExceeded.
+        let allowance_key = DataKey::Allowance(to.clone());
+        if env.storage().persistent().has(&allowance_key) {
+            let current: i128 = env.storage().persistent().get(&allowance_key).unwrap_or(0);
+            if current < amount {
+                return Err(Error::AllowanceExceeded);
+            }
+            let new_allowance = checked_sub(current, amount)?;
+            env.storage()
+                .persistent()
+                .set(&allowance_key, &new_allowance);
+            env.storage().persistent().extend_ttl(
+                &allowance_key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
         }
 
         // 3. Debit the internal ledger, then move real tokens out of custody.

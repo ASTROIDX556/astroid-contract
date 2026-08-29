@@ -24,6 +24,8 @@ pub enum Error {
     Overflow = 11,
     Underflow = 12,
     InvalidAmount = 13,
+    InsufficientAllowance = 14,
+    AllowanceExceeded = 15,
 
     // --- Policy (20-29) ---
     PolicyDenied = 20,
