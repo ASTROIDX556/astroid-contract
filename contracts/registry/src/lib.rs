@@ -19,7 +19,9 @@ use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRE
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -281,7 +283,7 @@ impl RegistryContract {
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
-        let key = DataKey::ApprovedWasm(kind.clone(), wasm_hash.clone());
+        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         env.storage().persistent().set(&key, &true);
         Self::bump(&env, &key);
         env.events().publish(
@@ -299,7 +301,7 @@ impl RegistryContract {
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
-        let key = DataKey::ApprovedWasm(kind.clone(), wasm_hash.clone());
+        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
         }

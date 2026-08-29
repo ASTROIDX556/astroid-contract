@@ -26,7 +26,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_time_reached;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol, Vec, Map,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, Symbol,
 };
 
 #[contracttype]
@@ -79,7 +79,7 @@ impl MultiSigContract {
         if n == 0 || n > MAX_SIGNERS {
             return Err(Error::InvalidInput);
         }
-        
+
         let mut total_weight: u32 = 0;
         for (_addr, weight) in signers.iter() {
             total_weight = total_weight.saturating_add(weight);
@@ -99,7 +99,12 @@ impl MultiSigContract {
     }
 
     /// Add a signer. Signer-gated. Rejects duplicates and over-capacity sets.
-    pub fn add_signer(env: Env, caller: Address, signer: Address, weight: u32) -> Result<(), Error> {
+    pub fn add_signer(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        weight: u32,
+    ) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         let mut signers = Self::signers(&env)?;
         if signers.contains_key(signer.clone()) {

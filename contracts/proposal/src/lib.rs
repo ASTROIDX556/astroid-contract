@@ -242,10 +242,6 @@ impl ProposalContract {
         Ok(())
     }
 
-    /// Execute an approved proposal. Only the proposer may execute (the actual
-    /// value movement happens in the wallet/treasury; this records completion).
-
-
     /// Purge an expired proposal from storage to reclaim space.
     pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
         let proposal = Self::load(&env, id)?;
