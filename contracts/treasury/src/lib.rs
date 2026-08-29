@@ -14,23 +14,28 @@
 //! Cross-contract calls go through the typed clients generated from
 //! [`astroid_interfaces`], keeping the graph acyclic: `Treasury → {Policy, Budget}`.
 //!
+//! [`TreasuryContract::batch_transfer`] applies the same gate chain to a whole
+//! vector of payouts in a single, atomic invocation: the cumulative amount is
+//! accumulated with checked math and validated against the treasury balance
+//! before any value moves, so autonomous agents can pay many contributors for
+//! the fee of one transaction. If any leg fails, the host reverts the entire
+//! invocation and no recipient is paid.
+//!
 //! Functions: `initialize`, `set_policy`, `set_budget`, `freeze`, `unfreeze`,
-//! `deposit`, `withdraw`, `allocate_budget`, `get`, `holding`.
+//! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`, `holding`.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
-use astroid_shared::types::ResourceState;
-use astroid_shared::validation::{
-    require_non_empty, require_non_negative_amount, require_positive_amount,
-};
+use astroid_shared::types::{Payment, ResourceState};
+use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
 };
 
 /// Stored treasury record.
@@ -275,51 +280,91 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Set or update a per-agent, per-asset spending allowance. Only the admin
-    /// may call. A zero limit effectively revokes the allowance.
-    pub fn set_allowance(
+    /// Disburse `payments` of a single `asset` to many recipients in one atomic
+    /// transaction. Only the admin may call, and the batch clears exactly the
+    /// same gates as [`TreasuryContract::withdraw`] — policy per leg, budget for
+    /// the aggregate — before the ledger is debited.
+    ///
+    /// The payout total is accumulated with the shared checked-math helpers and
+    /// verified against the treasury's recorded balance up front, so an
+    /// over-drawing batch is rejected before any token moves. Beyond that,
+    /// atomicity is guaranteed by the host: returning an error (or a failing
+    /// sub-call, such as a policy denial or a token transfer) rolls back every
+    /// storage write and every transfer made earlier in the invocation, so a
+    /// batch either pays every recipient or none of them.
+    pub fn batch_transfer(
         env: Env,
         caller: Address,
-        agent: Address,
         asset: Address,
-        limit: i128,
+        payments: Vec<Payment>,
     ) -> Result<(), Error> {
-        require_non_negative_amount(limit)?;
-        let _t = Self::require_admin(&env, &caller)?;
-        let mut a = Self::load_allowance(&env, &agent, &asset);
-        a.limit = limit;
-        // Reset consumed when the limit is changed so the agent can spend up
-        // to the new limit immediately.
-        a.consumed = 0;
-        Self::store_allowance(&env, &agent, &asset, &a);
-        events::allowance_set(&env, &agent, &asset, limit);
-        Ok(())
-    }
-
-    /// Read the current allowance for a given agent and asset.
-    pub fn get_allowance(env: Env, agent: Address, asset: Address) -> Allowance {
-        Self::load_allowance(&env, &agent, &asset)
-    }
-
-    /// Consume `amount` from the agent's per-asset allowance. The agent must
-    /// authorize the call. Returns an error when the remaining allowance is
-    /// insufficient.
-    pub fn consume_allowance(
-        env: Env,
-        agent: Address,
-        asset: Address,
-        amount: i128,
-    ) -> Result<(), Error> {
-        require_positive_amount(amount)?;
-        agent.require_auth();
-        let mut a = Self::load_allowance(&env, &agent, &asset);
-        let remaining = checked_sub(a.limit, a.consumed)?;
-        if amount > remaining {
-            return Err(Error::InsufficientAllowance);
+        if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
+            return Err(Error::InvalidInput);
         }
-        a.consumed = checked_add(a.consumed, amount)?;
-        Self::store_allowance(&env, &agent, &asset, &a);
-        events::allowance_consumed(&env, &agent, &asset, amount);
+        let t = Self::load(&env);
+        Self::require_active(&t)?;
+        if t.admin != caller {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        // 1. Validate every leg and accumulate the payout with checked math, so
+        //    a malformed or overflowing batch is rejected before anything moves.
+        let mut total: i128 = 0;
+        for payment in payments.iter() {
+            require_positive_amount(payment.amount)?;
+            total = checked_add(total, payment.amount)?;
+        }
+
+        // 2. Cumulative balance check against the recorded holding.
+        let mut holding = Self::load_holding(&env, &asset);
+        if holding.total_in < total {
+            return Err(Error::InsufficientFunds);
+        }
+
+        // 3. Policy verification — each leg is evaluated on its own, because
+        //    per-recipient and per-amount gates are what the policy encodes.
+        if let Some(policy_addr) = &t.policy {
+            let policy = PolicyClient::new(&env, policy_addr);
+            let policy_id = String::from_str(&env, "active");
+            for payment in payments.iter() {
+                policy.check_transfer(&policy_id, &asset, &payment.recipient, &payment.amount);
+            }
+        }
+
+        // 4. Budget consumption — one debit for the aggregate rather than one
+        //    cross-contract call per recipient.
+        if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
+            astroid_interfaces::BudgetClient::new(&env, budget_addr)
+                .consume(&caller, budget_id, &total);
+        }
+
+        // 5. Debit the internal ledger once, then move real tokens per recipient.
+        holding.total_in = checked_sub(holding.total_in, total)?;
+        holding.total_out = checked_add(holding.total_out, total)?;
+        Self::store_holding(&env, &asset, &holding);
+
+        let token_client = token::TokenClient::new(&env, &asset);
+        let custody = env.current_contract_address();
+        for payment in payments.iter() {
+            token_client.transfer(&custody, &payment.recipient, &payment.amount);
+        }
+
+        // A single summary event keeps the log concise; the per-recipient moves
+        // are already observable as the asset contract's own transfer events.
+        events::publish(
+            &env,
+            events::ContractEvent::BatchTransferExecuted {
+                from: t.admin.clone(),
+                asset: asset.clone(),
+                count: payments.len(),
+                total,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("batchpay")),
+            (asset, payments.len(), total),
+        );
         Ok(())
     }
 

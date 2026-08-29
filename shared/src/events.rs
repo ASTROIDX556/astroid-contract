@@ -53,6 +53,15 @@ pub enum ContractEvent {
         asset: Address,
         amount: i128,
     },
+    /// Value moved out of a contract to several recipients in one atomic batch.
+    /// Emitted once per batch (not once per leg) to keep the log concise; the
+    /// individual token transfers remain visible as SAC events.
+    BatchTransferExecuted {
+        from: Address,
+        asset: Address,
+        count: u32,
+        total: i128,
+    },
     /// A treasury configuration field was updated (`action` is e.g. `policy`).
     TreasuryConfigUpdated { org: String, action: Symbol },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
@@ -105,6 +114,17 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "TransferExecuted"),),
                 (from, to, asset, amount),
+            );
+        }
+        ContractEvent::BatchTransferExecuted {
+            from,
+            asset,
+            count,
+            total,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "BatchTransferExecuted"),),
+                (from, asset, count, total),
             );
         }
         ContractEvent::TreasuryConfigUpdated { org, action } => {
