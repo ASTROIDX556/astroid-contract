@@ -22,7 +22,7 @@
 //! sender, so no escrow can be `Closed` with money still locked.
 
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+    HOUR_IN_LEDGERS, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
@@ -56,7 +56,15 @@ pub struct Escrow {
     pub deadline: u64,
     pub funded_amount: i128,
     pub memo: String,
+    /// Pending beneficiary replacement address (None = no proposal active).
+    pub proposed_beneficiary: Option<Address>,
+    /// Ledger sequence at which the beneficiary proposal was created.
+    pub proposed_at_seq: u32,
 }
+
+/// Mandatory number of ledger sequences that must elapse between a beneficiary
+/// proposal and when it may be claimed. ~1 hour on Stellar.
+pub const BENEFICIARY_TIMELEDGER_DELTA: u32 = HOUR_IN_LEDGERS;
 
 #[contracttype]
 #[derive(Clone)]
@@ -131,6 +139,8 @@ impl EscrowContract {
             deadline,
             funded_amount: amount,
             memo,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
         };
         env.storage()
             .persistent()
@@ -180,6 +190,8 @@ impl EscrowContract {
             deadline: unlock_time,
             funded_amount: 0,
             memo,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
         };
         env.storage()
             .persistent()
@@ -340,6 +352,87 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Propose a new beneficiary for this escrow. Only the sender or arbiter may
+    /// call. A mandatory ledger-sequence timelock must elapse before the proposal
+    /// can be claimed via [`claim_beneficiary`]. Submitting a new proposal while
+    /// one already exists replaces it (resets the timelock).
+    pub fn propose_beneficiary(
+        env: Env,
+        caller: Address,
+        id: u64,
+        new_beneficiary: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if caller != escrow.sender && caller != escrow.arbiter {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Created | EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        if new_beneficiary == escrow.recipient {
+            return Err(Error::InvalidInput);
+        }
+        if new_beneficiary == escrow.sender {
+            return Err(Error::InvalidInput);
+        }
+        if new_beneficiary == escrow.arbiter {
+            return Err(Error::InvalidInput);
+        }
+        // Reject the zero address as a beneficiary.
+        if is_zero_address(&env, &new_beneficiary) {
+            return Err(Error::InvalidInput);
+        }
+
+        let current_seq = env.ledger().sequence();
+        escrow.proposed_beneficiary = Some(new_beneficiary.clone());
+        escrow.proposed_at_seq = current_seq;
+        Self::store(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("bene_prp")),
+            (id, caller, new_beneficiary, current_seq),
+        );
+        Ok(())
+    }
+
+    /// Claim a previously proposed beneficiary change. Callable only by the
+    /// proposed beneficiary and only after [`BENEFICIARY_TIMELEDGER_DELTA`]
+    /// ledgers have elapsed since the proposal was created. On success the
+    /// escrow's `recipient` is updated and the proposal is cleared.
+    pub fn claim_beneficiary(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Created | EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        let proposed = escrow
+            .proposed_beneficiary
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
+        if *proposed != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let current_seq = env.ledger().sequence();
+        let required_seq = escrow
+            .proposed_at_seq
+            .checked_add(BENEFICIARY_TIMELEDGER_DELTA)
+            .ok_or(Error::Overflow)?;
+        if current_seq < required_seq {
+            return Err(Error::TimeLockActive);
+        }
+
+        escrow.recipient = proposed.clone();
+        escrow.proposed_beneficiary = None;
+        escrow.proposed_at_seq = 0;
+        Self::store(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("bene_clm")),
+            (id, caller, escrow.recipient),
+        );
+        Ok(())
+    }
+
     /// Close a settled escrow (terminal). Callable only once the funds have
     /// actually moved — i.e. from `Released` or `Refunded`. An `Expired` escrow
     /// must be `refund`ed first so custody is emptied before it can be closed;
@@ -385,6 +478,15 @@ impl EscrowContract {
             PERSISTENT_BUMP_AMOUNT,
         );
     }
+}
+
+/// Returns `true` if `addr` is the zero public key (all 32 bytes zero).
+fn is_zero_address(_env: &Env, addr: &Address) -> bool {
+    let s = addr.to_string();
+    let len = s.len() as usize;
+    let mut buf = [0u8; 64];
+    s.copy_into_slice(&mut buf[..len]);
+    buf[..len].iter().all(|&b| b == 0)
 }
 
 #[cfg(test)]

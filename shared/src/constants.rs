@@ -9,6 +9,8 @@ pub const SECONDS_PER_MONTH: u64 = 2_592_000;
 
 /// Approximate number of ledgers closed per day on Stellar (~5s per ledger).
 pub const DAY_IN_LEDGERS: u32 = 17_280;
+/// Approximate number of ledgers closed per hour on Stellar.
+pub const HOUR_IN_LEDGERS: u32 = 720;
 
 /// Instance storage TTL bump (7 days) and the threshold at which we bump.
 pub const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
