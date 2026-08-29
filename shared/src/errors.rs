@@ -30,6 +30,8 @@ pub enum Error {
     PolicyHashMismatch = 21,
     EmergencyLock = 22,
     PolicyRecipientRestricted = 23,
+    /// A spend whose asset is not on the organization's approved token whitelist.
+    TokenNotWhitelisted = 24,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,

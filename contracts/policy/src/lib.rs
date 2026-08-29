@@ -16,7 +16,8 @@
 //! This contract answers: "may `amount` of `asset` flow to `recipient`
 //! right now?" with a deterministic [`Error`] when it may not.
 //!
-//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
+//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`,
+//! `add_to_whitelist`, `remove_from_whitelist`, `is_token_allowed`.
 
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
@@ -52,6 +53,9 @@ enum DataKey {
     Policy(String),
     Count,
     Blacklist(Address),
+    /// Approved token whitelist entry, scoped per organization/policy namespace:
+    /// `(policy_id, token)` -> unit. Only assets listed here may be spent.
+    Whitelist(String, Address),
 }
 
 #[contract]
@@ -175,6 +179,55 @@ impl PolicyContract {
         Ok(())
     }
 
+    /// Approve `token` for spends under `policy_id` (owner only). Unlisted
+    /// assets are rejected by `check_transfer` with `TokenNotWhitelisted`.
+    pub fn add_to_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        token: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(policy_id.clone(), token.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &());
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wht_add")),
+            (policy_id, token),
+        );
+        Ok(())
+    }
+
+    /// Revoke an approved `token` from the whitelist (owner only).
+    pub fn remove_from_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        token: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(policy_id.clone(), token.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wht_rem")),
+            (policy_id, token),
+        );
+        Ok(())
+    }
+
     /// Remove an address from the restricted blacklist (owner only).
     pub fn remove_blacklist(
         env: Env,
@@ -252,6 +305,15 @@ impl PolicyInterface for PolicyContract {
                 return Err(Error::PolicyDenied);
             }
         }
+        // Whitelist gate: only SAC addresses approved by the org owner may move.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Whitelist(policy_id.clone(), asset.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "token_not_whitelisted");
+            return Err(Error::TokenNotWhitelisted);
+        }
         // Check blacklist
         if env
             .storage()
@@ -262,6 +324,14 @@ impl PolicyInterface for PolicyContract {
             return Err(Error::PolicyRecipientRestricted);
         }
         Ok(())
+    }
+
+    /// Clean query the wallet/treasury can call before touching an external SAC
+    /// address: is `token` approved for spends under `policy_id`?
+    fn is_token_allowed(env: Env, policy_id: String, token: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Whitelist(policy_id, token))
     }
 }
 
