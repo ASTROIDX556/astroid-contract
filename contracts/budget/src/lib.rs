@@ -59,6 +59,12 @@ pub struct Budget {
     /// Unix timestamp after which the budget is expired (0 = never expires).
     pub expires_at: u64,
     pub state: ResourceState,
+    /// Maximum spend per day (0 = no velocity cap).
+    pub daily_velocity_cap: i128,
+    /// Amount spent in the current daily window.
+    pub daily_spent: i128,
+    /// Start of the current daily window (unix seconds).
+    pub daily_window_start: u64,
 }
 
 /// Per-asset budget tracking.
@@ -101,6 +107,7 @@ impl BudgetContract {
     /// `rollover_enabled` carries unspent allowance into the next period;
     /// `expires_at` (unix seconds, 0 = never) marks the budget expired after a
     /// given time, after which consumption is rejected.
+    /// `daily_velocity_cap` (0 = no cap) limits how much can be spent per day.
     pub fn allocate(
         env: Env,
         owner: Address,
@@ -109,30 +116,59 @@ impl BudgetContract {
         period: Period,
         rollover_enabled: bool,
         expires_at: u64,
+        daily_velocity_cap: i128,
     ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&budget_id)?;
         require_non_negative_amount(limit)?;
+        if daily_velocity_cap < 0 {
+            return Err(Error::InvalidInput);
+        }
         let key = DataKey::Budget(budget_id.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
         }
+        let now = env.ledger().timestamp();
         let budget = Budget {
             owner: owner.clone(),
             limit,
             spent: 0,
             period,
-            window_start: env.ledger().timestamp(),
+            window_start: now,
             rollover_enabled,
             rollover_credit: 0,
             expires_at,
             state: ResourceState::Active,
+            daily_velocity_cap,
+            daily_spent: 0,
+            daily_window_start: now,
         };
         env.storage().persistent().set(&key, &budget);
         Self::bump(&env, &budget_id);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("allocated")),
             (budget_id, owner, limit),
+        );
+        Ok(())
+    }
+
+    /// Update the daily velocity cap (owner-gated). Set to 0 to disable.
+    pub fn set_daily_velocity_cap(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        daily_velocity_cap: i128,
+    ) -> Result<(), Error> {
+        if daily_velocity_cap < 0 {
+            return Err(Error::InvalidInput);
+        }
+        let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+        budget.daily_velocity_cap = daily_velocity_cap;
+        Self::store(&env, &budget_id, &budget);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("set_vel")),
+            (budget_id, daily_velocity_cap),
         );
         Ok(())
     }
@@ -157,6 +193,34 @@ impl BudgetContract {
     /// a rollover; ordinary consumption cannot do so on its own.
     pub fn rollover(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        Self::store(&env, &budget_id, &budget);
+        Ok(())
+    }
+
+    /// Trigger a recurring allowance reset if the period has elapsed. This is
+    /// a public function that can be called by anyone (e.g., a keeper network)
+    /// to reset the budget's spent counter when the recurring period has passed.
+    /// Returns Ok(()) if the reset was applied or if the period has not yet
+    /// elapsed. Returns Err if the budget is expired.
+    pub fn trigger_recurring_reset(env: Env, budget_id: String) -> Result<(), Error> {
+        let mut budget = Self::load(&env, &budget_id)?;
+        let now = env.ledger().timestamp();
+        // Check expiration
+        if budget.expires_at != 0 && now >= budget.expires_at {
+            return Err(Error::BudgetExpired);
+        }
+        // Only apply if period has elapsed
+        let window = match budget.period {
+            Period::None => return Ok(()), // No recurring reset for one-shot budgets
+            Period::Daily => constants::SECONDS_PER_DAY,
+            Period::Weekly => constants::SECONDS_PER_WEEK,
+            Period::Monthly => constants::SECONDS_PER_MONTH,
+        };
+        if now < budget.window_start.saturating_add(window) {
+            return Ok(()); // Period not yet elapsed
+        }
+        // Apply the period transition
         Self::window_transition(&env, &mut budget, &budget_id, true)?;
         Self::store(&env, &budget_id, &budget);
         Ok(())
@@ -420,6 +484,20 @@ impl BudgetContract {
         Ok(())
     }
 
+    /// Reset the daily velocity window if a day has passed. Mutates `budget` in
+    /// place. Returns true if the window was reset.
+    fn daily_velocity_transition(budget: &mut Budget, now: u64) -> bool {
+        if budget.daily_velocity_cap <= 0 {
+            return false;
+        }
+        if now >= budget.daily_window_start.saturating_add(constants::SECONDS_PER_DAY) {
+            budget.daily_spent = 0;
+            budget.daily_window_start = now;
+            return true;
+        }
+        false
+    }
+
     /// Guard that rejects an expired budget.
     fn require_not_expired(env: &Env, budget: &Budget) -> Result<(), Error> {
         let now = env.ledger().timestamp();
@@ -453,7 +531,7 @@ impl BudgetContract {
 impl BudgetInterface for BudgetContract {
     /// Debit `amount` from the budget. Applies any pending period transition
     /// first, then enforces `spent + amount <= limit + rollover_credit`, else
-    /// [`Error::BudgetExceeded`].
+    /// [`Error::BudgetExceeded`]. Also enforces the daily velocity cap when set.
     fn consume(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
@@ -467,6 +545,23 @@ impl BudgetInterface for BudgetContract {
             events::budget_exceeded(&env, &budget_id, amount, remaining);
             return Err(Error::BudgetExceeded);
         }
+
+        // Enforce daily velocity cap
+        let now = env.ledger().timestamp();
+        Self::daily_velocity_transition(&mut budget, now);
+        if budget.daily_velocity_cap > 0 {
+            let new_daily_spent = checked_add(budget.daily_spent, amount)?;
+            if new_daily_spent > budget.daily_velocity_cap {
+                let daily_remaining = checked_sub(budget.daily_velocity_cap, budget.daily_spent)?;
+                env.events().publish(
+                    (symbol_short!("budget"), symbol_short!("vel_exceed")),
+                    (budget_id.clone(), amount, daily_remaining),
+                );
+                return Err(Error::VelocityExceeded);
+            }
+            budget.daily_spent = new_daily_spent;
+        }
+
         budget.spent = new_spent;
         Self::store(&env, &budget_id, &budget);
         let remaining = checked_sub(capacity, budget.spent)?;
@@ -483,6 +578,7 @@ impl BudgetInterface for BudgetContract {
         // Don't emit events from a read-only view, but persist the period
         // transition so the rolled-over state is observable via `get`.
         if Self::window_transition(&env, &mut budget, &budget_id, false).is_ok() {
+            Self::daily_velocity_transition(&mut budget, env.ledger().timestamp());
             Self::store(&env, &budget_id, &budget);
         } else {
             return Ok(0);

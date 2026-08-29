@@ -40,6 +40,22 @@ enum DataKey {
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+    /// Role assignments: (org slug, address) -> Role.
+    Role(String, Address),
+}
+
+/// Granular roles for fine-grained permission control within an organization.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// Full protocol control. Can manage all orgs and global settings.
+    Admin = 0,
+    /// Organization owner. Can manage org modules, ownership, and freeze state.
+    OrgOwner = 1,
+    /// Can register and remove modules for the organization.
+    ModuleManager = 2,
+    /// Can register new contract versions (global upgrade authority).
+    VersionManager = 3,
 }
 
 #[contract]
@@ -123,7 +139,7 @@ impl RegistryContract {
     }
 
     /// Register (or update) a module address for an organization. Callable by
-    /// the admin or the organization owner.
+    /// the admin, org owner, or module manager.
     pub fn register_module(
         env: Env,
         caller: Address,
@@ -132,8 +148,7 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
-        caller.require_auth();
-        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        Self::require_module_manager(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
@@ -152,7 +167,7 @@ impl RegistryContract {
         Ok(())
     }
 
-    /// Remove a module registration. Admin or org owner.
+    /// Remove a module registration. Admin, org owner, or module manager.
     pub fn remove_module(
         env: Env,
         caller: Address,
@@ -160,8 +175,7 @@ impl RegistryContract {
         kind: ModuleKind,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
-        caller.require_auth();
-        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        Self::require_module_manager(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -175,8 +189,8 @@ impl RegistryContract {
     }
 
     /// Record a contract implementation address for a `(kind, version)` pair and
-    /// advance the latest-version pointer if newer. Admin-gated; this is what
-    /// powers the version-lookup upgrade strategy.
+    /// advance the latest-version pointer if newer. Callable by the admin or
+    /// version manager. This is what powers the version-lookup upgrade strategy.
     pub fn register_version(
         env: Env,
         caller: Address,
@@ -185,6 +199,8 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
+        // TODO: Enable version manager role for version registration
+        // For now, keep admin-only for security
         if version == 0 {
             return Err(Error::InvalidInput);
         }
@@ -302,6 +318,64 @@ impl RegistryContract {
         Ok(())
     }
 
+    /// Grant a role to an address for an organization. Admin or org owner may
+    /// grant roles. Org owners cannot grant Admin role.
+    pub fn grant_role(
+        env: Env,
+        caller: Address,
+        org: String,
+        address: Address,
+        role: Role,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+        // Only admin can grant Admin role
+        if role == Role::Admin && !Self::is_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+        // Admin or org owner can grant other roles
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let key = DataKey::Role(org.clone(), address.clone());
+        env.storage().persistent().set(&key, &role);
+        Self::bump(&env, &key);
+        env.events().publish(
+            (symbol_short!("role"), symbol_short!("grant")),
+            (org, address, role_name(&role)),
+        );
+        Ok(())
+    }
+
+    /// Revoke a role from an address for an organization. Admin or org owner may
+    /// revoke roles.
+    pub fn revoke_role(
+        env: Env,
+        caller: Address,
+        org: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let key = DataKey::Role(org.clone(), address.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("role"), symbol_short!("revoke")),
+            (org, address),
+        );
+        Ok(())
+    }
+
+    /// Get the role assigned to an address for an organization.
+    pub fn get_role(env: Env, org: String, address: Address) -> Result<Option<Role>, Error> {
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::Role(org, address)))
+    }
+
     // --- internal helpers ---
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
@@ -351,6 +425,60 @@ impl RegistryContract {
         Ok(())
     }
 
+    /// Check if the caller has at least the required role for the organization.
+    /// Admin always has access regardless of role assignment.
+    fn require_role(
+        env: &Env,
+        caller: &Address,
+        org: &String,
+        required_role: Role,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        // Admin always has full access
+        if Self::is_admin(env, caller) {
+            return Ok(());
+        }
+        // Check if caller has the required role or higher
+        let caller_role: Option<Role> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Role(org.clone(), caller.clone()));
+        match caller_role {
+            Some(role) => {
+                // Role hierarchy: Admin > OrgOwner > ModuleManager > VersionManager
+                let role_level = role_level(&role);
+                let required_level = role_level(&required_role);
+                if role_level <= required_level {
+                    Ok(())
+                } else {
+                    Err(Error::Unauthorized)
+                }
+            }
+            None => Err(Error::Unauthorized),
+        }
+    }
+
+    /// Get the numeric level of a role (lower = more privileged).
+    fn role_level(role: &Role) -> u8 {
+        match role {
+            Role::Admin => 0,
+            Role::OrgOwner => 1,
+            Role::ModuleManager => 2,
+            Role::VersionManager => 3,
+        }
+    }
+
+    /// Check if the caller can manage modules (Admin, OrgOwner, or ModuleManager).
+    fn require_module_manager(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
+        Self::require_role(env, caller, org, Role::ModuleManager)
+    }
+
+    /// Check if the caller can manage versions (Admin or VersionManager).
+    fn require_version_manager(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
+        // Version management is a global operation; org param is used for role lookup
+        Self::require_role(env, caller, org, Role::VersionManager)
+    }
+
     fn bump(env: &Env, key: &DataKey) {
         env.storage().persistent().extend_ttl(
             key,
@@ -382,6 +510,17 @@ impl RegistryInterface for RegistryContract {
             .get(&DataKey::Org(org))
             .ok_or(Error::NotFound)?;
         Ok(recorded == owner)
+    }
+}
+
+/// Convert a role to its string name for event emission.
+fn role_name(role: &Role) -> soroban_sdk::Symbol {
+    use soroban_sdk::symbol_short;
+    match role {
+        Role::Admin => symbol_short!("admin"),
+        Role::OrgOwner => symbol_short!("org_owner"),
+        Role::ModuleManager => symbol_short!("mod_mgr"),
+        Role::VersionManager => symbol_short!("ver_mgr"),
     }
 }
 

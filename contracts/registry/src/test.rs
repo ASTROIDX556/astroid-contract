@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{RegistryContract, RegistryContractClient};
+use crate::{RegistryContract, RegistryContractClient, Role};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::testutils::Address as _;
@@ -182,4 +182,114 @@ fn standard_events_emitted() {
 
     client.freeze(&new_owner, &org);
     assert_event(&env, "RegistryFrozen");
+}
+
+#[test]
+fn module_manager_can_register_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // Grant module manager role to a different address
+    let module_mgr = Address::generate(&env);
+    client.grant_role(&owner, &org, &module_mgr, &Role::ModuleManager);
+
+    // Module manager can register modules
+    let wallet = Address::generate(&env);
+    client.register_module(&module_mgr, &org, &ModuleKind::Wallet, &wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn module_manager_can_remove_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+
+    // Grant module manager role
+    let module_mgr = Address::generate(&env);
+    client.grant_role(&owner, &org, &module_mgr, &Role::ModuleManager);
+
+    // Module manager can remove modules
+    client.remove_module(&module_mgr, &org, &ModuleKind::Wallet);
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn unauthorized_user_cannot_register_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // User without any role
+    let stranger = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    let res = client.try_register_module(&stranger, &org, &ModuleKind::Wallet, &wallet);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn grant_and_revoke_role_work() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let user = Address::generate(&env);
+    // Grant role
+    client.grant_role(&owner, &org, &user, &Role::ModuleManager);
+    assert_eq!(
+        client.get_role(&org, &user),
+        Some(Role::ModuleManager)
+    );
+    // Revoke role
+    client.revoke_role(&owner, &org, &user);
+    assert_eq!(client.get_role(&org, &user), None);
+}
+
+#[test]
+fn revoke_nonexistent_role_fails() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let user = Address::generate(&env);
+    let res = client.try_revoke_role(&owner, &org, &user);
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn org_owner_cannot_grant_admin_role() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let user = Address::generate(&env);
+    // Org owner cannot grant Admin role
+    let res = client.try_grant_role(&owner, &org, &user, &Role::Admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn admin_can_grant_admin_role() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let user = Address::generate(&env);
+    // Admin can grant Admin role
+    client.grant_role(&admin, &org, &user, &Role::Admin);
+    assert_eq!(client.get_role(&org, &user), Some(Role::Admin));
 }

@@ -155,3 +155,62 @@ fn standard_events_emitted() {
     h2.client.withdraw(&h2.admin, &h2.asset, &recipient, &100);
     assert_event(&h2.env, "TransferExecuted");
 }
+
+#[test]
+fn payout_schedule_limits_withdraw_per_interval() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    // Set payout schedule: max 300 per 1 hour
+    h.client.set_payout_schedule(&h.admin, &300, &3_600);
+    let recipient = Address::generate(&h.env);
+    // First withdraw within limit
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(token_balance(&h, &recipient), 200);
+    // Second withdraw would exceed limit (200 + 200 > 300)
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(res, Err(Ok(Error::PayoutScheduleViolated)));
+    // Can still withdraw up to the limit
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 300);
+}
+
+#[test]
+fn payout_schedule_resets_after_interval() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.set_payout_schedule(&h.admin, &300, &3_600);
+    let recipient = Address::generate(&h.env);
+    // Exhaust the interval
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &300);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1);
+    assert_eq!(res, Err(Ok(Error::PayoutScheduleViolated)));
+    // Advance past the interval
+    h.env.ledger().set_timestamp(1_700 + 3_600);
+    // Should be able to withdraw again
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(token_balance(&h, &recipient), 500);
+}
+
+#[test]
+fn clear_payout_schedule_removes_limit() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.set_payout_schedule(&h.admin, &100, &3_600);
+    // Clear the schedule
+    h.client.clear_payout_schedule(&h.admin);
+    let recipient = Address::generate(&h.env);
+    // Can now withdraw more than the previous limit
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &500);
+    assert_eq!(token_balance(&h, &recipient), 500);
+}
+
+#[test]
+fn payout_schedule_invalid_params_rejected() {
+    let h = setup("vault", 1_000);
+    // max_per_interval must be positive
+    let res = h.client.try_set_payout_schedule(&h.admin, &0, &3_600);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    // interval_seconds must be positive
+    let res = h.client.try_set_payout_schedule(&h.admin, &100, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}

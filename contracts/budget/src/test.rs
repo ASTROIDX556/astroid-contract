@@ -39,6 +39,7 @@ fn allocate_creates_active_budget() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     let b: Budget = h.client.get(&id(&h.env, "eng"));
     assert_eq!(b.limit, 1_000);
@@ -59,6 +60,7 @@ fn duplicate_allocation_fails() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     let res = h.client.try_allocate(
         &h.owner,
@@ -66,6 +68,7 @@ fn duplicate_allocation_fails() {
         &2_000,
         &Period::None,
         &false,
+        &0,
         &0,
     );
     assert_eq!(res, Err(Ok(Error::AlreadyExists)));
@@ -80,6 +83,7 @@ fn consume_reduces_remaining() {
         &1_000,
         &Period::None,
         &false,
+        &0,
         &0,
     );
     let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &400);
@@ -98,6 +102,7 @@ fn over_budget_consume_fails_budget_exceeded() {
         &1_000,
         &Period::None,
         &false,
+        &0,
         &0,
     );
     h.client.consume(&h.owner, &id(&h.env, "eng"), &800);
@@ -118,6 +123,7 @@ fn consume_zero_or_negative_rejected() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &0);
     assert_eq!(res, Err(Ok(Error::InvalidAmount)));
@@ -135,6 +141,7 @@ fn non_owner_cannot_consume() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     let stranger = Address::generate(&h.env);
     let res = h.client.try_consume(&stranger, &id(&h.env, "eng"), &100);
@@ -151,6 +158,7 @@ fn reset_clears_spent() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     h.client.consume(&h.owner, &id(&h.env, "eng"), &900);
     h.client.reset(&h.owner, &id(&h.env, "eng"));
@@ -166,6 +174,7 @@ fn frozen_budget_rejects_consume() {
         &1_000,
         &Period::None,
         &false,
+        &0,
         &0,
     );
     h.client.freeze(&h.owner, &id(&h.env, "eng"));
@@ -187,6 +196,7 @@ fn archived_budget_rejects_consume() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     h.client.archive(&h.owner, &id(&h.env, "eng"));
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &100);
@@ -202,6 +212,7 @@ fn daily_budget_auto_resets_after_window() {
         &1_000,
         &Period::Daily,
         &false,
+        &0,
         &0,
     );
     h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
@@ -250,6 +261,7 @@ fn rollover_disabled_clears_unspent() {
         &1_000,
         &Period::Weekly,
         &false,
+        &0,
         &0,
     );
     h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
@@ -332,6 +344,7 @@ fn set_limit_below_spent_rejected() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
     let res = h.client.try_set_limit(&h.owner, &id(&h.env, "eng"), &500);
@@ -351,6 +364,7 @@ fn transfer_allocation_moves_unspent_limit() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     h.client.allocate(
         &h.owner,
@@ -358,6 +372,7 @@ fn transfer_allocation_moves_unspent_limit() {
         &500,
         &Period::None,
         &false,
+        &0,
         &0,
     );
     h.client
@@ -376,6 +391,7 @@ fn transfer_allocation_over_available_fails() {
         &Period::None,
         &false,
         &0,
+        &0,
     );
     h.client.allocate(
         &h.owner,
@@ -383,6 +399,7 @@ fn transfer_allocation_over_available_fails() {
         &500,
         &Period::None,
         &false,
+        &0,
         &0,
     );
     h.client.consume(&h.owner, &id(&h.env, "eng"), &900);
@@ -398,4 +415,201 @@ fn get_missing_budget_fails_not_found() {
     let h = setup();
     let res = h.client.try_get(&id(&h.env, "nope"));
     assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn daily_velocity_cap_limits_spend_per_day() {
+    let h = setup();
+    // Budget with daily velocity cap of 300
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+        &300,
+    );
+    // First spend within cap
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &200);
+    assert_eq!(rem, 800);
+    // Second spend would exceed daily cap (200 + 200 > 300)
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &200);
+    assert_eq!(res, Err(Ok(Error::VelocityExceeded)));
+    // Can still spend up to the cap
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &100);
+    assert_eq!(rem, 700);
+    // Now daily cap is fully exhausted
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(Error::VelocityExceeded)));
+}
+
+#[test]
+fn daily_velocity_cap_resets_after_day() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+        &300,
+    );
+    // Exhaust daily cap
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &300);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(Error::VelocityExceeded)));
+    // Advance one day
+    h.env.ledger().set_timestamp(1_000 + 86_400);
+    // Daily cap should reset
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &200);
+    assert_eq!(rem, 500);
+}
+
+#[test]
+fn daily_velocity_cap_zero_means_no_cap() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+        &0,
+    );
+    // Can spend full budget since no velocity cap
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
+    assert_eq!(rem, 0);
+}
+
+#[test]
+fn set_daily_velocity_cap_works() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+        &0,
+    );
+    // Set velocity cap
+    h.client.set_daily_velocity_cap(&h.owner, &id(&h.env, "eng"), &500);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.daily_velocity_cap, 500);
+    // Spend within new cap
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &400);
+    assert_eq!(rem, 600);
+    // Exceed cap
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &200);
+    assert_eq!(res, Err(Ok(Error::VelocityExceeded)));
+}
+
+#[test]
+fn set_daily_velocity_cap_negative_rejected() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+        &0,
+    );
+    let res = h.client.try_set_daily_velocity_cap(&h.owner, &id(&h.env, "eng"), &-100);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn trigger_recurring_reset_resets_spent_after_period() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &false,
+        &0,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &800);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 200);
+    // Before period elapses, trigger should be a no-op
+    h.client.trigger_recurring_reset(&id(&h.env, "eng"));
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 200);
+    // Advance past the weekly window
+    h.env.ledger().set_timestamp(1_000 + 604_800);
+    // Anyone can trigger the reset
+    let keeper = Address::generate(&h.env);
+    h.env.mock_all_auths();
+    h.client.trigger_recurring_reset(&id(&h.env, "eng"));
+    // Spent should be reset
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 0);
+}
+
+#[test]
+fn trigger_recurring_reset_with_rollover() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &true, // rollover enabled
+        &0,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+    // Advance past the weekly window
+    h.env.ledger().set_timestamp(1_000 + 604_800);
+    h.client.trigger_recurring_reset(&id(&h.env, "eng"));
+    // Unspent (400) should roll over
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_400);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 400);
+    assert_eq!(b.spent, 0);
+}
+
+#[test]
+fn trigger_recurring_reset_one_shot_budget_noop() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None, // one-shot, no recurring reset
+        &false,
+        &0,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &800);
+    // Advance time
+    h.env.ledger().set_timestamp(1_000 + 604_800);
+    // Should be a no-op for one-shot budgets
+    h.client.trigger_recurring_reset(&id(&h.env, "eng"));
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 200);
+}
+
+#[test]
+fn trigger_recurring_reset_expired_budget_fails() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &false,
+        &10_000, // expires at t=10_000
+        &0,
+    );
+    // Advance past expiry
+    h.env.ledger().set_timestamp(20_000);
+    let res = h.client.try_trigger_recurring_reset(&id(&h.env, "eng"));
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
 }

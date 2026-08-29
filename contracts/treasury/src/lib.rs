@@ -43,6 +43,19 @@ pub struct Treasury {
     pub budget: Option<Address>,
     /// Lifecycle state shared with wallets.
     pub state: ResourceState,
+    /// Optional streaming payout schedule for validation.
+    pub payout_schedule: Option<PayoutSchedule>,
+}
+
+/// Streaming payout schedule configuration. Limits how much can be paid out
+/// within a given time interval to enforce a maximum streaming velocity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutSchedule {
+    /// Maximum amount that can be paid out per interval.
+    pub max_per_interval: i128,
+    /// Length of the interval in seconds.
+    pub interval_seconds: u64,
 }
 
 /// Per-asset accounting within the treasury.
@@ -54,6 +67,10 @@ pub struct Holding {
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
+    /// Amount paid out in the current interval (for streaming validation).
+    pub interval_payout: i128,
+    /// Start of the current payout interval (unix seconds).
+    pub interval_start: u64,
 }
 
 #[contracttype]
@@ -82,6 +99,7 @@ impl TreasuryContract {
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
+                payout_schedule: None,
             },
         );
         env.storage()
@@ -122,6 +140,57 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("budget")), ());
+        Ok(())
+    }
+
+    /// Set the streaming payout schedule (admin). Enforces a maximum payout
+    /// velocity per interval for all withdrawals.
+    pub fn set_payout_schedule(
+        env: Env,
+        caller: Address,
+        max_per_interval: i128,
+        interval_seconds: u64,
+    ) -> Result<(), Error> {
+        if max_per_interval <= 0 {
+            return Err(Error::InvalidInput);
+        }
+        if interval_seconds == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.payout_schedule = Some(PayoutSchedule {
+            max_per_interval,
+            interval_seconds,
+        });
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("payout"),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("payout")),
+            (max_per_interval, interval_seconds),
+        );
+        Ok(())
+    }
+
+    /// Clear the streaming payout schedule (admin).
+    pub fn clear_payout_schedule(env: Env, caller: Address) -> Result<(), Error> {
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.payout_schedule = None;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("payout_clr"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("payout_clr")), ());
         Ok(())
     }
 
@@ -202,7 +271,8 @@ impl TreasuryContract {
     }
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
-    /// must clear policy and budget gates before the ledger is debited.
+    /// must clear policy, budget, and payout schedule gates before the ledger
+    /// is debited.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -235,7 +305,22 @@ impl TreasuryContract {
                 .consume(&caller, budget_id, &amount);
         }
 
-        // 3. Debit the internal ledger, then move real tokens out of custody.
+        // 3. Streaming payout schedule validation — enforces max payout velocity.
+        if let Some(schedule) = &t.payout_schedule {
+            let now = env.ledger().timestamp();
+            // Reset interval if elapsed
+            if now >= holding.interval_start.saturating_add(schedule.interval_seconds) {
+                holding.interval_payout = 0;
+                holding.interval_start = now;
+            }
+            let new_payout = checked_add(holding.interval_payout, amount)?;
+            if new_payout > schedule.max_per_interval {
+                return Err(Error::PayoutScheduleViolated);
+            }
+            holding.interval_payout = new_payout;
+        }
+
+        // 4. Debit the internal ledger, then move real tokens out of custody.
         if holding.total_in < amount {
             return Err(Error::InsufficientFunds);
         }
@@ -311,6 +396,8 @@ impl TreasuryContract {
                 total_in: 0,
                 total_out: 0,
                 budget_id: None,
+                interval_payout: 0,
+                interval_start: 0,
             })
     }
 
