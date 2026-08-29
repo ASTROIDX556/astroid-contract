@@ -479,8 +479,6 @@ impl BudgetInterface for BudgetContract {
 
     /// Read remaining allocation, accounting for a pending period transition.
 
-
-
     fn release(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;

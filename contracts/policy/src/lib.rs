@@ -20,6 +20,7 @@
 
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
+use astroid_shared::events::ContractEvent;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Vec,
@@ -291,9 +292,18 @@ impl PolicyInterface for PolicyContract {
     }
 }
 
-/// Emit a `PolicyViolation` event with a stable reason symbol.
+/// Emit a `PolicyViolation` event with a stable reason symbol, using both the
+/// legacy tuple-topic helper and the canonical [`ContractEvent`] schema.
 fn events_policy_violation(env: &Env, policy_id: &String, reason: &str) {
-    astroid_shared::events::policy_violation(env, policy_id, soroban_sdk::Symbol::new(env, reason));
+    let r = soroban_sdk::Symbol::new(env, reason);
+    astroid_shared::events::policy_violation(env, policy_id, r.clone());
+    astroid_shared::events::publish(
+        env,
+        ContractEvent::PolicyViolation {
+            policy_id: policy_id.clone(),
+            reason: r,
+        },
+    );
 }
 
 #[cfg(test)]

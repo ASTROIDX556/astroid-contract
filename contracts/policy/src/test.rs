@@ -1,8 +1,22 @@
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events, Address, BytesN, Env, IntoVal, String, Symbol, Val,
+};
 
 use crate::{PolicyContract, PolicyContractClient};
+
+/// Assert that the canonical `ContractEvent` with the given variant symbol was
+/// published during the test (single-topic event = the variant name).
+fn assert_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+    assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
 
 fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
     let id = env.register_contract(None, PolicyContract);
@@ -160,4 +174,22 @@ fn test_asset_and_window_restrictions() {
         client.try_check_transfer(&p_id, &asset1, &recipient, &100),
         Ok(Ok(()))
     );
+}
+
+#[test]
+fn standard_policy_violation_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    // Amount above the configured max triggers a policy denial -> violation event.
+    let _ = p.try_check_transfer(
+        &String::from_str(&env, "max_txn"),
+        &asset,
+        &recip,
+        &1_000_001,
+    );
+    assert_event(&env, "PolicyViolation");
 }
