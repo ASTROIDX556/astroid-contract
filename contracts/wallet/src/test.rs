@@ -5,7 +5,19 @@ use crate::{ContractCall, WalletContract, WalletContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{token, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val};
+
+/// Assert that the canonical `ContractEvent` with the given variant symbol was
+/// published during the test (single-topic event = the variant name).
+fn assert_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+    assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
 
 struct Harness {
     env: Env,
@@ -402,4 +414,15 @@ fn unknown_wallet_fails_not_found() {
     assert_eq!(res, Err(Ok(Error::NotFound)));
     let res2 = h.client.try_freeze(&stranger, &999);
     assert_eq!(res2, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn standard_events_emitted() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    assert_event(&h.env, "WalletCreated");
+
+    h.client.freeze(&owner, &id);
+    assert_event(&h.env, "WalletStateChanged");
 }
