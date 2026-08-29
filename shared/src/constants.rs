@@ -25,3 +25,6 @@ pub const MIN_THRESHOLD: u32 = 1;
 
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
+
+/// Upper bound on how many discrete calls a single batch may contain (gas safety).
+pub const MAX_BATCH_CALLS: u32 = 16;
