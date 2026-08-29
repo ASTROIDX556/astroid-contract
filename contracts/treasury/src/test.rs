@@ -1,8 +1,22 @@
-use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events, token, Address, Env, IntoVal, String, Symbol, Val,
+};
 
 use astroid_shared::errors::Error;
 
 use crate::{TreasuryContract, TreasuryContractClient};
+
+/// Assert that the canonical `ContractEvent` with the given variant symbol was
+/// published during the test (single-topic event = the variant name).
+fn assert_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+    assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
 
 struct Harness<'a> {
     env: Env,
@@ -161,4 +175,25 @@ fn test_milestone_releases() {
     // releasing beyond fails
     let res = client.try_release_next_milestone(&admin, &mid);
     assert!(res.is_err());
+}
+
+#[test]
+fn standard_events_emitted() {
+    // Configuration changes publish a TreasuryConfigUpdated event. Setting a
+    // (here placeholder) policy/budget address is enough to exercise the emit
+    // path; we avoid a subsequent withdraw on this env because a real policy
+    // gate is not wired up.
+    let h = setup("vault", 0);
+    h.client.set_policy(&h.admin, &h.admin);
+    assert_event(&h.env, "TreasuryConfigUpdated");
+    h.client.set_budget(&h.admin, &h.admin);
+    assert_event(&h.env, "TreasuryConfigUpdated");
+
+    // A successful withdraw (no policy/budget gates configured) publishes a
+    // TransferExecuted event.
+    let h2 = setup("vault", 1_000);
+    let recipient = Address::generate(&h2.env);
+    h2.client.deposit(&h2.admin, &h2.asset, &1_000);
+    h2.client.withdraw(&h2.admin, &h2.asset, &recipient, &100);
+    assert_event(&h2.env, "TransferExecuted");
 }
