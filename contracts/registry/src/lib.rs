@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 //! # Astroid Registry Contract
 //!
 //! The backbone of the protocol and its single source of truth. The registry
@@ -17,6 +18,7 @@
 use astroid_interfaces::RegistryInterface;
 use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
+use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
@@ -110,6 +112,13 @@ impl RegistryContract {
         }
         env.storage().persistent().set(&key, &new_owner);
         Self::bump(&env, &key);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::OrgOwnerChanged {
+                org: org.clone(),
+                new_owner: new_owner.clone(),
+            },
+        );
         env.events().publish(
             (symbol_short!("org"), symbol_short!("owner")),
             (org, new_owner),
@@ -132,6 +141,14 @@ impl RegistryContract {
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryModuleUpdated {
+                org: org.clone(),
+                kind,
+                address: address.clone(),
+            },
+        );
         env.events().publish(
             (symbol_short!("module"), symbol_short!("register")),
             (org, kind, address),
@@ -252,6 +269,13 @@ impl RegistryContract {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Frozen, &true);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryFrozen {
+                org: org.clone(),
+                frozen: true,
+            },
+        );
         env.events()
             .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
         Ok(())
@@ -270,6 +294,13 @@ impl RegistryContract {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Frozen, &false);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryFrozen {
+                org: org.clone(),
+                frozen: false,
+            },
+        );
         env.events()
             .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
         Ok(())
