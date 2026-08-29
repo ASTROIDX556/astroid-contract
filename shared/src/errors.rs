@@ -59,6 +59,8 @@ pub enum Error {
     BatchCallFailed = 67,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
     InvalidNonce = 68,
+    /// A signer weight outside `[1, MAX_SIGNER_WEIGHT]` was supplied.
+    InvalidSignerWeight = 69,
 
     // --- Proposal (70-79) ---
     ProposalExpired = 70,

@@ -23,6 +23,14 @@ pub const MAX_SIGNERS: u32 = 20;
 /// Minimum allowed multisig threshold.
 pub const MIN_THRESHOLD: u32 = 1;
 
+/// Voting weight of a signer with no explicitly recorded weight, so an
+/// unweighted multisig behaves exactly like a plain N-of-M one.
+pub const DEFAULT_SIGNER_WEIGHT: u32 = 1;
+/// Upper bound on a single signer's voting weight. `MAX_SIGNERS *
+/// MAX_SIGNER_WEIGHT` stays far below `u32::MAX`, so aggregate weight can never
+/// overflow however the signer set is configured.
+pub const MAX_SIGNER_WEIGHT: u32 = 1_000_000;
+
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
 

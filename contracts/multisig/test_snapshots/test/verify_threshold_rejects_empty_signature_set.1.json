@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 5,
+    "address": 4,
     "nonce": 0
   },
   "auth": [
@@ -223,22 +223,16 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "propose"
+                "symbol": "verify_threshold"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "symbol": "payment"
+                  "vec": []
                 },
                 {
                   "bytes": "01020304"
-                },
-                {
-                  "u64": 0
                 }
               ]
             }
@@ -259,12 +253,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "propose"
+                "symbol": "verify_threshold"
               }
             ],
             "data": {
               "error": {
-                "contract": 63
+                "contract": 4
               }
             }
           }
@@ -285,7 +279,7 @@
               },
               {
                 "error": {
-                  "contract": 63
+                  "contract": 4
                 }
               }
             ],
@@ -310,7 +304,7 @@
               },
               {
                 "error": {
-                  "contract": 63
+                  "contract": 4
                 }
               }
             ],
@@ -320,21 +314,15 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "propose"
+                  "symbol": "verify_threshold"
                 },
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                    },
-                    {
-                      "symbol": "payment"
+                      "vec": []
                     },
                     {
                       "bytes": "01020304"
-                    },
-                    {
-                      "u64": 0
                     }
                   ]
                 }

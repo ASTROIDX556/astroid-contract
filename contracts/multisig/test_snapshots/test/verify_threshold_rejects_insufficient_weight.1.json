@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 5,
+    "address": 4,
     "nonce": 0
   },
   "auth": [
@@ -223,22 +223,20 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "propose"
+                "symbol": "verify_threshold"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "symbol": "payment"
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                    }
+                  ]
                 },
                 {
                   "bytes": "01020304"
-                },
-                {
-                  "u64": 0
                 }
               ]
             }
@@ -246,6 +244,36 @@
         }
       },
       "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "threshold"
+              },
+              {
+                "symbol": "notmet"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "u32": 1
+                },
+                {
+                  "u32": 2
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": true
     },
     {
       "event": {
@@ -259,12 +287,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "propose"
+                "symbol": "verify_threshold"
               }
             ],
             "data": {
               "error": {
-                "contract": 63
+                "contract": 61
               }
             }
           }
@@ -285,7 +313,7 @@
               },
               {
                 "error": {
-                  "contract": 63
+                  "contract": 61
                 }
               }
             ],
@@ -310,7 +338,7 @@
               },
               {
                 "error": {
-                  "contract": 63
+                  "contract": 61
                 }
               }
             ],
@@ -320,21 +348,19 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "propose"
+                  "symbol": "verify_threshold"
                 },
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                    },
-                    {
-                      "symbol": "payment"
+                      "vec": [
+                        {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      ]
                     },
                     {
                       "bytes": "01020304"
-                    },
-                    {
-                      "u64": 0
                     }
                   ]
                 }
