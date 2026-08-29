@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 //! # Astroid Wallet Contract
 //!
 //! Programmable, stateful custody wallets for AI agents. The contract is the
@@ -19,7 +20,7 @@
 
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
-use astroid_shared::math::{checked_add, checked_sub};
+use astroid_shared::math::{SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
@@ -70,7 +71,7 @@ impl WalletContract {
             .instance()
             .get(&DataKey::WalletCount)
             .ok_or(Error::NotInitialized)?;
-        count = checked_add(count as i128, 1)? as u64;
+        count = (count as i128).safe_add(1)? as u64;
         let id = count;
         let data = WalletData {
             owner: owner.clone(),
@@ -81,6 +82,13 @@ impl WalletContract {
         env.storage().instance().set(&DataKey::WalletCount, &count);
         Self::bump_instance(&env);
         events::wallet_created(&env, id, &owner);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletCreated {
+                wallet_id: id,
+                owner: owner.clone(),
+            },
+        );
         Ok(id)
     }
 
@@ -171,6 +179,13 @@ impl WalletContract {
         wallet.state = ResourceState::Frozen;
         Self::store_wallet(&env, wallet_id, &wallet);
         events::wallet_frozen(&env, wallet_id, &caller);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletStateChanged {
+                wallet_id,
+                state: symbol_short!("frozen"),
+            },
+        );
         Ok(())
     }
 
@@ -283,7 +298,7 @@ impl WalletContract {
     fn credit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
         let key = DataKey::Balance(id, asset.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let updated = checked_add(current, amount)?;
+        let updated = current.safe_add(amount)?;
         env.storage().persistent().set(&key, &updated);
         env.storage().persistent().extend_ttl(
             &key,
@@ -299,7 +314,7 @@ impl WalletContract {
         if current < amount {
             return Err(Error::InsufficientFunds);
         }
-        let updated = checked_sub(current, amount)?;
+        let updated = current.safe_sub(amount)?;
         env.storage().persistent().set(&key, &updated);
         env.storage().persistent().extend_ttl(
             &key,
@@ -310,7 +325,15 @@ impl WalletContract {
     }
 
     fn emit_state(env: &Env, id: u64, action: soroban_sdk::Symbol) {
-        env.events().publish((symbol_short!("wallet"), action), id);
+        env.events()
+            .publish((symbol_short!("wallet"), action.clone()), id);
+        events::publish(
+            env,
+            events::ContractEvent::WalletStateChanged {
+                wallet_id: id,
+                state: action,
+            },
+        );
     }
 
     fn bump_wallet(env: &Env, id: u64) {
