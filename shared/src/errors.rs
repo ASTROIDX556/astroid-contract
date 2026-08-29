@@ -69,6 +69,9 @@ pub enum Error {
     InvalidProposalState = 71,
     ProposalNotApproved = 72,
     NotAnApprover = 73,
+    /// The aggregated count of verified approver signatures did not reach the
+    /// configured threshold at execution time.
+    QuorumNotMet = 74,
 
     // --- Escrow (80-89) ---
     ConditionNotMet = 80,

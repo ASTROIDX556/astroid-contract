@@ -15,8 +15,13 @@
 //! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
 //! transaction reference — so the backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
-//! reaching the threshold moves the proposal to `Approved`, after which it may
-//! be `Executed` (marked done) and finally `Closed`.
+//! reaching the threshold moves the proposal to `Approved`. Execution is
+//! additionally gated on a **cryptographically verified quorum**: [`execute`]
+//! requires the approver signatures over the exact execution payload to be
+//! verified by the Soroban host (via [`Address::require_auth_for_args`]) and to
+//! aggregate to at least the threshold, so a proposal cannot be forged into an
+//! executed state without the genuine signer set. After `Executed` it may be
+//! `Closed`. An already-executed proposal can never be executed again.
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
 //! `close`.
@@ -28,7 +33,9 @@ use astroid_shared::constants::{
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, String, Vec,
+};
 
 /// Proposal lifecycle state.
 #[contracttype]
@@ -242,22 +249,69 @@ impl ProposalContract {
         Ok(())
     }
 
-    /// Execute an approved proposal. Only the proposer may execute (the actual
-    /// value movement happens in the wallet/treasury; this records completion).
-    pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+    /// Execute an approved proposal, gated on a **cryptographically verified
+    /// quorum of approver signatures**.
+    ///
+    /// `caller` relays the invocation; the actual authorization is the genuine
+    /// signer set, not the relayer's identity. Every address in `signers` must be
+    /// a registered approver and must have authorized the exact execution payload
+    /// `(proposal_id, execution_id)` — the Soroban host verifies each signature
+    /// and enforces replay prevention through [`Address::require_auth_for_args`].
+    /// Signatures are aggregated by distinct approver (duplicates count once);
+    /// if the aggregate is below the proposal's `threshold` the execution is
+    /// rejected with [`Error::QuorumNotMet`]. An unregistered signer is rejected
+    /// with [`Error::InvalidSignature`].
+    ///
+    /// The proposal must already be in `Approved` state (on-chain approvals met
+    /// the threshold). Anything else — including `Executed`/`Closed` — is
+    /// rejected, which **prevents double-execution**. The emitted event carries
+    /// `execution_id` so off-chain consumers can correlate each execution.
+    pub fn execute(
+        env: Env,
+        caller: Address,
+        id: u64,
+        execution_id: u64,
+        signers: Vec<Address>,
+    ) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
         Self::ensure_not_expired(&env, &proposal)?;
-        if caller != proposal.proposer {
-            return Err(Error::Unauthorized);
-        }
+        // Double-execution guard: only `Approved` may transition to `Executed`;
+        // an `Executed`/`Closed`/`Rejected`/... proposal never qualifies again.
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
+
+        // Aggregate and verify approver signatures over the exact execution
+        // payload, mirroring the multisig batch-signature scheme. Each distinct
+        // registered approver contributes one verified signature toward the
+        // threshold; duplicates are ignored to prevent weight inflation.
+        let payload = vec![&env, id.into_val(&env), execution_id.into_val(&env)];
+        let mut seen = Vec::new(&env);
+        let mut aggregate: u32 = 0;
+        for signer in signers.iter() {
+            if !proposal.approvers.contains(&signer) {
+                return Err(Error::InvalidSignature);
+            }
+            if seen.contains(&signer) {
+                continue;
+            }
+            seen.push_back(signer.clone());
+            // Soroban host cryptographically verifies the signer's authorization
+            // over the exact payload and enforces replay prevention.
+            signer.require_auth_for_args(payload.clone());
+            aggregate = checked_add(aggregate as i128, 1)? as u32;
+        }
+        if aggregate < proposal.threshold {
+            return Err(Error::QuorumNotMet);
+        }
+
         proposal.state = ProposalState::Executed;
         Self::store(&env, id, &proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("executed")), id);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("executed")),
+            (id, execution_id, caller),
+        );
         Ok(())
     }
 
