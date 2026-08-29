@@ -30,6 +30,8 @@ pub enum Error {
     PolicyHashMismatch = 21,
     EmergencyLock = 22,
     PolicyRecipientRestricted = 23,
+    PolicyMerchantBlocked = 24,
+    PolicyCategoryRestricted = 25,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -39,6 +41,7 @@ pub enum Error {
     BudgetFrozen = 41,
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
+    BudgetExpired = 44,
 
     // --- Wallet (50-59) ---
     WalletFrozen = 50,
@@ -54,12 +57,23 @@ pub enum Error {
     InvalidThreshold = 64,
     TimeLocked = 65,
     TooManySigners = 66,
+    /// A sub-call within a batch failed; the entire batch reverted atomically.
+    BatchCallFailed = 67,
+    /// Batch nonce is not strictly greater than the last used nonce (replay).
+    InvalidNonce = 68,
+    /// A signer with zero (or otherwise invalid) voting weight was supplied.
+    InvalidSignerWeight = 69,
+    /// Accumulated approval weight is below the configured threshold.
+    InsufficientWeight = 90,
 
     // --- Proposal (70-79) ---
     ProposalExpired = 70,
     InvalidProposalState = 71,
     ProposalNotApproved = 72,
     NotAnApprover = 73,
+    CancellationWindowClosed = 74,
+    MathOverflow = 75,
+    DivisionByZero = 76,
 
     // --- Escrow (80-89) ---
     ConditionNotMet = 80,
