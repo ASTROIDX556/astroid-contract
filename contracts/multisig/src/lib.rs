@@ -25,8 +25,8 @@ use astroid_shared::constants::{
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_time_reached;
-use soroban_sdk::{Map, 
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol, Vec,
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, Symbol, Vec,
 };
 
 #[contracttype]
@@ -86,7 +86,9 @@ impl MultiSigContract {
         for s in signers.iter() {
             weights.set(s, 1);
         }
-        env.storage().instance().set(&DataKey::SignerWeights, &weights);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerWeights, &weights);
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -99,10 +101,21 @@ impl MultiSigContract {
     }
 
     /// Add a signer. Signer-gated. Rejects duplicates and over-capacity sets.
-    pub fn add_signer(env: Env, caller: Address, signer: Address, weight: u32) -> Result<(), Error> {
+    pub fn add_signer(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        weight: u32,
+    ) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
-        if weight == 0 { return Err(Error::InvalidInput); }
-        let mut weights: Map<Address, u32> = env.storage().instance().get(&DataKey::SignerWeights).unwrap_or(Map::new(&env));
+        if weight == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let mut weights: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerWeights)
+            .unwrap_or(Map::new(&env));
         if weights.contains_key(signer.clone()) {
             return Err(Error::AlreadyExists);
         }
@@ -110,7 +123,9 @@ impl MultiSigContract {
             return Err(Error::TooManySigners);
         }
         weights.set(signer.clone(), weight);
-        env.storage().instance().set(&DataKey::SignerWeights, &weights);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerWeights, &weights);
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("signer"), symbol_short!("added")), signer);
@@ -132,7 +147,9 @@ impl MultiSigContract {
         for s in signers.iter() {
             weights.set(s, 1);
         }
-        env.storage().instance().set(&DataKey::SignerWeights, &weights);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerWeights, &weights);
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("signer"), symbol_short!("removed")), signer);
@@ -141,10 +158,21 @@ impl MultiSigContract {
 
     /// Update the approval threshold. Signer-gated. Must stay within
     /// `[MIN_THRESHOLD, signers.len()]`.
-    pub fn update_weight(env: Env, caller: Address, signer: Address, weight: u32) -> Result<(), Error> {
+    pub fn update_weight(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        weight: u32,
+    ) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
-        if weight == 0 { return Err(Error::InvalidInput); }
-        let mut weights: Map<Address, u32> = env.storage().instance().get(&DataKey::SignerWeights).unwrap_or(Map::new(&env));
+        if weight == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let mut weights: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerWeights)
+            .unwrap_or(Map::new(&env));
         if !weights.contains_key(signer.clone()) {
             return Err(Error::NotFound);
         }
@@ -157,15 +185,24 @@ impl MultiSigContract {
         if total < threshold {
             return Err(Error::InvalidThreshold);
         }
-        env.storage().instance().set(&DataKey::SignerWeights, &weights);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerWeights, &weights);
         Self::bump_instance(&env);
-        env.events().publish((symbol_short!("config"), symbol_short!("upd_wght")), (signer, weight));
+        env.events().publish(
+            (symbol_short!("config"), symbol_short!("upd_wght")),
+            (signer, weight),
+        );
         Ok(())
     }
 
     pub fn set_threshold(env: Env, caller: Address, threshold: u32) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
-        let weights: Map<Address, u32> = env.storage().instance().get(&DataKey::SignerWeights).unwrap_or(Map::new(&env));
+        let weights: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerWeights)
+            .unwrap_or(Map::new(&env));
         let mut total = 0;
         for (_, w) in weights.iter() {
             total += w;
@@ -259,7 +296,11 @@ impl MultiSigContract {
             return Err(Error::AlreadySigned);
         }
         env.storage().persistent().set(&akey, &true);
-        let weights: Map<Address, u32> = env.storage().instance().get(&DataKey::SignerWeights).unwrap_or(Map::new(&env));
+        let weights: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerWeights)
+            .unwrap_or(Map::new(&env));
         let weight = weights.get(caller.clone()).unwrap_or(0);
         proposal.approvals = checked_add(proposal.approvals as i128, weight as i128)? as u32;
         env.storage()
@@ -332,7 +373,11 @@ impl MultiSigContract {
     // --- internal helpers ---
 
     fn signers(env: &Env) -> Result<Vec<Address>, Error> {
-        let weights: Map<Address, u32> = env.storage().instance().get(&DataKey::SignerWeights).ok_or(Error::NotInitialized)?;
+        let weights: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerWeights)
+            .ok_or(Error::NotInitialized)?;
         let mut vec = Vec::new(env);
         for (k, _) in weights.iter() {
             vec.push_back(k);
@@ -356,7 +401,11 @@ impl MultiSigContract {
 
     fn require_signer(env: &Env, caller: &Address) -> Result<(), Error> {
         caller.require_auth();
-        let weights: Map<Address, u32> = env.storage().instance().get(&DataKey::SignerWeights).ok_or(Error::NotInitialized)?;
+        let weights: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerWeights)
+            .ok_or(Error::NotInitialized)?;
         if !weights.contains_key(caller.clone()) {
             return Err(Error::NotASigner);
         }

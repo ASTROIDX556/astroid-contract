@@ -219,24 +219,36 @@ fn non_signer_cannot_change_config() {
 fn test_dynamic_weights_and_threshold() {
     let h = setup(3, 3);
     let s1 = &h.signers[0];
-    let s2 = &h.signers[1];
+    let _s2 = &h.signers[1];
     let s3 = &h.signers[2];
-    
+
     // total weight is 3. Try to set threshold to 4, should fail.
-    assert_eq!(h.client.try_set_threshold(s1, &4), Err(Ok(Error::InvalidThreshold)));
-    
+    assert_eq!(
+        h.client.try_set_threshold(s1, &4),
+        Err(Ok(Error::InvalidThreshold))
+    );
+
     // Try to set threshold to 0, should fail.
-    assert_eq!(h.client.try_set_threshold(s1, &0), Err(Ok(Error::InvalidThreshold)));
-    
+    assert_eq!(
+        h.client.try_set_threshold(s1, &0),
+        Err(Ok(Error::InvalidThreshold))
+    );
+
     // update weight of s1 to 2. Total is 4.
     h.client.update_weight(s1, s1, &2);
-    
+
     // now we can set threshold to 4
     h.client.set_threshold(s1, &4);
-    
+
     // try to remove s3. weight would drop to 3, but threshold is 4.
-    assert_eq!(h.client.try_remove_signer(s1, s3), Err(Ok(Error::InvalidThreshold)));
-    
+    assert_eq!(
+        h.client.try_remove_signer(s1, s3),
+        Err(Ok(Error::InvalidThreshold))
+    );
+
     // Try to update s1 weight to 1. total drops to 3.
-    assert_eq!(h.client.try_update_weight(s1, s1, &1), Err(Ok(Error::InvalidThreshold)));
+    assert_eq!(
+        h.client.try_update_weight(s1, s1, &1),
+        Err(Ok(Error::InvalidThreshold))
+    );
 }
