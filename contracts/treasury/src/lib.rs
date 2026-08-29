@@ -124,6 +124,13 @@ impl TreasuryContract {
         let mut t = Self::require_admin(&env, &caller)?;
         t.policy = Some(policy);
         Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("policy"),
+            },
+        );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("policy")), ());
         Ok(())
@@ -134,6 +141,13 @@ impl TreasuryContract {
         let mut t = Self::require_admin(&env, &caller)?;
         t.budget = Some(budget);
         Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("budget"),
+            },
+        );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("budget")), ());
         Ok(())
@@ -144,6 +158,13 @@ impl TreasuryContract {
         let mut t = Self::require_admin(&env, &caller)?;
         t.state = ResourceState::Frozen;
         Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("frozen"),
+            },
+        );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("frozen")), ());
         Ok(())
@@ -157,6 +178,13 @@ impl TreasuryContract {
         }
         t.state = ResourceState::Active;
         Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("unfrozen"),
+            },
+        );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("unfrozen")), ());
         Ok(())
@@ -356,6 +384,15 @@ impl TreasuryContract {
             &amount,
         );
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
+        events::publish(
+            &env,
+            events::ContractEvent::TransferExecuted {
+                from: t.admin.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+            },
+        );
         Ok(())
     }
 

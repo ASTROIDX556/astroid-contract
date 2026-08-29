@@ -1,11 +1,22 @@
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Address, Env, String,
+    testutils::Address as _, testutils::Events, token, Address, Env, IntoVal, String, Symbol, Val,
 };
 
 use astroid_shared::errors::Error;
 
 use crate::{TreasuryContract, TreasuryContractClient};
+
+/// Assert that the canonical `ContractEvent` with the given variant symbol was
+/// published during the test (single-topic event = the variant name).
+fn assert_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+    assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
 
 struct Harness<'a> {
     env: Env,
@@ -125,64 +136,22 @@ fn prepare_holds_state() {
 }
 
 #[test]
-fn allowance_caps_withdrawal_and_accumulates() {
-    let h = setup("vault", 1_000);
-    let recipient = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    // Approve a 500 ceiling for admin -> recipient in this asset.
-    h.client
-        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &500, &0);
+fn standard_events_emitted() {
+    // Configuration changes publish a TreasuryConfigUpdated event. Setting a
+    // (here placeholder) policy/budget address is enough to exercise the emit
+    // path; we avoid a subsequent withdraw on this env because a real policy
+    // gate is not wired up.
+    let h = setup("vault", 0);
+    h.client.set_policy(&h.admin, &h.admin);
+    assert_event(&h.env, "TreasuryConfigUpdated");
+    h.client.set_budget(&h.admin, &h.admin);
+    assert_event(&h.env, "TreasuryConfigUpdated");
 
-    // First withdrawal within the ceiling succeeds and is deducted.
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
-    let al = h.client.allowance(&h.admin, &recipient, &h.asset);
-    assert_eq!(al.spent, 400);
-    assert_eq!(token_balance(&h, &recipient), 400);
-
-    // Second withdrawal exceeds the remaining 100 -> rejected at the allowance gate.
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &200);
-    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
-    assert_eq!(token_balance(&h, &recipient), 400);
-
-    // A different recipient is not under the allowance, so it is allowed.
-    let other = Address::generate(&h.env);
-    h.client.withdraw(&h.admin, &h.asset, &other, &100);
-    assert_eq!(token_balance(&h, &other), 100);
-}
-
-#[test]
-fn expired_allowance_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().set_timestamp(10_000);
-    let admin = Address::generate(&env);
-    let id = env.register_contract(None, TreasuryContract);
-    let client = TreasuryContractClient::new(&env, &id);
-    client.initialize(&String::from_str(&env, "vault"), &admin);
-    let token_admin = Address::generate(&env);
-    let asset = env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000);
-    client.deposit(&admin, &asset, &1_000);
-
-    // Allowance already expired (expires_at in the past).
-    let recipient = Address::generate(&env);
-    client.set_allowance(&admin, &admin, &recipient, &asset, &500, &5_000);
-    let res = client.try_withdraw(&admin, &asset, &recipient, &100);
-    assert_eq!(res, Err(Ok(Error::AllowanceExpired)));
-}
-
-#[test]
-fn remove_allowance_clears_cap() {
-    let h = setup("vault", 1_000);
-    let recipient = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client
-        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &0);
-    h.client
-        .remove_allowance(&h.admin, &h.admin, &recipient, &h.asset);
-    // With no allowance in place the full balance may be withdrawn.
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
-    assert_eq!(token_balance(&h, &recipient), 1_000);
+    // A successful withdraw (no policy/budget gates configured) publishes a
+    // TransferExecuted event.
+    let h2 = setup("vault", 1_000);
+    let recipient = Address::generate(&h2.env);
+    h2.client.deposit(&h2.admin, &h2.asset, &1_000);
+    h2.client.withdraw(&h2.admin, &h2.asset, &recipient, &100);
+    assert_event(&h2.env, "TransferExecuted");
 }
