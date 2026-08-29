@@ -37,12 +37,16 @@ use soroban_sdk::{
 pub struct Treasury {
     pub org: String,
     pub admin: Address,
+    /// Emergency admin able to trigger emergency pause.
+    pub emergency_admin: Option<Address>,
     /// Organization's Policy contract — consulted on every spend.
     pub policy: Option<Address>,
     /// Organization's Budget contract root.
     pub budget: Option<Address>,
     /// Lifecycle state shared with wallets.
     pub state: ResourceState,
+    /// Whether the treasury is under emergency pause.
+    pub emergency_paused: bool,
 }
 
 /// Per-asset accounting within the treasury.
@@ -61,6 +65,8 @@ pub struct Holding {
 enum DataKey {
     Treasury,
     Holding(Address),
+    /// Whitelisted asset flag: asset -> bool.
+    WhitelistedAsset(Address),
 }
 
 #[contract]
@@ -79,9 +85,11 @@ impl TreasuryContract {
             &Treasury {
                 org: org.clone(),
                 admin: admin.clone(),
+                emergency_admin: None,
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
+                emergency_paused: false,
             },
         );
         env.storage()
@@ -162,14 +170,122 @@ impl TreasuryContract {
         Ok(())
     }
 
+    // --- emergency pause mechanism ---
+
+    /// Set the emergency admin address. Only the current admin may call.
+    pub fn set_emergency_admin(
+        env: Env,
+        caller: Address,
+        emergency_admin: Address,
+    ) -> Result<(), Error> {
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.emergency_admin = Some(emergency_admin.clone());
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("em_admin"),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("em_admin")),
+            emergency_admin,
+        );
+        Ok(())
+    }
+
+    /// Trigger emergency pause. Only the emergency admin may call.
+    /// Blocks all deposits and withdrawals until cleared.
+    pub fn emergency_pause(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+        let mut t = Self::load(&env);
+        let emergency_admin = t
+            .emergency_admin
+            .ok_or(Error::Unauthorized)?;
+        if caller != emergency_admin {
+            return Err(Error::Unauthorized);
+        }
+        t.emergency_paused = true;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("em_pause"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("em_pause")), ());
+        Ok(())
+    }
+
+    /// Clear emergency pause. Only the admin may call.
+    pub fn emergency_unpause(env: Env, caller: Address) -> Result<(), Error> {
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.emergency_paused = false;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("unem_pa"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("unem_pa")), ());
+        Ok(())
+    }
+
+    // --- asset whitelist ---
+
+    /// Add an asset to the treasury whitelist. Only the admin may call.
+    /// Whitelisted assets are the only ones that can be deposited or withdrawn.
+    pub fn whitelist_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::WhitelistedAsset(asset.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::WhitelistedAsset(asset.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("wl_asset")),
+            asset,
+        );
+        Ok(())
+    }
+
+    /// Remove an asset from the treasury whitelist. Only the admin may call.
+    pub fn remove_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::WhitelistedAsset(asset.clone()), &false);
+        env.storage().persistent().extend_ttl(
+            &DataKey::WhitelistedAsset(asset.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("rm_asset")),
+            asset,
+        );
+        Ok(())
+    }
+
     /// Deposit assets into the treasury (any funder may authorize). Moves real
     /// SAC tokens from `from` into the treasury's custody, then credits the
-    /// internal per-asset accounting.
+    /// internal per-asset accounting. Only whitelisted assets are accepted.
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
         let t = Self::load(&env);
         Self::require_active(&t)?;
+        Self::require_not_emergency_paused(&t)?;
+        Self::require_whitelisted(&env, &asset)?;
         // Pull tokens into the contract's own custody.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -202,7 +318,8 @@ impl TreasuryContract {
     }
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
-    /// must clear policy and budget gates before the ledger is debited.
+    /// must clear policy and budget gates before the ledger is debited. Only
+    /// whitelisted assets may be withdrawn; emergency pause blocks all withdrawals.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -213,6 +330,8 @@ impl TreasuryContract {
         require_positive_amount(amount)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
+        Self::require_not_emergency_paused(&t)?;
+        Self::require_whitelisted(&env, &asset)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
         }
@@ -270,6 +389,14 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
+    /// Check whether an asset is whitelisted for this treasury.
+    pub fn is_whitelisted(env: Env, asset: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WhitelistedAsset(asset))
+            .unwrap_or(false)
+    }
+
     // --- internals ---
 
     fn load(env: &Env) -> Treasury {
@@ -300,6 +427,25 @@ impl TreasuryContract {
             ResourceState::Active => Ok(()),
             _ => Err(Error::InvalidState),
         }
+    }
+
+    fn require_not_emergency_paused(t: &Treasury) -> Result<(), Error> {
+        if t.emergency_paused {
+            return Err(Error::EmergencyPaused);
+        }
+        Ok(())
+    }
+
+    fn require_whitelisted(env: &Env, asset: &Address) -> Result<(), Error> {
+        let whitelisted: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WhitelistedAsset(asset.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            return Err(Error::AssetNotWhitelisted);
+        }
+        Ok(())
     }
 
     fn load_holding(env: &Env, asset: &Address) -> Holding {

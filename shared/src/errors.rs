@@ -46,6 +46,7 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    AllowanceExceeded = 54,
 
     // --- Multisig / approvals (60-69) ---
     InvalidSignature = 60,
@@ -76,4 +77,12 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+
+    // --- Treasury (90-99) ---
+    /// Accumulated approval weight is below the configured threshold.
+    InsufficientWeight = 90,
+    /// Treasury is under emergency pause — all operations blocked.
+    EmergencyPaused = 91,
+    /// Asset is not on the treasury whitelist.
+    AssetNotWhitelisted = 92,
 }

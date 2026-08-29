@@ -37,6 +37,8 @@ enum DataKey {
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
+    /// Per-wallet, per-spender, per-asset allowance: (id, spender, asset) -> i128.
+    Allowance(u64, Address, Address),
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -45,6 +47,18 @@ enum DataKey {
 pub struct WalletData {
     pub owner: Address,
     pub state: ResourceState,
+}
+
+/// Result of a dry-run simulation. Reports the projected balances that would
+/// result from executing the operation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimResult {
+    pub wallet_id: u64,
+    pub from_balance: i128,
+    pub to_balance: i128,
+    pub asset: Address,
+    pub amount: i128,
 }
 
 #[contract]
@@ -237,6 +251,218 @@ impl WalletContract {
         Ok(())
     }
 
+    // --- dry-run simulation interface ---
+
+    /// Simulate a transfer without mutating state. Validates ownership, wallet
+    /// state, and balance, then returns the projected balances. Useful for UIs
+    /// and off-chain callers to preview whether a transfer would succeed.
+    pub fn simulate_transfer(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<SimResult, Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        Self::require_active(&wallet)?;
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet_id, asset.clone()))
+            .unwrap_or(0);
+        if current < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        Ok(SimResult {
+            wallet_id,
+            from_balance: checked_sub(current, amount)?,
+            to_balance: amount,
+            asset,
+            amount,
+        })
+    }
+
+    /// Simulate a withdrawal without mutating state. Validates ownership, wallet
+    /// state, and balance, then returns the projected balances.
+    pub fn simulate_withdraw(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        asset: Address,
+        amount: i128,
+    ) -> Result<SimResult, Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        Self::require_active(&wallet)?;
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet_id, asset.clone()))
+            .unwrap_or(0);
+        if current < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        Ok(SimResult {
+            wallet_id,
+            from_balance: checked_sub(current, amount)?,
+            to_balance: amount,
+            asset,
+            amount,
+        })
+    }
+
+    // --- multi-token allowance tracking ---
+
+    /// Approve `spender` to spend up to `amount` of `asset` from a wallet.
+    /// Only the wallet owner may call. Sets the allowance to `amount`.
+    pub fn approve(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        spender: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        if wallet.state == ResourceState::Archived {
+            return Err(Error::WalletArchived);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()), &amount);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("approve")),
+            (wallet_id, spender, asset, amount),
+        );
+        Ok(())
+    }
+
+    /// Increase a spender's allowance by `amount`. Only the wallet owner may call.
+    pub fn increase_allowance(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        spender: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        if wallet.state == ResourceState::Archived {
+            return Err(Error::WalletArchived);
+        }
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()))
+            .unwrap_or(0);
+        let updated = checked_add(current, amount)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()), &updated);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("inc_allw")),
+            (wallet_id, spender, asset, updated),
+        );
+        Ok(())
+    }
+
+    /// Decrease a spender's allowance by `amount`. Only the wallet owner may call.
+    /// Fails if the resulting allowance would be negative.
+    pub fn decrease_allowance(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        spender: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        if wallet.state == ResourceState::Archived {
+            return Err(Error::WalletArchived);
+        }
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()))
+            .unwrap_or(0);
+        if current < amount {
+            return Err(Error::AllowanceExceeded);
+        }
+        let updated = checked_sub(current, amount)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()), &updated);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("dec_allw")),
+            (wallet_id, spender, asset, updated),
+        );
+        Ok(())
+    }
+
+    /// Transfer `amount` of `asset` from a wallet to `to`, drawing on the
+    /// caller's allowance. The caller must be an approved spender. Deducts the
+    /// allowance, debits the wallet, and moves tokens.
+    pub fn transfer_from(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        caller.require_auth();
+        let wallet = Self::load_wallet(&env, wallet_id)?;
+        Self::require_active(&wallet)?;
+        let allowance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(wallet_id, caller.clone(), asset.clone()))
+            .unwrap_or(0);
+        if allowance < amount {
+            return Err(Error::AllowanceExceeded);
+        }
+        Self::debit(&env, wallet_id, &asset, amount)?;
+        // Decrease allowance after successful debit.
+        let new_allowance = checked_sub(allowance, amount)?;
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, caller.clone(), asset.clone()),
+            &new_allowance,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, caller.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        token::TokenClient::new(&env, &asset).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
+        events::transfer_executed(&env, &env.current_contract_address(), &to, &asset, amount);
+        Ok(())
+    }
+
     // --- views ---
 
     /// Read a wallet's owner + state.
@@ -249,6 +475,14 @@ impl WalletContract {
         env.storage()
             .persistent()
             .get(&DataKey::Balance(wallet_id, asset))
+            .unwrap_or(0)
+    }
+
+    /// Read a spender's current allowance for a wallet's asset (0 if none).
+    pub fn allowance(env: Env, wallet_id: u64, spender: Address, asset: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(wallet_id, spender, asset))
             .unwrap_or(0)
     }
 
