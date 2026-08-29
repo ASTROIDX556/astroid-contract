@@ -40,6 +40,10 @@ enum DataKey {
     EmergencyLock,
     /// State: monotonic proposal id counter (instance).
     ProposalCount,
+    /// Config: ordered quorum tier by index (instance).
+    Tier(u32),
+    /// Config: number of configured tiers (instance).
+    TierCount,
     /// State: proposal record by id (persistent).
     Proposal(u64),
     /// Relationship: whether a signer approved a proposal (persistent).
@@ -52,12 +56,20 @@ enum DataKey {
 /// (e.g. the Treasury) which checks `is_executed`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumTier {
+    pub max_amount: i128,
+    pub required_weight: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MsProposal {
     pub proposer: Address,
     /// A short action tag, e.g. `payment`, `config`.
     pub action: Symbol,
     /// Opaque payload (e.g. serialized transfer intent / hash).
     pub payload: Bytes,
+    pub amount: i128,
     pub approvals: u32,
     pub executed: bool,
     /// Earliest timestamp at which execution is allowed (time lock; 0 = none).
@@ -83,6 +95,7 @@ impl MultiSigContract {
         Self::assert_unique(&signers)?;
 
         env.storage().instance().set(&DataKey::Signers, &signers);
+        env.storage().instance().set(&DataKey::TierCount, &0u32);
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -160,6 +173,41 @@ impl MultiSigContract {
         Ok(())
     }
 
+    /// Configure ascending amount tiers. The final tier must use `i128::MAX`.
+    pub fn set_quorum_tiers(env: Env, caller: Address, tiers: Vec<QuorumTier>) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        if tiers.is_empty() || tiers.get(tiers.len() - 1).unwrap().max_amount != i128::MAX {
+            return Err(Error::InvalidInput);
+        }
+        let signer_count = Self::signers(&env)?.len();
+        let mut previous = None;
+        let mut i = 0;
+        while i < tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if tier.max_amount < 0 || tier.required_weight == 0 || tier.required_weight > signer_count
+                || previous.map(|max| tier.max_amount <= max).unwrap_or(false) {
+                return Err(Error::InvalidInput);
+            }
+            env.storage().instance().set(&DataKey::Tier(i), &tier);
+            previous = Some(tier.max_amount);
+            i += 1;
+        }
+        env.storage().instance().set(&DataKey::TierCount, &tiers.len());
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    pub fn get_quorum_tiers(env: Env) -> Result<Vec<QuorumTier>, Error> {
+        let count: u32 = env.storage().instance().get(&DataKey::TierCount).unwrap_or(0);
+        let mut tiers = Vec::new(&env);
+        let mut i = 0;
+        while i < count {
+            tiers.push_back(env.storage().instance().get(&DataKey::Tier(i)).ok_or(Error::NotInitialized)?);
+            i += 1;
+        }
+        Ok(tiers)
+    }
+
     /// Create a proposal. Only a signer may propose. `unlock_at` sets an optional
     /// time lock (0 = immediately executable once threshold met). The proposer's
     /// approval is counted automatically.
@@ -168,10 +216,14 @@ impl MultiSigContract {
         proposer: Address,
         action: Symbol,
         payload: Bytes,
+        amount: i128,
         unlock_at: u64,
     ) -> Result<u64, Error> {
         Self::require_not_locked(&env)?;
         Self::require_signer(&env, &proposer)?;
+        if amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
 
         let mut count: u64 = env
             .storage()
@@ -185,6 +237,7 @@ impl MultiSigContract {
             proposer: proposer.clone(),
             action,
             payload,
+            amount,
             approvals: 1,
             executed: false,
             unlock_at,
@@ -244,8 +297,15 @@ impl MultiSigContract {
         if proposal.executed {
             return Err(Error::InvalidProposalState);
         }
-        let threshold = Self::threshold(&env)?;
+        let threshold = if let Some(tier) = Self::tier_for_amount(&env, proposal.amount)? {
+            tier.required_weight
+        } else {
+            Self::threshold(&env)?
+        };
         if proposal.approvals < threshold {
+            if Self::has_tiers(&env) {
+                return Err(Error::InsufficientTierWeight);
+            }
             return Err(Error::ThresholdNotMet);
         }
         if proposal.unlock_at != 0 {
@@ -297,6 +357,23 @@ impl MultiSigContract {
             .instance()
             .get(&DataKey::Signers)
             .ok_or(Error::NotInitialized)
+    }
+
+    fn has_tiers(env: &Env) -> bool {
+        env.storage().instance().get::<_, u32>(&DataKey::TierCount).unwrap_or(0) > 0
+    }
+
+    fn tier_for_amount(env: &Env, amount: i128) -> Result<Option<QuorumTier>, Error> {
+        let count: u32 = env.storage().instance().get(&DataKey::TierCount).unwrap_or(0);
+        let mut i = 0;
+        while i < count {
+            let tier: QuorumTier = env.storage().instance().get(&DataKey::Tier(i)).ok_or(Error::NotInitialized)?;
+            if amount <= tier.max_amount {
+                return Ok(Some(tier));
+            }
+            i += 1;
+        }
+        Ok(None)
     }
 
     fn threshold(env: &Env) -> Result<u32, Error> {

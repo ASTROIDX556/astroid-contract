@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{MultiSigContract, MultiSigContractClient};
+use crate::{MultiSigContract, MultiSigContractClient, QuorumTier};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec};
@@ -68,6 +68,7 @@ fn propose_approve_execute_happy_path() {
         &symbol_short!("payment"),
         &payload(&h.env),
         &0,
+        &0,
     );
     // proposer auto-approved (1); second signer approves -> 2 == threshold.
     let approvals = h.client.approve(&h.signers[1], &id);
@@ -77,12 +78,29 @@ fn propose_approve_execute_happy_path() {
 }
 
 #[test]
+#[test]
+fn tiered_quorum_selects_amount_brackets() {
+    let h = setup(3, 1);
+    let mut tiers = Vec::new(&h.env);
+    tiers.push_back(QuorumTier { max_amount: 100, required_weight: 1 });
+    tiers.push_back(QuorumTier { max_amount: 1_000, required_weight: 2 });
+    tiers.push_back(QuorumTier { max_amount: i128::MAX, required_weight: 3 });
+    h.client.set_quorum_tiers(&h.signers[0], &tiers);
+
+    let low = h.client.propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &100, &0);
+    h.client.execute(&h.signers[1], &low);
+    let high = h.client.propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &101, &0);
+    assert_eq!(h.client.try_execute(&h.signers[0], &high), Err(Ok(Error::InsufficientTierWeight)));
+}
+
+#[test]
 fn execute_below_threshold_fails() {
     let h = setup(3, 2);
     let id = h.client.propose(
         &h.signers[0],
         &symbol_short!("payment"),
         &payload(&h.env),
+        &0,
         &0,
     );
     // Only proposer's approval (1) < threshold (2).
@@ -107,6 +125,7 @@ fn double_approval_rejected() {
         &h.signers[0],
         &symbol_short!("payment"),
         &payload(&h.env),
+        &0,
         &0,
     );
     // Proposer already auto-approved.
@@ -146,6 +165,7 @@ fn emergency_lock_blocks_actions() {
         &symbol_short!("payment"),
         &payload(&h.env),
         &0,
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::EmergencyLock)));
 
@@ -155,6 +175,7 @@ fn emergency_lock_blocks_actions() {
         &h.signers[0],
         &symbol_short!("payment"),
         &payload(&h.env),
+        &0,
         &0,
     );
     h.client.approve(&h.signers[1], &id);
