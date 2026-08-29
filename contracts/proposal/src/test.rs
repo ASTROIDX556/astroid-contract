@@ -228,6 +228,6 @@ fn test_cancellation_grace_window() {
 
     h.env.ledger().set_timestamp(160);
     h.client.cancel(&h.proposer, &id2); // works since 160 < 151 + 50 (created at 151)
-    
+
     assert_eq!(h.client.state(&id2), crate::ProposalState::Cancelled);
 }

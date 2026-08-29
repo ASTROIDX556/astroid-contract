@@ -70,14 +70,14 @@ impl Proposal {
     }
 
     pub fn is_active(&self, env: &Env) -> bool {
-        !self.is_expired(env) && matches!(self.state, ProposalState::Pending | ProposalState::Approved)
+        !self.is_expired(env)
+            && matches!(self.state, ProposalState::Pending | ProposalState::Approved)
     }
 
     pub fn can_execute(&self, env: &Env) -> bool {
         self.is_active(env) && self.state == ProposalState::Approved
     }
 }
-
 
 #[contracttype]
 #[derive(Clone)]
@@ -177,7 +177,9 @@ impl ProposalContract {
     pub fn approve(env: Env, caller: Address, id: u64) -> Result<u32, Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        if proposal.is_expired(&env) { return Err(Error::ProposalExpired); }
+        if proposal.is_expired(&env) {
+            return Err(Error::ProposalExpired);
+        }
         if proposal.state != ProposalState::Pending {
             return Err(Error::InvalidProposalState);
         }
@@ -235,7 +237,9 @@ impl ProposalContract {
         ) {
             return Err(Error::InvalidProposalState);
         }
-        if proposal.grace_period != 0 && env.ledger().timestamp() > proposal.created_at + proposal.grace_period {
+        if proposal.grace_period != 0
+            && env.ledger().timestamp() > proposal.created_at + proposal.grace_period
+        {
             return Err(Error::CancellationWindowClosed);
         }
         proposal.state = ProposalState::Cancelled;
@@ -270,7 +274,9 @@ impl ProposalContract {
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        if proposal.is_expired(&env) { return Err(Error::ProposalExpired); }
+        if proposal.is_expired(&env) {
+            return Err(Error::ProposalExpired);
+        }
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
@@ -326,8 +332,6 @@ impl ProposalContract {
             .set(&DataKey::Proposal(id), proposal);
         Self::bump(env, id);
     }
-
-
 
     fn bump(env: &Env, id: u64) {
         env.storage().persistent().extend_ttl(

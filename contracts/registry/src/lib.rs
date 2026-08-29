@@ -129,7 +129,12 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
         env.events().publish(
-            (symbol_short!("module"), symbol_short!("register"), org.clone(), kind.clone()),
+            (
+                symbol_short!("module"),
+                symbol_short!("register"),
+                org.clone(),
+                kind,
+            ),
             address,
         );
         Ok(())
@@ -151,7 +156,12 @@ impl RegistryContract {
         }
         env.storage().persistent().remove(&key);
         env.events().publish(
-            (symbol_short!("module"), symbol_short!("remove"), org.clone(), kind.clone()),
+            (
+                symbol_short!("module"),
+                symbol_short!("remove"),
+                org.clone(),
+                kind,
+            ),
             (),
         );
         Ok(())
@@ -182,7 +192,12 @@ impl RegistryContract {
             Self::bump(&env, &lkey);
         }
         env.events().publish(
-            (symbol_short!("version"), symbol_short!("register"), kind.clone(), version),
+            (
+                symbol_short!("version"),
+                symbol_short!("register"),
+                kind,
+                version,
+            ),
             address,
         );
         Ok(())
@@ -191,15 +206,23 @@ impl RegistryContract {
     /// Look up a specific implementation version.
     pub fn get_version(env: Env, kind: ModuleKind, version: u32) -> Result<Address, Error> {
         let key = DataKey::Version(kind, version);
-        let val = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(val)
     }
 
     /// Look up the latest implementation address for a kind.
     pub fn get_latest(env: Env, kind: ModuleKind) -> Result<Address, Error> {
-        let key = DataKey::LatestVersion(kind.clone());
-        let latest: u32 = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        let key = DataKey::LatestVersion(kind);
+        let latest: u32 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Self::get_version(env, kind, latest)
     }
@@ -207,7 +230,11 @@ impl RegistryContract {
     /// Read the recorded owner of an organization.
     pub fn get_org_owner(env: Env, org: String) -> Result<Address, Error> {
         let key = DataKey::Org(org);
-        let val = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(val)
     }
@@ -336,7 +363,11 @@ impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org, kind);
-        let val = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(val)
     }
@@ -344,7 +375,11 @@ impl RegistryInterface for RegistryContract {
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
         Self::check_frozen(&env)?;
         let key = DataKey::Org(org);
-        let recorded: Address = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        let recorded: Address = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(recorded == owner)
     }

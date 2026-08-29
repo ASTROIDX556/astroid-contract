@@ -7,19 +7,27 @@
 use crate::errors::Error;
 
 pub trait SafeAdd {
-    fn safe_add(self, other: Self) -> Result<Self, Error> where Self: Sized;
+    fn safe_add(self, other: Self) -> Result<Self, Error>
+    where
+        Self: Sized;
 }
 
 pub trait SafeSub {
-    fn safe_sub(self, other: Self) -> Result<Self, Error> where Self: Sized;
+    fn safe_sub(self, other: Self) -> Result<Self, Error>
+    where
+        Self: Sized;
 }
 
 pub trait SafeMul {
-    fn safe_mul(self, other: Self) -> Result<Self, Error> where Self: Sized;
+    fn safe_mul(self, other: Self) -> Result<Self, Error>
+    where
+        Self: Sized;
 }
 
 pub trait SafeDiv {
-    fn safe_div(self, other: Self) -> Result<Self, Error> where Self: Sized;
+    fn safe_div(self, other: Self) -> Result<Self, Error>
+    where
+        Self: Sized;
 }
 
 impl SafeAdd for i128 {
@@ -64,5 +72,11 @@ pub fn checked_mul(a: i128, b: i128) -> Result<i128, Error> {
 }
 
 pub fn checked_div(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_div(b).map_err(|e| if e == Error::DivisionByZero { Error::InvalidInput } else { Error::Overflow })
+    a.safe_div(b).map_err(|e| {
+        if e == Error::DivisionByZero {
+            Error::InvalidInput
+        } else {
+            Error::Overflow
+        }
+    })
 }
