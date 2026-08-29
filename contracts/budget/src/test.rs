@@ -399,3 +399,221 @@ fn get_missing_budget_fails_not_found() {
     let res = h.client.try_get(&id(&h.env, "nope"));
     assert_eq!(res, Err(Ok(Error::NotFound)));
 }
+
+#[test]
+fn rollover_enabled_without_period_fails() {
+    let h = setup();
+    let res = h.client.try_allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &true,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidPeriod)));
+}
+
+#[test]
+fn multiple_daily_cycles_with_rollover() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Daily,
+        &true,
+        &0,
+    );
+    // Day 1: spend 600, leave 400 unspent
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 400);
+    
+    // Day 2: 400 rolls over, new capacity = 1000 + 400 = 1400
+    h.env.ledger().set_timestamp(1_000 + 86_400);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_400);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &800);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 600);
+    
+    // Day 3: 600 rolls over, new capacity = 1000 + 600 = 1600
+    h.env.ledger().set_timestamp(1_000 + 2 * 86_400);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_600);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 600);
+}
+
+#[test]
+fn multiple_daily_cycles_without_rollover() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Daily,
+        &false,
+        &0,
+    );
+    // Day 1: spend 600, leave 400 unspent
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+    
+    // Day 2: unspent cleared, capacity back to 1000
+    h.env.ledger().set_timestamp(1_000 + 86_400);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &500);
+    
+    // Day 3: again unspent cleared, capacity back to 1000
+    h.env.ledger().set_timestamp(1_000 + 2 * 86_400);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 0);
+}
+
+#[test]
+fn weekly_cycles_across_multiple_weeks() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "marketing"),
+        &5_000,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    // Week 1: spend 3000, leave 2000 unspent
+    h.client.consume(&h.owner, &id(&h.env, "marketing"), &3_000);
+    
+    // Week 2: 2000 rolls over, capacity = 5000 + 2000 = 7000
+    h.env.ledger().set_timestamp(1_000 + 604_800);
+    assert_eq!(h.client.remaining(&id(&h.env, "marketing")), 7_000);
+    h.client.consume(&h.owner, &id(&h.env, "marketing"), &4_000);
+    
+    // Week 3: 3000 rolls over, capacity = 5000 + 3000 = 8000
+    h.env.ledger().set_timestamp(1_000 + 2 * 604_800);
+    assert_eq!(h.client.remaining(&id(&h.env, "marketing")), 8_000);
+    
+    // Week 4: 8000 rolls over (since nothing spent in week 3), capacity = 5000 + 8000 = 13000
+    h.env.ledger().set_timestamp(1_000 + 3 * 604_800);
+    assert_eq!(h.client.remaining(&id(&h.env, "marketing")), 13_000);
+}
+
+#[test]
+fn monthly_cycles_with_rollover() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "ops"),
+        &10_000,
+        &Period::Monthly,
+        &true,
+        &0,
+    );
+    // Month 1: spend 7000, leave 3000 unspent
+    h.client.consume(&h.owner, &id(&h.env, "ops"), &7_000);
+    
+    // Month 2: 3000 rolls over, capacity = 10000 + 3000 = 13000
+    h.env.ledger().set_timestamp(1_000 + 2_592_000);
+    assert_eq!(h.client.remaining(&id(&h.env, "ops")), 13_000);
+    h.client.consume(&h.owner, &id(&h.env, "ops"), &8_000);
+    
+    // Month 3: 5000 rolls over, capacity = 10000 + 5000 = 15000
+    h.env.ledger().set_timestamp(1_000 + 2 * 2_592_000);
+    assert_eq!(h.client.remaining(&id(&h.env, "ops")), 15_000);
+}
+
+#[test]
+fn rollover_accumulates_across_periods() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "research"),
+        &1_000,
+        &Period::Daily,
+        &true,
+        &0,
+    );
+    // Day 1: spend 200, leave 800 unspent
+    h.client.consume(&h.owner, &id(&h.env, "research"), &200);
+    
+    // Day 2: 800 rolls over, spend 100, leave 700 unspent + 800 rollover = 1500 total capacity
+    h.env.ledger().set_timestamp(1_000 + 86_400);
+    assert_eq!(h.client.remaining(&id(&h.env, "research")), 1_800);
+    h.client.consume(&h.owner, &id(&h.env, "research"), &100);
+    
+    // Day 3: 1700 rolls over (1000 base + 800 previous rollover - 100 spent = 1700)
+    h.env.ledger().set_timestamp(1_000 + 2 * 86_400);
+    assert_eq!(h.client.remaining(&id(&h.env, "research")), 2_700);
+    let b: Budget = h.client.get(&id(&h.env, "research"));
+    assert_eq!(b.rollover_credit, 1_700);
+}
+
+#[test]
+fn auto_reset_during_consumption() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "dev"),
+        &1_000,
+        &Period::Daily,
+        &false,
+        &0,
+    );
+    // Exhaust the budget
+    h.client.consume(&h.owner, &id(&h.env, "dev"), &1_000);
+    assert_eq!(h.client.remaining(&id(&h.env, "dev")), 0);
+    
+    // Advance past the daily window and consume - should auto-reset
+    h.env.ledger().set_timestamp(1_000 + 86_400);
+    let rem = h.client.consume(&h.owner, &id(&h.env, "dev"), &500);
+    assert_eq!(rem, 500);
+    
+    let b: Budget = h.client.get(&id(&h.env, "dev"));
+    assert_eq!(b.spent, 500);
+    assert_eq!(b.window_start, 1_000 + 86_400);
+}
+
+#[test]
+fn period_transition_with_pending_spend() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "qa"),
+        &1_000,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    // Spend 600 in week 1
+    h.client.consume(&h.owner, &id(&h.env, "qa"), &600);
+    
+    // Advance to week 2, then spend 900 (400 rollover + 500 from new limit)
+    h.env.ledger().set_timestamp(1_000 + 604_800);
+    let rem = h.client.consume(&h.owner, &id(&h.env, "qa"), &900);
+    assert_eq!(rem, 500); // 1400 capacity - 900 spent = 500 remaining
+    
+    let b: Budget = h.client.get(&id(&h.env, "qa"));
+    assert_eq!(b.spent, 900);
+    assert_eq!(b.rollover_credit, 400);
+}
+
+#[test]
+fn budget_window_start_advances_correctly() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "infra"),
+        &1_000,
+        &Period::Daily,
+        &false,
+        &0,
+    );
+    
+    let b: Budget = h.client.get(&id(&h.env, "infra"));
+    assert_eq!(b.window_start, 1_000);
+    
+    // Advance time by 2 days and trigger a transition
+    h.env.ledger().set_timestamp(1_000 + 2 * 86_400);
+    h.client.consume(&h.owner, &id(&h.env, "infra"), &100);
+    
+    let b: Budget = h.client.get(&id(&h.env, "infra"));
+    assert_eq!(b.window_start, 1_000 + 2 * 86_400);
+}

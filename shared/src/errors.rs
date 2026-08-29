@@ -40,6 +40,8 @@ pub enum Error {
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
+    InvalidPeriod = 45,
+    PeriodMismatch = 46,
 
     // --- Wallet (50-59) ---
     WalletFrozen = 50,

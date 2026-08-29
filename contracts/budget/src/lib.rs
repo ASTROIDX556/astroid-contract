@@ -113,6 +113,7 @@ impl BudgetContract {
         owner.require_auth();
         require_non_empty(&budget_id)?;
         require_non_negative_amount(limit)?;
+        Self::validate_period_configuration(&period, &rollover_enabled)?;
         let key = DataKey::Budget(budget_id.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
@@ -335,6 +336,14 @@ impl BudgetContract {
 
     // --- internal helpers ---
 
+    /// Validate period configuration: rollover cannot be enabled without a period.
+    fn validate_period_configuration(period: &Period, rollover_enabled: &bool) -> Result<(), Error> {
+        if *rollover_enabled && *period == Period::None {
+            return Err(Error::InvalidPeriod);
+        }
+        Ok(())
+    }
+
     fn load(env: &Env, id: &String) -> Result<Budget, Error> {
         env.storage()
             .persistent()
@@ -400,7 +409,7 @@ impl BudgetContract {
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         let leftover = checked_sub(capacity, budget.spent)?;
         if budget.rollover_enabled {
-            budget.rollover_credit = checked_add(budget.rollover_credit, leftover)?;
+            budget.rollover_credit = leftover;
         } else {
             budget.rollover_credit = 0;
         }
