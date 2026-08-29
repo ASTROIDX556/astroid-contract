@@ -2,17 +2,16 @@
 #![allow(clippy::too_many_arguments)]
 //! # Astroid MultiSig Contract
 //!
-//! Prevents unilateral spending by requiring **N of M** signer approvals before
-//! an action executes (PRD Doc 7 §MultiSig). The contract owns a dynamic signer
-//! set and a threshold, and manages internal proposals through an
-//! approve → execute flow with an optional per-proposal time lock and a global
-//! emergency lock.
+//! Prevents unilateral spending by requiring an approval **weight** threshold
+//! before an action executes (PRD Doc 7 §MultiSig). Each signer is assigned a
+//! positive voting weight and the contract tracks the accumulated weight of
+//! approvals against a configurable `threshold` (expressed in weight units,
+//! not raw signer count). This lets organizations give different administrative
+//! keys or partner entities proportionally larger influence.
 //!
-//! Governance actions (`add_signer`, `remove_signer`, `set_threshold`,
-//! `set_emergency_lock`) are themselves gated: they require the caller to be a
-//! current signer and are authorized directly. In production these would
-//! typically be routed through the proposal flow too; they are exposed directly
-//! here for the platform's administrative bootstrap and kept signer-gated.
+//! The contract owns a dynamic weighted signer set and a threshold, and manages
+//! internal proposals through an approve → execute flow with an optional
+//! per-proposal time lock and a global emergency lock.
 //!
 //! [`MultiSigContract::execute_batch`] additionally supports bundling multiple
 //! discrete contract calls into one transaction: each contributing signer's
@@ -44,7 +43,12 @@
 //! `ThresholdChanged`, `ThresholdNotMet`, `ProposalApproved`,
 //! `ProposalExecuted`, `BatchExecuted`, `EmergencyLock`.
 //!
-//! Execution below threshold is rejected with [`Error::ThresholdNotMet`].
+//! Events: `SignerAdded`, `SignerRemoved`, `SignerWeightUpdated`,
+//! `ThresholdChanged`, `ProposalApproved`, `ProposalExecuted`,
+//! `EmergencyLock`.
+//!
+//! Execution below the weight threshold is rejected with
+//! [`Error::InsufficientWeight`].
 
 use astroid_shared::constants::{
     DEFAULT_SIGNER_WEIGHT, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS,
@@ -62,9 +66,9 @@ use soroban_sdk::{
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
-    /// Config: current signer set (instance).
+    /// Config: current weighted signer set (instance).
     Signers,
-    /// Config: current approval threshold (instance).
+    /// Config: current approval weight threshold (instance).
     Threshold,
     /// State: global emergency lock flag (instance).
     EmergencyLock,
@@ -81,10 +85,19 @@ enum DataKey {
     Weights,
 }
 
+/// A registered signer and its positive voting weight.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerWeight {
+    pub address: Address,
+    pub weight: u32,
+}
+
 /// Internal multisig proposal. `action`/`payload` describe the intended change
-/// or call; the multisig only records approvals and marks it executed once the
-/// threshold is met. Actual value movement is delegated to the calling context
-/// (e.g. the Treasury) which checks `is_executed`.
+/// or call; the multisig only records weighted approvals and marks it executed
+/// once the accumulated weight meets the threshold. Actual value movement is
+/// delegated to the calling context (e.g. the Treasury) which checks
+/// `is_executed`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MsProposal {
@@ -96,6 +109,8 @@ pub struct MsProposal {
     /// Accumulated signature weight of everyone who approved so far, compared
     /// against the threshold at execution time.
     pub approvals: u32,
+    /// Accumulated approval weight (sum of approver weights).
+    pub approval_weight: u32,
     pub executed: bool,
     /// Earliest timestamp at which execution is allowed (time lock; 0 = none).
     pub unlock_at: u64,
@@ -125,6 +140,10 @@ impl MultiSigContract {
     /// Weights are adjusted afterwards with
     /// [`MultiSigContract::set_signer_weight`].
     pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32) -> Result<(), Error> {
+    /// Initialize with an initial weighted signer set and a weight threshold.
+    /// `threshold` must be within `[MIN_THRESHOLD, total_weight]` and the signer
+    /// set within `MAX_SIGNERS`, with all weights positive and addresses unique.
+    pub fn initialize(env: Env, signers: Vec<SignerWeight>, threshold: u32) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Threshold) {
             return Err(Error::AlreadyInitialized);
         }
@@ -132,7 +151,13 @@ impl MultiSigContract {
         if n == 0 || n > MAX_SIGNERS {
             return Err(Error::InvalidInput);
         }
-        Self::validate_threshold(threshold, n)?;
+        for s in signers.iter() {
+            if s.weight == 0 {
+                return Err(Error::InvalidSignerWeight);
+            }
+        }
+        let total = Self::total_weight(&signers)?;
+        Self::validate_threshold(threshold, total)?;
         Self::assert_unique(&signers)?;
 
         env.storage().instance().set(&DataKey::Signers, &signers);
@@ -159,6 +184,9 @@ impl MultiSigContract {
     /// Add a signer with an explicit voting weight in
     /// `[1, MAX_SIGNER_WEIGHT]`. Signer-gated.
     pub fn add_signer_with_weight(
+    /// Add a signer with a positive weight. Signer-gated. Rejects duplicates and
+    /// over-capacity sets, and weights below 1.
+    pub fn add_signer(
         env: Env,
         caller: Address,
         signer: Address,
@@ -166,14 +194,20 @@ impl MultiSigContract {
     ) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         Self::validate_weight(weight)?;
+        if weight == 0 {
+            return Err(Error::InvalidSignerWeight);
+        }
         let mut signers = Self::signers(&env)?;
-        if signers.contains(&signer) {
+        if signers.iter().any(|s| s.address == signer) {
             return Err(Error::AlreadyExists);
         }
         if signers.len() >= MAX_SIGNERS {
             return Err(Error::TooManySigners);
         }
-        signers.push_back(signer.clone());
+        signers.push_back(SignerWeight {
+            address: signer.clone(),
+            weight,
+        });
         env.storage().instance().set(&DataKey::Signers, &signers);
         Self::store_weight(&env, &signer, weight);
         Self::bump_instance(&env);
@@ -215,11 +249,20 @@ impl MultiSigContract {
         Ok(())
     }
 
-    /// Remove a signer. Signer-gated. Refuses to drop below the threshold or to
-    /// empty the set, so the multisig can never become unusable.
+    /// Remove a signer. Signer-gated. Refuses to drop the remaining total weight
+    /// below the threshold, so the multisig can never become unusable.
     pub fn remove_signer(env: Env, caller: Address, signer: Address) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         let mut signers = Self::signers(&env)?;
+        let idx: u32 = signers
+            .iter()
+            .position(|s| s.address == signer)
+            .ok_or(Error::NotASigner)? as u32;
+        let removed_weight = signers.get(idx).unwrap().weight;
+        let remaining = checked_add(
+            Self::total_weight(&signers)? as i128 - removed_weight as i128,
+            0,
+        )? as u32;
         let threshold = Self::threshold(&env)?;
         let idx = signers.first_index_of(&signer).ok_or(Error::NotASigner)?;
         let mut weights = Self::weights(&env);
@@ -230,6 +273,7 @@ impl MultiSigContract {
             Self::weight_of(&weights, &signer) as i128,
         )?;
         if (remaining as u32) < threshold {
+        if remaining < threshold {
             return Err(Error::InvalidThreshold);
         }
         signers.remove(idx);
@@ -249,6 +293,49 @@ impl MultiSigContract {
         Self::require_signer(&env, &caller)?;
         let signers = Self::signers(&env)?;
         Self::validate_threshold(threshold, Self::total_weight(&env, &signers)?)?;
+    /// Update the voting weight of an existing signer. Signer-gated. The new
+    /// weight must keep the total at or above the configured threshold; weights
+    /// of 0 are rejected.
+    pub fn set_signer_weight(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        weight: u32,
+    ) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        if weight == 0 {
+            return Err(Error::InvalidSignerWeight);
+        }
+        let mut signers = Self::signers(&env)?;
+        let idx: u32 = signers
+            .iter()
+            .position(|s| s.address == signer)
+            .ok_or(Error::NotASigner)? as u32;
+        let old_weight = signers.get(idx).unwrap().weight;
+        let total = Self::total_weight(&signers)?;
+        let new_total = checked_add(total as i128 - old_weight as i128 + weight as i128, 0)? as u32;
+        let threshold = Self::threshold(&env)?;
+        if new_total < threshold {
+            return Err(Error::InvalidThreshold);
+        }
+        let mut updated = signers.get(idx).unwrap();
+        updated.weight = weight;
+        signers.set(idx, updated);
+        env.storage().instance().set(&DataKey::Signers, &signers);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("signer"), symbol_short!("weight")),
+            (signer, weight),
+        );
+        Ok(())
+    }
+
+    /// Update the approval weight threshold. Signer-gated. Must stay within
+    /// `[MIN_THRESHOLD, total_weight]`.
+    pub fn set_threshold(env: Env, caller: Address, threshold: u32) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        let signers = Self::signers(&env)?;
+        Self::validate_threshold(threshold, Self::total_weight(&signers)?)?;
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -275,7 +362,7 @@ impl MultiSigContract {
 
     /// Create a proposal. Only a signer may propose. `unlock_at` sets an optional
     /// time lock (0 = immediately executable once threshold met). The proposer's
-    /// approval is counted automatically.
+    /// weight is counted automatically.
     pub fn propose(
         env: Env,
         proposer: Address,
@@ -294,12 +381,14 @@ impl MultiSigContract {
         count = checked_add(count as i128, 1)? as u64;
         let id = count;
 
+        let proposer_weight = Self::weight_of(&env, &proposer)?;
         let proposal = MsProposal {
             proposer: proposer.clone(),
             action,
             payload,
             // The proposer's approval is counted at its own weight.
             approvals: Self::weight_of(&Self::weights(&env), &proposer),
+            approval_weight: proposer_weight,
             executed: false,
             unlock_at,
         };
@@ -325,6 +414,9 @@ impl MultiSigContract {
     /// Approve a proposal. Only signers may approve, once each. The caller's
     /// voting weight is added to the proposal's accumulated weight. Emits
     /// `ProposalApproved` with the running total.
+    /// Approve a proposal. Only signers may approve, once each. Their weight is
+    /// added to the accumulated total. Emits `ProposalApproved` with the running
+    /// weight.
     pub fn approve(env: Env, caller: Address, proposal_id: u64) -> Result<u32, Error> {
         Self::require_not_locked(&env)?;
         Self::require_signer(&env, &caller)?;
@@ -336,23 +428,27 @@ impl MultiSigContract {
         if env.storage().persistent().get(&akey).unwrap_or(false) {
             return Err(Error::AlreadySigned);
         }
+        let weight = Self::weight_of(&env, &caller)?;
         env.storage().persistent().set(&akey, &true);
         let weight = Self::weight_of(&Self::weights(&env), &caller);
         proposal.approvals = checked_add(proposal.approvals as i128, weight as i128)? as u32;
+        proposal.approval_weight =
+            checked_add(proposal.approval_weight as i128, weight as i128)? as u32;
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         Self::bump_proposal(&env, proposal_id);
         env.events().publish(
             (symbol_short!("proposal"), symbol_short!("approved")),
-            (proposal_id, caller, proposal.approvals),
+            (proposal_id, caller, proposal.approval_weight),
         );
-        Ok(proposal.approvals)
+        Ok(proposal.approval_weight)
     }
 
-    /// Execute a proposal once it has reached threshold and any time lock has
-    /// elapsed. Marks it executed and emits `ProposalExecuted`. Rejects with
-    /// [`Error::ThresholdNotMet`] when approvals are insufficient.
+    /// Execute a proposal once the accumulated approval weight meets the
+    /// threshold and any time lock has elapsed. Marks it executed and emits
+    /// `ProposalExecuted`. Rejects with [`Error::InsufficientWeight`] when the
+    /// accumulated weight is below the threshold.
     pub fn execute(env: Env, caller: Address, proposal_id: u64) -> Result<(), Error> {
         Self::require_not_locked(&env)?;
         Self::require_signer(&env, &caller)?;
@@ -364,6 +460,8 @@ impl MultiSigContract {
         if proposal.approvals < threshold {
             Self::emit_threshold_not_met(&env, proposal.approvals, threshold);
             return Err(Error::ThresholdNotMet);
+        if proposal.approval_weight < threshold {
+            return Err(Error::InsufficientWeight);
         }
         if proposal.unlock_at != 0 {
             require_time_reached(&env, proposal.unlock_at)?;
@@ -414,7 +512,7 @@ impl MultiSigContract {
         Self::require_not_locked(&env)?;
         let signers = Self::signers(&env)?;
         let threshold = Self::threshold(&env)?;
-        if !signers.contains(&caller) {
+        if !signers.iter().any(|s| s.address == caller) {
             return Err(Error::NotASigner);
         }
 
@@ -444,6 +542,15 @@ impl MultiSigContract {
         let mut signatories = vec![&env, caller.clone()];
         for approver in approvers.iter() {
             signatories.push_back(approver);
+            if !signers.iter().any(|s| s.address == approver) {
+                return Err(Error::NotASigner);
+            }
+            if seen.contains(&approver) {
+                continue;
+            }
+            seen.push_back(approver.clone());
+            approver.require_auth_for_args(payload.clone());
+            weight = checked_add(weight as i128, 1)? as u32;
         }
         let weight = Self::accumulate_weight(&env, &signers, &signatories, &payload)?;
         if weight < threshold {
@@ -530,8 +637,8 @@ impl MultiSigContract {
             .unwrap_or(0)
     }
 
-    pub fn get_signers(env: Env) -> Result<Vec<Address>, Error> {
-        Self::signers(&env)
+    pub fn get_signers(env: Env) -> Vec<SignerWeight> {
+        Self::signers(&env).unwrap_or_else(|_| Vec::new(&env))
     }
 
     pub fn get_threshold(env: Env) -> Result<u32, Error> {
@@ -540,7 +647,7 @@ impl MultiSigContract {
 
     pub fn is_signer(env: Env, who: Address) -> bool {
         Self::signers(&env)
-            .map(|s| s.contains(&who))
+            .map(|s| s.iter().any(|sw| sw.address == who))
             .unwrap_or(false)
     }
 
@@ -553,11 +660,32 @@ impl MultiSigContract {
 
     // --- internal helpers ---
 
-    fn signers(env: &Env) -> Result<Vec<Address>, Error> {
+    fn signers(env: &Env) -> Result<Vec<SignerWeight>, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Signers)
             .ok_or(Error::NotInitialized)
+    }
+
+    fn total_weight(signers: &Vec<SignerWeight>) -> Result<u32, Error> {
+        let mut total: i128 = 0;
+        let len = signers.len();
+        let mut i = 0;
+        while i < len {
+            let w = signers.get(i).unwrap().weight;
+            total = checked_add(total, w as i128)?;
+            i += 1;
+        }
+        Ok(total as u32)
+    }
+
+    fn weight_of(env: &Env, who: &Address) -> Result<u32, Error> {
+        let signers = Self::signers(env)?;
+        signers
+            .iter()
+            .find(|s| &s.address == who)
+            .map(|s| s.weight)
+            .ok_or(Error::NotASigner)
     }
 
     fn threshold(env: &Env) -> Result<u32, Error> {
@@ -577,7 +705,7 @@ impl MultiSigContract {
     fn require_signer(env: &Env, caller: &Address) -> Result<(), Error> {
         caller.require_auth();
         let signers = Self::signers(env)?;
-        if !signers.contains(caller) {
+        if !signers.iter().any(|s| &s.address == caller) {
             return Err(Error::NotASigner);
         }
         Ok(())
@@ -711,13 +839,14 @@ impl MultiSigContract {
     }
 
     fn assert_unique(signers: &Vec<Address>) -> Result<(), Error> {
+    fn assert_unique(signers: &Vec<SignerWeight>) -> Result<(), Error> {
         let len = signers.len();
         let mut i = 0;
         while i < len {
-            let a = signers.get(i).unwrap();
+            let a = signers.get(i).unwrap().address.clone();
             let mut j = i + 1;
             while j < len {
-                if a == signers.get(j).unwrap() {
+                if a == signers.get(j).unwrap().address {
                     return Err(Error::InvalidInput);
                 }
                 j += 1;

@@ -61,6 +61,10 @@ pub enum Error {
     InvalidNonce = 68,
     /// A signer weight outside `[1, MAX_SIGNER_WEIGHT]` was supplied.
     InvalidSignerWeight = 69,
+    /// A signer with zero (or otherwise invalid) voting weight was supplied.
+    InvalidSignerWeight = 69,
+    /// Accumulated approval weight is below the configured threshold.
+    InsufficientWeight = 90,
 
     // --- Proposal (70-79) ---
     ProposalExpired = 70,
