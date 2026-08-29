@@ -16,9 +16,18 @@
 //! This contract answers: "may `amount` of `asset` flow to `recipient`
 //! right now?" with a deterministic [`Error`] when it may not.
 //!
-//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
+//! Besides the scalar gates, a policy owns an **asset blacklist**: a set of
+//! token contract addresses that may never be moved under that policy, no
+//! matter what the rest of the configuration allows. Autonomous agents pull
+//! their token lists from off-chain data, so an explicit on-chain deny list is
+//! the backstop against an unsupported or malicious asset being transferred.
+//! A blacklisted asset denies the transfer with [`Error::AssetBlacklisted`].
+//!
+//! Functions: `initialize`, `register_policy`, `rotate_policy`,
+//! `add_asset_blacklist`, `remove_asset_blacklist`, `check_transfer`.
 
 use astroid_interfaces::PolicyInterface;
+use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::validation::require_non_empty;
@@ -52,6 +61,9 @@ enum DataKey {
     Policy(String),
     Count,
     Blacklist(Address),
+    /// Asset deny list, scoped to the policy that owns it:
+    /// (policy id, asset contract address) -> ().
+    AssetBlacklist(String, Address),
 }
 
 #[contract]
@@ -158,11 +170,7 @@ impl PolicyContract {
         policy_id: String,
         address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::Blacklist(address.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
@@ -182,11 +190,7 @@ impl PolicyContract {
         policy_id: String,
         address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::Blacklist(address.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -199,10 +203,62 @@ impl PolicyContract {
         Ok(())
     }
 
+    /// Blacklist an asset for a policy (owner only). Once listed, no transfer
+    /// evaluated against `policy_id` may move that token, regardless of the
+    /// policy's other gates.
+    pub fn add_asset_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &());
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("ablk_add")),
+            (policy_id, asset),
+        );
+        Ok(())
+    }
+
+    /// Remove an asset from a policy's blacklist (owner only).
+    pub fn remove_asset_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("ablk_rem")),
+            (policy_id, asset),
+        );
+        Ok(())
+    }
+
     // --- views ---
 
     pub fn get(env: Env, policy_id: String) -> Result<Policy, Error> {
         Self::load(&env, &policy_id)
+    }
+
+    /// Whether `asset` is blacklisted under `policy_id`.
+    pub fn is_asset_blacklisted(env: Env, policy_id: String, asset: Address) -> bool {
+        Self::asset_blacklisted(&env, &policy_id, &asset)
     }
 
     // --- internels ---
@@ -212,6 +268,23 @@ impl PolicyContract {
             .persistent()
             .get(&DataKey::Policy(id.clone()))
             .ok_or(Error::NotFound)
+    }
+
+    /// Authenticate `caller` and require it to own `policy_id`.
+    fn require_policy_owner(env: &Env, caller: &Address, policy_id: &String) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(env, policy_id)?;
+        if &policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Single membership probe against the policy-scoped asset deny list.
+    fn asset_blacklisted(env: &Env, policy_id: &String, asset: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::AssetBlacklist(policy_id.clone(), asset.clone()))
     }
 }
 
@@ -251,6 +324,12 @@ impl PolicyInterface for PolicyContract {
                 events_policy_violation(&env, &policy_id, "bad_asset");
                 return Err(Error::PolicyDenied);
             }
+        }
+        // A blacklisted asset is denied even when it satisfies every other gate
+        // (including an `allowed_asset` allow-list), so the deny list always wins.
+        if Self::asset_blacklisted(&env, &policy_id, &asset) {
+            events_policy_violation(&env, &policy_id, "blacklisted_asset");
+            return Err(Error::AssetBlacklisted);
         }
         // Check blacklist
         if env

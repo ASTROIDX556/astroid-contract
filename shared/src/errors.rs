@@ -30,6 +30,8 @@ pub enum Error {
     PolicyHashMismatch = 21,
     EmergencyLock = 22,
     PolicyRecipientRestricted = 23,
+    /// The transfer's asset is on the policy's asset blacklist.
+    AssetBlacklisted = 24,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
