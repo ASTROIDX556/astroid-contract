@@ -46,6 +46,8 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    /// An outbound transaction exceeded the wallet's configured rate limit.
+    RateLimitExceeded = 54,
 
     // --- Multisig / approvals (60-69) ---
     InvalidSignature = 60,
