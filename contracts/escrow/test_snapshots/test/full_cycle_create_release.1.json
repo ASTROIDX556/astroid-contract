@@ -337,6 +337,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "refund_window"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "sender"
                       },
                       "val": {
@@ -1565,6 +1573,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "sender"
                   },
                   "val": {
@@ -1908,6 +1924,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "sender"
                   },
                   "val": {
@@ -2190,6 +2214,14 @@
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {

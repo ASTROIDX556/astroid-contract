@@ -72,4 +72,8 @@ pub enum Error {
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+    /// A refund was attempted before the escrow's refund window opened.
+    RefundWindowNotOpen = 85,
+    /// A refund was attempted after the escrow's refund window closed.
+    RefundWindowClosed = 86,
 }

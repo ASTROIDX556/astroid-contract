@@ -311,6 +311,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "refund_window"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "sender"
                       },
                       "val": {
