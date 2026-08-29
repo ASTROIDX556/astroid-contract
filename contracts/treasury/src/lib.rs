@@ -271,16 +271,24 @@ impl TreasuryContract {
     }
 
     fn lock(env: &Env) -> Result<(), Error> {
-        let is_locked: bool = env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false);
+        let is_locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentrancyLock)
+            .unwrap_or(false);
         if is_locked {
             return Err(Error::InvalidState);
         }
-        env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
         Ok(())
     }
 
     fn unlock(env: &Env) {
-        env.storage().instance().set(&DataKey::ReentrancyLock, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &false);
     }
 
     fn load_holding(env: &Env, asset: &Address) -> Holding {

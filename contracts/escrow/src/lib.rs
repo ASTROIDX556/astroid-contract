@@ -29,8 +29,8 @@ use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_positive_amount;
-use soroban_sdk::{Map, 
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String,
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Map, String,
 };
 
 #[contracttype]
@@ -214,13 +214,7 @@ impl EscrowContract {
                 &escrow.recipient,
                 &amount,
             );
-            events::transfer_executed(
-                &env,
-                &escrow.sender,
-                &escrow.recipient,
-                &asset,
-                amount,
-            );
+            events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &asset, amount);
         }
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("claimed")),
@@ -256,13 +250,7 @@ impl EscrowContract {
                 &escrow.recipient,
                 &amount,
             );
-            events::transfer_executed(
-                &env,
-                &escrow.sender,
-                &escrow.recipient,
-                &asset,
-                amount,
-            );
+            events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &asset, amount);
         }
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("released")),

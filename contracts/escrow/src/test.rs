@@ -1,6 +1,6 @@
-use soroban_sdk::{Map, 
+use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env, String,
+    token, Address, Env, Map, String,
 };
 
 use astroid_shared::errors::Error;
@@ -193,7 +193,7 @@ fn create_rejects_bad_input() {
     let h = setup(5_000);
     let mut balances = Map::new(&h.env);
     balances.set(h.asset.clone(), 5_000);
-    
+
     // recipient == sender
     let r1 = h.client.try_create(
         &h.sender,
