@@ -315,7 +315,12 @@ impl BudgetContract {
 
         // Window rollover check
         let now = env.ledger().timestamp();
-        if asset_budget.window_seconds > 0 && now >= asset_budget.window_start.saturating_add(asset_budget.window_seconds) {
+        if asset_budget.window_seconds > 0
+            && now
+                >= asset_budget
+                    .window_start
+                    .saturating_add(asset_budget.window_seconds)
+        {
             asset_budget.spent = 0;
             asset_budget.window_start = now;
         }

@@ -19,8 +19,8 @@
 //! plus wallet-scoped state-change events.
 
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
-use astroid_shared::errors::Error;
 use astroid_shared::ensure;
+use astroid_shared::errors::Error;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
@@ -99,7 +99,10 @@ impl WalletContract {
         from.require_auth();
         let wallet = Self::load_wallet(&env, wallet_id)?;
         // Deposits are refused into archived wallets; other states may receive.
-        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
         // Move real tokens into the contract's custody, then credit internally.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -165,7 +168,10 @@ impl WalletContract {
     /// Freeze a wallet (owner or admin). Blocks all outbound movement.
     pub fn freeze(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner_or_admin(&env, wallet_id, &caller)?;
-        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
         wallet.state = ResourceState::Frozen;
         Self::store_wallet(&env, wallet_id, &wallet);
         events::wallet_frozen(&env, wallet_id, &caller);
@@ -205,7 +211,10 @@ impl WalletContract {
     /// Archive a wallet (owner only). Terminal state; no further transactions.
     pub fn archive(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
         let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
-        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
         wallet.state = ResourceState::Archived;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("archived"));
@@ -260,7 +269,10 @@ impl WalletContract {
     fn require_active(wallet: &WalletData) -> Result<(), Error> {
         ensure!(wallet.state != ResourceState::Frozen, Error::WalletFrozen);
         ensure!(wallet.state != ResourceState::Paused, Error::WalletPaused);
-        ensure!(wallet.state != ResourceState::Archived, Error::WalletArchived);
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
         Ok(())
     }
 

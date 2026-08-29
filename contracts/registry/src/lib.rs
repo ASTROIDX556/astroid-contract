@@ -17,8 +17,8 @@
 
 use astroid_interfaces::RegistryInterface;
 use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
-use astroid_shared::errors::Error;
 use astroid_shared::ensure;
+use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
@@ -242,7 +242,10 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        ensure!(owner == caller || Self::is_admin(&env, &caller), Error::Unauthorized);
+        ensure!(
+            owner == caller || Self::is_admin(&env, &caller),
+            Error::Unauthorized
+        );
         env.storage().instance().set(&DataKey::Frozen, &true);
         env.events()
             .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
@@ -258,7 +261,10 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        ensure!(owner == caller || Self::is_admin(&env, &caller), Error::Unauthorized);
+        ensure!(
+            owner == caller || Self::is_admin(&env, &caller),
+            Error::Unauthorized
+        );
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.events()
             .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
@@ -268,11 +274,13 @@ impl RegistryContract {
     // --- internal helpers ---
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
-        ensure!(!env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::Frozen)
-            .unwrap_or(false), Error::RegistryFrozen);
+        ensure!(
+            !env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Frozen)
+                .unwrap_or(false),
+            Error::RegistryFrozen
+        );
         Ok(())
     }
 
