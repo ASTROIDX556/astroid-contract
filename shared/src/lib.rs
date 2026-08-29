@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 //! # astroid-shared
 //!
 //! Common building blocks shared by every Astroid Soroban contract. Keeping
@@ -6,11 +7,11 @@
 //! schema and identical, overflow-safe math across the whole protocol.
 //!
 //! Modules:
-//! - [`errors`] — the canonical `#[contracterror]` code table.
-//! - [`events`] — helpers that publish the standardized cross-cutting events
+//! - [`errors`]     — the canonical `#[contracterror]` code table.
+//! - [`events`]     — helpers that publish the standardized cross-cutting events
 //!   the Astroid backend subscribes to.
-//! - [`types`] — `#[contracttype]` values reused by multiple contracts.
-//! - [`math`] — checked `i128` arithmetic (never wraps, returns errors).
+//! - [`types`]      — `#[contracttype]` values reused by multiple contracts.
+//! - [`math`]       — checked `i128` arithmetic (never wraps, returns errors).
 //! - [`validation`] — small guard helpers (positive amounts, time windows, ...).
 //! - [`constants`] — protocol-wide constants (time units, storage TTLs, limits).
 
