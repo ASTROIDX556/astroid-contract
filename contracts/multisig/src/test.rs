@@ -1,10 +1,50 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{MultiSigContract, MultiSigContractClient};
+use crate::{BatchCall, MultiSigContract, MultiSigContractClient};
+use astroid_shared::constants::MAX_BATCH_CALLS;
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec};
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Ledger};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
+    Val, Vec,
+};
+
+/// Minimal stateful contract used as a batch sub-call target: it stores values
+/// keyed by id and exposes a couple of always-failing functions to exercise the
+/// atomic rollback and error-mapping paths.
+#[contract]
+pub struct BatchHelper;
+
+#[contracttype]
+#[derive(Clone)]
+enum HKey {
+    Value(u64),
+}
+
+#[contractimpl]
+impl BatchHelper {
+    pub fn store(env: Env, key: u64, value: u64) {
+        env.storage().instance().set(&HKey::Value(key), &value);
+    }
+
+    pub fn get(env: Env, key: u64) -> u64 {
+        env.storage()
+            .instance()
+            .get(&HKey::Value(key))
+            .unwrap_or(0)
+    }
+
+    /// Always fails with a contract error (atomic rollback + error propagation).
+    pub fn fail(_env: Env) -> Result<(), Error> {
+        Err(Error::InvalidInput)
+    }
+
+    /// Always panics (maps to [`Error::BatchCallFailed`]).
+    pub fn boom(_env: Env) {
+        panic!("boom");
+    }
+}
 
 struct Harness {
     env: Env,
@@ -213,4 +253,279 @@ fn non_signer_cannot_change_config() {
         h.client.try_set_threshold(&stranger, &1),
         Err(Ok(Error::NotASigner))
     );
+}
+
+// --- batch execution ---
+
+struct BatchHarness {
+    env: Env,
+    client: MultiSigContractClient<'static>,
+    helper: Address,
+    helper_client: BatchHelperClient<'static>,
+    signers: std::vec::Vec<Address>,
+}
+
+/// Register the multisig plus a stateful helper contract and initialize with
+/// `n` signers and the given threshold.
+fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, MultiSigContract);
+    let client = MultiSigContractClient::new(&env, &contract_id);
+
+    let helper = env.register_contract(None, BatchHelper);
+    let helper_client = BatchHelperClient::new(&env, &helper);
+
+    let mut signers = std::vec::Vec::new();
+    let mut sv = Vec::new(&env);
+    for _ in 0..n {
+        let a = Address::generate(&env);
+        sv.push_back(a.clone());
+        signers.push(a);
+    }
+    client.initialize(&sv, &threshold);
+    BatchHarness {
+        env,
+        client,
+        helper,
+        helper_client,
+        signers,
+    }
+}
+
+/// Build a `Vec<Address>` from indices into the harness signer list.
+fn approvers(env: &Env, signers: &std::vec::Vec<Address>, idx: &[usize]) -> Vec<Address> {
+    let mut v = Vec::new(env);
+    for i in idx {
+        v.push_back(signers[*i].clone());
+    }
+    v
+}
+
+fn store_call(env: &Env, helper: &Address, key: u64, value: u64) -> BatchCall {
+    BatchCall {
+        contract: helper.clone(),
+        func: symbol_short!("store"),
+        args: vec![env, key.into_val(env), value.into_val(env)],
+    }
+}
+
+fn fail_call(env: &Env, helper: &Address) -> BatchCall {
+    BatchCall {
+        contract: helper.clone(),
+        func: symbol_short!("fail"),
+        args: Vec::new(env),
+    }
+}
+
+fn boom_call(env: &Env, helper: &Address) -> BatchCall {
+    BatchCall {
+        contract: helper.clone(),
+        func: symbol_short!("boom"),
+        args: Vec::new(env),
+    }
+}
+
+#[test]
+fn batch_executes_all_calls_under_single_threshold_check() {
+    let h = setup_batch(3, 2);
+    let calls = vec![
+        &h.env,
+        store_call(&h.env, &h.helper, 1, 100),
+        store_call(&h.env, &h.helper, 2, 200),
+    ];
+    // Caller (s0) plus one approver (s1) reach threshold 2.
+    h.client.execute_batch(&h.signers[0], &1, &calls, &approvers(&h.env, &h.signers, &[1]));
+    assert_eq!(h.helper_client.get(&1), 100);
+    assert_eq!(h.helper_client.get(&2), 200);
+    assert_eq!(h.client.get_last_batch_nonce(), 1);
+}
+
+#[test]
+fn batch_below_threshold_rejected() {
+    let h = setup_batch(3, 2);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    // Only the caller's signature (weight 1) < threshold 2.
+    let res = h.client.try_execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[]),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    // Nothing was executed and the nonce was not consumed.
+    assert_eq!(h.helper_client.get(&1), 0);
+    assert_eq!(h.client.get_last_batch_nonce(), 0);
+}
+
+#[test]
+fn batch_rejects_non_signer_approver() {
+    let h = setup_batch(3, 2);
+    let stranger = Address::generate(&h.env);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    let app = vec![&h.env, h.signers[1].clone(), stranger];
+    let res = h.client.try_execute_batch(&h.signers[0], &1, &calls, &app);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn batch_duplicate_approvers_do_not_stack_weight() {
+    let h = setup_batch(3, 2);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    // The caller listed as approver too must still count once: 1 < threshold 2.
+    let app = vec![&h.env, h.signers[0].clone()];
+    let res = h.client.try_execute_batch(&h.signers[0], &1, &calls, &app);
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+#[test]
+fn batch_nonce_replay_rejected() {
+    let h = setup_batch(3, 2);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    let app = approvers(&h.env, &h.signers, &[1]);
+    h.client.execute_batch(&h.signers[0], &1, &calls, &app);
+
+    // Replaying the same nonce is rejected.
+    let res = h.client.try_execute_batch(&h.signers[0], &1, &calls, &app);
+    assert_eq!(res, Err(Ok(Error::InvalidNonce)));
+    // A nonce below the initial counter is rejected too.
+    let res = h.client.try_execute_batch(&h.signers[0], &0, &calls, &app);
+    assert_eq!(res, Err(Ok(Error::InvalidNonce)));
+
+    // Nonces are monotonic, not strictly sequential: gaps are allowed.
+    let calls2 = vec![&h.env, store_call(&h.env, &h.helper, 2, 200)];
+    h.client.execute_batch(&h.signers[0], &5, &calls2, &app);
+    assert_eq!(h.client.get_last_batch_nonce(), 5);
+}
+
+#[test]
+fn batch_rolls_back_all_calls_on_sub_call_failure() {
+    let h = setup_batch(3, 2);
+    // store(1) succeeds, then the middle call fails, then store(2) would run.
+    let calls = vec![
+        &h.env,
+        store_call(&h.env, &h.helper, 1, 100),
+        fail_call(&h.env, &h.helper),
+        store_call(&h.env, &h.helper, 2, 200),
+    ];
+    let res = h.client.try_execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
+    // The callee's own contract error is surfaced...
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    // ...and no partial state was committed (atomicity).
+    assert_eq!(h.helper_client.get(&1), 0);
+    assert_eq!(h.helper_client.get(&2), 0);
+    // The nonce was rolled back too, so the same batch can be retried.
+    assert_eq!(h.client.get_last_batch_nonce(), 0);
+}
+
+#[test]
+fn batch_sub_call_panic_maps_to_batch_call_failed() {
+    let h = setup_batch(3, 2);
+    let calls = vec![
+        &h.env,
+        store_call(&h.env, &h.helper, 1, 100),
+        boom_call(&h.env, &h.helper),
+    ];
+    let res = h.client.try_execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
+    assert_eq!(res, Err(Ok(Error::BatchCallFailed)));
+    assert_eq!(h.helper_client.get(&1), 0);
+    assert_eq!(h.client.get_last_batch_nonce(), 0);
+}
+
+#[test]
+fn batch_signatures_cover_the_entire_payload() {
+    let h = setup_batch(3, 2);
+    let calls = vec![
+        &h.env,
+        store_call(&h.env, &h.helper, 1, 100),
+        store_call(&h.env, &h.helper, 2, 200),
+    ];
+    let app = approvers(&h.env, &h.signers, &[1]);
+    h.client.execute_batch(&h.signers[0], &7, &calls, &app);
+
+    let auths = h.env.auths();
+    // The caller AND every approver authorized exactly the batch payload
+    // `(nonce, calls)` — the same payload the contract re-derives internally.
+    let expected: Vec<Val> = vec![&h.env, 7u64.into_val(&h.env), calls.to_val()];
+    for signer in [&h.signers[0], &h.signers[1]] {
+        assert!(
+            auths.iter().any(|(addr, inv)| {
+                addr == signer
+                    && inv.function
+                        == AuthorizedFunction::Contract((
+                            h.client.address.clone(),
+                            Symbol::new(&h.env, "execute_batch"),
+                            expected.clone(),
+                        ))
+            }),
+            "signer {signer:?} did not authorize the exact batch payload"
+        );
+    }
+}
+
+#[test]
+fn batch_rejects_empty_calls() {
+    let h = setup_batch(3, 2);
+    let calls = Vec::new(&h.env);
+    let res = h.client.try_execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn batch_rejects_too_many_calls() {
+    let h = setup_batch(3, 2);
+    let mut calls = Vec::new(&h.env);
+    for i in 0..MAX_BATCH_CALLS + 1 {
+        calls.push_back(store_call(&h.env, &h.helper, i as u64, i as u64));
+    }
+    let res = h.client.try_execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn batch_requires_signer_caller() {
+    let h = setup_batch(3, 2);
+    let stranger = Address::generate(&h.env);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    let res = h.client.try_execute_batch(
+        &stranger,
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn batch_blocked_by_emergency_lock() {
+    let h = setup_batch(3, 2);
+    h.client.set_emergency_lock(&h.signers[0], &true);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    let res = h.client.try_execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
+    assert_eq!(res, Err(Ok(Error::EmergencyLock)));
 }

@@ -14,20 +14,29 @@
 //! typically be routed through the proposal flow too; they are exposed directly
 //! here for the platform's administrative bootstrap and kept signer-gated.
 //!
+//! [`MultiSigContract::execute_batch`] additionally supports bundling multiple
+//! discrete contract calls into one transaction: each contributing signer's
+//! signature is verified (by the Soroban host) over the exact batch payload
+//! `(nonce, calls)`, the aggregate signature weight must meet the threshold, and
+//! the nonce makes batches replay-proof. Execution is atomic — if any sub-call
+//! fails the whole batch reverts with [`Error::BatchCallFailed`] or the callee's
+//! error.
+//!
 //! Events: `SignerAdded`, `SignerRemoved`, `ThresholdChanged`,
-//! `ProposalApproved`, `ProposalExecuted`, `EmergencyLock`.
+//! `ProposalApproved`, `ProposalExecuted`, `BatchExecuted`, `EmergencyLock`.
 //!
 //! Execution below threshold is rejected with [`Error::ThresholdNotMet`].
 
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS, MIN_THRESHOLD,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS, MAX_SIGNERS,
+    MIN_THRESHOLD, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_time_reached;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
+    Val, Vec,
 };
 
 #[contracttype]
@@ -45,6 +54,8 @@ enum DataKey {
     Proposal(u64),
     /// Relationship: whether a signer approved a proposal (persistent).
     Approval(u64, Address),
+    /// State: last used batch nonce (instance); batches must use a greater one.
+    LastBatchNonce,
 }
 
 /// Internal multisig proposal. `action`/`payload` describe the intended change
@@ -63,6 +74,19 @@ pub struct MsProposal {
     pub executed: bool,
     /// Earliest timestamp at which execution is allowed (time lock; 0 = none).
     pub unlock_at: u64,
+}
+
+/// A single discrete contract call inside a batch. `args` are raw Soroban
+/// values, so any contract function can be targeted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchCall {
+    /// Contract to invoke.
+    pub contract: Address,
+    /// Function to invoke on the target contract.
+    pub func: Symbol,
+    /// Arguments passed to the target function.
+    pub args: Vec<Val>,
 }
 
 #[contract]
@@ -91,6 +115,7 @@ impl MultiSigContract {
             .instance()
             .set(&DataKey::EmergencyLock, &false);
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
+        env.storage().instance().set(&DataKey::LastBatchNonce, &0u64);
         Self::bump_instance(&env);
         Ok(())
     }
@@ -264,10 +289,116 @@ impl MultiSigContract {
         Ok(())
     }
 
+    /// Execute a batch of discrete contract calls under a single threshold
+    /// verification. Bundling several calls into one transaction reduces fees
+    /// and makes multi-step administrative operations atomic.
+    ///
+    /// - `caller` must be a current signer. Its signature is verified against
+    ///   the batch payload itself and counts toward the threshold (mirroring
+    ///   how a proposer auto-approves in the proposal flow), so every
+    ///   contributing signer signs the exact same payload.
+    /// - `nonce` must be strictly greater than the last used batch nonce, which
+    ///   makes batches replay-proof; the nonce is part of the signed payload.
+    /// - `calls` must be non-empty and within [`MAX_BATCH_CALLS`].
+    /// - `approvers` lists any additional signers backing the batch. Every
+    ///   listed approver must be a current signer and must authorize the exact
+    ///   payload `(nonce, calls)`; the host cryptographically verifies each
+    ///   signature and enforces replay prevention via
+    ///   [`Address::require_auth_for_args`]. Duplicate entries (including the
+    ///   caller) only count once. Each signer carries weight 1, so the number
+    ///   of distinct signers — caller plus approvers — must meet the threshold.
+    ///
+    /// Execution is atomic: each call runs inside a Soroban error-handling
+    /// boundary ([`Env::try_invoke_contract`]); if any sub-call fails the whole
+    /// batch reverts (including the nonce), so no partial state is committed.
+    /// A failing sub-call surfaces its own contract error when known, otherwise
+    /// [`Error::BatchCallFailed`].
+    pub fn execute_batch(
+        env: Env,
+        caller: Address,
+        nonce: u64,
+        calls: Vec<BatchCall>,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        Self::require_not_locked(&env)?;
+        let signers = Self::signers(&env)?;
+        let threshold = Self::threshold(&env)?;
+        if !signers.contains(&caller) {
+            return Err(Error::NotASigner);
+        }
+
+        if calls.is_empty() || calls.len() > MAX_BATCH_CALLS {
+            return Err(Error::InvalidInput);
+        }
+        // A list longer than the maximum signer set can only hold duplicates or
+        // non-signers; reject it up front (gas safety).
+        if approvers.len() > MAX_SIGNERS {
+            return Err(Error::InvalidInput);
+        }
+
+        // Replay protection: batch nonces must be strictly increasing.
+        let last_nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastBatchNonce)
+            .unwrap_or(0);
+        if nonce <= last_nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        // Aggregate signature verification over the entire batch payload: the
+        // caller plus every distinct approver must be a signer and must have
+        // authorized `(nonce, calls)`. Each signer carries weight 1.
+        let payload = Self::batch_payload(&env, nonce, &calls);
+        let mut weight: u32 = 1; // the caller's signature counts
+        let mut seen = Vec::new(&env);
+        seen.push_back(caller.clone());
+        caller.require_auth_for_args(payload.clone());
+        for approver in approvers.iter() {
+            if !signers.contains(approver) {
+                return Err(Error::NotASigner);
+            }
+            if seen.contains(approver) {
+                continue;
+            }
+            seen.push_back(approver.clone());
+            approver.require_auth_for_args(payload.clone());
+            weight = checked_add(weight as i128, 1)? as u32;
+        }
+        if weight < threshold {
+            return Err(Error::ThresholdNotMet);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LastBatchNonce, &nonce);
+
+        // Execute every call atomically; any failure reverts the whole batch.
+        for call in calls.iter() {
+            Self::execute_call(&env, &call)?;
+        }
+
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("batch"), symbol_short!("executed")),
+            (nonce, caller, calls.len()),
+        );
+        Ok(())
+    }
+
     // --- views ---
 
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<MsProposal, Error> {
         Self::load_proposal(&env, proposal_id)
+    }
+
+    /// Last used batch nonce. The next `execute_batch` call must pass a strictly
+    /// greater nonce.
+    pub fn get_last_batch_nonce(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastBatchNonce)
+            .unwrap_or(0)
     }
 
     pub fn get_signers(env: Env) -> Result<Vec<Address>, Error> {
@@ -333,6 +464,32 @@ impl MultiSigContract {
             return Err(Error::EmergencyLock);
         }
         Ok(())
+    }
+
+    /// Build the deterministic payload `(nonce, calls)` that every approver's
+    /// signature must cover, so a signature can never be replayed against a
+    /// different batch or a reused nonce.
+    fn batch_payload(env: &Env, nonce: u64, calls: &Vec<BatchCall>) -> Vec<Val> {
+        let nonce_val: Val = nonce.into_val(env);
+        let calls_val: Val = calls.to_val();
+        vec![env, nonce_val, calls_val]
+    }
+
+    /// Invoke a single batch call inside a Soroban error-handling boundary so a
+    /// failure can be caught and the whole batch reverted atomically instead of
+    /// aborting with an opaque trap. Returns the callee's own contract error
+    /// when it is one of ours, otherwise [`Error::BatchCallFailed`].
+    fn execute_call(env: &Env, call: &BatchCall) -> Result<(), Error> {
+        match env.try_invoke_contract::<Val, Error>(&call.contract, &call.func, call.args.clone()) {
+            Ok(Ok(_)) => Ok(()),
+            // A raw `Val` always decodes, so this arm is unreachable in
+            // practice; kept for exhaustiveness.
+            Ok(Err(_)) => Err(Error::BatchCallFailed),
+            // The callee exited with a contract error — surface it precisely.
+            Err(Ok(e)) => Err(e),
+            // System-level failure (panic / abort / unknown error code).
+            Err(Err(_)) => Err(Error::BatchCallFailed),
+        }
     }
 
     fn validate_threshold(threshold: u32, n: u32) -> Result<(), Error> {
