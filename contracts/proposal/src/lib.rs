@@ -28,7 +28,10 @@ use astroid_shared::constants::{
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{token::TokenClient, contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
+    Vec,
+};
 
 /// Proposal lifecycle state.
 #[contracttype]
@@ -118,8 +121,14 @@ impl ProposalContract {
             return Err(Error::InvalidInput);
         }
         if let Some(asset) = &deposit_asset {
-            if deposit_amount <= 0 { return Err(Error::InvalidAmount); }
-            TokenClient::new(&env, asset).transfer(&proposer, &env.current_contract_address(), &deposit_amount);
+            if deposit_amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            TokenClient::new(&env, asset).transfer(
+                &proposer,
+                &env.current_contract_address(),
+                &deposit_amount,
+            );
         }
         if false {
             return Err(Error::InvalidInput);
@@ -207,7 +216,11 @@ impl ProposalContract {
         }
         proposal.state = ProposalState::Rejected;
         if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
+            TokenClient::new(&env, asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit_amount,
+            );
         }
         Self::store(&env, id, &proposal);
         env.events().publish(
@@ -233,7 +246,11 @@ impl ProposalContract {
         }
         proposal.state = ProposalState::Cancelled;
         if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
+            TokenClient::new(&env, asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit_amount,
+            );
         }
         Self::store(&env, id, &proposal);
         env.events()
@@ -255,10 +272,17 @@ impl ProposalContract {
         }
         proposal.state = ProposalState::Expired;
         if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
+            TokenClient::new(&env, asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit_amount,
+            );
         }
         Self::store(&env, proposal_id, &proposal);
-        env.events().publish((symbol_short!("proposal"), symbol_short!("refunded")), proposal_id);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("refunded")),
+            proposal_id,
+        );
         Ok(())
     }
 
@@ -276,7 +300,11 @@ impl ProposalContract {
         }
         proposal.state = ProposalState::Executed;
         if let Some(asset) = &proposal.deposit_asset {
-            TokenClient::new(&env, asset).transfer(&env.current_contract_address(), &proposal.proposer, &proposal.deposit_amount);
+            TokenClient::new(&env, asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit_amount,
+            );
         }
         Self::store(&env, id, &proposal);
         env.events()

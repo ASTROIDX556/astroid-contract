@@ -123,5 +123,8 @@ fn test_evaluate_policy_fee_limit() {
     );
 
     assert_eq!(client.evaluate_policy(&p_id, &500), ());
-    assert_eq!(client.try_evaluate_policy(&p_id, &1500), Err(Ok(Error::FeeLimitExceeded)));
+    assert_eq!(
+        client.try_evaluate_policy(&p_id, &1500),
+        Err(Ok(Error::FeeLimitExceeded))
+    );
 }

@@ -69,6 +69,7 @@ impl PolicyContract {
 
     /// Register a policy. `owner` gates subsequent rotations. Cheap scalar gates
     /// are stored on-chain; the full configuration is hashed for tamper-evidence.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_policy(
         env: Env,
         owner: Address,
@@ -203,11 +204,7 @@ impl PolicyContract {
         Ok(())
     }
 
-    pub fn evaluate_policy(
-        env: Env,
-        policy_id: String,
-        tx_fee: i128,
-    ) -> Result<(), Error> {
+    pub fn evaluate_policy(env: Env, policy_id: String, tx_fee: i128) -> Result<(), Error> {
         let policy = Self::load(&env, &policy_id)?;
         if !policy.enabled {
             events_policy_violation(&env, &policy_id, "disabled");
