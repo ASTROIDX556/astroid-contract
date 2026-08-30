@@ -408,7 +408,7 @@ impl TreasuryContract {
         // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
         //    pre-approved periodic ceilings per (agent, recipient, asset).
         Self::lock(&env)?;
-        
+
         let allowance_id = AllowanceId {
             agent: caller.clone(),
             recipient: to.clone(),
@@ -715,7 +715,7 @@ impl TreasuryContract {
         if frozen {
             return Err(Error::InvalidState);
         }
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 
@@ -746,7 +746,7 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .set(&DataKey::ReentrancyLock, &true);
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 

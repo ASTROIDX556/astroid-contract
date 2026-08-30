@@ -271,10 +271,8 @@ impl MultiSigContract {
         signers.remove(idx);
         env.storage().instance().set(&DataKey::Signers, &signers);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("signer"), symbol_short!("removed")),
-            signer,
-        );
+        env.events()
+            .publish((symbol_short!("signer"), symbol_short!("removed")), signer);
         Ok(())
     }
 
