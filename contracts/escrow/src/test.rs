@@ -583,16 +583,16 @@ fn timelock_cliff_rejects_early_withdraw_and_claims_post_maturity() {
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 
-    // Pre-maturity check: withdrawal and claim must fail with EscrowLocked
+    // Pre-maturity check: withdrawal and claim must fail with TimeLockActive
     h.env.ledger().with_mut(|l| l.timestamp = START + 500);
     assert_eq!(h.client.get_claimable_amount(&id), 0);
     assert_eq!(h.client.get_vested_amount(&id), 0);
 
     let early_claim = h.client.try_claim(&h.recipient, &id);
-    assert_eq!(early_claim, Err(Ok(Error::EscrowLocked)));
+    assert_eq!(early_claim, Err(Ok(Error::TimeLockActive)));
 
     let early_withdraw = h.client.try_withdraw(&h.recipient, &id, &5_000);
-    assert_eq!(early_withdraw, Err(Ok(Error::EscrowLocked)));
+    assert_eq!(early_withdraw, Err(Ok(Error::TimeLockActive)));
 
     // Post-maturity check: claim succeeds
     h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
@@ -636,7 +636,7 @@ fn timelock_linear_release_gradual_withdrawals() {
     assert_eq!(h.client.get_claimable_amount(&id), 0);
     assert_eq!(h.client.get_vested_amount(&id), 0);
     let res = h.client.try_withdraw(&h.recipient, &id, &1_000);
-    assert_eq!(res, Err(Ok(Error::EscrowLocked)));
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
 
     // 2. At 50% time (timestamp = START + 500, past cliff):
     // 50% of 10,000 = 5,000 vested.
@@ -794,7 +794,7 @@ fn timelock_refund_rules() {
     // Pre-deadline refund attempt fails
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let early = h.client.try_refund_timelock(&h.sender, &id);
-    assert_eq!(early, Err(Ok(Error::EscrowLocked)));
+    assert_eq!(early, Err(Ok(Error::TimeLockActive)));
 
     // Non-sender cannot refund
     let intruder = Address::generate(&h.env);
@@ -838,7 +838,7 @@ fn initialize_and_fund_timelock_lifecycle() {
     // Pre-maturity claim fails
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let early = h.client.try_claim(&h.recipient, &id);
-    assert_eq!(early, Err(Ok(Error::EscrowLocked)));
+    assert_eq!(early, Err(Ok(Error::TimeLockActive)));
 
     // Post-maturity claim succeeds
     h.env.ledger().with_mut(|l| l.timestamp = START + 600);

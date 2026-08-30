@@ -47,7 +47,7 @@
 //! - Linear release schedules (`ReleaseType::Linear`): Continuous linear vesting
 //!   from start_time to end_time with optional cliff_time.
 //! - Partial and multiple gradual withdrawals by the beneficiary.
-//! - Deterministic `Error::EscrowLocked` when withdrawing before maturity or cliff.
+//! - Deterministic `Error::TimeLockActive` when withdrawing before maturity or cliff.
 
 pub mod storage;
 
@@ -477,7 +477,7 @@ impl EscrowContract {
         let now = env.ledger().timestamp();
         let claimable = calculate_claimable_amount(&escrow, now)?;
         if claimable <= 0 {
-            return Err(Error::EscrowLocked);
+            return Err(Error::TimeLockActive);
         }
         if amount > claimable {
             return Err(Error::InsufficientFunds);
@@ -531,13 +531,13 @@ impl EscrowContract {
                 calculate_claimable_amount(&escrow, now)?
             } else {
                 if now < escrow.deadline {
-                    return Err(Error::EscrowLocked);
+                    return Err(Error::TimeLockActive);
                 }
                 checked_sub(escrow.funded_amount, escrow.released_amount)?
             };
 
             if claimable <= 0 {
-                return Err(Error::EscrowLocked);
+                return Err(Error::TimeLockActive);
             }
 
             escrow.released_amount = checked_add(escrow.released_amount, claimable)?;
@@ -571,7 +571,7 @@ impl EscrowContract {
             Ok(claimable)
         } else if matches!(escrow.state, EscrowState::Created) {
             if now < escrow.deadline {
-                return Err(Error::EscrowLocked);
+                return Err(Error::TimeLockActive);
             }
             escrow.state = EscrowState::Released;
             store_escrow(&env, id, &escrow);
@@ -778,7 +778,7 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
         if env.ledger().timestamp() < escrow.deadline {
-            return Err(Error::EscrowLocked);
+            return Err(Error::TimeLockActive);
         }
 
         let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
