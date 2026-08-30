@@ -97,7 +97,7 @@ impl PolicyContract {
             u64::MAX
         } else {
             if duration > MAX_PAUSE_DURATION {
-                return Err(Error::PauseDurationExceeded);
+                return Err(Error::InvalidInput);
             }
             env.ledger()
                 .timestamp()

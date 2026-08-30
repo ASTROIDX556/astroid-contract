@@ -32,7 +32,6 @@ pub enum Error {
     PolicyCategoryRestricted = 24,
     AssetNotWhitelisted = 25,
     PolicyPaused = 26,
-    PauseDurationExceeded = 27,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -80,7 +79,8 @@ pub enum Error {
     EscrowExpired = 80,
     TimeLockActive = 81,
 
-    // --- Treasury allowances (83, 85) ---
+    // --- Treasury allowances (83-85) ---
     AllowanceExceeded = 83,
+    AllowanceExpired = 84,
     AllowanceNotFound = 85,
 }
