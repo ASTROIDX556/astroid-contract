@@ -12,12 +12,28 @@
 //! `Archived`. Outbound value movement is only permitted from an `Active`
 //! wallet; every other state fails safely with a specific error.
 //!
+//! Access control is role-based (see [`access`]). Every wallet has an owner,
+//! who is implicitly [`Role::Admin`], and may delegate a role to any number of
+//! other principals so that organization owners, human managers and autonomous
+//! agent executors can share a wallet without sharing all of its powers:
+//!
+//! | Entrypoint                                   | Minimum role |
+//! |----------------------------------------------|--------------|
+//! | `withdraw`, `pause`, `unpause`, `archive`     | `Admin`      |
+//! | `grant_role`, `revoke_role`                   | `Admin`      |
+//! | `transfer`                                    | `Agent`      |
+//! | `freeze`, `unfreeze`                          | `Agent`, or the contract admin |
+//!
+//! A caller whose role is below the requirement — including an `Auditor`, who
+//! holds no mutating power at all — is rejected with [`Error::Unauthorized`].
+//!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `grant_role`, `revoke_role`.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted` (shared schema)
-//! plus wallet-scoped state-change events.
+//! plus wallet-scoped state-change and role-administration events.
 
+use crate::access::Role;
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
 use astroid_shared::math::{SafeAdd, SafeSub};
@@ -25,6 +41,8 @@ use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
+
+pub mod access;
 
 #[contracttype]
 #[derive(Clone)]
@@ -122,8 +140,10 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Pay `amount` of `asset` from a wallet to an arbitrary recipient. Only the
-    /// wallet owner may call, and only while the wallet is `Active`.
+    /// Pay `amount` of `asset` from a wallet to an arbitrary recipient. This is
+    /// the routine operational spend, so [`Role::Agent`] is enough - an
+    /// autonomous executor can pay without holding administrative power - and it
+    /// is still only permitted while the wallet is `Active`.
     pub fn transfer(
         env: Env,
         caller: Address,
@@ -133,7 +153,7 @@ impl WalletContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
@@ -145,8 +165,11 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Withdraw `amount` of `asset` from a wallet back to its owner. Only the
-    /// owner may call, and only while the wallet is `Active`.
+    /// Withdraw `amount` of `asset` from a wallet back to its owner. Funds
+    /// leaving the wallet for its owner is an administrative action, so this
+    /// requires [`Role::Admin`]; agents are deliberately excluded. Only
+    /// permitted while the wallet is `Active`, and the destination is always
+    /// the recorded owner regardless of who calls.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -155,7 +178,7 @@ impl WalletContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
@@ -170,9 +193,11 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Freeze a wallet (owner or admin). Blocks all outbound movement.
+    /// Freeze a wallet. Blocks all outbound movement. Freezing is a safety
+    /// action, so [`Role::Agent`] is enough - an agent that detects trouble can
+    /// stop the bleeding - as is the contract-level emergency admin.
     pub fn freeze(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner_or_admin(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role_or_admin(&env, wallet_id, &caller, Role::Agent)?;
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
@@ -189,9 +214,9 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Unfreeze a wallet back to `Active` (owner or admin).
+    /// Unfreeze a wallet back to `Active`. Same gate as `freeze`.
     pub fn unfreeze(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner_or_admin(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role_or_admin(&env, wallet_id, &caller, Role::Agent)?;
         if wallet.state != ResourceState::Frozen {
             return Err(Error::InvalidState);
         }
@@ -201,9 +226,9 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Pause a wallet (owner only). Temporarily blocks outbound movement.
+    /// Pause a wallet ([`Role::Admin`]). Temporarily blocks outbound movement.
     pub fn pause(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         if wallet.state != ResourceState::Active {
             return Err(Error::InvalidState);
         }
@@ -213,9 +238,9 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Resume a paused wallet (owner only).
+    /// Resume a paused wallet ([`Role::Admin`]).
     pub fn unpause(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         if wallet.state != ResourceState::Paused {
             return Err(Error::InvalidState);
         }
@@ -225,9 +250,10 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Archive a wallet (owner only). Terminal state; no further transactions.
+    /// Archive a wallet ([`Role::Admin`]). Terminal state; no further
+    /// transactions.
     pub fn archive(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
@@ -237,7 +263,75 @@ impl WalletContract {
         Ok(())
     }
 
+    /// Delegate `role` on a wallet to `account`, replacing any role it already
+    /// held. Requires [`Role::Admin`], so the owner (implicitly `Admin`) or an
+    /// admin it has already delegated to may administer roles.
+    ///
+    /// Granting to the owner is refused: the owner is implicitly `Admin`, so the
+    /// grant would either be redundant or an attempted demotion that the guards
+    /// would ignore anyway. Refusing it keeps the stored roles honest.
+    pub fn grant_role(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        account: Address,
+        role: Role,
+    ) -> Result<(), Error> {
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        if wallet.state == ResourceState::Archived {
+            return Err(Error::WalletArchived);
+        }
+        if account == wallet.owner {
+            return Err(Error::InvalidInput);
+        }
+        access::set_role(&env, wallet_id, &account, role);
+        env.events().publish(
+            (symbol_short!("role"), symbol_short!("granted")),
+            (wallet_id, account, role),
+        );
+        Ok(())
+    }
+
+    /// Revoke whatever role `account` holds on a wallet. Requires
+    /// [`Role::Admin`]. Fails with [`Error::NotFound`] when the account holds no
+    /// granted role, so a revocation is never silently a no-op.
+    ///
+    /// Permitted on an archived wallet so role records can still be cleaned up.
+    pub fn revoke_role(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        account: Address,
+    ) -> Result<(), Error> {
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        access::clear_role(&env, wallet_id, &account)?;
+        env.events().publish(
+            (symbol_short!("role"), symbol_short!("revoked")),
+            (wallet_id, account),
+        );
+        Ok(())
+    }
+
     // --- views ---
+
+    /// Read the role `account` effectively holds on a wallet, or `None` if it
+    /// holds none. The wallet owner always resolves to [`Role::Admin`].
+    pub fn get_role(env: Env, wallet_id: u64, account: Address) -> Result<Option<Role>, Error> {
+        let wallet = Self::load_wallet(&env, wallet_id)?;
+        Ok(access::effective_role(
+            &env,
+            wallet_id,
+            &wallet.owner,
+            &account,
+        ))
+    }
+
+    /// Whether `account` holds at least `role` on a wallet - the same question
+    /// the entrypoint guards ask, exposed for off-chain callers.
+    pub fn has_role(env: Env, wallet_id: u64, account: Address, role: Role) -> Result<bool, Error> {
+        let wallet = Self::load_wallet(&env, wallet_id)?;
+        Ok(access::require_role(&env, wallet_id, &wallet.owner, &account, role).is_ok())
+    }
 
     /// Read a wallet's owner + state.
     pub fn get_wallet(env: Env, wallet_id: u64) -> Result<WalletData, Error> {
@@ -266,23 +360,36 @@ impl WalletContract {
         Self::bump_wallet(env, id);
     }
 
-    fn require_owner(env: &Env, id: u64, caller: &Address) -> Result<WalletData, Error> {
+    /// Authenticate `caller`, then require it to hold at least `required` on the
+    /// wallet. The wallet is loaded first so an unknown id reports
+    /// [`Error::NotFound`] rather than an authorization failure.
+    fn require_wallet_role(
+        env: &Env,
+        id: u64,
+        caller: &Address,
+        required: Role,
+    ) -> Result<WalletData, Error> {
         caller.require_auth();
         let wallet = Self::load_wallet(env, id)?;
-        if &wallet.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        access::require_role(env, id, &wallet.owner, caller, required)?;
         Ok(wallet)
     }
 
-    fn require_owner_or_admin(env: &Env, id: u64, caller: &Address) -> Result<WalletData, Error> {
+    /// As [`Self::require_wallet_role`], but the contract-level emergency admin
+    /// also passes regardless of any per-wallet role.
+    fn require_wallet_role_or_admin(
+        env: &Env,
+        id: u64,
+        caller: &Address,
+        required: Role,
+    ) -> Result<WalletData, Error> {
         caller.require_auth();
         let wallet = Self::load_wallet(env, id)?;
         let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
-        let is_admin = admin.map(|a| &a == caller).unwrap_or(false);
-        if &wallet.owner != caller && !is_admin {
-            return Err(Error::Unauthorized);
+        if admin.map(|a| &a == caller).unwrap_or(false) {
+            return Ok(wallet);
         }
+        access::require_role(env, id, &wallet.owner, caller, required)?;
         Ok(wallet)
     }
 
