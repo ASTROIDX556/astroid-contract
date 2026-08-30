@@ -163,6 +163,7 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::TreasuryUnfrozen { org } => {
             env.events()
                 .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
+        }
         ContractEvent::EscrowReleased {
             escrow_id,
             recipient,
