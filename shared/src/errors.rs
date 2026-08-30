@@ -38,6 +38,8 @@ pub enum Error {
 
     // --- Registry (30-39) ---
     RegistryFrozen = 19,
+    /// The module is deprecated: it stays readable but no longer routes.
+    ModuleDeprecated = 50,
     /// The Wasm hash is not registered/approved in the registry version map, or
     /// the caller is not allowed to upgrade this contract.
     UnauthorizedUpgrade = 48,
