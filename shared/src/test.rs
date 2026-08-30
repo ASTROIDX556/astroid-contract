@@ -22,7 +22,7 @@ fn math_happy_paths() {
 #[test]
 fn math_overflow_underflow() {
     assert_eq!(checked_add(i128::MAX, 1), Err(Error::Overflow));
-    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::MathOverflow));
+    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Overflow));
     assert_eq!(checked_mul(i128::MAX, 2), Err(Error::Overflow));
     assert_eq!(checked_div(1, 0), Err(Error::InvalidInput));
 }
@@ -92,7 +92,10 @@ fn time_validation() {
     // Time lock: reached only once timestamp >= unlock_at.
     assert_eq!(require_time_reached(&env, 500), Ok(()));
     assert_eq!(require_time_reached(&env, 1_000), Ok(()));
-    assert_eq!(require_time_reached(&env, 2_000), Err(Error::TimeLocked));
+    assert_eq!(
+        require_time_reached(&env, 2_000),
+        Err(Error::TimelockNotExpired)
+    );
 }
 
 #[test]

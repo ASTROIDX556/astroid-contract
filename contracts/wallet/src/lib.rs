@@ -242,7 +242,6 @@ impl WalletContract {
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
         Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
@@ -270,7 +269,6 @@ impl WalletContract {
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
         Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
