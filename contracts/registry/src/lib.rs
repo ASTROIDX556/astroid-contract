@@ -304,7 +304,6 @@ impl RegistryContract {
             .ok_or(Error::NotFound)
     }
 
-    /// Remove a module registration. Admin or org owner.
     /// Remove a module registration. Same gate as `register_module`: admin, org
     /// owner, or a delegated role that reaches this [`ModuleKind`].
     pub fn remove_module(

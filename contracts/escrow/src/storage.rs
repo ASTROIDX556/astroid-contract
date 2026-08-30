@@ -77,6 +77,7 @@ pub struct Escrow {
 pub enum DataKey {
     Count,
     Escrow(u64),
+    Milestones(u64),
 }
 
 pub fn get_count(env: &Env) -> u64 {
