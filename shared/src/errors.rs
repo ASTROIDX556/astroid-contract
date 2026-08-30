@@ -32,10 +32,10 @@ pub enum Error {
     PolicyCategoryRestricted = 24,
     AssetNotWhitelisted = 25,
     PolicyPaused = 26,
-    PauseDurationExceeded = 27,
 
-    // --- Registry (30) ---
+    // --- Registry (30-39) ---
     RegistryFrozen = 30,
+    ModuleDeprecated = 31,
 
     // --- Budget (40-44) ---
     BudgetExceeded = 40,
@@ -50,8 +50,7 @@ pub enum Error {
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (60-69) ---
-    InvalidSignature = 60,
+    // --- Multisig / approvals (61-69) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
@@ -62,7 +61,7 @@ pub enum Error {
     BatchCallFailed = 68,
     InsufficientWeight = 69,
 
-    // --- Proposal (71-77) ---
+    // --- Proposal (71-79) ---
     ProposalExpired = 71,
     InvalidProposalState = 72,
     ProposalNotApproved = 73,
@@ -70,11 +69,15 @@ pub enum Error {
     CancellationWindowClosed = 75,
     MathOverflow = 76,
     DivisionByZero = 77,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 78,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 79,
 
-    // --- Escrow (80-84) ---
+    // --- Escrow (80-81) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
-    GraceActive = 82,
 
     // --- Treasury allowances (83-85) ---
     AllowanceExceeded = 83,
