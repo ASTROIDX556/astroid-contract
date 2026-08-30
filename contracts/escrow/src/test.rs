@@ -234,7 +234,7 @@ fn expire_marks_then_refund_returns() {
 #[test]
 fn released_escrow_cannot_be_refunded() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     h.client.release(&h.arbiter, &id, &5_000);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
