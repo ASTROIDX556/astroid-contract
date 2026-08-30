@@ -65,6 +65,7 @@ enum DataKey {
 pub struct PolicyContract;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl PolicyContract {
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
