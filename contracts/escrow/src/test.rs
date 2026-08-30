@@ -7,7 +7,10 @@ use soroban_sdk::{
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 
-use crate::{EscrowContract, EscrowContractClient, EscrowState, OverrideSignature};
+use crate::{
+    EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, OverrideSignature,
+    ReleaseSchedule, ReleaseType,
+};
 
 const START: u64 = 1_000;
 
@@ -21,8 +24,6 @@ struct Harness<'a> {
     arbiter: Address,
 }
 
-/// Register an escrow contract plus two test SAC tokens, and mint `funded_*` of
-/// each to the sender so `create` moves real value into custody.
 fn setup(funded_a: i128, funded_b: i128) -> Harness<'static> {
     let env = Env::default();
     env.mock_all_auths();
@@ -107,8 +108,6 @@ fn create(h: &Harness, assets: &Vec<AssetAmount>, deadline: u64) -> u64 {
     )
 }
 
-/// Deterministic ed25519 keypair for test signers (never use fixed seeds in
-/// production — this is solely to keep tests reproducible).
 fn keypair(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
@@ -117,8 +116,6 @@ fn public_key(env: &Env, kp: &SigningKey) -> BytesN<32> {
     BytesN::from_array(env, &kp.verifying_key().to_bytes())
 }
 
-/// Build a valid override signature for `id`/`nonce` using the exact
-/// deterministic payload the contract itself verifies against.
 fn sign_override(h: &Harness, kp: &SigningKey, id: u64, nonce: u64) -> OverrideSignature {
     let contract = h.client.address.clone();
     let digest: [u8; 32] = h.env.as_contract(&contract, || {
@@ -132,13 +129,21 @@ fn sign_override(h: &Harness, kp: &SigningKey, id: u64, nonce: u64) -> OverrideS
     }
 }
 
+fn milestone_spec(env: &Env, description: &str, bps: u32) -> MilestoneSpec {
+    MilestoneSpec {
+        description: String::from_str(env, description),
+        release_bps: bps,
+    }
+}
+
+// --- Core multi-asset tests ---
+
 #[test]
 fn full_cycle_create_release() {
     let h = setup(10_000, 5_000);
     let assets = two_assets(&h, 10_000, 5_000);
     let id = create(&h, &assets, START + 86_400);
     assert_eq!(id, 1);
-    // Funds are now in the escrow's custody, out of the sender's account.
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
     assert_eq!(balance(&h, &h.asset_b, &h.sender), 0);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
@@ -147,7 +152,6 @@ fn full_cycle_create_release() {
 
     h.client.release(&h.arbiter, &id, &10_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    // The recipient received every real token; custody is empty.
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
     assert_eq!(balance(&h, &h.asset_b, &h.recipient), 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
@@ -165,7 +169,6 @@ fn non_arbiter_cannot_release() {
 
     let res = h.client.try_release(&intruder, &id, &5_000);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    // Nothing moved.
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 }
@@ -175,9 +178,6 @@ fn release_after_deadline_is_refused() {
     let h = setup(5_000, 0);
     let id = create(&h, &one_asset(&h, 5_000), START + 100);
 
-    // Releasing after the deadline is refused with EscrowExpired. The host rolls
-    // back state on the returned error, so the escrow stays Funded and the sender
-    // can still reclaim funds via the permissionless refund path.
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_release(&h.arbiter, &id, &5_000);
     assert_eq!(res, Err(Ok(Error::EscrowExpired)));
@@ -193,7 +193,6 @@ fn refund_returns_funds_after_deadline() {
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.refund(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    // The sender got every real token back; custody is empty.
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
     assert_eq!(balance(&h, &h.asset_b, &h.sender), 2_000);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
@@ -215,14 +214,12 @@ fn expire_marks_then_refund_returns() {
     let h = setup(5_000, 0);
     let id = create(&h, &one_asset(&h, 5_000), START + 100);
 
-    // Cannot expire before the deadline.
     let early = h.client.try_expire(&id);
     assert_eq!(early, Err(Ok(Error::InvalidState)));
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.expire(&id);
     assert_eq!(h.client.get(&id).state, EscrowState::Expired);
-    // Marking Expired must NOT move funds — they wait for refund.
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
 
@@ -238,7 +235,6 @@ fn released_escrow_cannot_be_refunded() {
     let id = create(&h, &one_asset(&h, 5_000), START + 100);
     h.client.release(&h.arbiter, &id);
 
-    // Even past the deadline, a released escrow cannot double-spend via refund.
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_refund(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
@@ -253,7 +249,6 @@ fn cannot_close_while_expired() {
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.expire(&id);
 
-    // Closing an Expired escrow would strand its still-held funds — refused.
     let res = h.client.try_close(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
@@ -262,7 +257,6 @@ fn cannot_close_while_expired() {
 #[test]
 fn create_rejects_bad_input() {
     let h = setup(5_000, 0);
-    // recipient == sender
     let r1 = h.client.try_create(
         &h.sender,
         &h.sender,
@@ -274,7 +268,6 @@ fn create_rejects_bad_input() {
         &0,
     );
     assert_eq!(r1, Err(Ok(Error::InvalidInput)));
-    // deadline in the past
     let r2 = h.client.try_create(
         &h.sender,
         &h.recipient,
@@ -286,7 +279,6 @@ fn create_rejects_bad_input() {
         &0,
     );
     assert_eq!(r2, Err(Ok(Error::InvalidInput)));
-    // non-positive amount
     let r3 = h.client.try_create(
         &h.sender,
         &h.recipient,
@@ -298,7 +290,6 @@ fn create_rejects_bad_input() {
         &0,
     );
     assert_eq!(r3, Err(Ok(Error::InvalidAmount)));
-    // empty asset list
     let r4 = h.client.try_create(
         &h.sender,
         &h.recipient,
@@ -310,7 +301,6 @@ fn create_rejects_bad_input() {
         &0,
     );
     assert_eq!(r4, Err(Ok(Error::InvalidInput)));
-    // duplicate asset in the list
     let dup = vec![
         &h.env,
         AssetAmount {
@@ -333,7 +323,6 @@ fn create_rejects_bad_input() {
         &0,
     );
     assert_eq!(r5, Err(Ok(Error::InvalidInput)));
-    // No successful escrow was created, so the sender keeps every token.
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
 }
 
@@ -343,7 +332,6 @@ fn create_rejects_bad_override_config() {
     let signer = public_key(&h.env, &keypair(1));
     let signers = vec![&h.env, signer];
 
-    // Non-empty signer set with a zero threshold.
     let r1 = h.client.try_create(
         &h.sender,
         &h.recipient,
@@ -356,7 +344,6 @@ fn create_rejects_bad_override_config() {
     );
     assert_eq!(r1, Err(Ok(Error::InvalidThreshold)));
 
-    // Threshold above the number of signers.
     let r2 = h.client.try_create(
         &h.sender,
         &h.recipient,
@@ -369,7 +356,6 @@ fn create_rejects_bad_override_config() {
     );
     assert_eq!(r2, Err(Ok(Error::InvalidThreshold)));
 
-    // Empty signer set with a non-zero threshold.
     let r3 = h.client.try_create(
         &h.sender,
         &h.recipient,
@@ -382,6 +368,8 @@ fn create_rejects_bad_override_config() {
     );
     assert_eq!(r3, Err(Ok(Error::InvalidThreshold)));
 }
+
+// --- Override release tests ---
 
 #[test]
 fn override_release_with_threshold_signatures_releases_funds() {
@@ -437,10 +425,6 @@ fn override_release_rejects_replayed_nonce() {
         .override_release(&id, &nonce, &vec![&h.env, sig.clone()]);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
 
-    // A second escrow reusing the same signer set and the same nonce must be
-    // rejected even though the escrow itself has since moved past `Funded` —
-    // the nonce guard is checked before the state guard would matter, and a
-    // captured (nonce, signature) pair must never verify twice.
     let res = h
         .client
         .try_override_release(&id, &nonce, &vec![&h.env, sig]);
@@ -465,7 +449,6 @@ fn override_release_requires_strictly_increasing_nonce() {
         &2,
     );
 
-    // Nonce 0 is never valid (must be strictly greater than the initial 0).
     let sig1 = sign_override(&h, &kp1, id, 0);
     let sig2 = sign_override(&h, &kp2, id, 0);
     let res = h
@@ -563,195 +546,404 @@ fn override_release_disabled_without_configured_signers() {
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
 
-// ---------------------------------------------------------------------------
-// Revocation tests
-// ---------------------------------------------------------------------------
+// --- Milestone tests ---
 
 #[test]
-fn revoke_returns_full_funds_when_nothing_released() {
-    let h = setup(10_000);
-    let id = create(&h, 10_000, START + 86_400);
-    assert_eq!(balance(&h, &h.sender), 0);
-
-    h.client.revoke(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Revoked);
-    // All funds returned to the sender; custody empty.
-    assert_eq!(balance(&h, &h.sender), 10_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-}
-
-#[test]
-fn partial_claim_then_revoke_returns_remainder() {
-    let h = setup(10_000);
-    let id = create(&h, 10_000, START + 86_400);
-
-    // Arbiter releases 6 000 to the recipient (partial release).
-    h.client.release(&h.arbiter, &id, &6_000);
-    let escrow = h.client.get(&id);
-    assert_eq!(escrow.state, EscrowState::Funded); // still Funded, not Released
-    assert_eq!(escrow.released_amount, 6_000);
-    assert_eq!(balance(&h, &h.recipient), 6_000);
-    assert_eq!(balance(&h, &h.client.address), 4_000);
-
-    // Sender revokes; remaining 4 000 returned.
-    h.client.revoke(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Revoked);
-    assert_eq!(balance(&h, &h.sender), 4_000);
-    assert_eq!(balance(&h, &h.recipient), 6_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-}
-
-#[test]
-fn partial_release_stays_funded_then_full_release_completes() {
-    let h = setup(10_000);
-    let id = create(&h, 10_000, START + 86_400);
-
-    // First partial release: 4 000
-    h.client.release(&h.arbiter, &id, &4_000);
-    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-    assert_eq!(h.client.get(&id).released_amount, 4_000);
-    assert_eq!(balance(&h, &h.recipient), 4_000);
-
-    // Second partial release: 6 000 (completes the escrow)
-    h.client.release(&h.arbiter, &id, &6_000);
-    assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(h.client.get(&id).released_amount, 10_000);
-    assert_eq!(balance(&h, &h.recipient), 10_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-}
-
-#[test]
-fn revoke_rejects_already_released_escrow() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    h.client.release(&h.arbiter, &id, &5_000);
-    assert_eq!(h.client.get(&id).state, EscrowState::Released);
-
-    let res = h.client.try_revoke(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::EscrowAlreadyReleased)));
-    // Nothing changed.
-    assert_eq!(balance(&h, &h.recipient), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-}
-
-#[test]
-fn revoke_rejects_double_revocation() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-
-    h.client.revoke(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Revoked);
-
-    let res = h.client.try_revoke(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::AlreadyRevoked)));
-}
-
-#[test]
-fn unauthorised_revoker_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    let intruder = Address::generate(&h.env);
-
-    let res = h.client.try_revoke(&intruder, &id);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    assert_eq!(balance(&h, &h.client.address), 5_000);
-}
-
-#[test]
-fn revoke_rejected_after_deadline() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    // After deadline, Funded escrows can still be refunded or expired, but
-    // revocation is a sender-initiated action that should only work before
-    // the deadline (the refund path is the post-deadline equivalent).
-    // In the current design, the sender can still revoke a Funded escrow
-    // regardless of deadline — the refund path just adds the Expired marker.
-    // This test documents that revocation works even after deadline for
-    // consistency (the sender can always reclaim).
-    h.client.revoke(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Revoked);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-}
-
-#[test]
-fn revoke_time_lock_escrow() {
-    let h = setup(0); // unfunded time-lock
-    let unlock = START + 600;
-    let id = h.client.initialize_timelock(
+fn milestone_partial_then_full_release() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 4_000),
+        milestone_spec(&h.env, "build", 6_000),
+    ];
+    let id = h.client.deposit_with_milestones(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &h.asset,
-        &5_000,
-        &unlock,
-        &String::from_str(&h.env, "tl"),
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "project"),
+        &specs,
     );
-    assert_eq!(h.client.get(&id).state, EscrowState::Created);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 
-    // Revoke before unlock — no tokens to move, just state change.
-    h.client.revoke(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Revoked);
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    let set = h.client.milestones(&id);
+    assert!(set.milestones.get(0).unwrap().released);
+    assert_eq!(set.released_amount, 4_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
 
-    // Cannot claim after revocation.
-    h.env.ledger().with_mut(|l| l.timestamp = unlock);
-    let res = h.client.try_claim(&h.recipient, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
 
-#[test]
-fn revoked_escrow_cannot_be_refunded() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-
-    h.client.revoke(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Revoked);
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    let res = h.client.try_refund(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn revoked_escrow_can_be_closed() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-
-    h.client.revoke(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Revoked);
-
-    h.client.close(&h.sender, &id);
+    h.client.close(&h.arbiter, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Closed);
 }
 
 #[test]
-fn partial_release_over_amount_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-
-    // Try to release more than the funded amount.
-    let res = h.client.try_release(&h.arbiter, &id, &6_000);
-    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
-    assert_eq!(balance(&h, &h.client.address), 5_000);
+fn milestone_unauthorized_approval_rejected() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    let res = h.client.try_release_milestone(&h.sender, &id, &0);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 }
 
 #[test]
-fn partial_release_then_refund_returns_remainder() {
-    let h = setup(10_000);
-    let id = create(&h, 10_000, START + 100);
+fn milestone_double_release_rejected() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    let res = h.client.try_release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+}
 
-    // Partial release: 3 000
-    h.client.release(&h.arbiter, &id, &3_000);
-    assert_eq!(balance(&h, &h.recipient), 3_000);
-    assert_eq!(balance(&h, &h.client.address), 7_000);
+#[test]
+fn milestone_bps_must_total_100() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 4_000),
+        milestone_spec(&h.env, "b", 5_000),
+    ];
+    let res = h.client.try_deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 10_000);
+}
 
-    // Past deadline: refund returns the remaining 7 000.
+#[test]
+fn plain_release_blocked_on_milestone_escrow() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    let res = h.client.try_release(&h.arbiter, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+}
+
+#[test]
+fn timelock_cliff_rejects_early_withdraw_and_claims_post_maturity() {
+    let h = setup(10_000, 0);
+    let unlock_time = START + 1_000;
+
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &unlock_time,
+        &String::from_str(&h.env, "timelock cliff"),
+    );
+    assert_eq!(id, 1);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    // Pre-maturity check: withdrawal and claim must fail with TimeLockActive
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+    assert_eq!(h.client.get_vested_amount(&id), 0);
+
+    let early_claim = h.client.try_claim(&h.recipient, &id);
+    assert_eq!(early_claim, Err(Ok(Error::TimeLockActive)));
+
+    let early_withdraw = h.client.try_withdraw(&h.recipient, &id, &5_000);
+    assert_eq!(early_withdraw, Err(Ok(Error::TimeLockActive)));
+
+    // Post-maturity check: claim succeeds
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert_eq!(h.client.get_claimable_amount(&id), 10_000);
+    assert_eq!(h.client.get_vested_amount(&id), 10_000);
+
+    let claimed = h.client.claim(&h.recipient, &id);
+    assert_eq!(claimed, 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+}
+
+#[test]
+fn timelock_linear_release_gradual_withdrawals() {
+    let h = setup(10_000, 0);
+    let start_time = START;
+    let cliff_time = START + 200;
+    let end_time = START + 1_000;
+
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time,
+        cliff_time,
+        end_time,
+    };
+
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &end_time,
+        &String::from_str(&h.env, "linear schedule"),
+    );
+
+    // 1. Before cliff (timestamp = START + 100): locked
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+    assert_eq!(h.client.get_vested_amount(&id), 0);
+    let res = h.client.try_withdraw(&h.recipient, &id, &1_000);
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
+
+    // 2. At 50% time (timestamp = START + 500, past cliff):
+    // 50% of 10,000 = 5,000 vested.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_vested_amount(&id), 5_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 5_000);
+
+    // Partial withdrawal of 3,000
+    let total_released = h.client.withdraw(&h.recipient, &id, &3_000);
+    assert_eq!(total_released, 3_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 3_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 7_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 2_000);
+
+    // Attempt to withdraw more than currently claimable (3,000 > 2,000)
+    let over_withdraw = h.client.try_withdraw(&h.recipient, &id, &3_000);
+    assert_eq!(over_withdraw, Err(Ok(Error::InsufficientFunds)));
+
+    // 3. At 80% time (timestamp = START + 800):
+    // 80% of 10,000 = 8,000 vested; already released 3,000 => claimable = 5,000.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 800);
+    assert_eq!(h.client.get_vested_amount(&id), 8_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 5_000);
+
+    let next_released = h.client.withdraw(&h.recipient, &id, &5_000);
+    assert_eq!(next_released, 8_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 8_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+
+    // 4. At 100% maturity (timestamp = START + 1_000):
+    // Total vested = 10,000; claimable = 2,000.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
+    assert_eq!(h.client.get_vested_amount(&id), 10_000);
+    assert_eq!(h.client.get_claimable_amount(&id), 2_000);
+
+    let claimed = h.client.claim(&h.recipient, &id);
+    assert_eq!(claimed, 2_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(h.client.get_claimable_amount(&id), 0);
+}
+
+#[test]
+fn scheduled_escrow_rejects_bad_schedule_inputs() {
+    let h = setup(10_000, 0);
+
+    // start_time > cliff_time
+    let s1 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START + 500,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let r1 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 1_000),
+        &s1,
+        &(START + 1_000),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r1, Err(Ok(Error::InvalidInput)));
+
+    // cliff_time > end_time
+    let s2 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 1_200,
+        end_time: START + 1_000,
+    };
+    let r2 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 1_000),
+        &s2,
+        &(START + 1_000),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r2, Err(Ok(Error::InvalidInput)));
+
+    // end_time <= start_time
+    let s3 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START + 500,
+        cliff_time: START + 500,
+        end_time: START + 500,
+    };
+    let r3 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 1_000),
+        &s3,
+        &(START + 500),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r3, Err(Ok(Error::InvalidInput)));
+
+    // deadline < end_time
+    let s4 = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 100,
+        end_time: START + 1_000,
+    };
+    let r4 = h.client.try_create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 1_000),
+        &s4,
+        &(START + 500),
+        &String::from_str(&h.env, "bad schedule"),
+    );
+    assert_eq!(r4, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn timelock_unauthorized_claim_and_withdraw() {
+    let h = setup(5_000, 0);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 500),
+        &String::from_str(&h.env, "timelock"),
+    );
+
+    let intruder = Address::generate(&h.env);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
+
+    let r1 = h.client.try_withdraw(&intruder, &id, &1_000);
+    assert_eq!(r1, Err(Ok(Error::Unauthorized)));
+
+    let r2 = h.client.try_claim(&intruder, &id);
+    assert_eq!(r2, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn timelock_refund_rules() {
+    let h = setup(5_000, 0);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 500),
+        &String::from_str(&h.env, "timelock"),
+    );
+
+    // Pre-deadline refund attempt fails
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    h.client.refund(&h.sender, &id);
+    let early = h.client.try_refund_timelock(&h.sender, &id);
+    assert_eq!(early, Err(Ok(Error::TimeLockActive)));
+
+    // Non-sender cannot refund
+    let intruder = Address::generate(&h.env);
+    let unauth = h.client.try_refund_timelock(&intruder, &id);
+    assert_eq!(unauth, Err(Ok(Error::Unauthorized)));
+
+    // Post-deadline refund succeeds
+    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
+    h.client.refund_timelock(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.sender), 7_000);
-    assert_eq!(balance(&h, &h.recipient), 3_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
+fn initialize_and_fund_timelock_lifecycle() {
+    let h = setup(5_000, 0);
+    let id = h.client.initialize_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 500),
+        &String::from_str(&h.env, "unfunded"),
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Created);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+
+    // Intruder cannot fund
+    let intruder = Address::generate(&h.env);
+    let unauth_fund = h.client.try_fund(&intruder, &id);
+    assert_eq!(unauth_fund, Err(Ok(Error::Unauthorized)));
+
+    // Sender funds
+    h.client.fund(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+
+    // Pre-maturity claim fails
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    let early = h.client.try_claim(&h.recipient, &id);
+    assert_eq!(early, Err(Ok(Error::TimeLockActive)));
+
+    // Post-maturity claim succeeds
+    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
+    let claimed = h.client.claim(&h.recipient, &id);
+    assert_eq!(claimed, 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
 }

@@ -64,6 +64,10 @@ pub enum ContractEvent {
     },
     /// A treasury configuration field was updated (`action` is e.g. `policy`).
     TreasuryConfigUpdated { org: String, action: Symbol },
+    /// A treasury was frozen by the multisig.
+    TreasuryFrozen { org: String },
+    /// A treasury was unfrozen by the multisig.
+    TreasuryUnfrozen { org: String },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -151,6 +155,14 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::PolicyViolation { policy_id, reason } => {
             env.events()
                 .publish((Symbol::new(env, "PolicyViolation"),), (policy_id, reason));
+        }
+        ContractEvent::TreasuryFrozen { org } => {
+            env.events()
+                .publish((Symbol::new(env, "TreasuryFrozen"),), org);
+        }
+        ContractEvent::TreasuryUnfrozen { org } => {
+            env.events()
+                .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
         }
         ContractEvent::EscrowReleased {
             escrow_id,
