@@ -242,7 +242,7 @@ impl MultiSigContract {
             return Err(Error::AlreadyExists);
         }
         if signers.len() >= MAX_SIGNERS {
-            return Err(Error::TooManySigners);
+            return Err(Error::InvalidThreshold);
         }
         signers.push_back(SignerWeight {
             address: signer.clone(),
@@ -271,10 +271,8 @@ impl MultiSigContract {
         signers.remove(idx);
         env.storage().instance().set(&DataKey::Signers, &signers);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("signer"), symbol_short!("removed")),
-            signer,
-        );
+        env.events()
+            .publish((symbol_short!("signer"), symbol_short!("removed")), signer);
         Ok(())
     }
 
@@ -935,7 +933,7 @@ impl MultiSigContract {
                     return Err(Error::AlreadyExists);
                 }
                 if signers.len() >= MAX_SIGNERS {
-                    return Err(Error::TooManySigners);
+                    return Err(Error::InvalidThreshold);
                 }
                 // Total weight only grows here, so the threshold stays
                 // satisfiable; the check is purely an overflow guard.

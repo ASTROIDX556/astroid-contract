@@ -4,8 +4,8 @@ extern crate std;
 use crate::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, String, Vec};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
+use soroban_sdk::{Address, Env, IntoVal, String, Symbol, Val, Vec};
 
 struct Harness {
     env: Env,
@@ -89,6 +89,15 @@ fn dep_vec(h: &Harness, deps: &[u64]) -> Vec<u64> {
         v.push_back(*d);
     }
     v
+}
+
+/// Whether any event carrying `symbol` in its topics has been emitted.
+fn emitted(env: &Env, symbol: &str) -> bool {
+    let want: Val = Symbol::new(env, symbol).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want))
 }
 
 /// Drive a proposal all the way to `Executed`.
@@ -422,6 +431,68 @@ fn too_many_dependencies_rejected() {
         deps.push(create(&h, 2, 5_000));
     }
     assert_eq!(try_create_with_deps(&h, &deps), Err(Error::InvalidInput));
+}
+
+#[test]
+fn blocked_execution_emits_dependency_failure_event() {
+    let h = setup(3);
+    let first = create(&h, 2, 5_000);
+    let second = create_with_deps(&h, 2, 5_000, &[first]);
+
+    // Fully approved, but the prerequisite has not executed.
+    h.client.approve(&h.approvers[0], &second);
+    h.client.approve(&h.approvers[1], &second);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &second),
+        Err(Ok(Error::PrerequisiteNotMet))
+    );
+    assert!(emitted(&h.env, "dep_fail"));
+    assert!(!emitted(&h.env, "dep_ok"));
+}
+
+#[test]
+fn satisfied_chain_emits_dependency_success_event() {
+    let h = setup(3);
+    let first = create(&h, 2, 5_000);
+    let second = create_with_deps(&h, 2, 5_000, &[first]);
+
+    approve_and_execute(&h, first);
+    h.client.approve(&h.approvers[0], &second);
+    h.client.approve(&h.approvers[1], &second);
+    h.client.execute(&h.proposer, &second);
+    assert_eq!(h.client.state(&second), ProposalState::Executed);
+
+    assert!(emitted(&h.env, "dep_ok"));
+    assert!(!emitted(&h.env, "dep_fail"));
+}
+
+#[test]
+fn is_executed_reflects_completion_states() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+
+    // Not executed while pending or merely approved.
+    assert!(!h.client.is_executed(&id));
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert!(!h.client.is_executed(&id));
+
+    // Executed, and still satisfied once tidied away into Closed.
+    h.client.execute(&h.proposer, &id);
+    assert!(h.client.is_executed(&id));
+    h.client.close(&h.proposer, &id);
+    assert!(h.client.is_executed(&id));
+}
+
+#[test]
+fn failed_is_never_executed() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+    assert!(!h.client.is_executed(&id));
 }
 
 #[test]

@@ -2,11 +2,11 @@
 extern crate std;
 
 use crate::access::Role;
-use crate::{WalletContract, WalletContractClient};
+use crate::{ContractCall, WalletContract, WalletContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val, Vec};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -25,6 +25,7 @@ struct Harness {
     client: WalletContractClient<'static>,
     admin: Address,
     token: Address,
+    contract_id: Address,
 }
 
 fn setup() -> Harness {
@@ -47,6 +48,7 @@ fn setup() -> Harness {
         client,
         admin,
         token,
+        contract_id,
     }
 }
 
@@ -225,50 +227,12 @@ fn zero_amount_transfer_rejected() {
 
 // --- Batch execution tests ---
 
-/// Helper: build a `ContractCall` targeting `wallet.transfer`.
-fn transfer_call(
-    env: &Env,
-    wallet_addr: &Address,
-    caller: &Address,
-    to: &Address,
-    asset: &Address,
-    amount: i128,
-) -> ContractCall {
-    let mut args: Vec<soroban_sdk::RawVal> = Vec::new(env);
-    args.push_back(caller.clone().into_val(env));
-    args.push_back((*wallet_addr).into_val(env));
-    args.push_back(to.clone().into_val(env));
-    args.push_back(asset.clone().into_val(env));
-    args.push_back(amount.into_val(env));
-    ContractCall {
-        contract_addr: wallet_addr.clone(),
-        fn_name: Symbol::new(env, "transfer"),
-        args,
-    }
-}
-
-/// Helper: build a `ContractCall` targeting `wallet.deposit`.
-fn deposit_call(
-    env: &Env,
-    wallet_addr: &Address,
-    wallet_id: u64,
-    from: &Address,
-    asset: &Address,
-    amount: i128,
-) -> ContractCall {
-    let mut args: Vec<soroban_sdk::RawVal> = Vec::new(env);
-    args.push_back(wallet_id.into_val(env));
-    args.push_back(from.clone().into_val(env));
-    args.push_back(asset.clone().into_val(env));
-    args.push_back(amount.into_val(env));
-    ContractCall {
-        contract_addr: wallet_addr.clone(),
-        fn_name: Symbol::new(env, "deposit"),
-        args,
-    }
-}
-
 /// Helper: build a `ContractCall` targeting the token's `transfer`.
+///
+/// Soroban forbids a contract from re-entering itself, so batch sub-calls must
+/// target external contracts. Transfers out of a wallet therefore call the
+/// Stellar Asset Contract directly, moving real custody held at the wallet
+/// contract's address.
 fn token_transfer_call(
     env: &Env,
     token_addr: &Address,
@@ -276,7 +240,7 @@ fn token_transfer_call(
     to: &Address,
     amount: i128,
 ) -> ContractCall {
-    let mut args: Vec<soroban_sdk::RawVal> = Vec::new(env);
+    let mut args: Vec<soroban_sdk::Val> = Vec::new(env);
     args.push_back(from.clone().into_val(env));
     args.push_back(to.clone().into_val(env));
     args.push_back(amount.into_val(env));
@@ -294,7 +258,7 @@ fn batch_execute_empty_fails() {
     let id = h.client.create_wallet(&owner);
     let empty: Vec<ContractCall> = Vec::new(&h.env);
     let res = h.client.try_batch_execute(&owner, &id, &empty);
-    assert_eq!(res, Err(Ok(Error::BatchEmpty)));
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
 }
 
 #[test]
@@ -307,11 +271,17 @@ fn batch_execute_single_transfer() {
     h.client.deposit(&id, &owner, &h.token, &500);
 
     let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &recipient, &h.token, 200));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        200,
+    ));
     h.client.batch_execute(&owner, &id, &calls);
 
-    assert_eq!(h.client.balance(&id, &h.token), 300);
     assert_eq!(token_balance(&h, &recipient), 200);
+    assert_eq!(token_balance(&h, &h.contract_id), 300);
 }
 
 #[test]
@@ -325,13 +295,25 @@ fn batch_execute_multiple_transfers() {
     h.client.deposit(&id, &owner, &h.token, &1_000);
 
     let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r1, &h.token, 300));
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r2, &h.token, 200));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        300,
+    ));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        200,
+    ));
     h.client.batch_execute(&owner, &id, &calls);
 
-    assert_eq!(h.client.balance(&id, &h.token), 500);
     assert_eq!(token_balance(&h, &r1), 300);
     assert_eq!(token_balance(&h, &r2), 200);
+    assert_eq!(token_balance(&h, &h.contract_id), 500);
 }
 
 #[test]
@@ -346,14 +328,26 @@ fn batch_execute_atomicity_on_failure() {
     // First call succeeds (50), second fails (90 > 50 remaining).
     // Atomicity means the first transfer is rolled back too.
     let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r1, &h.token, 50));
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r1, &h.token, 90));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        50,
+    ));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        90,
+    ));
     let res = h.client.try_batch_execute(&owner, &id, &calls);
     assert!(res.is_err());
 
     // Balance unchanged — full rollback.
-    assert_eq!(h.client.balance(&id, &h.token), 100);
     assert_eq!(token_balance(&h, &r1), 0);
+    assert_eq!(token_balance(&h, &h.contract_id), 100);
 }
 
 #[test]
@@ -366,7 +360,13 @@ fn batch_execute_non_owner_fails() {
     h.client.deposit(&id, &owner, &h.token, &100);
 
     let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(deposit_call(&h.env, &h.contract_id, id, &stranger, &h.token, 50));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &stranger,
+        50,
+    ));
     let res = h.client.try_batch_execute(&stranger, &id, &calls);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
@@ -377,16 +377,48 @@ fn batch_execute_mixed_operations() {
     let owner = Address::generate(&h.env);
     let recipient = Address::generate(&h.env);
     let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 1_000);
 
-    // Batch: deposit 500, then transfer 200 to recipient.
+    // A second asset to move alongside the default one in a single batch.
+    let token_admin = Address::generate(&h.env);
+    let token_b = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+    sac_b.mint(&owner, &400);
+
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &500);
+    h.client.deposit(&id, &owner, &token_b, &400);
+
+    // Batch: move both assets to the recipient atomically.
     let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(deposit_call(&h.env, &h.contract_id, id, &owner, &h.token, 500));
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &recipient, &h.token, 200));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        200,
+    ));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &token_b,
+        &h.contract_id,
+        &recipient,
+        100,
+    ));
     h.client.batch_execute(&owner, &id, &calls);
 
-    assert_eq!(h.client.balance(&id, &h.token), 300);
     assert_eq!(token_balance(&h, &recipient), 200);
+    assert_eq!(
+        token::TokenClient::new(&h.env, &token_b).balance(&recipient),
+        100
+    );
+    assert_eq!(token_balance(&h, &h.contract_id), 300);
+    assert_eq!(
+        token::TokenClient::new(&h.env, &token_b).balance(&h.contract_id),
+        300
+    );
 }
 
 #[test]
@@ -400,11 +432,17 @@ fn batch_execute_frozen_wallet_fails() {
     h.client.freeze(&owner, &id);
 
     let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &recipient, &h.token, 10));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        10,
+    ));
     let res = h.client.try_batch_execute(&owner, &id, &calls);
-    assert!(res.is_err());
+    assert_eq!(res, Err(Ok(Error::WalletFrozen)));
     // Balance unchanged.
-    assert_eq!(h.client.balance(&id, &h.token), 100);
+    assert_eq!(token_balance(&h, &h.contract_id), 100);
 }
 
 #[test]
