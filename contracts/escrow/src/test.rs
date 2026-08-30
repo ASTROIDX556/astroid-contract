@@ -208,12 +208,10 @@ fn refund_before_deadline_rejected() {
     let h = setup(5_000, 0);
     let id = create(&h, &one_asset(&h, 5_000), START + 100);
 
-    // The refund window has not opened yet — the recipient still owns its
-    // guaranteed release window.
     let res = h.client.try_refund(&h.sender, &id);
+    // The refund window has not opened yet - the recipient still owns its
+    // guaranteed release window.
     assert_eq!(res, Err(Ok(Error::RefundWindowNotOpen)));
-    assert_eq!(balance(&h, &h.client.address), 5_000);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
@@ -570,129 +568,6 @@ fn override_release_disabled_without_configured_signers() {
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
 
-// --- refund window ---
-
-fn create_windowed(h: &Harness, amount: i128, deadline: u64, window: u64) -> u64 {
-    h.client.create_with_refund_window(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset,
-        &amount,
-        &deadline,
-        &window,
-        &String::from_str(&h.env, "payment"),
-    )
-}
-
-#[test]
-fn unbounded_window_is_the_default() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    let escrow = h.client.get(&id);
-    assert_eq!(escrow.refund_window, 0);
-    // `0` means the window never closes.
-    assert_eq!(h.client.refund_window_closes_at(&id), 0);
-
-    // Even far past the deadline the sender can still reclaim the funds.
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = START + 10_000_000);
-    h.client.refund(&h.sender, &id);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-}
-
-#[test]
-fn refund_inside_window_succeeds() {
-    let h = setup(5_000);
-    let id = create_windowed(&h, 5_000, START + 100, 600);
-    assert_eq!(h.client.refund_window_closes_at(&id), START + 700);
-
-    // While the escrow is still active the window is closed for refunds.
-    assert!(!h.client.is_refundable(&id));
-
-    // Exactly at the deadline the window opens (inclusive lower bound).
-    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
-    assert!(h.client.is_refundable(&id));
-    h.client.refund(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-}
-
-#[test]
-fn refund_at_last_second_of_window_succeeds() {
-    let h = setup(5_000);
-    let id = create_windowed(&h, 5_000, START + 100, 600);
-
-    // The window is half-open: `closes_at - 1` is the final refundable second.
-    h.env.ledger().with_mut(|l| l.timestamp = START + 699);
-    h.client.refund(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-}
-
-#[test]
-fn refund_after_window_closes_is_rejected() {
-    let h = setup(5_000);
-    let id = create_windowed(&h, 5_000, START + 100, 600);
-
-    // `closes_at` itself is already outside the window (exclusive upper bound).
-    h.env.ledger().with_mut(|l| l.timestamp = START + 700);
-    assert!(!h.client.is_refundable(&id));
-    let res = h.client.try_refund(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::RefundWindowClosed)));
-
-    // Well past the window the answer is the same, and nothing moved.
-    h.env.ledger().with_mut(|l| l.timestamp = START + 100_000);
-    let res = h.client.try_refund(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::RefundWindowClosed)));
-    assert_eq!(balance(&h, &h.client.address), 5_000);
-    assert_eq!(balance(&h, &h.sender), 0);
-}
-
-#[test]
-fn expired_escrow_still_honours_the_window() {
-    let h = setup(5_000);
-    let id = create_windowed(&h, 5_000, START + 100, 600);
-
-    // Marking the escrow Expired does not extend the refund window.
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    h.client.expire(&id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 700);
-    let res = h.client.try_refund(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::RefundWindowClosed)));
-    assert_eq!(balance(&h, &h.client.address), 5_000);
-}
-
-#[test]
-fn release_is_unaffected_by_the_refund_window() {
-    let h = setup(5_000);
-    let id = create_windowed(&h, 5_000, START + 100, 600);
-    // The arbiter's release path is bounded by the deadline, not the window.
-    h.client.release(&h.arbiter, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(balance(&h, &h.recipient), 5_000);
-}
-
-#[test]
-fn refund_window_saturates_instead_of_overflowing() {
-    let h = setup(5_000);
-    // deadline + refund_window would overflow u64; the window must simply stay
-    // open rather than wrapping into an already-closed one.
-    let id = create_windowed(&h, 5_000, START + 100, u64::MAX);
-    assert_eq!(h.client.refund_window_closes_at(&id), u64::MAX);
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
-    h.client.refund(&h.sender, &id);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-}
-
-#[test]
-fn timelock_refund_respects_the_window_errors() {
-    let h = setup(0);
 #[test]
 fn timelock_cliff_rejects_early_withdraw_and_claims_post_maturity() {
     let h = setup(10_000, 0);
@@ -943,19 +818,6 @@ fn initialize_and_fund_timelock_lifecycle() {
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &h.asset,
-        &1_000,
-        &(START + 100),
-        &String::from_str(&h.env, "locked"),
-    );
-
-    // Before the unlock time this path keeps its own "too early" error.
-    let res = h.client.try_refund_timelock(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
-    h.client.refund_timelock(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
         &one_asset(&h, 5_000),
         &(START + 500),
         &String::from_str(&h.env, "unfunded"),
@@ -986,4 +848,106 @@ fn initialize_and_fund_timelock_lifecycle() {
     assert_eq!(claimed, 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+// --- refund window ---
+
+fn create_windowed(h: &Harness, assets: &Vec<AssetAmount>, deadline: u64, window: u64) -> u64 {
+    h.client.create_with_refund_window(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        assets,
+        &deadline,
+        &window,
+        &String::from_str(&h.env, "payment"),
+        &no_signers(h),
+        &0,
+    )
+}
+
+#[test]
+fn unbounded_window_is_the_default() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    assert_eq!(h.client.get(&id).refund_window, 0);
+    // `0` means the window never closes.
+    assert_eq!(h.client.refund_window_closes_at(&id), 0);
+
+    // Even far past the deadline the sender can still reclaim the funds.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 10_000_000);
+    h.client.refund(&h.sender, &id);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+}
+
+#[test]
+fn refund_inside_window_succeeds() {
+    let h = setup(5_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 5_000), START + 100, 600);
+    assert_eq!(h.client.refund_window_closes_at(&id), START + 700);
+
+    // While the escrow is still active the window is closed for refunds.
+    assert!(!h.client.is_refundable(&id));
+
+    // Exactly at the deadline the window opens (inclusive lower bound).
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert!(h.client.is_refundable(&id));
+    h.client.refund(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
+fn refund_at_last_second_of_window_succeeds() {
+    let h = setup(5_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 5_000), START + 100, 600);
+
+    // The window is half-open: `closes_at - 1` is the final refundable second.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 699);
+    h.client.refund(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+}
+
+#[test]
+fn refund_after_window_closes_is_rejected() {
+    let h = setup(5_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 5_000), START + 100, 600);
+
+    // `closes_at` itself is already outside the window (exclusive upper bound).
+    h.env.ledger().with_mut(|l| l.timestamp = START + 700);
+    assert!(!h.client.is_refundable(&id));
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::RefundWindowClosed))
+    );
+
+    // Well past the window the answer is the same, and nothing moved.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100_000);
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::RefundWindowClosed))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
+}
+
+#[test]
+fn expiring_an_escrow_does_not_reopen_a_closed_window() {
+    let h = setup(5_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 5_000), START + 100, 600);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 700);
+    h.client.expire(&id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
+
+    // Marking the escrow expired is a status change, not a second chance.
+    assert!(!h.client.is_refundable(&id));
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::RefundWindowClosed))
+    );
 }

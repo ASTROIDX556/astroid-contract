@@ -525,6 +525,17 @@
                     },
                     {
                       "key": {
+                        "symbol": "funded_amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 15000
+                        }
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "memo"
                       },
                       "val": {
@@ -569,12 +580,16 @@
                       },
                       "val": {
                         "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "released_amount"
                       },
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000
+                          "lo": 15000
                         }
                       }
                     },
@@ -2715,6 +2730,17 @@
                 },
                 {
                   "key": {
+                    "symbol": "funded_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 15000
+                    }
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -2759,6 +2785,10 @@
                   },
                   "val": {
                     "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "released_amount"
                   },
                   "val": {
@@ -3371,6 +3401,17 @@
                 },
                 {
                   "key": {
+                    "symbol": "funded_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 15000
+                    }
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -3415,12 +3456,16 @@
                   },
                   "val": {
                     "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "released_amount"
                   },
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 10000
+                      "lo": 15000
                     }
                   }
                 },
@@ -3866,6 +3911,17 @@
                 },
                 {
                   "key": {
+                    "symbol": "funded_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 15000
+                    }
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -3910,12 +3966,16 @@
                   },
                   "val": {
                     "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "released_amount"
                   },
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 10000
+                      "lo": 15000
                     }
                   }
                 },

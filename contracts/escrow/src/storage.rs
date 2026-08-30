@@ -60,6 +60,9 @@ pub struct Escrow {
     pub assets: Vec<AssetAmount>,
     pub state: EscrowState,
     pub deadline: u64,
+    /// Seconds after `deadline` during which a refund may be claimed.
+    /// `0` means the refund window never closes.
+    pub refund_window: u64,
     pub funded_amount: i128,
     pub memo: String,
     pub schedule: ReleaseSchedule,

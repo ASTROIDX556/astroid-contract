@@ -23,23 +23,6 @@
 //! deadline passes); funds stay in custody until `refund` returns them to the
 //! sender, so no escrow can be `Closed` with money still locked.
 //!
-//! ## Refund window
-//!
-//! Refunds are only valid inside an explicit window that opens at the escrow's
-//! `deadline` and — when a non-zero `refund_window` was configured — closes
-//! `refund_window` seconds later:
-//!
-//! ```text
-//! ── funded ──┤ deadline ├── refund window (open) ──┤ closes_at ├── expired ──▶
-//!   too early                    refundable                    too late
-//! ```
-//!
-//! Attempting a refund outside that window fails deterministically with
-//! [`Error::RefundWindowNotOpen`] (before the deadline — the counterparty still
-//! owns its guaranteed release window) or [`Error::RefundWindowClosed`] (after
-//! the window elapsed). A `refund_window` of `0` means "no upper bound", which
-//! is what [`EscrowContract::create`] configures so existing behaviour is
-//! unchanged; use [`EscrowContract::create_with_refund_window`] to bound it.
 //! ## Signature-based release override
 //!
 //! Besides the single named `arbiter`, an escrow may name a set of
@@ -65,6 +48,23 @@
 //!   from start_time to end_time with optional cliff_time.
 //! - Partial and multiple gradual withdrawals by the beneficiary.
 //! - Deterministic `Error::TimeLockActive` when withdrawing before maturity or cliff.
+//!
+//! ## Refund window
+//!
+//! Refunds are only valid inside an explicit window that opens at the escrow's
+//! `deadline` and -- when a non-zero `refund_window` was configured -- closes
+//! `refund_window` seconds later:
+//!
+//! ```text
+//! -- funded --| deadline |-- refund window (open) --| closes_at |-- too late --
+//! ```
+//!
+//! Attempting a refund outside that window fails deterministically with
+//! [`Error::RefundWindowNotOpen`] (before the deadline -- the recipient still
+//! owns its guaranteed release window) or [`Error::RefundWindowClosed`] (after
+//! the window elapsed). A `refund_window` of `0` means "no upper bound", which
+//! is what [`EscrowContract::create`] configures so existing behaviour is
+//! unchanged; use [`EscrowContract::create_with_refund_window`] to bound it.
 
 pub mod storage;
 
@@ -135,33 +135,6 @@ pub fn calculate_vested_amount(
     }
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Escrow {
-    pub sender: Address,
-    pub recipient: Address,
-    pub arbiter: Address,
-    /// The assets (and per-asset amounts) held by this escrow. Populated at
-    /// creation time; `create` pulls every listed amount into custody
-    /// atomically, so this always reflects funds actually held once `state`
-    /// is `Funded`.
-    pub assets: Vec<AssetAmount>,
-    pub state: EscrowState,
-    pub deadline: u64,
-    /// Seconds after `deadline` during which a refund may be claimed.
-    /// `0` means the refund window never closes.
-    pub refund_window: u64,
-    pub funded_amount: i128,
-    pub memo: String,
-    /// Pre-configured ed25519 public keys allowed to co-sign a manual release
-    /// override. Empty disables the override mechanism for this escrow.
-    pub override_signers: Vec<BytesN<32>>,
-    /// Minimum number of distinct, valid signatures (from `override_signers`)
-    /// required to release via [`EscrowContract::override_release`].
-    pub override_threshold: u32,
-    /// The last nonce consumed by a successful override release. A subsequent
-    /// override call must supply a strictly greater nonce.
-    pub override_nonce: u64,
 /// Calculate currently claimable (vested minus already released) amount for an escrow.
 pub fn calculate_claimable_amount(escrow: &Escrow, current_time: u64) -> Result<i128, Error> {
     if matches!(
@@ -225,7 +198,16 @@ impl EscrowContract {
         release_threshold: u32,
     ) -> Result<u64, Error> {
         Self::create_with_refund_window(
-            env, sender, recipient, arbiter, asset, amount, deadline, 0, memo,
+            env,
+            sender,
+            recipient,
+            arbiter,
+            assets,
+            deadline,
+            0,
+            memo,
+            release_signers,
+            release_threshold,
         )
     }
 
@@ -240,13 +222,13 @@ impl EscrowContract {
         sender: Address,
         recipient: Address,
         arbiter: Address,
-        asset: Address,
-        amount: i128,
+        assets: Vec<AssetAmount>,
         deadline: u64,
         refund_window: u64,
         memo: String,
+        release_signers: Vec<BytesN<32>>,
+        release_threshold: u32,
     ) -> Result<u64, Error> {
-        // `sender` commits the funds.
         sender.require_auth();
         if recipient == sender {
             return Err(Error::InvalidInput);
@@ -277,7 +259,6 @@ impl EscrowContract {
             state: EscrowState::Funded,
             deadline,
             refund_window,
-            funded_amount: amount,
             funded_amount,
             memo,
             schedule: ReleaseSchedule::none(),
@@ -342,6 +323,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline: unlock_time,
+            refund_window: 0,
             funded_amount,
             memo,
             schedule,
@@ -417,6 +399,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline: effective_deadline,
+            refund_window: 0,
             funded_amount,
             memo,
             schedule: schedule.clone(),
@@ -484,7 +467,6 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Created,
             deadline: unlock_time,
-            // Time-locked escrows have no upper refund bound.
             refund_window: 0,
             funded_amount: 0,
             memo,
@@ -802,15 +784,11 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Refund the escrow back to the sender after the deadline (permissionless
-    /// settlement path used when the escrow was never released — either still
-    /// `Funded` past its deadline, or already marked `Expired`). Returns the real
-    /// tokens to the sender.
+    /// Refund remaining funds back to the sender after the deadline.
     ///
     /// The refund window is enforced here: the call fails with
     /// [`Error::RefundWindowNotOpen`] before the deadline and with
     /// [`Error::RefundWindowClosed`] once a bounded window has elapsed.
-    /// Refund remaining funds back to the sender after the deadline.
     pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -818,9 +796,6 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
         Self::check_refund_window(&env, &escrow, Error::RefundWindowNotOpen)?;
-        if env.ledger().timestamp() < escrow.deadline {
-            return Err(Error::InvalidState);
-        }
 
         let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         escrow.state = EscrowState::Refunded;
@@ -846,11 +821,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Refund time-locked escrow after unlock_time has elapsed. The same refund
-    /// window applies; before the unlock time the historical
+    /// Refund time-locked escrow after unlock_time / deadline has elapsed. The
+    /// same refund window applies; before the unlock time the historical
     /// [`Error::TimeLockActive`] is kept, since for this path the deadline *is*
     /// the time lock.
-    /// Refund time-locked escrow after unlock_time / deadline has elapsed.
     pub fn refund_timelock(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -906,21 +880,16 @@ impl EscrowContract {
 
     // --- views ---
 
-    pub fn get(env: Env, id: u64) -> Result<Escrow, Error> {
-        load_escrow(&env, id)
-    }
-
     /// Timestamp at which the escrow's refund window closes, or `0` when the
     /// window has no upper bound. Lets clients show a countdown without
     /// recomputing the window rule off-chain.
     pub fn refund_window_closes_at(env: Env, id: u64) -> Result<u64, Error> {
-        let escrow = Self::load(&env, id)?;
-        Ok(Self::closes_at(&escrow))
+        Ok(Self::closes_at(&load_escrow(&env, id)?))
     }
 
     /// Whether a refund may be claimed for `id` at the current ledger time.
     pub fn is_refundable(env: Env, id: u64) -> Result<bool, Error> {
-        let escrow = Self::load(&env, id)?;
+        let escrow = load_escrow(&env, id)?;
         if !matches!(
             escrow.state,
             EscrowState::Created | EscrowState::Funded | EscrowState::Expired
@@ -930,39 +899,10 @@ impl EscrowContract {
         Ok(Self::check_refund_window(&env, &escrow, Error::RefundWindowNotOpen).is_ok())
     }
 
-    // --- internals ---
-
-    /// Timestamp the refund window closes at (`0` = never). `saturating_add`
-    /// keeps an absurd `refund_window` from overflowing into a closed window.
-    fn closes_at(escrow: &Escrow) -> u64 {
-        if escrow.refund_window == 0 {
-            0
-        } else {
-            escrow.deadline.saturating_add(escrow.refund_window)
-        }
+    pub fn get(env: Env, id: u64) -> Result<Escrow, Error> {
+        load_escrow(&env, id)
     }
 
-    /// Enforce that the current ledger time falls inside the escrow's refund
-    /// window `[deadline, closes_at)`. `not_open` lets each settlement path keep
-    /// its own error for "too early" while sharing one window rule. The escrow
-    /// record is passed in so the check adds no extra storage reads.
-    fn check_refund_window(env: &Env, escrow: &Escrow, not_open: Error) -> Result<(), Error> {
-        let now = env.ledger().timestamp();
-        if now < escrow.deadline {
-            return Err(not_open);
-        }
-        let closes_at = Self::closes_at(escrow);
-        if closes_at != 0 && now >= closes_at {
-            return Err(Error::RefundWindowClosed);
-        }
-        Ok(())
-    }
-
-    fn load(env: &Env, id: u64) -> Result<Escrow, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Escrow(id))
-            .ok_or(Error::NotFound)
     pub fn get_claimable_amount(env: Env, id: u64) -> Result<i128, Error> {
         let escrow = load_escrow(&env, id)?;
         calculate_claimable_amount(&escrow, env.ledger().timestamp())
@@ -995,6 +935,32 @@ impl EscrowContract {
 
     /// Validate a multi-asset list: non-empty, within the size cap, every
     /// amount strictly positive, and no asset listed more than once.
+    /// Timestamp the refund window closes at (`0` = never). `saturating_add`
+    /// keeps an absurd `refund_window` from overflowing into a closed window.
+    fn closes_at(escrow: &Escrow) -> u64 {
+        if escrow.refund_window == 0 {
+            0
+        } else {
+            escrow.deadline.saturating_add(escrow.refund_window)
+        }
+    }
+
+    /// Enforce that the current ledger time falls inside the escrow's refund
+    /// window `[deadline, closes_at)`. `not_open` lets each settlement path keep
+    /// its own error for "too early" while sharing one window rule. The escrow
+    /// record is passed in so the check adds no extra storage reads.
+    fn check_refund_window(env: &Env, escrow: &Escrow, not_open: Error) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        if now < escrow.deadline {
+            return Err(not_open);
+        }
+        let closes_at = Self::closes_at(escrow);
+        if closes_at != 0 && now >= closes_at {
+            return Err(Error::RefundWindowClosed);
+        }
+        Ok(())
+    }
+
     fn validate_assets(assets: &Vec<AssetAmount>) -> Result<(), Error> {
         if assets.is_empty() || assets.len() > MAX_ESCROW_ASSETS {
             return Err(Error::InvalidInput);

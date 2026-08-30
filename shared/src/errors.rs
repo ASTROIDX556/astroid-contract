@@ -78,15 +78,10 @@ pub enum Error {
     DivisionByZero = 45,
 
     // --- Escrow (80-89) ---
-    ConditionNotMet = 80,
-    EscrowNotFunded = 81,
-    EscrowExpired = 82,
-    InvalidCondition = 83,
-    TimeLockActive = 84,
-    /// A refund was attempted before the escrow's refund window opened.
-    RefundWindowNotOpen = 85,
-    /// A refund was attempted after the escrow's refund window closed.
-    RefundWindowClosed = 86,
     EscrowExpired = 46,
     TimeLockActive = 47,
+    /// A refund was attempted before the escrow's refund window opened.
+    RefundWindowNotOpen = 48,
+    /// A refund was attempted after the escrow's refund window closed.
+    RefundWindowClosed = 49,
 }
