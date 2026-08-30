@@ -56,7 +56,9 @@ pub use storage::{
     EscrowState, ReleaseSchedule, ReleaseType,
 };
 
-use astroid_shared::constants::{MAX_ESCROW_ASSETS, MAX_SIGNERS};
+use astroid_shared::constants::{
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
+};
 use astroid_shared::errors::Error;
 use astroid_shared::events::{self, ContractEvent};
 use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
