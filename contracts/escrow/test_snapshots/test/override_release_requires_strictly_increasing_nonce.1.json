@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 9,
+    "address": 8,
     "nonce": 0
   },
   "auth": [
@@ -114,19 +114,26 @@
                   ]
                 },
                 {
-                  "u64": 1100
+                  "u64": 2000
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "string": "payment"
+                  "string": "override"
                 },
                 {
-                  "vec": []
+                  "vec": [
+                    {
+                      "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                    },
+                    {
+                      "bytes": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+                    }
+                  ]
                 },
                 {
-                  "u32": 0
+                  "u32": 2
                 }
               ]
             }
@@ -377,7 +384,7 @@
                         "symbol": "deadline"
                       },
                       "val": {
-                        "u64": 1100
+                        "u64": 2000
                       }
                     },
                     {
@@ -404,7 +411,7 @@
                         "symbol": "memo"
                       },
                       "val": {
-                        "string": "payment"
+                        "string": "override"
                       }
                     },
                     {
@@ -420,7 +427,14 @@
                         "symbol": "override_signers"
                       },
                       "val": {
-                        "vec": []
+                        "vec": [
+                          {
+                            "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                          },
+                          {
+                            "bytes": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+                          }
+                        ]
                       }
                     },
                     {
@@ -428,7 +442,7 @@
                         "symbol": "override_threshold"
                       },
                       "val": {
-                        "u32": 0
+                        "u32": 2
                       }
                     },
                     {
@@ -1452,19 +1466,26 @@
                   ]
                 },
                 {
-                  "u64": 1100
+                  "u64": 2000
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "string": "payment"
+                  "string": "override"
                 },
                 {
-                  "vec": []
+                  "vec": [
+                    {
+                      "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                    },
+                    {
+                      "bytes": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+                    }
+                  ]
                 },
                 {
-                  "u32": 0
+                  "u32": 2
                 }
               ]
             }
@@ -1663,22 +1684,60 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "release"
+                "symbol": "override_release"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
-                },
-                {
                   "u64": 1
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 5000
-                  }
+                  "u64": 0
+                },
+                {
+                  "vec": [
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "public_key"
+                          },
+                          "val": {
+                            "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "signature"
+                          },
+                          "val": {
+                            "bytes": "8f75d323066862164a52e1b9305e9d5db70e629b3ad089649dbe3005d3d73d145fcc4605db4e8dc7b68c99d6a6fc7f9250f3a7d35019b39a87d52718f74e8d00"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "public_key"
+                          },
+                          "val": {
+                            "bytes": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "signature"
+                          },
+                          "val": {
+                            "bytes": "e27e445eb120126ed42219655f7cecdd9ed598a68960ed20f8d1742e71b700bba2a4ece09c77751744002924713d3a54cf15dae283677c2c563d74b300a46400"
+                          }
+                        }
+                      ]
+                    }
+                  ]
                 }
               ]
             }
@@ -1699,12 +1758,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "release"
+                "symbol": "override_release"
               }
             ],
             "data": {
               "error": {
-                "contract": 3
+                "contract": 68
               }
             }
           }
@@ -1725,7 +1784,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 68
                 }
               }
             ],
@@ -1750,7 +1809,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 68
                 }
               }
             ],
@@ -1760,129 +1819,63 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "release"
+                  "symbol": "override_release"
                 },
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
-                    },
-                    {
                       "u64": 1
                     },
                     {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 5000
-                      }
+                      "u64": 0
+                    },
+                    {
+                      "vec": [
+                        {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "public_key"
+                              },
+                              "val": {
+                                "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "signature"
+                              },
+                              "val": {
+                                "bytes": "8f75d323066862164a52e1b9305e9d5db70e629b3ad089649dbe3005d3d73d145fcc4605db4e8dc7b68c99d6a6fc7f9250f3a7d35019b39a87d52718f74e8d00"
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "public_key"
+                              },
+                              "val": {
+                                "bytes": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "signature"
+                              },
+                              "val": {
+                                "bytes": "e27e445eb120126ed42219655f7cecdd9ed598a68960ed20f8d1742e71b700bba2a4ece09c77751744002924713d3a54cf15dae283677c2c563d74b300a46400"
+                              }
+                            }
+                          ]
+                        }
+                      ]
                     }
                   ]
                 }
               ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 5000
-              }
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 0
-              }
             }
           }
         }

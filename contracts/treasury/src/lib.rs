@@ -719,6 +719,7 @@ impl TreasuryContract {
                 budget_id: None,
             })
     }
+
     fn store_holding(env: &Env, asset: &Address, h: &Holding) {
         env.storage()
             .persistent()

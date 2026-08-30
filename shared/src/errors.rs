@@ -49,12 +49,11 @@ pub enum Error {
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (61-69) ---
+    // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
     InvalidThreshold = 64,
-    TimeLocked = 65,
     TooManySigners = 66,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
     BatchCallFailed = 67,
@@ -75,13 +74,16 @@ pub enum Error {
     ProposalNotApproved = 73,
     NotAnApprover = 74,
     CancellationWindowClosed = 75,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
     PrerequisiteNotMet = 78,
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-81) ---
+    // --- Escrow (80-82) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
+    GraceActive = 82,
 
     // --- Treasury allowances (83-86) ---
     AllowanceExceeded = 83,

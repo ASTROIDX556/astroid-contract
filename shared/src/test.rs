@@ -70,7 +70,10 @@ fn time_validation() {
     // Time lock: reached only once timestamp >= unlock_at.
     assert_eq!(require_time_reached(&env, 500), Ok(()));
     assert_eq!(require_time_reached(&env, 1_000), Ok(()));
-    assert_eq!(require_time_reached(&env, 2_000), Err(Error::TimeLocked));
+    assert_eq!(
+        require_time_reached(&env, 2_000),
+        Err(Error::TimelockNotExpired)
+    );
 }
 
 #[test]

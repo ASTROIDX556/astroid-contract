@@ -117,7 +117,7 @@
                   "u64": 1100
                 },
                 {
-                  "u64": 0
+                  "u64": 1000
                 },
                 {
                   "string": "payment"
@@ -159,7 +159,6 @@
         }
       ]
     ],
-    [],
     [],
     []
   ],
@@ -396,7 +395,7 @@
                         "symbol": "grace_period"
                       },
                       "val": {
-                        "u64": 0
+                        "u64": 1000
                       }
                     },
                     {
@@ -1455,7 +1454,7 @@
                   "u64": 1100
                 },
                 {
-                  "u64": 0
+                  "u64": 1000
                 },
                 {
                   "string": "payment"
@@ -1663,7 +1662,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "release"
+                "symbol": "cancel"
               }
             ],
             "data": {
@@ -1673,12 +1672,6 @@
                 },
                 {
                   "u64": 1
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 5000
-                  }
                 }
               ]
             }
@@ -1699,7 +1692,7 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "release"
+                "symbol": "cancel"
               }
             ],
             "data": {
@@ -1760,7 +1753,7 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "release"
+                  "symbol": "cancel"
                 },
                 {
                   "vec": [
@@ -1769,12 +1762,6 @@
                     },
                     {
                       "u64": 1
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 5000
-                      }
                     }
                   ]
                 }
@@ -1830,58 +1817,6 @@
               "i128": {
                 "hi": 0,
                 "lo": 5000
-              }
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 0
               }
             }
           }

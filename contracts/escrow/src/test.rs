@@ -13,6 +13,7 @@ use crate::{
 };
 
 const START: u64 = 1_000;
+const GRACE: u64 = 1_000;
 
 struct Harness<'a> {
     env: Env,
@@ -95,13 +96,14 @@ fn no_signers(h: &Harness) -> Vec<BytesN<32>> {
     Vec::new(&h.env)
 }
 
-fn create(h: &Harness, assets: &Vec<AssetAmount>, deadline: u64) -> u64 {
+fn create(h: &Harness, assets: &Vec<AssetAmount>, deadline: u64, grace_period: u64) -> u64 {
     h.client.create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
         assets,
         &deadline,
+        &grace_period,
         &String::from_str(&h.env, "payment"),
         &no_signers(h),
         &0,
@@ -142,7 +144,7 @@ fn milestone_spec(env: &Env, description: &str, bps: u32) -> MilestoneSpec {
 fn full_cycle_create_release() {
     let h = setup(10_000, 5_000);
     let assets = two_assets(&h, 10_000, 5_000);
-    let id = create(&h, &assets, START + 86_400);
+    let id = create(&h, &assets, START + 86_400, 0);
     assert_eq!(id, 1);
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
     assert_eq!(balance(&h, &h.asset_b, &h.sender), 0);
@@ -164,7 +166,7 @@ fn full_cycle_create_release() {
 #[test]
 fn non_arbiter_cannot_release() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     let intruder = Address::generate(&h.env);
 
     let res = h.client.try_release(&intruder, &id, &5_000);
@@ -176,7 +178,7 @@ fn non_arbiter_cannot_release() {
 #[test]
 fn release_after_deadline_is_refused() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_release(&h.arbiter, &id, &5_000);
@@ -188,7 +190,7 @@ fn release_after_deadline_is_refused() {
 #[test]
 fn refund_returns_funds_after_deadline() {
     let h = setup(5_000, 2_000);
-    let id = create(&h, &two_assets(&h, 5_000, 2_000), START + 100);
+    let id = create(&h, &two_assets(&h, 5_000, 2_000), START + 100, 0);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.refund(&h.sender, &id);
@@ -202,7 +204,7 @@ fn refund_returns_funds_after_deadline() {
 #[test]
 fn refund_before_deadline_rejected() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     let res = h.client.try_refund(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
@@ -212,7 +214,7 @@ fn refund_before_deadline_rejected() {
 #[test]
 fn expire_marks_then_refund_returns() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     let early = h.client.try_expire(&id);
     assert_eq!(early, Err(Ok(Error::InvalidState)));
@@ -232,7 +234,7 @@ fn expire_marks_then_refund_returns() {
 #[test]
 fn released_escrow_cannot_be_refunded() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     h.client.release(&h.arbiter, &id, &5_000);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
@@ -245,7 +247,7 @@ fn released_escrow_cannot_be_refunded() {
 #[test]
 fn cannot_close_while_expired() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.expire(&id);
 
@@ -263,6 +265,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &one_asset(&h, 1_000),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &no_signers(&h),
         &0,
@@ -274,6 +277,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &one_asset(&h, 1_000),
         &(START - 500),
+        &0,
         &String::from_str(&h.env, "x"),
         &no_signers(&h),
         &0,
@@ -285,6 +289,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &one_asset(&h, 0),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &no_signers(&h),
         &0,
@@ -296,6 +301,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &Vec::new(&h.env),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &no_signers(&h),
         &0,
@@ -318,6 +324,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &dup,
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &no_signers(&h),
         &0,
@@ -338,6 +345,7 @@ fn create_rejects_bad_override_config() {
         &h.arbiter,
         &one_asset(&h, 1_000),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &signers,
         &0,
@@ -350,6 +358,7 @@ fn create_rejects_bad_override_config() {
         &h.arbiter,
         &one_asset(&h, 1_000),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &signers,
         &2,
@@ -362,6 +371,7 @@ fn create_rejects_bad_override_config() {
         &h.arbiter,
         &one_asset(&h, 1_000),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &Vec::new(&h.env),
         &1,
@@ -384,6 +394,7 @@ fn override_release_with_threshold_signatures_releases_funds() {
         &h.arbiter,
         &two_assets(&h, 5_000, 1_000),
         &(START + 1_000),
+        &0,
         &String::from_str(&h.env, "override"),
         &signers,
         &2,
@@ -414,6 +425,7 @@ fn override_release_rejects_replayed_nonce() {
         &h.arbiter,
         &one_asset(&h, 5_000),
         &(START + 1_000),
+        &0,
         &String::from_str(&h.env, "override"),
         &signers,
         &1,
@@ -444,6 +456,7 @@ fn override_release_requires_strictly_increasing_nonce() {
         &h.arbiter,
         &one_asset(&h, 5_000),
         &(START + 1_000),
+        &0,
         &String::from_str(&h.env, "override"),
         &signers,
         &2,
@@ -470,6 +483,7 @@ fn override_release_rejects_insufficient_signatures() {
         &h.arbiter,
         &one_asset(&h, 5_000),
         &(START + 1_000),
+        &0,
         &String::from_str(&h.env, "override"),
         &signers,
         &2,
@@ -496,6 +510,7 @@ fn override_release_rejects_unknown_signer() {
         &h.arbiter,
         &one_asset(&h, 5_000),
         &(START + 1_000),
+        &0,
         &String::from_str(&h.env, "override"),
         &signers,
         &1,
@@ -521,6 +536,7 @@ fn override_release_rejects_duplicate_signer_in_one_call() {
         &h.arbiter,
         &one_asset(&h, 5_000),
         &(START + 1_000),
+        &0,
         &String::from_str(&h.env, "override"),
         &signers,
         &2,
@@ -536,7 +552,7 @@ fn override_release_rejects_duplicate_signer_in_one_call() {
 #[test]
 fn override_release_disabled_without_configured_signers() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 1_000);
+    let id = create(&h, &one_asset(&h, 5_000), START + 1_000, 0);
 
     let kp1 = keypair(1);
     let sig1 = sign_override(&h, &kp1, id, 1);
@@ -661,7 +677,7 @@ fn plain_release_blocked_on_milestone_escrow() {
         &String::from_str(&h.env, "p"),
         &specs,
     );
-    let res = h.client.try_release(&h.arbiter, &id, &0);
+    let res = h.client.try_release(&h.arbiter, &id, &10_000);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 }
@@ -918,6 +934,7 @@ fn initialize_and_fund_timelock_lifecycle() {
         &h.arbiter,
         &one_asset(&h, 5_000),
         &(START + 500),
+        &0,
         &String::from_str(&h.env, "unfunded"),
     );
     assert_eq!(h.client.get(&id).state, EscrowState::Created);
@@ -948,91 +965,134 @@ fn initialize_and_fund_timelock_lifecycle() {
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
 }
 
-// --- Cancellation grace period ---
+// --- Grace period & cancellation (pr-137) ---
 
 #[test]
-fn cancel_before_deadline_rejected() {
+fn release_after_grace_is_refused() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    // Premature cancellation before the deadline is rejected.
-    let res = h.client.try_cancel_escrow(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 200 + GRACE);
+    let res = h.client.try_release(&h.arbiter, &id, &5_000);
+    assert_eq!(res, Err(Ok(Error::EscrowExpired)));
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
 #[test]
-fn cancel_after_deadline_succeeds_and_claim_refund() {
+fn release_allowed_during_grace() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    h.client.cancel_escrow(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
-    // Funds still in custody until the refund is claimed.
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
 
-    h.client.claim_refund(&h.sender, &id);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 150);
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+}
+
+#[test]
+fn refund_returns_funds_after_grace() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 150);
+    let early = h.client.try_refund(&h.sender, &id);
+    assert_eq!(early, Err(Ok(Error::GraceActive)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 200 + GRACE);
+    h.client.refund(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-    h.client.close(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Closed);
 }
 
 #[test]
-fn double_cancel_and_double_claim_guarded() {
+fn cancel_by_sender_before_deadline_returns_funds() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    h.client.cancel_escrow(&h.sender, &id);
-    let res = h.client.try_cancel_escrow(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
 
-    h.client.claim_refund(&h.sender, &id);
-    let res2 = h.client.try_claim_refund(&h.sender, &id);
-    assert_eq!(res2, Err(Ok(Error::InvalidState)));
-    // Double-refund via the old refund path is also blocked (no longer Funded/Expired).
-    let res3 = h.client.try_refund(&h.sender, &id);
-    assert_eq!(res3, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn claim_without_cancel_rejected() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    let res = h.client.try_claim_refund(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn cancel_requires_sender_auth() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    let stranger = Address::generate(&h.env);
-    // Stranger cannot cancel or claim.
-    let res = h.client.try_cancel_escrow(&stranger, &id);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    let res2 = h.client.try_claim_refund(&stranger, &id);
-    assert_eq!(res2, Err(Ok(Error::Unauthorized)));
-    // After cancel, only the sender may claim.
-    h.client.cancel_escrow(&h.sender, &id);
-    let res3 = h.client.try_claim_refund(&stranger, &id);
-    assert_eq!(res3, Err(Ok(Error::Unauthorized)));
-}
-
-#[test]
-fn cancel_after_expired_also_works() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    h.client.expire(&id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
-    h.client.cancel_escrow(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
-    h.client.claim_refund(&h.sender, &id);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    h.client.cancel(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
+fn arbiter_may_also_cancel_before_deadline() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.client.cancel(&h.arbiter, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+}
+
+#[test]
+fn cancel_rejected_after_deadline() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 150);
+    let res = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn cancel_rejected_for_non_party() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+    let intruder = Address::generate(&h.env);
+
+    let res = h.client.try_cancel(&intruder, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn reclaim_after_grace_returns_funds() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 150);
+    let early = h.client.try_reclaim(&h.sender, &id);
+    assert_eq!(early, Err(Ok(Error::GraceActive)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 200 + GRACE);
+    h.client.reclaim(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
+fn reclaim_rejected_for_non_sender() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 200 + GRACE);
+    let res = h.client.try_reclaim(&h.recipient, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn reclaim_rejected_after_release() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.client.release(&h.arbiter, &id, &5_000);
+    let res = h.client.try_reclaim(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
 }
