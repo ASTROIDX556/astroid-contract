@@ -6,6 +6,9 @@
 //! records, per organization:
 //! - the **owner** of the organization,
 //! - the **module address** for each [`ModuleKind`] (wallet, treasury, policy…),
+//! - optional **deprecation** flags and **migration targets**, so a superseded
+//!   module is blocked from new interactions (`Error::ModuleDeprecated`) while
+//!   clients are pointed at its replacement,
 //!
 //! and, globally, a **version → address** table used by the upgrade strategy so
 //! new contract versions (e.g. Wallet v1 → v2 → v3) can be introduced without
@@ -64,6 +67,10 @@ enum DataKey {
     /// surface (`lookup`) rejects new interactions with [`Error::ModuleDeprecated`]
     /// while the raw address stays readable for legacy migrations.
     ModuleDeprecated(String, ModuleKind),
+    /// Module migration target: (org slug, kind) -> successor contract address.
+    /// When a deprecated module is superseded, this points at the up-to-date
+    /// replacement so clients and automated agents can be guided to it.
+    ModuleMigration(String, ModuleKind),
     /// Delegated role: (org slug, account) -> RegistryRole.
     OrgRole(String, Address),
     /// Version table: (kind, version) -> contract address (global upgrade map).
@@ -98,6 +105,20 @@ pub enum RegistryRole {
     /// May repoint any of the organization's modules, which is what rolling a
     /// module forward to a new implementation version amounts to.
     ModuleUpgrader = 3,
+}
+
+/// A composite view of a registered module returned by [`RegistryContract::get_module`].
+/// Lets a client resolve, in one call, the current address, whether the module is
+/// deprecated, and where to migrate to (if one has been configured).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleInfo {
+    /// The currently registered (possibly deprecated) implementation address.
+    pub address: Address,
+    /// Whether the module is deprecated and `lookup` rejects new interactions.
+    pub deprecated: bool,
+    /// The successor implementation to migrate to, when one is configured.
+    pub migration_target: Option<Address>,
 }
 
 impl RegistryRole {
@@ -212,10 +233,15 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
         // A (re)registration points at a fresh implementation, so any prior
-        // deprecation flag must not carry over and block the new address.
+        // deprecation flag and migration target must not carry over and block
+        // or misdirect lookups of the new address.
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
+        }
+        let gkey = DataKey::ModuleMigration(org.clone(), kind);
+        if env.storage().persistent().has(&gkey) {
+            env.storage().persistent().remove(&gkey);
         }
         astroid_shared::events::publish(
             &env,
@@ -304,6 +330,112 @@ impl RegistryContract {
             .ok_or(Error::NotFound)
     }
 
+    /// Link a registered module to its successor implementation. Admin-gated.
+    ///
+    /// This is the formal migration pointer: once set, consumers can read it via
+    /// [`Self::get_module_migration`] (or [`Self::get_module`]) to be guided from
+    /// a deprecated module to the up-to-date replacement. The target must exist
+    /// as a registered module of the same kind and must differ from the module it
+    /// would replace (a module cannot be its own successor).
+    pub fn set_migration_target(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        successor: Address,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        let mkey = DataKey::Module(org.clone(), kind);
+        let address: Address = env
+            .storage()
+            .persistent()
+            .get(&mkey)
+            .ok_or(Error::NotFound)?;
+        if successor == address {
+            return Err(Error::InvalidInput);
+        }
+        let gkey = DataKey::ModuleMigration(org.clone(), kind);
+        env.storage().persistent().set(&gkey, &successor);
+        Self::bump(&env, &gkey);
+        env.events().publish(
+            (
+                symbol_short!("module"),
+                symbol_short!("migrate"),
+                org.clone(),
+                kind,
+            ),
+            successor,
+        );
+        Ok(())
+    }
+
+    /// Clear a module's migration target, un-linking it from any successor.
+    /// Admin-gated. The module keeps its existing deprecation status.
+    pub fn clear_migration_target(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        let gkey = DataKey::ModuleMigration(org.clone(), kind);
+        if !env.storage().persistent().has(&gkey) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&gkey);
+        env.events().publish(
+            (symbol_short!("module"), symbol_short!("mig_clear")),
+            (org, kind),
+        );
+        Ok(())
+    }
+
+    /// Read the migration target configured for a module, or [`Error::NotFound`]
+    /// when none has been set.
+    pub fn get_module_migration(
+        env: Env,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<Address, Error> {
+        let gkey = DataKey::ModuleMigration(org, kind);
+        let val = env
+            .storage()
+            .persistent()
+            .get(&gkey)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &gkey);
+        Ok(val)
+    }
+
+    /// Composite view of a registered module: its address, deprecated status and
+    /// configured migration target. Returns [`Error::NotFound`] when the module
+    /// is not registered.
+    pub fn get_module(env: Env, org: String, kind: ModuleKind) -> Result<ModuleInfo, Error> {
+        let mkey = DataKey::Module(org.clone(), kind);
+        let address: Address = env
+            .storage()
+            .persistent()
+            .get(&mkey)
+            .ok_or(Error::NotFound)?;
+        let deprecated: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ModuleDeprecated(org.clone(), kind))
+            .unwrap_or(false);
+        let migration_target: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ModuleMigration(org, kind));
+        Self::bump(&env, &mkey);
+        Ok(ModuleInfo {
+            address,
+            deprecated,
+            migration_target,
+        })
+    }
+
     /// Remove a module registration. Same gate as `register_module`: admin, org
     /// owner, or a delegated role that reaches this [`ModuleKind`].
     pub fn remove_module(
@@ -318,12 +450,16 @@ impl RegistryContract {
         let key = DataKey::Module(org.clone(), kind);
         ensure!(env.storage().persistent().has(&key), Error::NotFound);
         env.storage().persistent().remove(&key);
-        // Drop the deprecation flag together with the record so a later
-        // re-registration starts clean and lookups report NotFound, not
-        // ModuleDeprecated, for a removed module.
+        // Drop the deprecation flag and migration target together with the
+        // record so a later re-registration starts clean and lookups report
+        // NotFound rather than ModuleDeprecated for a removed module.
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
+        }
+        let gkey = DataKey::ModuleMigration(org.clone(), kind);
+        if env.storage().persistent().has(&gkey) {
+            env.storage().persistent().remove(&gkey);
         }
         env.events().publish(
             (
