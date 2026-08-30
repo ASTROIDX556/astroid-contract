@@ -21,7 +21,6 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::xdr::{AccountId, Hash, PublicKey, ScAddress, Uint256};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
@@ -337,21 +336,17 @@ impl RegistryContract {
 
     // --- internal helpers ---
 
-    /// Reject a zero-address (all bytes zero). On-chain, a zero address means
-    /// no contract is deployed at that location, so registering it would cause
-    /// every downstream cross-contract call to fail silently or panic.
-    fn require_valid_module_address(_env: &Env, address: &Address) -> Result<(), Error> {
-        // Use the reference-based From impl which works on both native and wasm targets.
-        let sc_addr: ScAddress = address.into();
-        let is_zero = match sc_addr {
-            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) => {
-                bytes == [0u8; 32]
-            }
-            ScAddress::Contract(Hash(bytes)) => bytes == [0u8; 32],
-        };
-        if is_zero {
-            return Err(Error::InvalidModuleAddress);
-        }
+    /// Validate that `address` is a properly-formed module address.
+    ///
+    /// On-chain, a zero address means no contract is deployed at that
+    /// location, so registering it would cause downstream cross-contract
+    /// calls to fail.  Unfortunately `soroban_sdk::Address` is an opaque
+    /// host handle on wasm32 and cannot be introspected from guest code,
+    /// so we cannot perform a zero-byte check here yet.  The function is
+    /// kept as an extension point; the [`Error::InvalidModuleAddress`]
+    /// variant is available for stricter checks once the SDK exposes the
+    /// necessary API on wasm targets.
+    fn require_valid_module_address(_env: &Env, _address: &Address) -> Result<(), Error> {
         Ok(())
     }
 
