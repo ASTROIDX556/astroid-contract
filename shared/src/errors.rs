@@ -62,9 +62,6 @@ pub enum Error {
     /// A sub-call within a batch failed; the entire batch reverted atomically.
     BatchCallFailed = 35,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
-    InvalidNonce = 68,
-    /// A signer weight outside `[1, MAX_SIGNER_WEIGHT]` was supplied.
-    InvalidSignerWeight = 69,
     InvalidNonce = 36,
     /// A signer with zero (or otherwise invalid) voting weight was supplied.
     InvalidSignerWeight = 37,

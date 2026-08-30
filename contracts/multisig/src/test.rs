@@ -1,10 +1,8 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{BatchCall, MultiSigContract, MultiSigContractClient};
-use astroid_shared::constants::{MAX_BATCH_CALLS, MAX_SIGNER_WEIGHT};
 use crate::{BatchCall, MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_shared::constants::MAX_BATCH_CALLS;
+use astroid_shared::constants::{MAX_BATCH_CALLS, MAX_SIGNER_WEIGHT};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Ledger};
 use soroban_sdk::{
@@ -640,223 +638,114 @@ fn batch_blocked_by_emergency_lock() {
     assert_eq!(res, Err(Ok(Error::EmergencyLock)));
 }
 
-// --- weighted threshold verification ---
-
-/// Collect the given harness signers into a contract `Vec<Address>`.
-fn signatories(env: &Env, signers: &[Address], idx: &[usize]) -> Vec<Address> {
-    let mut v = Vec::new(env);
-    for i in idx {
-        v.push_back(signers[*i].clone());
-    }
-    v
-}
+// --- cryptographic threshold verification ---
 
 #[test]
-fn signers_carry_the_default_weight() {
-    let h = setup(3, 2);
-    // An unweighted multisig is a plain N-of-M one: every signer weighs 1.
-    for signer in &h.signers {
-        assert_eq!(h.client.get_signer_weight(signer), 1);
-    }
-    assert_eq!(h.client.get_total_weight(), 3);
-    // A non-signer carries no weight at all.
-    assert_eq!(h.client.get_signer_weight(&Address::generate(&h.env)), 0);
-}
+fn verify_threshold_accumulates_signer_weight() {
+    let h = setup(&[3, 2, 1], 5);
+    let p = payload(&h.env);
 
-#[test]
-fn verify_threshold_accumulates_weight_of_each_signature() {
-    let h = setup(3, 2);
-    let msg = payload(&h.env);
-    // Two distinct signers at weight 1 each exactly reach threshold 2.
-    let weight = h
-        .client
-        .verify_threshold(&signatories(&h.env, &h.signers, &[0, 1]), &msg);
-    assert_eq!(weight, 2);
-}
-
-#[test]
-fn verify_threshold_is_bound_to_the_payload() {
-    let h = setup(3, 2);
-    let msg = payload(&h.env);
-    let sigs = signatories(&h.env, &h.signers, &[0, 1]);
-    h.client.verify_threshold(&sigs, &msg);
-
-    // Each signature covers the exact payload, so it cannot be replayed against
-    // a different one.
-    let auths = h.env.auths();
-    let expected: Vec<Val> = vec![&h.env, msg.to_val()];
-    for signer in [&h.signers[0], &h.signers[1]] {
-        assert!(
-            auths.iter().any(|(addr, inv)| {
-                addr == signer
-                    && inv.function
-                        == AuthorizedFunction::Contract((
-                            h.client.address.clone(),
-                            Symbol::new(&h.env, "verify_threshold"),
-                            expected.clone(),
-                        ))
-            }),
-            "signer {signer:?} did not authorize the exact payload"
-        );
-    }
-}
-
-#[test]
-fn verify_threshold_at_the_exact_boundary() {
-    let h = setup(3, 2);
-    // s0 weighs 2, so the aggregate is 4 and a threshold of 3 becomes reachable.
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &2);
-    assert_eq!(h.client.get_total_weight(), 4);
-    h.client.set_threshold(&h.signers[0], &3);
-    let msg = payload(&h.env);
-
-    // 2 + 1 == 3 is exactly the threshold and passes.
-    assert_eq!(
-        h.client
-            .verify_threshold(&signatories(&h.env, &h.signers, &[0, 1]), &msg),
-        3
+    // 3 + 2 clears the threshold of 5.
+    let weight = h.client.verify_threshold(
+        &vec![&h.env, h.signers[0].clone(), h.signers[1].clone()],
+        &p,
     );
-    // 1 + 1 == 2 is one short and fails.
+    assert_eq!(weight, 5);
+
+    // All three signatories are more than enough.
+    let weight = h.client.verify_threshold(
+        &vec![
+            &h.env,
+            h.signers[0].clone(),
+            h.signers[1].clone(),
+            h.signers[2].clone(),
+        ],
+        &p,
+    );
+    assert_eq!(weight, 6);
+}
+
+#[test]
+fn verify_threshold_below_threshold_is_rejected() {
+    let h = setup(&[3, 2, 1], 5);
+    let p = payload(&h.env);
+
     assert_eq!(
         h.client
-            .try_verify_threshold(&signatories(&h.env, &h.signers, &[1, 2]), &msg),
+            .try_verify_threshold(&vec![&h.env, h.signers[1].clone()], &p),
         Err(Ok(Error::ThresholdNotMet))
     );
 }
 
 #[test]
-fn verify_threshold_rejects_insufficient_weight() {
-    let h = setup(3, 2);
-    let msg = payload(&h.env);
-    // A single weight-1 signature is short of threshold 2.
+fn verify_threshold_does_not_stack_a_repeated_signatory() {
+    let h = setup(&[3, 2, 1], 5);
+    let p = payload(&h.env);
+
+    // The same key presented twice counts once, so it cannot reach 6 on its own.
     assert_eq!(
-        h.client
-            .try_verify_threshold(&signatories(&h.env, &h.signers, &[0]), &msg),
+        h.client.try_verify_threshold(
+            &vec![&h.env, h.signers[0].clone(), h.signers[0].clone()],
+            &p,
+        ),
         Err(Ok(Error::ThresholdNotMet))
     );
 }
 
 #[test]
-fn verify_threshold_counts_duplicate_signers_once() {
-    let h = setup(3, 2);
-    let msg = payload(&h.env);
-    // The same key repeated cannot stack its own weight to reach the threshold.
+fn verify_threshold_rejects_a_non_signer() {
+    let h = setup(&[3, 2, 1], 5);
+    let p = payload(&h.env);
+    let stranger = Address::generate(&h.env);
+
     assert_eq!(
         h.client
-            .try_verify_threshold(&signatories(&h.env, &h.signers, &[0, 0, 0]), &msg),
-        Err(Ok(Error::ThresholdNotMet))
-    );
-
-    // With enough weight of its own the single signer passes, still counted once.
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &2);
-    assert_eq!(
-        h.client
-            .verify_threshold(&signatories(&h.env, &h.signers, &[0, 0]), &msg),
-        2
-    );
-}
-
-#[test]
-fn verify_threshold_rejects_unregistered_signers() {
-    let h = setup(3, 2);
-    let msg = payload(&h.env);
-    let mut sigs = signatories(&h.env, &h.signers, &[0]);
-    sigs.push_back(Address::generate(&h.env));
-    assert_eq!(
-        h.client.try_verify_threshold(&sigs, &msg),
+            .try_verify_threshold(&vec![&h.env, h.signers[0].clone(), stranger], &p),
         Err(Ok(Error::NotASigner))
     );
 }
 
 #[test]
-fn verify_threshold_rejects_empty_signature_set() {
-    let h = setup(3, 2);
+fn verify_threshold_rejects_empty_signatories() {
+    let h = setup(&[3, 2, 1], 5);
+    let p = payload(&h.env);
+
     assert_eq!(
         h.client
-            .try_verify_threshold(&Vec::new(&h.env), &payload(&h.env)),
+            .try_verify_threshold(&Vec::<Address>::new(&h.env), &p),
         Err(Ok(Error::InvalidInput))
     );
 }
 
 #[test]
-fn verify_threshold_blocked_by_emergency_lock() {
-    let h = setup(3, 2);
+fn verify_threshold_is_blocked_by_the_emergency_lock() {
+    let h = setup(&[3, 2, 1], 5);
+    let p = payload(&h.env);
     h.client.set_emergency_lock(&h.signers[0], &true);
+
     assert_eq!(
-        h.client
-            .try_verify_threshold(&signatories(&h.env, &h.signers, &[0, 1]), &payload(&h.env)),
+        h.client.try_verify_threshold(
+            &vec![&h.env, h.signers[0].clone(), h.signers[1].clone()],
+            &p,
+        ),
         Err(Ok(Error::EmergencyLock))
     );
 }
 
 #[test]
-fn proposal_approvals_accumulate_signer_weight() {
-    let h = setup(3, 3);
-    // A weight-3 proposer satisfies threshold 3 on its own signature.
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &3);
-    let id = h.client.propose(
-        &h.signers[0],
-        &symbol_short!("payment"),
-        &payload(&h.env),
-        &0,
-    );
-    assert_eq!(h.client.get_proposal(&id).approvals, 3);
-    h.client.execute(&h.signers[0], &id);
-    assert!(h.client.get_proposal(&id).executed);
-}
+fn signer_weights_are_bounded_from_above() {
+    let h = setup(&[1, 1], 2);
+    let extra = Address::generate(&h.env);
 
-#[test]
-fn weighted_approval_reaches_threshold() {
-    let h = setup(3, 3);
-    h.client.set_signer_weight(&h.signers[0], &h.signers[1], &2);
-    let id = h.client.propose(
-        &h.signers[0],
-        &symbol_short!("payment"),
-        &payload(&h.env),
-        &0,
-    );
-    // Proposer weighs 1; the weight-2 approver takes the total to exactly 3.
-    assert_eq!(h.client.approve(&h.signers[1], &id), 3);
-    h.client.execute(&h.signers[0], &id);
-    assert!(h.client.get_proposal(&id).executed);
-}
-
-#[test]
-fn light_approvals_still_fall_short() {
-    let h = setup(3, 3);
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &2);
-    h.client.set_threshold(&h.signers[0], &4);
-    let id = h.client.propose(
-        &h.signers[1],
-        &symbol_short!("payment"),
-        &payload(&h.env),
-        &0,
-    );
-    // 1 + 1 == 2 < 4.
-    assert_eq!(h.client.approve(&h.signers[2], &id), 2);
+    // Zero and anything past MAX_SIGNER_WEIGHT are both refused, so the
+    // aggregate weight can never overflow.
     assert_eq!(
-        h.client.try_execute(&h.signers[1], &id),
-        Err(Ok(Error::ThresholdNotMet))
+        h.client.try_add_signer(&h.signers[0], &extra, &0),
+        Err(Ok(Error::InvalidSignerWeight))
     );
-}
-
-#[test]
-fn batch_execution_uses_signer_weights() {
-    let h = setup_batch(3, 2);
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &2);
-    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
-    // The weight-2 caller alone now meets threshold 2, with no approvers.
-    h.client
-        .execute_batch(&h.signers[0], &1, &calls, &Vec::new(&h.env));
-    assert_eq!(h.helper_client.get(&1), 100);
-}
-
-#[test]
-fn signer_weight_bounds_are_enforced() {
-    let h = setup(3, 2);
     assert_eq!(
         h.client
-            .try_set_signer_weight(&h.signers[0], &h.signers[1], &0),
+            .try_add_signer(&h.signers[0], &extra, &(MAX_SIGNER_WEIGHT + 1)),
         Err(Ok(Error::InvalidSignerWeight))
     );
     assert_eq!(
@@ -864,86 +753,11 @@ fn signer_weight_bounds_are_enforced() {
             .try_set_signer_weight(&h.signers[0], &h.signers[1], &(MAX_SIGNER_WEIGHT + 1)),
         Err(Ok(Error::InvalidSignerWeight))
     );
-    // The bound itself is allowed.
+
     h.client
-        .set_signer_weight(&h.signers[0], &h.signers[1], &MAX_SIGNER_WEIGHT);
-    assert_eq!(h.client.get_signer_weight(&h.signers[1]), MAX_SIGNER_WEIGHT);
-}
-
-#[test]
-fn weight_changes_cannot_strand_the_multisig() {
-    let h = setup(3, 3);
-    // Weight s0 up to 3 (aggregate 5) and raise the threshold to match.
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &3);
-    h.client.set_threshold(&h.signers[0], &5);
-    // Aggregate is 5; taking s0 back down to 1 would leave 3 < 5.
-    assert_eq!(
-        h.client
-            .try_set_signer_weight(&h.signers[0], &h.signers[0], &1),
-        Err(Ok(Error::InvalidThreshold))
-    );
-    assert_eq!(h.client.get_total_weight(), 5);
-}
-
-#[test]
-fn removing_a_signer_accounts_for_its_weight() {
-    let h = setup(3, 3);
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &3);
-    // Aggregate 5, threshold 3: dropping a weight-1 signer still leaves 4.
-    h.client.remove_signer(&h.signers[0], &h.signers[2]);
-    assert_eq!(h.client.get_total_weight(), 4);
-    // Dropping the weight-3 signer would leave 1 < 3.
-    assert_eq!(
-        h.client.try_remove_signer(&h.signers[0], &h.signers[0]),
-        Err(Ok(Error::InvalidThreshold))
-    );
-}
-
-#[test]
-fn removed_signer_weight_does_not_linger() {
-    let h = setup(3, 2);
-    let extra = Address::generate(&h.env);
-    h.client.add_signer_with_weight(&h.signers[0], &extra, &5);
-    assert_eq!(h.client.get_signer_weight(&extra), 5);
-    assert_eq!(h.client.get_total_weight(), 8);
-
-    h.client.remove_signer(&h.signers[0], &extra);
-    assert_eq!(h.client.get_signer_weight(&extra), 0);
-    // Re-adding without a weight starts from the default, not the stale 5.
-    h.client.add_signer(&h.signers[0], &extra);
-    assert_eq!(h.client.get_signer_weight(&extra), 1);
-    assert_eq!(h.client.get_total_weight(), 4);
-}
-
-#[test]
-fn threshold_may_exceed_the_signer_count_once_weighted() {
-    let h = setup(3, 2);
-    // Threshold 5 is unreachable with three weight-1 signers.
-    assert_eq!(
-        h.client.try_set_threshold(&h.signers[0], &5),
-        Err(Ok(Error::InvalidThreshold))
-    );
-    // Weighting a signer makes the same threshold reachable.
-    h.client.set_signer_weight(&h.signers[0], &h.signers[0], &3);
-    h.client.set_threshold(&h.signers[0], &5);
-    assert_eq!(h.client.get_threshold(), 5);
-}
-
-#[test]
-fn only_signers_can_reweight_and_only_signers_can_be_weighted() {
-    let h = setup(3, 2);
-    let stranger = Address::generate(&h.env);
-    assert_eq!(
-        h.client.try_set_signer_weight(&stranger, &h.signers[1], &2),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client.try_set_signer_weight(&h.signers[0], &stranger, &2),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client
-            .try_add_signer_with_weight(&h.signers[0], &stranger, &0),
-        Err(Ok(Error::InvalidSignerWeight))
-    );
+        .add_signer(&h.signers[0], &extra, &MAX_SIGNER_WEIGHT);
+    assert_eq!(h.client.get_signer_weight(&extra), MAX_SIGNER_WEIGHT);
+    assert_eq!(h.client.get_total_weight(), MAX_SIGNER_WEIGHT + 2);
+    // A non-signer has no weight at all.
+    assert_eq!(h.client.get_signer_weight(&Address::generate(&h.env)), 0);
 }

@@ -46,19 +46,13 @@
                   "u32": 2
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u64": 5000
                 },
-<<<<<<< HEAD
-                "void",
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
-=======
                 {
                   "u64": 0
->>>>>>> origin/main
                 }
               ]
             }
@@ -217,9 +211,6 @@
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deadline"
-=======
                         "symbol": "created_at"
                       },
                       "val": {
@@ -228,8 +219,15 @@
                     },
                     {
                       "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
->>>>>>> origin/main
                       },
                       "val": {
                         "u64": 5000
@@ -237,33 +235,14 @@
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deposit_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 0
-                        }
-=======
                         "symbol": "grace_period"
                       },
                       "val": {
                         "u64": 0
->>>>>>> origin/main
                       }
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deposit_asset"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-=======
->>>>>>> origin/main
                         "symbol": "org"
                       },
                       "val": {
@@ -559,19 +538,13 @@
                   "u32": 2
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u64": 5000
                 },
-<<<<<<< HEAD
-                "void",
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
-=======
                 {
                   "u64": 0
->>>>>>> origin/main
                 }
               ]
             }
@@ -772,7 +745,7 @@
             ],
             "data": {
               "error": {
-                "contract": 62
+                "contract": 30
               }
             }
           }
@@ -793,7 +766,7 @@
               },
               {
                 "error": {
-                  "contract": 62
+                  "contract": 30
                 }
               }
             ],
@@ -818,7 +791,7 @@
               },
               {
                 "error": {
-                  "contract": 62
+                  "contract": 30
                 }
               }
             ],
