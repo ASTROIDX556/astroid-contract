@@ -27,8 +27,12 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
+use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
+    Vec,
+};
 
 /// Proposal lifecycle state.
 #[contracttype]
@@ -60,6 +64,7 @@ pub struct Proposal {
     pub approvals: u32,
     pub state: ProposalState,
     pub created_at: u64,
+    pub deposit: Vec<AssetAmount>,
     pub expires_at: u64,
     pub grace_period: u64,
 }
@@ -116,6 +121,7 @@ impl ProposalContract {
         tx_ref: String,
         approvers: Vec<Address>,
         threshold: u32,
+        deposit: Vec<AssetAmount>,
         expires_at: u64,
         grace_period: u64,
     ) -> Result<u64, Error> {
@@ -127,6 +133,16 @@ impl ProposalContract {
         }
         if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
+        }
+        if let Some(dep) = deposit.first() {
+            if dep.amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            TokenClient::new(&env, &dep.asset).transfer(
+                &proposer,
+                &env.current_contract_address(),
+                &dep.amount,
+            );
         }
         if expires_at != 0 && expires_at <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
@@ -149,6 +165,7 @@ impl ProposalContract {
             approvers,
             threshold,
             approvals: 0,
+            deposit,
             state: ProposalState::Pending,
             created_at: env.ledger().timestamp(),
             expires_at,
@@ -215,6 +232,13 @@ impl ProposalContract {
             return Err(Error::NotAnApprover);
         }
         proposal.state = ProposalState::Rejected;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events().publish(
             (symbol_short!("proposal"), symbol_short!("rejected")),
@@ -243,6 +267,13 @@ impl ProposalContract {
             return Err(Error::CancellationWindowClosed);
         }
         proposal.state = ProposalState::Cancelled;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("cancelled")), id);
@@ -263,6 +294,13 @@ impl ProposalContract {
             return Err(Error::InvalidProposalState);
         }
         proposal.state = ProposalState::Expired;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("expired")), id);
@@ -294,6 +332,13 @@ impl ProposalContract {
             return Err(Error::ProposalNotApproved);
         }
         proposal.state = ProposalState::Executed;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("executed")), id);

@@ -94,25 +94,6 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "allow_deficit"
-                      },
-                      "val": {
-                        "bool": false
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "deficit_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 0
-                        }
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {
@@ -511,7 +492,7 @@
             ],
             "data": {
               "error": {
-                "contract": 12
+                "contract": 13
               }
             }
           }
@@ -532,7 +513,7 @@
               },
               {
                 "error": {
-                  "contract": 12
+                  "contract": 13
                 }
               }
             ],
@@ -557,7 +538,7 @@
               },
               {
                 "error": {
-                  "contract": 12
+                  "contract": 13
                 }
               }
             ],
@@ -648,7 +629,7 @@
             ],
             "data": {
               "error": {
-                "contract": 12
+                "contract": 13
               }
             }
           }
@@ -669,7 +650,7 @@
               },
               {
                 "error": {
-                  "contract": 12
+                  "contract": 13
                 }
               }
             ],
@@ -694,7 +675,7 @@
               },
               {
                 "error": {
-                  "contract": 12
+                  "contract": 13
                 }
               }
             ],
