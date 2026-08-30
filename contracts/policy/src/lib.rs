@@ -61,9 +61,6 @@ enum DataKey {
     Policy(String),
     Count,
     Blacklist(Address),
-    /// Asset deny list, scoped to the policy that owns it:
-    /// (policy id, asset contract address) -> ().
-    AssetBlacklist(String, Address),
     MerchantBlacklist(Address),
     CategoryBlacklist(String),
     /// Per-policy asset whitelist: (policy_id, asset) -> true.
@@ -71,6 +68,9 @@ enum DataKey {
     /// Whether an org uses a permissive (all-assets-allowed) or restrictive
     /// (whitelist-enforced) asset mode. Stored per policy_id.
     AssetWhitelistEnabled(String),
+    /// Asset deny list, scoped to the policy that owns it:
+    /// (policy id, asset contract address) -> ().
+    AssetBlacklist(String, Address),
 }
 
 #[contract]
@@ -302,29 +302,6 @@ impl PolicyContract {
         Ok(())
     }
 
-    /// Blacklist an asset for a policy (owner only). Once listed, no transfer
-    /// evaluated against `policy_id` may move that token, regardless of the
-    /// policy's other gates.
-    pub fn add_asset_blacklist(
-        env: Env,
-        caller: Address,
-        policy_id: String,
-        asset: Address,
-    ) -> Result<(), Error> {
-        Self::require_policy_owner(&env, &caller, &policy_id)?;
-        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
-        if env.storage().persistent().has(&key) {
-            return Err(Error::AlreadyExists);
-        }
-        env.storage().persistent().set(&key, &());
-        env.storage().persistent().extend_ttl(
-            &key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("ablk_add")),
-            (policy_id, asset),
     /// Add a merchant address to the merchant blacklist (owner only).
     pub fn add_merchant_blacklist(
         env: Env,
@@ -373,15 +350,6 @@ impl PolicyContract {
         Ok(())
     }
 
-    /// Remove an asset from a policy's blacklist (owner only).
-    pub fn remove_asset_blacklist(
-        env: Env,
-        caller: Address,
-        policy_id: String,
-        asset: Address,
-    ) -> Result<(), Error> {
-        Self::require_policy_owner(&env, &caller, &policy_id)?;
-        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
     /// Add a spending category to the category blacklist (owner only).
     pub fn add_category_blacklist(
         env: Env,
@@ -425,10 +393,55 @@ impl PolicyContract {
         }
         env.storage().persistent().remove(&key);
         env.events().publish(
-            (symbol_short!("policy"), symbol_short!("ablk_rem")),
-            (policy_id, asset),
             (symbol_short!("policy"), symbol_short!("cat_rem")),
             (policy_id, category),
+        );
+        Ok(())
+    }
+
+    /// Blacklist an asset for a policy (owner only). Once listed, no transfer
+    /// evaluated against `policy_id` may move that token, regardless of the
+    /// policy's other gates.
+    pub fn add_asset_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &());
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("ablk_add")),
+            (policy_id, asset),
+        );
+        Ok(())
+    }
+
+    /// Remove an asset from a policy's blacklist (owner only).
+    pub fn remove_asset_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("ablk_rem")),
+            (policy_id, asset),
         );
         Ok(())
     }
@@ -599,14 +612,14 @@ impl PolicyInterface for PolicyContract {
                 return Err(Error::PolicyDenied);
             }
         }
+        // Check asset whitelist (Issue #37)
+        Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
         // A blacklisted asset is denied even when it satisfies every other gate
         // (including an `allowed_asset` allow-list), so the deny list always wins.
         if Self::asset_blacklisted(&env, &policy_id, &asset) {
             events_policy_violation(&env, &policy_id, "blacklisted_asset");
             return Err(Error::AssetBlacklisted);
         }
-        // Check asset whitelist (Issue #37)
-        Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
         // Check blacklist
         if env
             .storage()

@@ -378,6 +378,17 @@
                     },
                     {
                       "key": {
+                        "symbol": "funded_amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 5000
+                        }
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "memo"
                       },
                       "val": {
@@ -1672,7 +1683,7 @@
             ],
             "data": {
               "error": {
-                "contract": 53
+                "contract": 28
               }
             }
           }
@@ -1693,7 +1704,7 @@
               },
               {
                 "error": {
-                  "contract": 53
+                  "contract": 28
                 }
               }
             ],
@@ -1718,7 +1729,7 @@
               },
               {
                 "error": {
-                  "contract": 53
+                  "contract": 28
                 }
               }
             ],

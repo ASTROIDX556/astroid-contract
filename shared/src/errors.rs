@@ -26,14 +26,6 @@ pub enum Error {
     InvalidAmount = 10,
 
     // --- Policy (20-29) ---
-    PolicyDenied = 20,
-    PolicyHashMismatch = 21,
-    EmergencyLock = 22,
-    PolicyRecipientRestricted = 23,
-    /// The transfer's asset is on the policy's asset blacklist.
-    AssetBlacklisted = 24,
-    PolicyMerchantBlocked = 24,
-    PolicyCategoryRestricted = 25,
     PolicyDenied = 11,
     PolicyHashMismatch = 12,
     EmergencyLock = 13,
@@ -43,6 +35,8 @@ pub enum Error {
     /// The asset is not in the organization's whitelist.
     AssetNotWhitelisted = 17,
     FeeLimitExceeded = 18,
+    /// The transfer's asset is on the policy's asset blacklist.
+    AssetBlacklisted = 48,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 19,
