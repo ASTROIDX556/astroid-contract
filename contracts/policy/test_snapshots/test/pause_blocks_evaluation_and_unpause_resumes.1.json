@@ -48,7 +48,15 @@
                   }
                 },
                 "void",
-                "void",
+                {
+                  "vec": []
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "u64": 0
+                },
                 {
                   "u64": 0
                 }
@@ -236,9 +244,11 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "allowed_asset"
+                        "symbol": "allowed_assets"
                       },
-                      "val": "void"
+                      "val": {
+                        "vec": []
+                      }
                     },
                     {
                       "key": {
@@ -287,6 +297,22 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "time_window_end"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "time_window_start"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     }
                   ]
@@ -474,7 +500,15 @@
                   }
                 },
                 "void",
-                "void",
+                {
+                  "vec": []
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "u64": 0
+                },
                 {
                   "u64": 0
                 }
@@ -879,7 +913,7 @@
             ],
             "data": {
               "error": {
-                "contract": 26
+                "contract": 21
               }
             }
           }
@@ -900,7 +934,7 @@
               },
               {
                 "error": {
-                  "contract": 26
+                  "contract": 21
                 }
               }
             ],
@@ -925,7 +959,7 @@
               },
               {
                 "error": {
-                  "contract": 26
+                  "contract": 21
                 }
               }
             ],
