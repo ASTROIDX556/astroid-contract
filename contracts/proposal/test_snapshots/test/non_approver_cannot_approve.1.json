@@ -27,9 +27,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -43,10 +40,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u64": 5000
+                },
+                {
+                  "u64": 0
                 }
               ]
             }
@@ -132,10 +138,42 @@
                     },
                     {
                       "key": {
+                        "symbol": "created_at"
+                      },
+                      "val": {
+                        "u64": 1000
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {
                         "u64": 5000
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     },
                     {
@@ -176,14 +214,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
                       }
                     },
                     {
@@ -383,9 +413,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -399,10 +426,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u64": 5000
+                },
+                {
+                  "u64": 0
                 }
               ]
             }
@@ -514,7 +550,7 @@
             ],
             "data": {
               "error": {
-                "contract": 73
+                "contract": 74
               }
             }
           }
@@ -535,7 +571,7 @@
               },
               {
                 "error": {
-                  "contract": 73
+                  "contract": 74
                 }
               }
             ],
@@ -560,7 +596,7 @@
               },
               {
                 "error": {
-                  "contract": 73
+                  "contract": 74
                 }
               }
             ],

@@ -366,17 +366,13 @@
               },
               {
                 "symbol": "register"
+              },
+              {
+                "string": "acme"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "acme"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                }
-              ]
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
             }
           }
         }
@@ -449,10 +445,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "org"
-              },
-              {
-                "symbol": "owner"
+                "symbol": "OrgOwnerChanged"
               }
             ],
             "data": {
@@ -464,6 +457,32 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                 }
               ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "org"
+              },
+              {
+                "symbol": "owner"
+              },
+              {
+                "string": "acme"
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
             }
           }
         }

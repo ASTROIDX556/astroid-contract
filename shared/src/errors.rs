@@ -11,7 +11,7 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    // --- Generic / lifecycle (1-9) ---
+    // --- Generic / lifecycle (1-6) ---
     NotFound = 1,
     AlreadyExists = 2,
     Unauthorized = 3,
@@ -19,36 +19,37 @@ pub enum Error {
     NotInitialized = 5,
     AlreadyInitialized = 6,
 
-    // --- Value / arithmetic (10-19) ---
+    // --- Value / arithmetic (10-12) ---
     InsufficientFunds = 10,
     Overflow = 11,
-    Underflow = 12,
-    InvalidAmount = 13,
+    InvalidAmount = 12,
 
-    // --- Policy (20-29) ---
+    // --- Policy (20-25) ---
     PolicyDenied = 20,
-    PolicyHashMismatch = 21,
-    EmergencyLock = 22,
-    PolicyRecipientRestricted = 23,
+    EmergencyLock = 21,
+    PolicyRecipientRestricted = 22,
+    PolicyMerchantBlocked = 23,
+    PolicyCategoryRestricted = 24,
+    AssetNotWhitelisted = 25,
 
-    // --- Registry (30-39) ---
+    // --- Registry (30-31) ---
     RegistryFrozen = 30,
+    ModuleDeprecated = 31,
 
-    // --- Budget (40-49) ---
+    // --- Budget (40-44) ---
     BudgetExceeded = 40,
     BudgetFrozen = 41,
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
 
-    // --- Wallet (50-59) ---
+    // --- Wallet (50-53) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (60-69) ---
-    InvalidSignature = 60,
+    // --- Multisig / approvals (61-69) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
@@ -59,21 +60,32 @@ pub enum Error {
     BatchCallFailed = 67,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
     InvalidNonce = 68,
-    /// A signer with zero (or otherwise invalid) voting weight was supplied.
-    InvalidSignerWeight = 69,
-    /// Accumulated approval weight is below the configured threshold.
-    InsufficientWeight = 90,
+    /// A signer with zero (or otherwise invalid) weight, or accumulated
+    /// approval weight below the configured threshold.
+    InsufficientWeight = 69,
+    /// A timelocked governance change was executed before its delay elapsed.
+    TimelockNotExpired = 91,
+    /// A caller without governance rights attempted to modify signers,
+    /// weights or the threshold.
+    UnauthorizedModification = 92,
 
-    // --- Proposal (70-79) ---
-    ProposalExpired = 70,
-    InvalidProposalState = 71,
-    ProposalNotApproved = 72,
-    NotAnApprover = 73,
+    // --- Proposal (71-79) ---
+    ProposalExpired = 71,
+    InvalidProposalState = 72,
+    ProposalNotApproved = 73,
+    NotAnApprover = 74,
+    CancellationWindowClosed = 75,
+    PrerequisiteNotMet = 78,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 79,
 
-    // --- Escrow (80-89) ---
-    ConditionNotMet = 80,
-    EscrowNotFunded = 81,
-    EscrowExpired = 82,
-    InvalidCondition = 83,
-    TimeLockActive = 84,
+    // --- Escrow (80-81) ---
+    EscrowExpired = 80,
+    TimeLockActive = 81,
+
+    // --- Treasury allowances (83-86) ---
+    AllowanceExceeded = 83,
+    AllowanceExpired = 84,
+    AllowanceNotFound = 85,
+    AllowanceAlreadyExists = 86,
 }
