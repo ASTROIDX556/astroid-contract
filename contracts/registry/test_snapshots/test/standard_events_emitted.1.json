@@ -544,17 +544,13 @@
               },
               {
                 "symbol": "register"
+              },
+              {
+                "string": "acme"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "acme"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                }
-              ]
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
             }
           }
         }
@@ -664,20 +660,16 @@
               },
               {
                 "symbol": "register"
+              },
+              {
+                "string": "acme"
+              },
+              {
+                "u32": 0
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "acme"
-                },
-                {
-                  "u32": 0
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                }
-              ]
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
             }
           }
         }
@@ -781,17 +773,13 @@
               },
               {
                 "symbol": "owner"
+              },
+              {
+                "string": "acme"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "acme"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                }
-              ]
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
             }
           }
         }
