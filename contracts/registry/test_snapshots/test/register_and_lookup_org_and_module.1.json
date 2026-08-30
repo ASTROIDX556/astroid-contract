@@ -609,6 +609,36 @@
           "v0": {
             "topics": [
               {
+                "symbol": "RegistryModuleUpdated"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "acme"
+                },
+                {
+                  "u32": 0
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
                 "symbol": "module"
               },
               {
