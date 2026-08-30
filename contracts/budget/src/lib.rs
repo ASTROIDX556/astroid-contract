@@ -72,6 +72,7 @@ pub struct AssetBudget {
     pub limit: i128,
     pub spent: i128,
     pub window_start: u64,
+    pub window_seconds: u64,
 }
 
 #[contracttype]
@@ -307,7 +308,7 @@ impl BudgetContract {
         budget_id: String,
         token: Address,
         limit: i128,
-        _window_seconds: u64,
+        window_seconds: u64,
     ) -> Result<(), Error> {
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
@@ -318,6 +319,7 @@ impl BudgetContract {
             limit,
             spent: 0,
             window_start: env.ledger().timestamp(),
+            window_seconds,
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
@@ -346,6 +348,18 @@ impl BudgetContract {
             .persistent()
             .get(&key)
             .ok_or(Error::AssetNotAuthorized)?;
+
+        // Window rollover check
+        let now = env.ledger().timestamp();
+        if asset_budget.window_seconds > 0
+            && now
+                >= asset_budget
+                    .window_start
+                    .saturating_add(asset_budget.window_seconds)
+        {
+            asset_budget.spent = 0;
+            asset_budget.window_start = now;
+        }
 
         // Check if within limit
         let new_spent = checked_add(asset_budget.spent, amount)?;

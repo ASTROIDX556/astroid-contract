@@ -45,8 +45,12 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
+use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
+    Vec,
+};
 
 /// Proposal lifecycle state.
 #[contracttype]
@@ -97,6 +101,7 @@ pub struct Proposal {
     pub approvals: u32,
     pub state: ProposalState,
     pub created_at: u64,
+    pub deposit: Vec<AssetAmount>,
     pub expires_at: u64,
     pub grace_period: u64,
 }
@@ -169,6 +174,7 @@ impl ProposalContract {
         approvers: Vec<Address>,
         dependencies: Vec<u64>,
         threshold: u32,
+        deposit: Vec<AssetAmount>,
         expires_at: u64,
         grace_period: u64,
     ) -> Result<u64, Error> {
@@ -180,6 +186,16 @@ impl ProposalContract {
         }
         if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
+        }
+        if let Some(dep) = deposit.first() {
+            if dep.amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            TokenClient::new(&env, &dep.asset).transfer(
+                &proposer,
+                &env.current_contract_address(),
+                &dep.amount,
+            );
         }
         if expires_at != 0 && expires_at <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
@@ -224,6 +240,7 @@ impl ProposalContract {
             dependencies: deps,
             threshold,
             approvals: 0,
+            deposit,
             state: ProposalState::Pending,
             created_at: env.ledger().timestamp(),
             expires_at,
@@ -290,6 +307,13 @@ impl ProposalContract {
             return Err(Error::NotAnApprover);
         }
         proposal.state = ProposalState::Rejected;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events().publish(
             (symbol_short!("proposal"), symbol_short!("rejected")),
@@ -318,6 +342,13 @@ impl ProposalContract {
             return Err(Error::CancellationWindowClosed);
         }
         proposal.state = ProposalState::Cancelled;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("cancelled")), id);
@@ -338,6 +369,13 @@ impl ProposalContract {
             return Err(Error::InvalidProposalState);
         }
         proposal.state = ProposalState::Expired;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("expired")), id);
@@ -351,6 +389,18 @@ impl ProposalContract {
     /// fails with [`Error::PrerequisiteNotMet`] and nothing changes. This is
     /// checked after approval and expiry so that a proposal blocked only by its
     /// chain reports the dependency rather than a less specific error.
+    /// Purge an expired proposal from storage to reclaim space.
+    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+        let proposal = Self::load(&env, id)?;
+        if proposal.expires_at == 0 || env.ledger().timestamp() < proposal.expires_at {
+            return Err(Error::InvalidProposalState);
+        }
+        env.storage().persistent().remove(&DataKey::Proposal(id));
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
+        Ok(())
+    }
+
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
@@ -365,6 +415,13 @@ impl ProposalContract {
         }
         Self::ensure_dependencies_met(&env, &proposal)?;
         proposal.state = ProposalState::Executed;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("executed")), id);

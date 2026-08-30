@@ -59,6 +59,7 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
         &approver_vec(h),
         &dep_vec(h, deps),
         &threshold,
+        &soroban_sdk::vec![&h.env],
         &expires_at,
         &0,
     )
@@ -209,6 +210,7 @@ fn create_with_bad_threshold_fails() {
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &3,
+        &soroban_sdk::vec![&h.env],
         &5_000,
         &0,
     );
@@ -227,6 +229,7 @@ fn create_with_past_expiry_fails() {
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &1,
+        &soroban_sdk::vec![&h.env],
         &500, // in the past (now = 1000)
         &0,
     );
@@ -455,6 +458,7 @@ fn test_cancellation_grace_window() {
         &String::from_str(&h.env, "tx1"),
         &approver_vec(&h),
         &2,
+        &soroban_sdk::vec![&h.env],
         &0,
         &50, // 50 seconds grace period
     );
@@ -475,6 +479,7 @@ fn test_cancellation_grace_window() {
         &String::from_str(&h.env, "tx1"),
         &approver_vec(&h),
         &2,
+        &soroban_sdk::vec![&h.env],
         &0,
         &50,
     );
