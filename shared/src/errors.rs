@@ -19,13 +19,12 @@ pub enum Error {
     NotInitialized = 5,
     AlreadyInitialized = 6,
 
-    // --- Value / arithmetic (10-15) ---
+    // --- Value / arithmetic (10-12) ---
     InsufficientFunds = 10,
     Overflow = 11,
-    Underflow = 12,
-    InvalidAmount = 13,
+    InvalidAmount = 12,
 
-    // --- Policy (20-29) ---
+    // --- Policy (20-27) ---
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
@@ -38,7 +37,7 @@ pub enum Error {
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
 
-    // --- Budget (40-49) ---
+    // --- Budget (40-44) ---
     BudgetExceeded = 40,
     BudgetFrozen = 41,
     BudgetArchived = 42,
@@ -46,30 +45,48 @@ pub enum Error {
     BudgetExpired = 44,
 
     // --- Wallet (50-59) ---
+    // --- Wallet (50-53) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
     ReserveViolation = 54,
+    WalletFrozen = 25,
+    WalletArchived = 26,
+    WalletPaused = 27,
+    InvalidState = 28,
 
-    // --- Multisig / approvals (60-69) ---
-    ThresholdNotMet = 60,
-    AlreadySigned = 61,
-    NotASigner = 62,
-    InvalidThreshold = 63,
-    TooManySigners = 64,
-    BatchCallFailed = 65,
-    InvalidNonce = 66,
-    InvalidSignerWeight = 67,
+    // --- Multisig / approvals (61-69, 90-92) ---
+    ThresholdNotMet = 61,
+    AlreadySigned = 62,
+    NotASigner = 63,
+    InvalidThreshold = 64,
+    TooManySigners = 66,
+    /// A sub-call within a batch failed; the entire batch reverted atomically.
+    BatchCallFailed = 67,
+    /// Batch nonce is not strictly greater than the last used nonce (replay).
+    InvalidNonce = 68,
+    /// A signer with zero (or otherwise invalid) voting weight was supplied.
+    InvalidSignerWeight = 69,
+    /// Accumulated approval weight is below the configured threshold.
+    InsufficientWeight = 90,
+    /// A timelocked governance change was executed before its delay elapsed.
+    TimelockNotExpired = 91,
+    /// A caller without governance rights attempted to modify signers,
+    /// weights or the threshold.
+    UnauthorizedModification = 92,
 
-    // --- Proposal (70-79) ---
-    ProposalExpired = 70,
-    InvalidProposalState = 71,
-    ProposalNotApproved = 72,
-    NotAnApprover = 73,
-    CancellationWindowClosed = 74,
-    PrerequisiteNotMet = 75,
-    CircularDependencyDetected = 76,
+    // --- Proposal (71-79) ---
+    ProposalExpired = 71,
+    InvalidProposalState = 72,
+    ProposalNotApproved = 73,
+    NotAnApprover = 74,
+    CancellationWindowClosed = 75,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 78,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 79,
 
     // --- Escrow (80-89) ---
     ConditionNotMet = 80,
@@ -79,14 +96,15 @@ pub enum Error {
     TimeLockActive = 84,
     EscrowNotExpired = 85,
     EscrowAlreadySettled = 86,
-    GraceActive = 87,
+    EscrowExpired = 46,
+    TimeLockActive = 47,
+    // --- Escrow (80-81) ---
+    // --- Escrow (80-82) ---
+    EscrowExpired = 80,
+    TimeLockActive = 81,
+    GraceActive = 82,
 
-    // --- Governance & Misc (90-99) ---
-    InsufficientWeight = 90,
-    TimelockNotExpired = 91,
-    UnauthorizedModification = 92,
-
-    // --- Treasury allowances (100-109) ---
-    AllowanceExceeded = 100,
-    AllowanceExpired = 101,
+    // --- Treasury allowances (83-85) ---
+    AllowanceExceeded = 83,
+    AllowanceExpired = 84,
 }

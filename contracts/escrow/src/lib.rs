@@ -100,8 +100,6 @@ pub enum EscrowState {
     Expired = 4,
     Closed = 5,
     Cancelled = 6,
-}
-
 /// Calculate vested amount according to a ReleaseSchedule at a given ledger timestamp.
 pub fn calculate_vested_amount(
     amount: i128,
