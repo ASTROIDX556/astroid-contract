@@ -2,11 +2,14 @@
 extern crate std;
 
 use crate::access::Role;
-use crate::{ContractCall, WalletContract, WalletContractClient};
+use crate::{BatchAction, BatchReceipt, ContractCall, WalletContract, WalletContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, testutils::Events, token, Address, Env, IntoVal, String,
+    Symbol, Val, Vec,
+};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -966,4 +969,506 @@ fn granting_on_an_archived_wallet_is_refused() {
     // Revocation still works so stale grants can be cleaned up.
     h.client.revoke_role(&owner, &id, &agent);
     assert_eq!(h.client.get_role(&id, &agent), None);
+}
+
+// ---------------------------------------------------------------- stubs ----
+
+/// Storage keys for the policy stub.
+#[contracttype]
+#[derive(Clone)]
+enum PolicyKey {
+    /// Approved value cap for a policy envelope id.
+    Cap(String),
+}
+
+/// A configurable policy stub: every envelope id has a cap, and any check for
+/// an amount above the cap is denied so tests can force a policy rejection.
+#[contract]
+pub struct TestPolicy;
+
+#[contractimpl]
+impl TestPolicy {
+    /// Set the approved value cap for `policy_id`.
+    pub fn set_cap(env: Env, policy_id: String, cap: i128) {
+        env.storage()
+            .persistent()
+            .set(&PolicyKey::Cap(policy_id), &cap);
+    }
+
+    /// Mirrors `PolicyInterface::check_transfer`, denying spends above the
+    /// envelope's approved cap.
+    pub fn check_transfer(
+        env: Env,
+        policy_id: String,
+        _asset: Address,
+        _recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let cap: i128 = env
+            .storage()
+            .persistent()
+            .get(&PolicyKey::Cap(policy_id))
+            .unwrap_or(0);
+        if amount > cap {
+            return Err(Error::PolicyDenied);
+        }
+        Ok(())
+    }
+}
+
+/// Storage keys for the budget stub.
+#[contracttype]
+#[derive(Clone)]
+enum BudgetKey {
+    /// Allocation still available for a budget envelope id.
+    Remaining(String),
+}
+
+/// A budget stub with a top-up-able allocation: `consume` debits the remaining
+/// allocation, returning `BudgetExceeded` when the batch asks for too much.
+#[contract]
+pub struct TestBudget;
+
+#[contractimpl]
+impl TestBudget {
+    /// Credit `amount` to `budget_id`'s remaining allocation.
+    pub fn top_up(env: Env, budget_id: String, amount: i128) {
+        let key = BudgetKey::Remaining(budget_id.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(current + amount));
+    }
+
+    /// Mirrors `BudgetInterface::consume`, returning the new remaining balance
+    /// and refusing when the requested amount exceeds what is left.
+    pub fn consume(
+        env: Env,
+        _caller: Address,
+        budget_id: String,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        let key = BudgetKey::Remaining(budget_id.clone());
+        let remaining: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount > remaining {
+            return Err(Error::BudgetExceeded);
+        }
+        let new_remaining = remaining - amount;
+        env.storage().persistent().set(&key, &new_remaining);
+        Ok(new_remaining)
+    }
+
+    /// Read the allocation still available for `budget_id`.
+    pub fn remaining(env: Env, budget_id: String) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&BudgetKey::Remaining(budget_id))
+            .unwrap_or(0)
+    }
+}
+
+// ------------------------------------------------------- validated batch ----
+
+/// Register and wire the policy/budget stubs as the wallet's gates.
+fn wire_gates(h: &Harness) -> (Address, Address) {
+    let policy = h.env.register_contract(None, TestPolicy);
+    let budget = h.env.register_contract(None, TestBudget);
+    h.client.set_policy(&h.admin, &policy);
+    h.client.set_budget(&h.admin, &budget);
+    (policy, budget)
+}
+
+/// Build a validated `BatchAction` moving `amount` of `token` from the wallet
+/// to `to`, checked against the given policy/budget envelopes (empty ids skip
+/// the corresponding gate).
+fn validated_action(
+    env: &Env,
+    token_addr: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+    policy_id: &str,
+    budget_id: &str,
+) -> BatchAction {
+    BatchAction {
+        call: token_transfer_call(env, token_addr, from, to, amount),
+        policy_id: String::from_str(env, policy_id),
+        budget_id: String::from_str(env, budget_id),
+        asset: token_addr.clone(),
+        recipient: to.clone(),
+        amount,
+    }
+}
+
+#[test]
+fn validated_batch_executes_and_reports_aggregates() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let (policy, budget) = wire_gates(&h);
+    TestPolicyClient::new(&h.env, &policy).set_cap(&String::from_str(&h.env, "p1"), &500);
+    TestBudgetClient::new(&h.env, &budget).top_up(&String::from_str(&h.env, "b1"), &1_000);
+
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        200,
+        "p1",
+        "b1",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        150,
+        "p1",
+        "b1",
+    ));
+
+    let receipt = h.client.batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(
+        receipt,
+        BatchReceipt {
+            executed: 2,
+            total_amount: 350,
+            budget_remaining: 650,
+        }
+    );
+    assert_eq!(token_balance(&h, &r1), 200);
+    assert_eq!(token_balance(&h, &r2), 150);
+    assert_eq!(token_balance(&h, &h.contract_id), 650);
+    assert_eq!(
+        TestBudgetClient::new(&h.env, &budget).remaining(&String::from_str(&h.env, "b1")),
+        650
+    );
+
+    // The aggregated outcome is published as ("wallet", "batch_validated").
+    let want: Val = Symbol::new(&h.env, "batch_validated").into_val(&h.env);
+    let found = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
+    assert!(found, "expected batch_validated event to be emitted");
+}
+
+#[test]
+fn validated_batch_policy_denial_reverts_atomically() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let r1 = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let (policy, budget) = wire_gates(&h);
+    // Cap of 100: the first action passes, the second is denied by policy.
+    TestPolicyClient::new(&h.env, &policy).set_cap(&String::from_str(&h.env, "p1"), &100);
+    TestBudgetClient::new(&h.env, &budget).top_up(&String::from_str(&h.env, "b1"), &1_000);
+
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        50,
+        "p1",
+        "b1",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        200,
+        "p1",
+        "b1",
+    ));
+
+    let res = h.client.try_batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
+
+    // Nothing moved and the budget was never debited — full rollback.
+    assert_eq!(token_balance(&h, &r1), 0);
+    assert_eq!(token_balance(&h, &h.contract_id), 1_000);
+    assert_eq!(
+        TestBudgetClient::new(&h.env, &budget).remaining(&String::from_str(&h.env, "b1")),
+        1_000
+    );
+}
+
+#[test]
+fn validated_batch_budget_insufficiency_reverts() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let (policy, budget) = wire_gates(&h);
+    TestPolicyClient::new(&h.env, &policy).set_cap(&String::from_str(&h.env, "p1"), &1_000);
+    // Only 100 available: 80 fits, the second action's 60 does not.
+    TestBudgetClient::new(&h.env, &budget).top_up(&String::from_str(&h.env, "b1"), &100);
+
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        80,
+        "p1",
+        "b1",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        60,
+        "p1",
+        "b1",
+    ));
+
+    let res = h.client.try_batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+
+    // Full rollback: no tokens moved, budget untouched.
+    assert_eq!(token_balance(&h, &r1), 0);
+    assert_eq!(token_balance(&h, &r2), 0);
+    assert_eq!(token_balance(&h, &h.contract_id), 1_000);
+    assert_eq!(
+        TestBudgetClient::new(&h.env, &budget).remaining(&String::from_str(&h.env, "b1")),
+        100
+    );
+}
+
+#[test]
+fn validated_batch_cumulative_overflow_reverts() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let r1 = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, i128::MAX);
+    h.client.deposit(&id, &owner, &h.token, &i128::MAX);
+
+    // The cumulative total exceeds i128 before any call executes. The checked
+    // aggregate must abort the batch with Overflow, before any value moves.
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        i128::MAX,
+        "",
+        "",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        1,
+        "",
+        "",
+    ));
+
+    let res = h.client.try_batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+    assert_eq!(token_balance(&h, &r1), 0);
+    assert_eq!(token_balance(&h, &h.contract_id), i128::MAX);
+}
+
+#[test]
+fn validated_batch_unwired_gate_is_refused() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 100);
+    h.client.deposit(&id, &owner, &h.token, &100);
+
+    // No policy contract wired, yet an action declares a policy envelope.
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        10,
+        "p1",
+        "",
+    ));
+    let res = h.client.try_batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(token_balance(&h, &h.contract_id), 100);
+}
+
+#[test]
+fn validated_batch_without_envelopes_passes_unwired() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 100);
+    h.client.deposit(&id, &owner, &h.token, &100);
+
+    // No gates wired and no envelope ids: behaves like the raw path, but still
+    // reports the aggregated totals.
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        40,
+        "",
+        "",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        60,
+        "",
+        "",
+    ));
+
+    let receipt = h.client.batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(
+        receipt,
+        BatchReceipt {
+            executed: 2,
+            total_amount: 100,
+            budget_remaining: 0,
+        }
+    );
+    assert_eq!(token_balance(&h, &recipient), 100);
+    assert_eq!(token_balance(&h, &h.contract_id), 0);
+}
+
+#[test]
+fn validated_batch_mixed_assets_aggregate_total() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let token_admin = Address::generate(&h.env);
+    let token_b = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+    sac_b.mint(&owner, &1_000);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &500);
+    h.client.deposit(&id, &owner, &token_b, &500);
+
+    // Cumulative value is aggregated across assets with checked math.
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        200,
+        "",
+        "",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &token_b,
+        &h.contract_id,
+        &recipient,
+        100,
+        "",
+        "",
+    ));
+
+    let receipt = h.client.batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(
+        receipt,
+        BatchReceipt {
+            executed: 2,
+            total_amount: 300,
+            budget_remaining: 0,
+        }
+    );
+    assert_eq!(token_balance(&h, &recipient), 200);
+    assert_eq!(
+        token::TokenClient::new(&h.env, &token_b).balance(&recipient),
+        100
+    );
+}
+
+#[test]
+fn validated_batch_empty_fails() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let empty: Vec<BatchAction> = Vec::new(&h.env);
+    let res = h.client.try_batch_execute_validated(&owner, &id, &empty);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn validated_batch_non_agent_rejected() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        50,
+        "",
+        "",
+    ));
+    let res = h
+        .client
+        .try_batch_execute_validated(&stranger, &id, &actions);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn validated_batch_frozen_wallet_rejected() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 100);
+    h.client.deposit(&id, &owner, &h.token, &100);
+    h.client.freeze(&owner, &id);
+
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        10,
+        "",
+        "",
+    ));
+    let res = h.client.try_batch_execute_validated(&owner, &id, &actions);
+    assert_eq!(res, Err(Ok(Error::WalletFrozen)));
 }
