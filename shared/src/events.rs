@@ -64,6 +64,10 @@ pub enum ContractEvent {
     },
     /// A treasury configuration field was updated (`action` is e.g. `policy`).
     TreasuryConfigUpdated { org: String, action: Symbol },
+    /// A treasury was frozen by the multisig.
+    TreasuryFrozen { org: String },
+    /// A treasury was unfrozen by the multisig.
+    TreasuryUnfrozen { org: String },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -152,6 +156,14 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events()
                 .publish((Symbol::new(env, "PolicyViolation"),), (policy_id, reason));
         }
+        ContractEvent::TreasuryFrozen { org } => {
+            env.events()
+                .publish((Symbol::new(env, "TreasuryFrozen"),), org);
+        }
+        ContractEvent::TreasuryUnfrozen { org } => {
+            env.events()
+                .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
+        }
         ContractEvent::EscrowReleased {
             escrow_id,
             recipient,
@@ -215,6 +227,20 @@ pub fn policy_violation(env: &Env, policy_id: &String, reason: Symbol) {
 pub fn treasury_created(env: &Env, org: &String, admin: &Address) {
     let topics = (symbol_short!("treasury"), symbol_short!("created"));
     env.events().publish(topics, (org.clone(), admin.clone()));
+}
+
+/// `AllowanceSet` — topic `("treasury", "allow_set")`.
+pub fn allowance_set(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_set"));
+    env.events()
+        .publish(topics, (agent.clone(), asset.clone(), amount));
+}
+
+/// `AllowanceConsumed` — topic `("treasury", "allow_use")`.
+pub fn allowance_consumed(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_use"));
+    env.events()
+        .publish(topics, (agent.clone(), asset.clone(), amount));
 }
 
 /// Construct a `Symbol` reason code from a static name (used as event payloads
