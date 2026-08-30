@@ -205,9 +205,7 @@ impl TreasuryContract {
         Self::bump_frozen(&env);
         events::publish(
             &env,
-            events::ContractEvent::TreasuryFrozen {
-                org: t.org.clone(),
-            },
+            events::ContractEvent::TreasuryFrozen { org: t.org.clone() },
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("frozen")), ());
@@ -230,9 +228,7 @@ impl TreasuryContract {
         Self::bump_frozen(&env);
         events::publish(
             &env,
-            events::ContractEvent::TreasuryUnfrozen {
-                org: t.org.clone(),
-            },
+            events::ContractEvent::TreasuryUnfrozen { org: t.org.clone() },
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("unfrozen")), ());

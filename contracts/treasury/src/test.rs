@@ -2,8 +2,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger}, token, vec, Address, Env, IntoVal, String, Symbol,
-    Val, Vec,
+    testutils::{Address as _, Events, Ledger},
+    token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use astroid_shared::constants::MAX_BATCH_PAYMENTS;
@@ -452,9 +452,7 @@ fn emergency_freeze_by_multisig_blocks_transfers() {
 
     // All outbound transfers should be blocked
     let recipient = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
 
     let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 50)];
@@ -475,9 +473,7 @@ fn emergency_unfreeze_restores_transfers() {
 
     // Verify frozen state blocks transfers
     let recipient = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
 
     // Unfreeze with multisig
@@ -508,9 +504,7 @@ fn emergency_unfreeze_rejected_by_non_multisig() {
 
     // Should still be frozen
     let recipient = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
 }
 
