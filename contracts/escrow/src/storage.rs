@@ -4,7 +4,8 @@
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
-use soroban_sdk::{contracttype, Address, Env, String};
+use astroid_shared::types::AssetAmount;
+use soroban_sdk::{contracttype, Address, BytesN, Env, String, Vec};
 
 /// Release type for time-locked escrow schedules.
 #[contracttype]
@@ -56,14 +57,16 @@ pub struct Escrow {
     pub sender: Address,
     pub recipient: Address,
     pub arbiter: Address,
-    pub asset: Address,
-    pub amount: i128,
+    pub assets: Vec<AssetAmount>,
     pub state: EscrowState,
     pub deadline: u64,
     pub funded_amount: i128,
     pub memo: String,
     pub schedule: ReleaseSchedule,
     pub released_amount: i128,
+    pub override_signers: Vec<BytesN<32>>,
+    pub override_threshold: u32,
+    pub override_nonce: u64,
 }
 
 #[contracttype]
