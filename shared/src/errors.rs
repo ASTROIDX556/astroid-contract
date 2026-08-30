@@ -11,7 +11,7 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    // --- Generic / lifecycle (1-9) ---
+    // --- Generic / lifecycle (1-6) ---
     NotFound = 1,
     AlreadyExists = 2,
     Unauthorized = 3,
@@ -19,36 +19,39 @@ pub enum Error {
     NotInitialized = 5,
     AlreadyInitialized = 6,
 
-    // --- Value / arithmetic (10-19) ---
+    // --- Value / arithmetic (10-13) ---
     InsufficientFunds = 10,
     Overflow = 11,
     Underflow = 12,
     InvalidAmount = 13,
 
-    // --- Policy (20-29) ---
+    // --- Policy (20-27) ---
     PolicyDenied = 20,
     PolicyHashMismatch = 21,
     EmergencyLock = 22,
     PolicyRecipientRestricted = 23,
     PolicyPaused = 24,
     PauseDurationExceeded = 25,
+    PolicyMerchantBlocked = 26,
+    PolicyCategoryRestricted = 27,
+    AssetNotWhitelisted = 28,
 
-    // --- Registry (30-39) ---
+    // --- Registry (30) ---
     RegistryFrozen = 30,
 
-    // --- Budget (40-49) ---
+    // --- Budget (40-43) ---
     BudgetExceeded = 40,
     BudgetFrozen = 41,
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
 
-    // --- Wallet (50-59) ---
+    // --- Wallet (50-53) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (60-69) ---
+    // --- Multisig / approvals (60-66) ---
     InvalidSignature = 60,
     ThresholdNotMet = 61,
     AlreadySigned = 62,
@@ -56,17 +59,22 @@ pub enum Error {
     InvalidThreshold = 64,
     TimeLocked = 65,
     TooManySigners = 66,
+    InvalidNonce = 67,
 
-    // --- Proposal (70-79) ---
+    // --- Proposal (70-73) ---
     ProposalExpired = 70,
     InvalidProposalState = 71,
     ProposalNotApproved = 72,
     NotAnApprover = 73,
 
-    // --- Escrow (80-89) ---
+    // --- Escrow (80-84) ---
     ConditionNotMet = 80,
     EscrowNotFunded = 81,
     EscrowExpired = 82,
     InvalidCondition = 83,
     TimeLockActive = 84,
+
+    // --- Arithmetic (85-86) ---
+    MathOverflow = 85,
+    DivisionByZero = 86,
 }
