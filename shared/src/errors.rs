@@ -19,31 +19,30 @@ pub enum Error {
     NotInitialized = 5,
     AlreadyInitialized = 6,
 
-    // --- Value / arithmetic (10-13) ---
+    // --- Value / arithmetic (10-12) ---
     InsufficientFunds = 10,
     Overflow = 11,
-    Underflow = 12,
-    InvalidAmount = 13,
+    InvalidAmount = 12,
 
-    // --- Policy (20-27) ---
+    // --- Policy (20-28) ---
     PolicyDenied = 20,
-    PolicyHashMismatch = 21,
-    EmergencyLock = 22,
-    PolicyRecipientRestricted = 23,
-    PolicyPaused = 24,
-    PauseDurationExceeded = 25,
-    PolicyMerchantBlocked = 26,
-    PolicyCategoryRestricted = 27,
-    AssetNotWhitelisted = 28,
+    EmergencyLock = 21,
+    PolicyRecipientRestricted = 22,
+    PolicyMerchantBlocked = 23,
+    PolicyCategoryRestricted = 24,
+    AssetNotWhitelisted = 25,
+    PolicyPaused = 26,
+    PauseDurationExceeded = 27,
 
     // --- Registry (30) ---
     RegistryFrozen = 30,
 
-    // --- Budget (40-43) ---
+    // --- Budget (40-44) ---
     BudgetExceeded = 40,
     BudgetFrozen = 41,
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
+    BudgetExpired = 44,
 
     // --- Wallet (50-53) ---
     WalletFrozen = 50,
@@ -51,7 +50,7 @@ pub enum Error {
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (60-66) ---
+    // --- Multisig / approvals (60-70) ---
     InvalidSignature = 60,
     ThresholdNotMet = 61,
     AlreadySigned = 62,
@@ -60,21 +59,23 @@ pub enum Error {
     TimeLocked = 65,
     TooManySigners = 66,
     InvalidNonce = 67,
+    BatchCallFailed = 68,
+    InsufficientWeight = 69,
+    InvalidSignerWeight = 70,
 
-    // --- Proposal (70-73) ---
-    ProposalExpired = 70,
-    InvalidProposalState = 71,
-    ProposalNotApproved = 72,
-    NotAnApprover = 73,
+    // --- Proposal (71-77) ---
+    ProposalExpired = 71,
+    InvalidProposalState = 72,
+    ProposalNotApproved = 73,
+    NotAnApprover = 74,
+    CancellationWindowClosed = 75,
+    MathOverflow = 76,
+    DivisionByZero = 77,
 
     // --- Escrow (80-84) ---
-    ConditionNotMet = 80,
-    EscrowNotFunded = 81,
-    EscrowExpired = 82,
-    InvalidCondition = 83,
-    TimeLockActive = 84,
-
-    // --- Arithmetic (85-86) ---
-    MathOverflow = 85,
-    DivisionByZero = 86,
+    EscrowNotFunded = 80,
+    EscrowExpired = 81,
+    InvalidCondition = 82,
+    TimeLockActive = 83,
+    GraceActive = 84,
 }
