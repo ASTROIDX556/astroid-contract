@@ -158,6 +158,25 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "allow_deficit"
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deficit_amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {
@@ -283,6 +302,25 @@
                 "durability": "persistent",
                 "val": {
                   "map": [
+                    {
+                      "key": {
+                        "symbol": "allow_deficit"
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deficit_amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
                     {
                       "key": {
                         "symbol": "expires_at"
@@ -961,7 +999,7 @@
             ],
             "data": {
               "error": {
-                "contract": 40
+                "contract": 22
               }
             }
           }
@@ -982,7 +1020,7 @@
               },
               {
                 "error": {
-                  "contract": 40
+                  "contract": 22
                 }
               }
             ],
@@ -1007,7 +1045,7 @@
               },
               {
                 "error": {
-                  "contract": 40
+                  "contract": 22
                 }
               }
             ],

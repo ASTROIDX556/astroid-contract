@@ -58,7 +58,7 @@ pub use storage::{
 
 use astroid_shared::constants::{
     HOUR_IN_LEDGERS, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS,
-    MAX_SIGNERS, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    MAX_SIGNERS,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events::{self, ContractEvent};
@@ -364,6 +364,8 @@ impl EscrowContract {
             override_signers: Vec::new(&env),
             override_threshold: 0,
             override_nonce: 0,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
         };
         store_escrow(&env, id, &escrow);
 

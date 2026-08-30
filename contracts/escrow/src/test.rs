@@ -881,8 +881,8 @@ fn advance_ledgers(h: &Harness, delta: u32) {
 
 #[test]
 fn successful_beneficiary_proposal() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -897,8 +897,8 @@ fn successful_beneficiary_proposal() {
 
 #[test]
 fn successful_beneficiary_claim_after_timelock() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -915,8 +915,8 @@ fn successful_beneficiary_claim_after_timelock() {
 
 #[test]
 fn premature_claim_is_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -930,8 +930,8 @@ fn premature_claim_is_rejected() {
 
 #[test]
 fn claim_one_ledger_before_boundary_is_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -944,8 +944,8 @@ fn claim_one_ledger_before_boundary_is_rejected() {
 
 #[test]
 fn claim_at_exact_boundary_succeeds() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -958,8 +958,8 @@ fn claim_at_exact_boundary_succeeds() {
 
 #[test]
 fn unauthorized_proposal_is_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let stranger = Address::generate(&h.env);
     let new_beneficiary = Address::generate(&h.env);
 
@@ -970,8 +970,8 @@ fn unauthorized_proposal_is_rejected() {
 
 #[test]
 fn unauthorized_claim_is_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
     let intruder = Address::generate(&h.env);
 
@@ -985,8 +985,8 @@ fn unauthorized_claim_is_rejected() {
 
 #[test]
 fn arbiter_can_propose_beneficiary() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.arbiter, id, &new_beneficiary);
@@ -998,8 +998,8 @@ fn arbiter_can_propose_beneficiary() {
 
 #[test]
 fn original_beneficiary_retains_rights_before_timelock() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -1008,13 +1008,13 @@ fn original_beneficiary_retains_rights_before_timelock() {
     // Original recipient is still the beneficiary — release still works.
     h.client.release(&h.arbiter, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(balance(&h, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
 }
 
 #[test]
 fn proposed_beneficiary_no_rights_before_timelock() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -1026,8 +1026,8 @@ fn proposed_beneficiary_no_rights_before_timelock() {
 
 #[test]
 fn proposal_state_cleared_after_claim() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -1041,8 +1041,8 @@ fn proposal_state_cleared_after_claim() {
 
 #[test]
 fn repeated_proposal_replaces_previous() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let first = Address::generate(&h.env);
     let second = Address::generate(&h.env);
 
@@ -1059,8 +1059,8 @@ fn repeated_proposal_replaces_previous() {
 
 #[test]
 fn propose_same_beneficiary_again_resets_timelock() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -1076,8 +1076,8 @@ fn propose_same_beneficiary_again_resets_timelock() {
 
 #[test]
 fn propose_to_current_recipient_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
 
     // Proposing the current recipient as the new beneficiary is rejected.
     let res = try_propose(&h, &h.sender, id, &h.recipient);
@@ -1086,8 +1086,8 @@ fn propose_to_current_recipient_rejected() {
 
 #[test]
 fn propose_to_sender_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
 
     let res = try_propose(&h, &h.sender, id, &h.sender);
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
@@ -1095,8 +1095,8 @@ fn propose_to_sender_rejected() {
 
 #[test]
 fn propose_to_arbiter_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
 
     let res = try_propose(&h, &h.sender, id, &h.arbiter);
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
@@ -1104,8 +1104,8 @@ fn propose_to_arbiter_rejected() {
 
 #[test]
 fn propose_on_released_escrow_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     h.client.release(&h.arbiter, &id);
@@ -1116,8 +1116,8 @@ fn propose_on_released_escrow_rejected() {
 
 #[test]
 fn claim_on_released_escrow_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -1133,8 +1133,8 @@ fn claim_on_released_escrow_rejected() {
 
 #[test]
 fn claim_without_proposal_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let anyone = Address::generate(&h.env);
 
     advance_ledgers(&h, HOUR_IN_LEDGERS);
@@ -1144,7 +1144,7 @@ fn claim_without_proposal_rejected() {
 
 #[test]
 fn proposal_on_timelock_escrow_works() {
-    let h = setup(0);
+    let h = setup(0, 0);
     let new_beneficiary = Address::generate(&h.env);
     let unlock_time = START + 100;
 
@@ -1152,8 +1152,7 @@ fn proposal_on_timelock_escrow_works() {
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &h.asset,
-        &5_000,
+        &one_asset(&h, 5_000),
         &unlock_time,
         &String::from_str(&h.env, "locked"),
     );
@@ -1166,7 +1165,7 @@ fn proposal_on_timelock_escrow_works() {
 
 #[test]
 fn claim_on_timelock_escrow_after_timelock() {
-    let h = setup(0);
+    let h = setup(0, 0);
     let new_beneficiary = Address::generate(&h.env);
     let unlock_time = START + 100;
 
@@ -1174,8 +1173,7 @@ fn claim_on_timelock_escrow_after_timelock() {
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &h.asset,
-        &5_000,
+        &one_asset(&h, 5_000),
         &unlock_time,
         &String::from_str(&h.env, "locked"),
     );
@@ -1189,8 +1187,8 @@ fn claim_on_timelock_escrow_after_timelock() {
 
 #[test]
 fn new_beneficiary_can_release_after_claim() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 86_400);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 86_400);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
@@ -1200,13 +1198,13 @@ fn new_beneficiary_can_release_after_claim() {
     // The new beneficiary is now the recipient — arbiter releases to them.
     h.client.release(&h.arbiter, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(balance(&h, &new_beneficiary), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &new_beneficiary), 5_000);
 }
 
 #[test]
 fn propose_and_claim_event_emission() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let new_beneficiary = Address::generate(&h.env);
 
     propose(&h, &h.sender, id, &new_beneficiary);
