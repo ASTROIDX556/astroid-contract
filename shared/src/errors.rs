@@ -50,12 +50,11 @@ pub enum Error {
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (61-69) ---
+    // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
     InvalidThreshold = 64,
-    TimeLocked = 65,
     TooManySigners = 66,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
     BatchCallFailed = 67,
@@ -70,9 +69,6 @@ pub enum Error {
     /// A caller without governance rights attempted to modify signers,
     /// weights or the threshold.
     UnauthorizedModification = 92,
-    InvalidNonce = 67,
-    BatchCallFailed = 68,
-    InsufficientWeight = 69,
 
     // --- Proposal (71-79) ---
     ProposalExpired = 71,
@@ -80,8 +76,6 @@ pub enum Error {
     ProposalNotApproved = 73,
     NotAnApprover = 74,
     CancellationWindowClosed = 75,
-    MathOverflow = 76,
-    DivisionByZero = 77,
     /// A prerequisite proposal has not executed, so the dependent proposal may
     /// not execute yet.
     PrerequisiteNotMet = 78,
