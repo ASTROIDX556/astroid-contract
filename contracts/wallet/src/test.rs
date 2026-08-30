@@ -245,11 +245,6 @@ fn standard_events_emitted() {
 }
 
 // ---------------------------------------------------------------------------
-// Emergency pause switch / circuit breaker
-// ---------------------------------------------------------------------------
-
-/// Create a wallet holding `amount` of the harness token.
-fn funded_wallet(h: &Harness, amount: i128) -> (u64, Address) {
 // Role-based access control
 // ---------------------------------------------------------------------------
 
@@ -259,7 +254,7 @@ fn funded_wallet(h: &Harness, amount: i128) -> (Address, u64) {
     let id = h.client.create_wallet(&owner);
     mint(h, &owner, amount);
     h.client.deposit(&id, &owner, &h.token, &amount);
-    (id, owner)
+    (owner, id)
 }
 
 #[test]
@@ -272,7 +267,7 @@ fn breaker_starts_reset_and_guardian_defaults_to_admin() {
 #[test]
 fn paused_wallet_contract_blocks_all_outgoing_value() {
     let h = setup();
-    let (id, owner) = funded_wallet(&h, 1_000);
+    let (owner, id) = funded_wallet(&h, 1_000);
     let recipient = Address::generate(&h.env);
 
     h.client.emergency_pause(&h.admin);
@@ -307,7 +302,7 @@ fn paused_wallet_contract_blocks_new_wallets() {
 #[test]
 fn inspection_and_recovery_stay_available_while_paused() {
     let h = setup();
-    let (id, owner) = funded_wallet(&h, 1_000);
+    let (owner, id) = funded_wallet(&h, 1_000);
     h.client.emergency_pause(&h.admin);
 
     // Read-only inspection is unaffected.
@@ -332,7 +327,7 @@ fn inspection_and_recovery_stay_available_while_paused() {
 #[test]
 fn normal_operation_resumes_after_unpause() {
     let h = setup();
-    let (id, owner) = funded_wallet(&h, 1_000);
+    let (owner, id) = funded_wallet(&h, 1_000);
     let recipient = Address::generate(&h.env);
 
     h.client.emergency_pause(&h.admin);
@@ -412,7 +407,7 @@ fn redundant_breaker_transitions_are_rejected() {
     assert_eq!(
         h.client.try_emergency_pause(&h.admin),
         Err(Ok(Error::InvalidState))
-    (owner, id)
+    );
 }
 
 #[test]
@@ -648,6 +643,9 @@ fn breaker_events_are_emitted() {
     assert_event(&h.env, "WalletPaused");
     h.client.emergency_unpause(&h.admin);
     assert_event(&h.env, "WalletUnpaused");
+}
+
+#[test]
 fn granting_on_an_archived_wallet_is_refused() {
     let h = setup();
     let owner = Address::generate(&h.env);
