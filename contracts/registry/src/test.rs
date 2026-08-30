@@ -5,7 +5,8 @@ use crate::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{testutils::Events, Address, Env, IntoVal, String, Symbol, Val};
+use soroban_sdk::xdr::{AccountId, PublicKey, ScAddress, Uint256};
+use soroban_sdk::{testutils::Events, Address, Env, IntoVal, String, Symbol, TryFromVal, Val};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -163,6 +164,66 @@ fn admin_rotation() {
         client.try_register_org(&admin, &org, &owner),
         Err(Ok(Error::Unauthorized))
     );
+}
+
+// --- Issue #43: Contract dependency validation ---
+
+#[test]
+fn register_module_rejects_zero_address() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // Construct a zero address via xdr (all 32 bytes zero)
+    let zero_sc = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+        Uint256([0u8; 32]),
+    )));
+    let zero_addr = Address::try_from_val(&env, &zero_sc).unwrap();
+    let res = client.try_register_module(
+        &owner,
+        &org,
+        &ModuleKind::Wallet,
+        &zero_addr,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidModuleAddress)));
+}
+
+#[test]
+fn register_module_accepts_valid_address() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn register_version_rejects_zero_address() {
+    let (env, client, admin) = setup();
+    // Construct a zero address via xdr (all 32 bytes zero)
+    let zero_sc = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+        Uint256([0u8; 32]),
+    )));
+    let zero_addr = Address::try_from_val(&env, &zero_sc).unwrap();
+    let res = client.try_register_version(
+        &admin,
+        &ModuleKind::Wallet,
+        &1,
+        &zero_addr,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidModuleAddress)));
+}
+
+#[test]
+fn register_version_accepts_valid_address() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
 }
 
 #[test]

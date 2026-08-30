@@ -21,6 +21,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
+use soroban_sdk::xdr::{AccountId, Hash, PublicKey, ScAddress, Uint256};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
@@ -124,6 +125,11 @@ impl RegistryContract {
 
     /// Register (or update) a module address for an organization. Callable by
     /// the admin or the organization owner.
+    ///
+    /// Validates that `address` is a non-zero, properly-formed Soroban address
+    /// before persisting it, preventing accidental registration of uninitialized
+    /// or null contract addresses that would cause downstream calls to fail
+    /// unpredictably (Issue #43).
     pub fn register_module(
         env: Env,
         caller: Address,
@@ -133,6 +139,7 @@ impl RegistryContract {
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
         caller.require_auth();
+        Self::require_valid_module_address(&address)?;
         Self::require_admin_or_org_owner(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
@@ -195,6 +202,7 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
+        Self::require_valid_module_address(&address)?;
         if version == 0 {
             return Err(Error::InvalidInput);
         }
@@ -328,6 +336,23 @@ impl RegistryContract {
     }
 
     // --- internal helpers ---
+
+    /// Reject a zero-address (all bytes zero). On-chain, a zero address means
+    /// no contract is deployed at that location, so registering it would cause
+    /// every downstream cross-contract call to fail silently or panic.
+    fn require_valid_module_address(address: &Address) -> Result<(), Error> {
+        let sc_addr: ScAddress = address.clone().into();
+        let is_zero = match sc_addr {
+            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) => {
+                bytes == [0u8; 32]
+            }
+            ScAddress::Contract(Hash(bytes)) => bytes == [0u8; 32],
+        };
+        if is_zero {
+            return Err(Error::InvalidModuleAddress);
+        }
+        Ok(())
+    }
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
         if env
