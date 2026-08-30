@@ -192,15 +192,14 @@ impl EscrowContract {
 
         let id = increment_count(&env)?;
 
-        // Pull every listed asset amount into the escrow's own custody. If the
-        // sender lacks any balance this panics and the whole invocation
-        // (including the id bump) rolls back.
+        let mut funded_amount: i128 = 0;
         for a in assets.iter() {
             token::TokenClient::new(&env, &a.asset).transfer(
                 &sender,
                 &env.current_contract_address(),
                 &a.amount,
             );
+            funded_amount = checked_add(funded_amount, a.amount)?;
         }
 
         let escrow = Escrow {
@@ -210,6 +209,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline,
+            funded_amount,
             memo,
             schedule: ReleaseSchedule::none(),
             released_amount: 0,
@@ -415,6 +415,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Created,
             deadline: unlock_time,
+            funded_amount: 0,
             memo,
             schedule,
             released_amount: 0,
