@@ -650,7 +650,13 @@ impl EscrowContract {
 
     /// Release the escrowed assets to the recipient. Only the arbiter may call,
     /// and only before the deadline — afterward the sender reclaims via `refund`.
-    pub fn release(env: Env, arbiter: Address, id: u64) -> Result<(), Error> {
+    ///
+    /// `release_amount` is the amount to release this call. Partial releases are
+    /// supported: the cumulative `released_amount` is tracked on the escrow and
+    /// must not exceed `funded_amount`. A full release transitions the escrow to
+    /// `Released`; a partial release keeps the escrow in `Funded` so that more
+    /// can be released later or the remaining balance can be revoked.
+    pub fn release(env: Env, arbiter: Address, id: u64, release_amount: i128) -> Result<(), Error> {
         arbiter.require_auth();
         let mut escrow = load_escrow(&env, id)?;
         if escrow.arbiter != arbiter {
@@ -668,6 +674,13 @@ impl EscrowContract {
             // storage write, so the marker is set through the permissionless `expire`
             // entrypoint and the funds are reclaimed via `refund` / `reclaim`.
             return Err(Error::EscrowExpired);
+        }
+        let remaining = escrow
+            .funded_amount
+            .checked_sub(escrow.released_amount)
+            .ok_or(Error::Overflow)?;
+        if release_amount > remaining {
+            return Err(Error::InvalidAmount);
         }
 
         escrow.released_amount = escrow.funded_amount;
@@ -688,7 +701,7 @@ impl EscrowContract {
         );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("released")),
-            (id, arbiter),
+            (id, arbiter, release_amount),
         );
         Ok(())
     }
