@@ -451,12 +451,7 @@ fn blocklist_blocks_transfers_immediately() {
     p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
 
     // Transfer to blocked address should fail
-    let result = p.try_check_transfer(
-        &String::from_str(&env, "max_txn"),
-        &asset,
-        &blocked,
-        &100,
-    );
+    let result = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &blocked, &100);
     assert!(result.is_err());
 
     // Transfer to non-blocked address should succeed
@@ -496,8 +491,7 @@ fn blocklist_unauthorized_add_fails() {
     let p = setup(&env, &owner);
     let addr = Address::generate(&env);
 
-    let result =
-        p.try_add_to_blocklist(&unauthorized, &String::from_str(&env, "max_txn"), &addr);
+    let result = p.try_add_to_blocklist(&unauthorized, &String::from_str(&env, "max_txn"), &addr);
     assert!(result.is_err());
 }
 
@@ -510,8 +504,7 @@ fn blocklist_duplicate_add_fails() {
     let addr = Address::generate(&env);
 
     p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
-    let result =
-        p.try_add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
+    let result = p.try_add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
     assert!(result.is_err());
 }
 
@@ -523,8 +516,7 @@ fn blocklist_nonexistent_remove_fails() {
     let p = setup(&env, &owner);
     let addr = Address::generate(&env);
 
-    let result =
-        p.try_remove_from_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
+    let result = p.try_remove_from_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
     assert!(result.is_err());
 }
 
@@ -561,11 +553,6 @@ fn blocklist_violation_event_emitted() {
 
     p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
 
-    let _ = p.try_check_transfer(
-        &String::from_str(&env, "max_txn"),
-        &asset,
-        &blocked,
-        &100,
-    );
+    let _ = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &blocked, &100);
     assert_event(&env, "PolicyViolation");
 }
