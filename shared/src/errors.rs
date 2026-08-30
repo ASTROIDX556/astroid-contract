@@ -62,7 +62,7 @@ pub enum Error {
     BatchCallFailed = 68,
     InsufficientWeight = 69,
 
-    // --- Proposal (71-77) ---
+    // --- Proposal (71-79) ---
     ProposalExpired = 71,
     InvalidProposalState = 72,
     ProposalNotApproved = 73,
@@ -70,14 +70,17 @@ pub enum Error {
     CancellationWindowClosed = 75,
     MathOverflow = 76,
     DivisionByZero = 77,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 78,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 79,
 
-    // --- Escrow (80-84) ---
+    // --- Escrow (80-81) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
-    GraceActive = 82,
 
-    // --- Treasury allowances (83-85) ---
+    // --- Treasury allowances (83, 85) ---
     AllowanceExceeded = 83,
-    AllowanceExpired = 84,
     AllowanceNotFound = 85,
 }
