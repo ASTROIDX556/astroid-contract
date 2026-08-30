@@ -434,3 +434,138 @@ fn category_restricted_event_emitted() {
     );
     assert_event(&env, "PolicyViolation");
 }
+
+// --- Issue #32: Dynamic recipient blocklist tests ---
+
+#[test]
+fn blocklist_blocks_transfers_immediately() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    let safe = Address::generate(&env);
+
+    // Block the address
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
+
+    // Transfer to blocked address should fail
+    let result = p.try_check_transfer(
+        &String::from_str(&env, "max_txn"),
+        &asset,
+        &blocked,
+        &100,
+    );
+    assert!(result.is_err());
+
+    // Transfer to non-blocked address should succeed
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &safe, &100,)
+        .is_ok());
+}
+
+#[test]
+fn blocklist_removal_allows_transfers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let addr = Address::generate(&env);
+
+    // Block
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &addr, &100,)
+        .is_err());
+
+    // Remove
+    p.remove_from_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &addr, &100,)
+        .is_ok());
+}
+
+#[test]
+fn blocklist_unauthorized_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let addr = Address::generate(&env);
+
+    let result =
+        p.try_add_to_blocklist(&unauthorized, &String::from_str(&env, "max_txn"), &addr);
+    assert!(result.is_err());
+}
+
+#[test]
+fn blocklist_duplicate_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let addr = Address::generate(&env);
+
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
+    let result =
+        p.try_add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
+    assert!(result.is_err());
+}
+
+#[test]
+fn blocklist_nonexistent_remove_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let addr = Address::generate(&env);
+
+    let result =
+        p.try_remove_from_blocklist(&owner, &String::from_str(&env, "max_txn"), &addr);
+    assert!(result.is_err());
+}
+
+#[test]
+fn blocklist_checked_before_amount_gate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+
+    // Block the address
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
+
+    // Even a small amount (below max_amount) is rejected when blocked
+    let result = p.try_check_transfer(
+        &String::from_str(&env, "max_txn"),
+        &asset,
+        &blocked,
+        &1, // well below max_amount of 1_000_000
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn blocklist_violation_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
+
+    let _ = p.try_check_transfer(
+        &String::from_str(&env, "max_txn"),
+        &asset,
+        &blocked,
+        &100,
+    );
+    assert_event(&env, "PolicyViolation");
+}
