@@ -238,50 +238,6 @@ fn standard_events_emitted() {
     assert_event(&h.env, "WalletStateChanged");
 }
 
-// --- registry-authorized upgrades ---
-
-/// The upgrade surface is wired to `astroid_interfaces::upgrade`, whose
-/// end-to-end behaviour against a real registry is covered in the registry
-/// crate. These assertions pin this contract's own gating: an upgrade is
-/// impossible before an authority exists, and a caller that is not the upgrade
-/// admin is rejected before the registry is ever consulted.
-#[test]
-fn upgrade_is_gated_by_the_configured_authority() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let id = env.register_contract(None, crate::WalletContract);
-    let client = crate::WalletContractClient::new(&env, &id);
-
-    let admin = Address::generate(&env);
-    let registry = Address::generate(&env);
-    let stranger = Address::generate(&env);
-    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-
-    // No authority configured yet.
-    assert_eq!(
-        client.try_check_upgrade(&admin, &wasm_hash),
-        Err(Ok(astroid_shared::errors::Error::NotInitialized))
-    );
-
-    client.set_upgrade_authority(&admin, &admin, &registry);
-    let authority = client.get_upgrade_authority();
-    assert_eq!(authority.admin, admin);
-    assert_eq!(authority.registry, registry);
-
-    // A stranger can neither dry-run nor perform an upgrade...
-    assert_eq!(
-        client.try_check_upgrade(&stranger, &wasm_hash),
-        Err(Ok(astroid_shared::errors::Error::Unauthorized))
-    );
-    assert_eq!(
-        client.try_upgrade(&stranger, &wasm_hash),
-        Err(Ok(astroid_shared::errors::Error::Unauthorized))
-    );
-    // ...nor rotate the authority to itself.
-    assert_eq!(
-        client.try_set_upgrade_authority(&stranger, &stranger, &registry),
-        Err(Ok(astroid_shared::errors::Error::Unauthorized))
-    );
 // ---------------------------------------------------------------------------
 // Role-based access control
 // ---------------------------------------------------------------------------
@@ -538,4 +494,50 @@ fn granting_on_an_archived_wallet_is_refused() {
     // Revocation still works so stale grants can be cleaned up.
     h.client.revoke_role(&owner, &id, &agent);
     assert_eq!(h.client.get_role(&id, &agent), None);
+}
+
+// --- registry-authorized upgrades ---
+
+/// The upgrade surface is wired to `astroid_interfaces::upgrade`, whose
+/// end-to-end behaviour against a real registry is covered in the registry
+/// crate. These assertions pin this contract's own gating: an upgrade is
+/// impossible before an authority exists, and a caller that is not the upgrade
+/// admin is rejected before the registry is ever consulted.
+#[test]
+fn upgrade_is_gated_by_the_configured_authority() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, crate::WalletContract);
+    let client = crate::WalletContractClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let registry = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+
+    // No authority configured yet.
+    assert_eq!(
+        client.try_check_upgrade(&admin, &wasm_hash),
+        Err(Ok(astroid_shared::errors::Error::NotInitialized))
+    );
+
+    client.set_upgrade_authority(&admin, &admin, &registry);
+    let authority = client.get_upgrade_authority();
+    assert_eq!(authority.admin, admin);
+    assert_eq!(authority.registry, registry);
+
+    // A stranger can neither dry-run nor perform an upgrade...
+    assert_eq!(
+        client.try_check_upgrade(&stranger, &wasm_hash),
+        Err(Ok(astroid_shared::errors::Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_upgrade(&stranger, &wasm_hash),
+        Err(Ok(astroid_shared::errors::Error::Unauthorized))
+    );
+    // ...nor rotate the authority to itself.
+    assert_eq!(
+        client.try_set_upgrade_authority(&stranger, &stranger, &registry),
+        Err(Ok(astroid_shared::errors::Error::Unauthorized))
+    );
 }

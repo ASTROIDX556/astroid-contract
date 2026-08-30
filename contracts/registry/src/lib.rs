@@ -78,7 +78,7 @@ enum DataKey {
     WasmHash(ModuleKind, u32),
     /// Reverse index of the above: (kind, Wasm hash) -> version. Lets an
     /// upgrade check resolve a hash in one read instead of scanning versions.
-    ApprovedWasm(ModuleKind, BytesN<32>),
+    WasmVersion(ModuleKind, BytesN<32>),
     /// Emergency freeze status (instance).
     Frozen,
     /// Approved WASM hashes: (kind, hash) -> bool.
@@ -402,11 +402,11 @@ impl RegistryContract {
             }
             env.storage()
                 .persistent()
-                .remove(&DataKey::ApprovedWasm(kind, previous));
+                .remove(&DataKey::WasmVersion(kind, previous));
         }
         env.storage().persistent().set(&hkey, &wasm_hash);
         Self::bump(&env, &hkey);
-        let akey = DataKey::ApprovedWasm(kind, wasm_hash.clone());
+        let akey = DataKey::WasmVersion(kind, wasm_hash.clone());
         env.storage().persistent().set(&akey, &version);
         Self::bump(&env, &akey);
 
@@ -442,7 +442,7 @@ impl RegistryContract {
         env.storage().persistent().remove(&hkey);
         env.storage()
             .persistent()
-            .remove(&DataKey::ApprovedWasm(kind, wasm_hash.clone()));
+            .remove(&DataKey::WasmVersion(kind, wasm_hash.clone()));
         env.events().publish(
             (symbol_short!("wasm"), symbol_short!("revoked")),
             (kind, version, wasm_hash),
@@ -747,7 +747,7 @@ impl RegistryInterface for RegistryContract {
         Self::check_frozen(&env)?;
         env.storage()
             .persistent()
-            .get(&DataKey::ApprovedWasm(kind, wasm_hash))
+            .get(&DataKey::WasmVersion(kind, wasm_hash))
             .ok_or(Error::UnauthorizedUpgrade)
     }
 }

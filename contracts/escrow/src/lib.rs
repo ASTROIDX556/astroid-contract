@@ -23,13 +23,6 @@
 //! deadline passes); funds stay in custody until `refund` returns them to the
 //! sender, so no escrow can be `Closed` with money still locked.
 //!
-//! ## Upgradeability
-//!
-//! Code upgrades are gated twice: the caller must be this contract's recorded
-//! upgrade admin, and the new Wasm hash must be approved for
-//! [`ModuleKind::Escrow`] in the registry's version map. See
-//! [`astroid_interfaces::upgrade`]; anything else is refused with
-//! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
 //! ## Signature-based release override
 //!
 //! Besides the single named `arbiter`, an escrow may name a set of
@@ -56,6 +49,14 @@
 //! - Partial and multiple gradual withdrawals by the beneficiary.
 //! - Deterministic `Error::TimeLockActive` when withdrawing before maturity or cliff.
 
+//! ## Upgradeability
+//!
+//! Code upgrades are gated twice: the caller must be this contract's recorded
+//! upgrade admin, and the new Wasm hash must be approved for
+//! [`ModuleKind::Escrow`] in the registry's version map. See
+//! [`astroid_interfaces::upgrade`]; anything else is refused with
+//! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
+
 pub mod storage;
 
 pub use storage::{
@@ -69,14 +70,11 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events::{self, ContractEvent};
-use astroid_shared::math::checked_add;
-use astroid_shared::types::ModuleKind;
 use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
-use astroid_shared::types::AssetAmount;
+use astroid_shared::types::{AssetAmount, ModuleKind};
 use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, String,
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, String,
     Vec,
 };

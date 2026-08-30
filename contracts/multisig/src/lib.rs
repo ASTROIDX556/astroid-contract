@@ -24,7 +24,12 @@
 //! Events: `SignerAdded`, `SignerRemoved`, `ThresholdChanged`,
 //! `ProposalApproved`, `ProposalExecuted`, `BatchExecuted`, `EmergencyLock`.
 //!
-//! Execution below threshold is rejected with [`Error::ThresholdNotMet`].
+//! Events: `SignerAdded`, `SignerRemoved`, `SignerWeightUpdated`,
+//! `ThresholdChanged`, `ProposalApproved`, `ProposalExecuted`,
+//! `EmergencyLock`.
+//!
+//! Execution below the weight threshold is rejected with
+//! [`Error::InsufficientWeight`].
 //!
 //! ## Upgradeability
 //!
@@ -33,12 +38,6 @@
 //! [`ModuleKind::Multisig`] in the registry's version map. See
 //! [`astroid_interfaces::upgrade`]; anything else is refused with
 //! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
-//! Events: `SignerAdded`, `SignerRemoved`, `SignerWeightUpdated`,
-//! `ThresholdChanged`, `ProposalApproved`, `ProposalExecuted`,
-//! `EmergencyLock`.
-//!
-//! Execution below the weight threshold is rejected with
-//! [`Error::InsufficientWeight`].
 
 use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 use astroid_shared::constants::{

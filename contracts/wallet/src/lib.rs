@@ -31,7 +31,6 @@
 //! `unfreeze`, `pause`, `unpause`, `archive`, `grant_role`, `revoke_role`.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted` (shared schema)
-//! plus wallet-scoped state-change events.
 //!
 //! ## Upgradeability
 //!
@@ -41,17 +40,13 @@
 //! [`astroid_interfaces::upgrade`]; anything else is refused with
 //! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
 
-use astroid_interfaces::upgrade::{self, UpgradeAuthority};
-//! plus wallet-scoped state-change and role-administration events.
-
 use crate::access::Role;
+use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
-use astroid_shared::math::{checked_add, checked_sub};
-use astroid_shared::types::{ModuleKind, ResourceState};
 use astroid_shared::math::{SafeAdd, SafeSub};
-use astroid_shared::types::ResourceState;
+use astroid_shared::types::{ModuleKind, ResourceState};
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
 use soroban_sdk::{
@@ -285,44 +280,6 @@ impl WalletContract {
         Ok(())
     }
 
-    // --- upgradeability (registry-authorized) ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. The first call bootstraps the authority and is
-    /// meant to run in the same transaction as `initialize`; afterwards only
-    /// the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: Env,
-        caller: Address,
-        admin: Address,
-        registry: Address,
-    ) -> Result<(), Error> {
-        upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(env: Env) -> Result<UpgradeAuthority, Error> {
-        upgrade::get_authority(&env)
-    }
-
-    /// Validate an upgrade without performing it: the caller must be the
-    /// upgrade admin and `new_wasm_hash` must be an approved implementation of
-    /// [`ModuleKind::Wallet`] in the registry's version map. Returns the
-    /// approved version, or [`Error::UnauthorizedUpgrade`].
-    pub fn check_upgrade(
-        env: Env,
-        caller: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<u32, Error> {
-        upgrade::check(&env, &caller, ModuleKind::Wallet, &new_wasm_hash)
-    }
-
-    /// Replace this contract's code with `new_wasm_hash` after the registry has
-    /// authorized it. An unauthorized caller or an unregistered hash aborts
-    /// before any code is swapped, so the contract keeps running its current
-    /// implementation.
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<u32, Error> {
-        upgrade::perform(&env, &caller, ModuleKind::Wallet, new_wasm_hash)
     /// Delegate `role` on a wallet to `account`, replacing any role it already
     /// held. Requires [`Role::Admin`], so the owner (implicitly `Admin`) or an
     /// admin it has already delegated to may administer roles.
@@ -370,6 +327,46 @@ impl WalletContract {
             (wallet_id, account),
         );
         Ok(())
+    }
+
+    // --- upgradeability (registry-authorized) ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. The first call bootstraps the authority and is
+    /// meant to run in the same transaction as `initialize`; afterwards only
+    /// the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(env: Env) -> Result<UpgradeAuthority, Error> {
+        upgrade::get_authority(&env)
+    }
+
+    /// Validate an upgrade without performing it: the caller must be the
+    /// upgrade admin and `new_wasm_hash` must be an approved implementation of
+    /// [`ModuleKind::Wallet`] in the registry's version map. Returns the
+    /// approved version, or [`Error::UnauthorizedUpgrade`].
+    pub fn check_upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        upgrade::check(&env, &caller, ModuleKind::Wallet, &new_wasm_hash)
+    }
+
+    /// Replace this contract's code with `new_wasm_hash` after the registry has
+    /// authorized it. An unauthorized caller or an unregistered hash aborts
+    /// before any code is swapped, so the contract keeps running its current
+    /// implementation.
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<u32, Error> {
+        upgrade::perform(&env, &caller, ModuleKind::Wallet, new_wasm_hash)
     }
 
     // --- views ---

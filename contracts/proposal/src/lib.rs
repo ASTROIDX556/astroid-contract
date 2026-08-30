@@ -36,15 +36,11 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
-use astroid_shared::types::ModuleKind;
+use astroid_shared::types::{AssetAmount, ModuleKind};
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Vec,
-use astroid_shared::types::AssetAmount;
-use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, BytesN, Env,
+    String, Vec,
 };
 
 /// Proposal lifecycle state.

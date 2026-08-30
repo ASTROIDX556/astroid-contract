@@ -37,11 +37,10 @@ pub enum Error {
     FeeLimitExceeded = 18,
 
     // --- Registry (30-39) ---
-    RegistryFrozen = 30,
+    RegistryFrozen = 19,
     /// The Wasm hash is not registered/approved in the registry version map, or
     /// the caller is not allowed to upgrade this contract.
-    UnauthorizedUpgrade = 31,
-    RegistryFrozen = 19,
+    UnauthorizedUpgrade = 48,
 
     // --- Budget (40-49) ---
     BudgetExceeded = 20,
