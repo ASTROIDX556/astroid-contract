@@ -29,11 +29,13 @@ pub enum Error {
     PolicyDenied = 20,
     EmergencyLock = 22,
     PolicyRecipientRestricted = 23,
-    AssetRestricted = 26,
+    AssetRestricted = 29,
     LimitExceeded = 27,
     OutOfWindow = 28,
     PolicyMerchantBlocked = 24,
     PolicyCategoryRestricted = 25,
+    /// The asset is not in the organization's whitelist.
+    AssetNotWhitelisted = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
