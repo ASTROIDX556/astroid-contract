@@ -29,12 +29,16 @@ pub enum Error {
 
     // --- Policy (20-29) ---
     PolicyDenied = 20,
-    PolicyHashMismatch = 21,
-    EmergencyLock = 22,
-    PolicyRecipientRestricted = 23,
+    EmergencyLock = 21,
+    PolicyRecipientRestricted = 22,
+    PolicyMerchantBlocked = 23,
+    PolicyCategoryRestricted = 24,
+    /// The asset is not in the organization's whitelist.
+    AssetNotWhitelisted = 25,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
+    ModuleDeprecated = 31,
 
     // --- Budget (40-49) ---
     BudgetExceeded = 40,
@@ -50,7 +54,6 @@ pub enum Error {
     InvalidState = 53,
 
     // --- Multisig / approvals (60-69) ---
-    InvalidSignature = 60,
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
@@ -71,11 +74,16 @@ pub enum Error {
     InvalidProposalState = 71,
     ProposalNotApproved = 72,
     NotAnApprover = 73,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 74,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 75,
+    CancellationWindowClosed = 76,
+    MathOverflow = 77,
+    DivisionByZero = 78,
 
     // --- Escrow (80-89) ---
-    ConditionNotMet = 80,
-    EscrowNotFunded = 81,
     EscrowExpired = 82,
-    InvalidCondition = 83,
     TimeLockActive = 84,
 }

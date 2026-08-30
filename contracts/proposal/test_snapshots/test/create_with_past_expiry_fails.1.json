@@ -155,32 +155,95 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "acme"
-                },
-                {
-                  "string": "wallet-1"
-                },
-                {
-                  "string": "policy-1"
-                },
-                {
-                  "string": "tx-ref-1"
-                },
-                {
-                  "vec": [
+                  "map": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                      "key": {
+                        "symbol": "approvers"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                          },
+                          {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                          }
+                        ]
+                      }
                     },
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "expires_at"
+                      },
+                      "val": {
+                        "u64": 500
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "string": "acme"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy"
+                      },
+                      "val": {
+                        "string": "policy-1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "threshold"
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tx_ref"
+                      },
+                      "val": {
+                        "string": "tx-ref-1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "wallet"
+                      },
+                      "val": {
+                        "string": "wallet-1"
+                      }
                     }
                   ]
-                },
-                {
-                  "u32": 1
-                },
-                {
-                  "u64": 500
                 }
               ]
             }
@@ -270,32 +333,95 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                     },
                     {
-                      "string": "acme"
-                    },
-                    {
-                      "string": "wallet-1"
-                    },
-                    {
-                      "string": "policy-1"
-                    },
-                    {
-                      "string": "tx-ref-1"
-                    },
-                    {
-                      "vec": [
+                      "map": [
                         {
-                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                          "key": {
+                            "symbol": "approvers"
+                          },
+                          "val": {
+                            "vec": [
+                              {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              },
+                              {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                              }
+                            ]
+                          }
                         },
                         {
-                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                          "key": {
+                            "symbol": "dependencies"
+                          },
+                          "val": {
+                            "vec": []
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "deposit"
+                          },
+                          "val": {
+                            "vec": []
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "expires_at"
+                          },
+                          "val": {
+                            "u64": 500
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "grace_period"
+                          },
+                          "val": {
+                            "u64": 0
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "org"
+                          },
+                          "val": {
+                            "string": "acme"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "policy"
+                          },
+                          "val": {
+                            "string": "policy-1"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "threshold"
+                          },
+                          "val": {
+                            "u32": 1
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "tx_ref"
+                          },
+                          "val": {
+                            "string": "tx-ref-1"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "wallet"
+                          },
+                          "val": {
+                            "string": "wallet-1"
+                          }
                         }
                       ]
-                    },
-                    {
-                      "u32": 1
-                    },
-                    {
-                      "u64": 500
                     }
                   ]
                 }
