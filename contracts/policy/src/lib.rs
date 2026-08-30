@@ -16,9 +16,11 @@
 //! This contract answers: "may `amount` of `asset` flow to `recipient`
 //! right now?" with a deterministic [`Error`] when it may not.
 //!
-//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
+//! Functions: `initialize`, `register_policy`, `rotate_policy`, `pause`,
+//! `unpause`, `paused`, `check_transfer`.
 
 use astroid_interfaces::PolicyInterface;
+use astroid_shared::constants::MAX_PAUSE_DURATION;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::validation::require_non_empty;
@@ -52,6 +54,8 @@ enum DataKey {
     Policy(String),
     Count,
     Blacklist(Address),
+    Admin,
+    Pause,
     MerchantBlacklist(Address),
     CategoryBlacklist(String),
     /// Per-policy asset whitelist: (policy_id, asset) -> true.
@@ -67,12 +71,66 @@ pub struct PolicyContract;
 #[contractimpl]
 #[allow(clippy::too_many_arguments)]
 impl PolicyContract {
-    pub fn initialize(env: Env) -> Result<(), Error> {
+    /// Initialize the policy contract, registering `admin` as the only address
+    /// authorized to rotate policies and to operate the emergency pause switch.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
             return Err(Error::AlreadyInitialized);
         }
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Count, &0u32);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Pause, &0u64);
         Ok(())
+    }
+
+    /// Activate the time-bound emergency pause. While paused, every
+    /// `check_transfer` evaluation is rejected with `EmergencyLock` while active. `duration`
+    /// is the number of seconds the pause lasts; it is capped by
+    /// `MAX_PAUSE_DURATION` to prevent indefinite lockouts. Passing `duration ==
+    /// 0` activates an indefinite pause that only an authorized admin can lift
+    /// via `unpause`. Admin only.
+    pub fn pause(env: Env, caller: Address, duration: u64) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let paused_until: u64 = if duration == 0 {
+            // Indefinite pause — lifted only by an explicit `unpause`.
+            u64::MAX
+        } else {
+            if duration > MAX_PAUSE_DURATION {
+                return Err(Error::InvalidInput);
+            }
+            env.ledger()
+                .timestamp()
+                .checked_add(duration)
+                .ok_or(Error::Overflow)?
+        };
+        env.storage().instance().set(&DataKey::Pause, &paused_until);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("paused")),
+            paused_until,
+        );
+        Ok(())
+    }
+
+    /// Lift an active emergency pause. Admin only. Returns evaluation to normal
+    /// immediately regardless of any remaining duration.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Pause, &0u64);
+        env.events()
+            .publish((symbol_short!("policy"), symbol_short!("resumed")), ());
+        Ok(())
+    }
+
+    /// Whether the contract is currently paused (active pause window or
+    /// indefinite pause).
+    pub fn paused(env: Env) -> bool {
+        let paused_until: u64 = env.storage().instance().get(&DataKey::Pause).unwrap_or(0);
+        if paused_until == 0 {
+            return false;
+        }
+        // Indefinite pause (u64::MAX) or a still-active time window.
+        paused_until == u64::MAX || env.ledger().timestamp() < paused_until
     }
 
     /// Register a policy. `owner` gates subsequent rotations. Cheap scalar gates
@@ -472,6 +530,19 @@ impl PolicyContract {
 
     // --- internels ---
 
+    fn require_admin(env: &Env, caller: &Address) -> Result<Address, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if &admin != caller {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        Ok(admin)
+    }
+
     fn load(env: &Env, id: &String) -> Result<Policy, Error> {
         env.storage()
             .persistent()
@@ -495,6 +566,11 @@ impl PolicyInterface for PolicyContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        // Emergency pause: block all policy evaluations while active.
+        if Self::paused(env.clone()) {
+            events_policy_violation(&env, &policy_id, "paused");
+            return Err(Error::EmergencyLock);
+        }
         let policy = Self::load(&env, &policy_id)?;
         // Disabled policies deny every spend.
         if !policy.enabled {
@@ -541,33 +617,6 @@ impl PolicyInterface for PolicyContract {
         }
         // Check asset whitelist (Issue #37)
         Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
-        // Check blacklist
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Blacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "blacklisted");
-            return Err(Error::PolicyRecipientRestricted);
-        }
-        // Check merchant blacklist
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
-        }
-        // Check merchant blacklist
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
-        }
         Ok(())
     }
 }

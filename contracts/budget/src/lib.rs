@@ -450,6 +450,18 @@ impl BudgetContract {
         // Recurring per-asset limits replenish lazily, on the spend itself.
         Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &token, true);
 
+        // Window rollover check
+        let now = env.ledger().timestamp();
+        if asset_budget.window_seconds > 0
+            && now
+                >= asset_budget
+                    .window_start
+                    .saturating_add(asset_budget.window_seconds)
+        {
+            asset_budget.spent = 0;
+            asset_budget.window_start = now;
+        }
+
         // Check if within limit
         let new_spent = checked_add(asset_budget.spent, amount)?;
         if new_spent > asset_budget.limit {
@@ -607,17 +619,16 @@ impl BudgetContract {
             budget.rollover_credit = 0;
         }
         let spent = budget.spent;
+        // Deficit: spent exceeded capacity (base limit + rollover credit).
+        // Track it so the next period's effective limit is reduced, and drop
+        // any (negative) rollover credit computed above. `spent > capacity`
+        // with `!allow_deficit` cannot happen — consume rejects it — but is
+        // handled defensively by simply resetting the window.
         if spent > capacity && budget.allow_deficit {
-            // Deficit: spent exceeded capacity. Track the deficit and carry it
-            // forward; a deficit means there is no surplus to roll over.
             let deficit = checked_sub(spent, capacity)?;
             budget.deficit_amount = checked_add(budget.deficit_amount, deficit)?;
-            budget.rollover_credit = 0;
+            budget.rollover_credit = 0; // No surplus to roll over
         }
-        // else: spent <= capacity — the surplus was already folded into
-        // `rollover_credit` above (or dropped when rollover is disabled).
-        // spent > capacity without allow_deficit cannot happen: consume
-        // rejects it, but handle defensively.
         budget.spent = 0;
         // Re-anchor to the period boundary, not to `now`, so windows never
         // drift away from the schedule the budget was granted on.
@@ -646,7 +657,7 @@ impl BudgetContract {
                 ContractEvent::BudgetUpdated {
                     budget_id: budget_id.clone(),
                     action,
-                    amount,
+                    amount: leftover,
                 },
             );
         }

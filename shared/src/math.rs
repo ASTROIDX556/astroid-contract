@@ -72,8 +72,5 @@ pub fn checked_mul(a: i128, b: i128) -> Result<i128, Error> {
 }
 
 pub fn checked_div(a: i128, b: i128) -> Result<i128, Error> {
-    if b == 0 {
-        return Err(Error::InvalidInput);
-    }
-    a.safe_div(b).map_err(|_| Error::Overflow)
+    a.safe_div(b)
 }

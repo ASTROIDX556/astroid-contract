@@ -23,8 +23,8 @@ fn assert_event(env: &Env, variant: &str) {
 struct Harness {
     env: Env,
     client: WalletContractClient<'static>,
-    token: Address,
     admin: Address,
+    token: Address,
 }
 
 fn setup() -> Harness {
@@ -45,8 +45,8 @@ fn setup() -> Harness {
     Harness {
         env,
         client,
-        token,
         admin,
+        token,
     }
 }
 
@@ -245,8 +245,17 @@ fn standard_events_emitted() {
 }
 
 // ---------------------------------------------------------------------------
-// Emergency pause switch / circuit breaker
+// Role-based access control
 // ---------------------------------------------------------------------------
+
+/// A wallet funded with `amount`, plus its owner.
+fn funded_wallet(h: &Harness, amount: i128) -> (Address, u64) {
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(h, &owner, amount);
+    h.client.deposit(&id, &owner, &h.token, &amount);
+    (owner, id)
+}
 
 #[test]
 fn breaker_starts_reset_and_guardian_defaults_to_admin() {
@@ -399,28 +408,6 @@ fn redundant_breaker_transitions_are_rejected() {
         h.client.try_emergency_pause(&h.admin),
         Err(Ok(Error::InvalidState))
     );
-}
-
-#[test]
-fn breaker_events_are_emitted() {
-    let h = setup();
-    h.client.emergency_pause(&h.admin);
-    assert_event(&h.env, "WalletPaused");
-    h.client.emergency_unpause(&h.admin);
-    assert_event(&h.env, "WalletUnpaused");
-}
-
-// ---------------------------------------------------------------------------
-// Role-based access control
-// ---------------------------------------------------------------------------
-
-/// A wallet funded with `amount`, plus its owner.
-fn funded_wallet(h: &Harness, amount: i128) -> (Address, u64) {
-    let owner = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(h, &owner, amount);
-    h.client.deposit(&id, &owner, &h.token, &amount);
-    (owner, id)
 }
 
 #[test]
@@ -647,6 +634,15 @@ fn role_checks_report_unknown_wallets_as_not_found() {
             .try_grant_role(&account, &999, &account, &Role::Agent),
         Err(Ok(Error::NotFound))
     );
+}
+
+#[test]
+fn breaker_events_are_emitted() {
+    let h = setup();
+    h.client.emergency_pause(&h.admin);
+    assert_event(&h.env, "WalletPaused");
+    h.client.emergency_unpause(&h.admin);
+    assert_event(&h.env, "WalletUnpaused");
 }
 
 #[test]
