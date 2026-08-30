@@ -93,27 +93,51 @@
             "data": {
               "vec": [
                 {
-                  "map": [
+                  "vec": [
                     {
-                      "key": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                      },
-                      "val": {
-                        "u32": 1
-                      }
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "address"
+                          },
+                          "val": {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "weight"
+                          },
+                          "val": {
+                            "u32": 0
+                          }
+                        }
+                      ]
                     },
                     {
-                      "key": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                      },
-                      "val": {
-                        "u32": 1
-                      }
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "address"
+                          },
+                          "val": {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "weight"
+                          },
+                          "val": {
+                            "u32": 1
+                          }
+                        }
+                      ]
                     }
                   ]
                 },
                 {
-                  "u32": 3
+                  "u32": 1
                 }
               ]
             }
@@ -139,7 +163,7 @@
             ],
             "data": {
               "error": {
-                "contract": 64
+                "contract": 69
               }
             }
           }
@@ -160,7 +184,7 @@
               },
               {
                 "error": {
-                  "contract": 64
+                  "contract": 69
                 }
               }
             ],
@@ -185,7 +209,7 @@
               },
               {
                 "error": {
-                  "contract": 64
+                  "contract": 69
                 }
               }
             ],
@@ -200,27 +224,51 @@
                 {
                   "vec": [
                     {
-                      "map": [
+                      "vec": [
                         {
-                          "key": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                          },
-                          "val": {
-                            "u32": 1
-                          }
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "address"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "weight"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            }
+                          ]
                         },
                         {
-                          "key": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                          },
-                          "val": {
-                            "u32": 1
-                          }
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "address"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "weight"
+                              },
+                              "val": {
+                                "u32": 1
+                              }
+                            }
+                          ]
                         }
                       ]
                     },
                     {
-                      "u32": 3
+                      "u32": 1
                     }
                   ]
                 }
