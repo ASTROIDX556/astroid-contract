@@ -233,7 +233,7 @@ fn expire_marks_then_refund_returns() {
 fn released_escrow_cannot_be_refunded() {
     let h = setup(5_000, 0);
     let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    h.client.release(&h.arbiter, &id);
+    h.client.release(&h.arbiter, &id, &5_000);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_refund(&h.sender, &id);
@@ -661,7 +661,7 @@ fn plain_release_blocked_on_milestone_escrow() {
         &String::from_str(&h.env, "p"),
         &specs,
     );
-    let res = h.client.try_release(&h.arbiter, &id);
+    let res = h.client.try_release(&h.arbiter, &id, &10_000);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 }
