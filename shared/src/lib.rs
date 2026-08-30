@@ -26,3 +26,19 @@ pub use errors::Error;
 
 #[cfg(test)]
 mod test;
+
+/// Ensure a condition is true, returning an Error early if not.
+#[macro_export]
+macro_rules! ensure {
+    ($cond:expr, $err:expr) => {
+        if !($cond) {
+            return Err($err);
+        }
+    };
+    ($cond:expr, $err:expr, $msg:expr) => {
+        if !($cond) {
+            // in a real environment we'd log the message
+            return Err($err);
+        }
+    };
+}
