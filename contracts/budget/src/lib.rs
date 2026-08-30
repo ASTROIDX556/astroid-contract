@@ -112,6 +112,7 @@ pub struct AssetBudget {
     /// Window length in seconds; 0 means the limit never auto-resets.
     pub window_seconds: u64,
     pub window_start: u64,
+    pub window_seconds: u64,
 }
 
 #[contracttype]
@@ -419,6 +420,7 @@ impl BudgetContract {
             spent: 0,
             window_seconds,
             window_start: env.ledger().timestamp(),
+            window_seconds,
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
@@ -449,6 +451,18 @@ impl BudgetContract {
             .ok_or(Error::AssetNotAuthorized)?;
         // Recurring per-asset limits replenish lazily, on the spend itself.
         Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &token, true);
+
+        // Window rollover check
+        let now = env.ledger().timestamp();
+        if asset_budget.window_seconds > 0
+            && now
+                >= asset_budget
+                    .window_start
+                    .saturating_add(asset_budget.window_seconds)
+        {
+            asset_budget.spent = 0;
+            asset_budget.window_start = now;
+        }
 
         // Check if within limit
         let new_spent = checked_add(asset_budget.spent, amount)?;
