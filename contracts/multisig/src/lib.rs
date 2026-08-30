@@ -234,31 +234,6 @@ impl MultiSigContract {
         new_threshold: u32,
     ) -> Result<u64, Error> {
         Self::propose_change(&env, &caller, GovernanceChange::Threshold(new_threshold))
-        signer: Address,
-        weight: u32,
-    ) -> Result<(), Error> {
-        Self::require_signer(&env, &caller)?;
-        if weight == 0 {
-            return Err(Error::InsufficientWeight);
-        }
-        let mut signers = Self::signers(&env)?;
-        if signers.iter().any(|s| s.address == signer) {
-            return Err(Error::AlreadyExists);
-        }
-        if signers.len() >= MAX_SIGNERS {
-            return Err(Error::TooManySigners);
-        }
-        signers.push_back(SignerWeight {
-            address: signer.clone(),
-            weight,
-        });
-        env.storage().instance().set(&DataKey::Signers, &signers);
-        Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("signer"), symbol_short!("added")),
-            (signer, weight),
-        );
-        Ok(())
     }
 
     /// Propose changing an existing signer's voting weight. Signer-gated. The
@@ -330,9 +305,6 @@ impl MultiSigContract {
         let now = env.ledger().timestamp();
         if now < pending.eta {
             return Err(Error::TimelockNotExpired);
-        Self::require_signer(&env, &caller)?;
-        if weight == 0 {
-            return Err(Error::InsufficientWeight);
         }
         if now >= pending.expires_at {
             return Err(Error::ProposalExpired);
@@ -814,7 +786,7 @@ impl MultiSigContract {
             }
             GovernanceChange::SignerWeight(signer, weight) => {
                 if *weight == 0 {
-                    return Err(Error::InvalidSignerWeight);
+                    return Err(Error::InsufficientWeight);
                 }
                 let current = Self::weight_of(env, signer)?;
                 let new_total = checked_add(checked_sub(total, current as i128)?, *weight as i128)?;
@@ -826,7 +798,7 @@ impl MultiSigContract {
             }
             GovernanceChange::AddSigner(signer, weight) => {
                 if *weight == 0 {
-                    return Err(Error::InvalidSignerWeight);
+                    return Err(Error::InsufficientWeight);
                 }
                 if signers.iter().any(|s| &s.address == signer) {
                     return Err(Error::AlreadyExists);

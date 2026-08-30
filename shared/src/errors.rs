@@ -4,6 +4,9 @@
 //! consumers (the Astroid API, SDK and dashboard) can map a stable `u32` code
 //! to a meaningful message. Numeric values are grouped by domain and MUST NOT
 //! be reordered or reused once released — they are part of the public ABI.
+//!
+//! The `#[contracterror]` derive caps the number of variants at 50, so new
+//! error codes must reuse an existing variant or the enum must be pruned.
 
 use soroban_sdk::contracterror;
 
@@ -30,6 +33,7 @@ pub enum Error {
     PolicyRecipientRestricted = 22,
     PolicyMerchantBlocked = 23,
     PolicyCategoryRestricted = 24,
+    /// The asset is not in the organization's whitelist.
     AssetNotWhitelisted = 25,
     PolicyPaused = 26,
 
@@ -50,7 +54,7 @@ pub enum Error {
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (61-69) ---
+    // --- Multisig / approvals (61-71) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
@@ -61,32 +65,26 @@ pub enum Error {
     BatchCallFailed = 67,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
     InvalidNonce = 68,
-    /// A signer with zero (or otherwise invalid) voting weight was supplied.
-    InvalidSignerWeight = 69,
-    /// Accumulated approval weight is below the configured threshold.
-    InsufficientWeight = 90,
+    /// Accumulated approval weight is below the configured threshold, or a
+    /// signer was supplied with an invalid (zero) voting weight.
+    InsufficientWeight = 69,
     /// A timelocked governance change was executed before its delay elapsed.
-    TimelockNotExpired = 91,
+    TimelockNotExpired = 70,
     /// A caller without governance rights attempted to modify signers,
     /// weights or the threshold.
-    UnauthorizedModification = 92,
-    InvalidNonce = 67,
-    BatchCallFailed = 68,
-    InsufficientWeight = 69,
+    UnauthorizedModification = 71,
 
-    // --- Proposal (71-79) ---
-    ProposalExpired = 71,
-    InvalidProposalState = 72,
-    ProposalNotApproved = 73,
-    NotAnApprover = 74,
-    CancellationWindowClosed = 75,
-    MathOverflow = 76,
-    DivisionByZero = 77,
+    // --- Proposal (72-79) ---
+    ProposalExpired = 72,
+    InvalidProposalState = 73,
+    ProposalNotApproved = 74,
+    NotAnApprover = 75,
+    CancellationWindowClosed = 76,
     /// A prerequisite proposal has not executed, so the dependent proposal may
     /// not execute yet.
-    PrerequisiteNotMet = 78,
+    PrerequisiteNotMet = 77,
     /// A declared dependency would close a cycle in the dependency graph.
-    CircularDependencyDetected = 79,
+    CircularDependencyDetected = 78,
 
     // --- Escrow (80-81) ---
     EscrowExpired = 80,

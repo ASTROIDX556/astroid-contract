@@ -532,8 +532,6 @@ fn cannot_add_signer_with_zero_weight() {
     let res = h
         .client
         .try_propose_signer_addition(&h.signers[0], &extra, &0);
-    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
-    let res = h.client.try_add_signer(&h.signers[0], &extra, &0);
     assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
 }
 
@@ -592,7 +590,7 @@ fn cannot_drop_total_weight_below_threshold() {
     let res = h
         .client
         .try_propose_weight_change(&h.signers[1], &h.signers[0], &0);
-    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
+    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
 }
 
 #[test]
