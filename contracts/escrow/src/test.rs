@@ -234,7 +234,7 @@ fn expire_marks_then_refund_returns() {
 #[test]
 fn released_escrow_cannot_be_refunded() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     h.client.release(&h.arbiter, &id, &5_000);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
@@ -254,6 +254,68 @@ fn cannot_close_while_expired() {
     let res = h.client.try_close(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn cancel_after_deadline_claws_back_to_depositor() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+
+    // Premature cancellation is refused with the dedicated error.
+    let early = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(early, Err(Ok(Error::EscrowNotExpired)));
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+
+    // After the deadline the depositor claws the locked funds back.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    h.client.cancel(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+
+    // The cancelled escrow can be closed, and cannot be refunded again.
+    h.client.close(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Closed);
+}
+
+#[test]
+fn cancel_after_release_is_refused_already_settled() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.client.release(&h.arbiter, &id);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    let res = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::EscrowAlreadySettled)));
+    // The recipient keeps the released funds; nothing was clawed back.
+    assert_eq!(balance(&h, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn only_depositor_can_cancel() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+
+    let intruder = Address::generate(&h.env);
+    let res = h.client.try_cancel(&intruder, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.client.address), 5_000);
+}
+
+#[test]
+fn cancel_on_expired_escrow_returns_funds() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    h.client.expire(&id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
+
+    h.client.cancel(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
 }
 
 #[test]
