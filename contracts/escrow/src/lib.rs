@@ -56,7 +56,9 @@ pub use storage::{
     EscrowState, ReleaseSchedule, ReleaseType,
 };
 
-use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS};
+use astroid_shared::constants::{
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
+};
 use astroid_shared::errors::Error;
 use astroid_shared::events::{self, ContractEvent};
 use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
@@ -64,7 +66,8 @@ use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, String, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, String,
+    Vec,
 };
 
 /// Calculate vested amount according to a ReleaseSchedule at a given ledger timestamp.
@@ -139,7 +142,6 @@ pub fn calculate_claimable_amount(escrow: &Escrow, current_time: u64) -> Result<
 pub struct OverrideSignature {
     pub public_key: BytesN<32>,
     pub signature: BytesN<64>,
-}
 }
 
 #[contract]
@@ -377,6 +379,7 @@ impl EscrowContract {
 
     /// Initialize an escrow with time-lock (unfunded version). Manual
     /// signature override is not available on this path (empty signer set).
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize_timelock(
         env: Env,
         sender: Address,
@@ -545,7 +548,8 @@ impl EscrowContract {
             store_escrow(&env, id, &escrow);
 
             for a in escrow.assets.iter() {
-                let send_amount = checked_div(checked_mul(a.amount, claimable)?, escrow.funded_amount)?;
+                let send_amount =
+                    checked_div(checked_mul(a.amount, claimable)?, escrow.funded_amount)?;
                 if send_amount > 0 {
                     token::TokenClient::new(&env, &a.asset).transfer(
                         &env.current_contract_address(),
@@ -607,7 +611,6 @@ impl EscrowContract {
             return Err(Error::EscrowExpired);
         }
 
-        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         escrow.released_amount = escrow.funded_amount;
         escrow.state = EscrowState::Released;
         store_escrow(&env, id, &escrow);
@@ -744,7 +747,8 @@ impl EscrowContract {
 
         if remaining > 0 {
             for a in escrow.assets.iter() {
-                let return_amount = checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
                 if return_amount > 0 {
                     token::TokenClient::new(&env, &a.asset).transfer(
                         &env.current_contract_address(),
@@ -784,7 +788,8 @@ impl EscrowContract {
 
         if remaining > 0 {
             for a in escrow.assets.iter() {
-                let return_amount = checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
                 if return_amount > 0 {
                     token::TokenClient::new(&env, &a.asset).transfer(
                         &env.current_contract_address(),
