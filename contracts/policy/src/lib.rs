@@ -389,9 +389,10 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("wl_mode")),
-            (policy_id, enabled),
+        env.events().publish((symbol_short!("policy"), symbol_short!("wl_mode")), (policy_id, enabled));
+        Ok(())
+    }
+
     /// Add a merchant address to the merchant blacklist (owner only).
     pub fn add_merchant_blacklist(
         env: Env,
@@ -442,6 +443,25 @@ impl PolicyContract {
 
     /// Add an address to the recipient whitelist (owner only).
     pub fn add_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(address.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &policy_id);
+        env.events().publish((symbol_short!("policy"), symbol_short!("wl_add")), (policy_id, address));
+        Ok(())
+    }
+
     /// Add a spending category to the category blacklist (owner only).
     pub fn add_category_blacklist(
         env: Env,
@@ -505,22 +525,38 @@ impl PolicyContract {
         if policy.owner != caller {
             return Err(Error::Unauthorized);
         }
-        let key = DataKey::Whitelist(address.clone());
         let key = DataKey::Blacklist(address.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("wl_add")),
-            (symbol_short!("policy"), symbol_short!("blk_add")),
-            (policy_id, address),
-        );
+        env.events().publish((symbol_short!("policy"), symbol_short!("blk_add")), (policy_id, address));
         Ok(())
     }
 
     /// Remove an address from the recipient whitelist (owner only).
     pub fn remove_whitelist(
+    /// Remove a recipient address from the blocklist (owner only).
+    pub fn remove_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(address.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish((symbol_short!("policy"), symbol_short!("wl_rem")), (policy_id, address));
+        Ok(())
+    }
+
     /// Remove a recipient address from the blocklist (owner only).
     pub fn remove_from_blocklist(
         env: Env,
@@ -533,17 +569,12 @@ impl PolicyContract {
         if policy.owner != caller {
             return Err(Error::Unauthorized);
         }
-        let key = DataKey::Whitelist(address.clone());
         let key = DataKey::Blacklist(address.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("wl_rem")),
-            (symbol_short!("policy"), symbol_short!("blk_rem")),
-            (policy_id, address),
-        );
+        env.events().publish((symbol_short!("policy"), symbol_short!("blk_rem")), (policy_id, address));
         Ok(())
     }
 
