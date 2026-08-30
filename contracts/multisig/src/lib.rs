@@ -121,7 +121,7 @@ impl MultiSigContract {
         }
         for s in signers.iter() {
             if s.weight == 0 {
-                return Err(Error::InvalidSignerWeight);
+                return Err(Error::InsufficientWeight);
             }
         }
         let total = Self::total_weight(&signers)?;
@@ -153,7 +153,7 @@ impl MultiSigContract {
     ) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         if weight == 0 {
-            return Err(Error::InvalidSignerWeight);
+            return Err(Error::InsufficientWeight);
         }
         let mut signers = Self::signers(&env)?;
         if signers.iter().any(|s| s.address == signer) {
@@ -212,7 +212,7 @@ impl MultiSigContract {
     ) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         if weight == 0 {
-            return Err(Error::InvalidSignerWeight);
+            return Err(Error::InsufficientWeight);
         }
         let mut signers = Self::signers(&env)?;
         let idx: u32 = signers

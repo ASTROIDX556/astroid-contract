@@ -24,7 +24,7 @@ pub enum Error {
     Overflow = 11,
     InvalidAmount = 12,
 
-    // --- Policy (20-28) ---
+    // --- Policy (20-27) ---
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
@@ -50,7 +50,7 @@ pub enum Error {
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (60-70) ---
+    // --- Multisig / approvals (60-69) ---
     InvalidSignature = 60,
     ThresholdNotMet = 61,
     AlreadySigned = 62,
@@ -61,7 +61,6 @@ pub enum Error {
     InvalidNonce = 67,
     BatchCallFailed = 68,
     InsufficientWeight = 69,
-    InvalidSignerWeight = 70,
 
     // --- Proposal (71-77) ---
     ProposalExpired = 71,
@@ -73,9 +72,12 @@ pub enum Error {
     DivisionByZero = 77,
 
     // --- Escrow (80-84) ---
-    EscrowNotFunded = 80,
-    EscrowExpired = 81,
-    InvalidCondition = 82,
-    TimeLockActive = 83,
-    GraceActive = 84,
+    EscrowExpired = 80,
+    TimeLockActive = 81,
+    GraceActive = 82,
+
+    // --- Treasury allowances (83-85) ---
+    AllowanceExceeded = 83,
+    AllowanceExpired = 84,
+    AllowanceNotFound = 85,
 }
