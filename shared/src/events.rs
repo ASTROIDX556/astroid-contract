@@ -20,8 +20,8 @@
 //! The two layers are emitted together on key state transitions so neither
 //! existing nor new consumers break.
 
-use crate::types::ModuleKind;
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
+use crate::types::{AssetAmount, ModuleKind};
+use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -76,6 +76,13 @@ pub enum ContractEvent {
     },
     /// A policy rejected a transfer.
     PolicyViolation { policy_id: String, reason: Symbol },
+    /// An escrow's held assets were released to its recipient, whether via the
+    /// standard arbiter path or a signature-based manual override.
+    EscrowReleased {
+        escrow_id: u64,
+        recipient: Address,
+        assets: Vec<AssetAmount>,
+    },
 }
 
 /// Publish a [`ContractEvent`] using the canonical schema.
@@ -156,6 +163,15 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::TreasuryUnfrozen { org } => {
             env.events()
                 .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
+        ContractEvent::EscrowReleased {
+            escrow_id,
+            recipient,
+            assets,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "EscrowReleased"),),
+                (escrow_id, recipient, assets),
+            );
         }
     }
 }

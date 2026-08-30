@@ -32,6 +32,8 @@ pub enum Error {
     PolicyRecipientRestricted = 23,
     PolicyMerchantBlocked = 24,
     PolicyCategoryRestricted = 25,
+    /// The asset is not in the organization's whitelist.
+    AssetNotWhitelisted = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
