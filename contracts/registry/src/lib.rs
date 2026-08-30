@@ -14,13 +14,40 @@
 //! Security model (PRD Doc 10): validate caller → ownership → inputs →
 //! permissions → fail safely → emit events. All mutating calls are admin- or
 //! owner-gated and require Soroban auth.
+//!
+//! ## Permission delegation
+//!
+//! Requiring the root owner's key for every registry edit does not survive
+//! contact with a real organization: the people who rotate a policy contract
+//! are usually not the people who hold ultimate ownership, and handing them the
+//! root key to do it defeats the point of having one. The registry therefore
+//! records a [`RegistryRole`] per `(organization, account)` and checks it on the
+//! org-scoped modifications, so an owner can delegate narrow administrative
+//! powers to sub-accounts or secondary operational keys without transferring
+//! ownership:
+//!
+//! | Role               | May register/remove modules of kind                |
+//! |--------------------|----------------------------------------------------|
+//! | `Owner`            | any kind (a delegated co-owner for module records) |
+//! | `ModuleUpgrader`   | any kind (repointing modules at new versions)      |
+//! | `PolicyManager`    | `Policy`                                           |
+//! | `TreasuryOperator` | `Treasury`, `Budget`, `Escrow`                     |
+//!
+//! Delegation is deliberately bounded. Root actions — transferring ownership,
+//! the emergency freeze, and administering roles themselves — stay with the
+//! recorded org owner and the protocol admin, so no grant can be used to
+//! escalate into ownership or to widen its own reach.
 
 use astroid_interfaces::RegistryInterface;
 use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
+use astroid_shared::ensure;
 use astroid_shared::errors::Error;
+use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -37,12 +64,55 @@ enum DataKey {
     /// surface (`lookup`) rejects new interactions with [`Error::ModuleDeprecated`]
     /// while the raw address stays readable for legacy migrations.
     ModuleDeprecated(String, ModuleKind),
+    /// Delegated role: (org slug, account) -> RegistryRole.
+    OrgRole(String, Address),
     /// Version table: (kind, version) -> contract address (global upgrade map).
     Version(ModuleKind, u32),
     /// Latest known version number for a kind.
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+    /// Approved WASM hashes: (kind, hash) -> bool.
+    ApprovedWasm(ModuleKind, BytesN<32>),
+}
+
+/// A delegated administrative role over one organization's registry records.
+///
+/// One role per account keeps the ledger footprint to a single small entry per
+/// delegation. Roles are capability-scoped rather than ranked: `PolicyManager`
+/// is not "less" than `TreasuryOperator`, it simply reaches different module
+/// kinds. Discriminants are part of the public ABI and MUST NOT be reordered or
+/// reused once released.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryRole {
+    /// Delegated co-owner of the organization's module records. Reaches every
+    /// module kind, but not the root actions (ownership transfer, freeze, role
+    /// administration), which stay with the recorded owner.
+    Owner = 0,
+    /// May manage the organization's `Policy` module registration.
+    PolicyManager = 1,
+    /// May manage the organization's `Treasury`, `Budget` and `Escrow` module
+    /// registrations — the value-custody side of the protocol.
+    TreasuryOperator = 2,
+    /// May repoint any of the organization's modules, which is what rolling a
+    /// module forward to a new implementation version amounts to.
+    ModuleUpgrader = 3,
+}
+
+impl RegistryRole {
+    /// Whether this role may register or remove the module of `kind` for the
+    /// organization it was granted on.
+    pub fn may_manage(self, kind: ModuleKind) -> bool {
+        match self {
+            RegistryRole::Owner | RegistryRole::ModuleUpgrader => true,
+            RegistryRole::PolicyManager => matches!(kind, ModuleKind::Policy),
+            RegistryRole::TreasuryOperator => matches!(
+                kind,
+                ModuleKind::Treasury | ModuleKind::Budget | ModuleKind::Escrow
+            ),
+        }
+    }
 }
 
 #[contract]
@@ -84,8 +154,8 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &owner);
         Self::bump(&env, &key);
         env.events().publish(
-            (symbol_short!("org"), symbol_short!("register")),
-            (org, owner),
+            (symbol_short!("org"), symbol_short!("register"), org.clone()),
+            owner,
         );
         Ok(())
     }
@@ -111,15 +181,23 @@ impl RegistryContract {
         }
         env.storage().persistent().set(&key, &new_owner);
         Self::bump(&env, &key);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::OrgOwnerChanged {
+                org: org.clone(),
+                new_owner: new_owner.clone(),
+            },
+        );
         env.events().publish(
-            (symbol_short!("org"), symbol_short!("owner")),
-            (org, new_owner),
+            (symbol_short!("org"), symbol_short!("owner"), org.clone()),
+            new_owner,
         );
         Ok(())
     }
 
     /// Register (or update) a module address for an organization. Callable by
-    /// the admin or the organization owner.
+    /// the protocol admin, the organization owner, or an account holding a
+    /// delegated [`RegistryRole`] that reaches this [`ModuleKind`].
     pub fn register_module(
         env: Env,
         caller: Address,
@@ -129,7 +207,7 @@ impl RegistryContract {
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
         caller.require_auth();
-        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        Self::require_module_permission(&env, &caller, &org, kind)?;
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
@@ -139,9 +217,22 @@ impl RegistryContract {
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
         }
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryModuleUpdated {
+                org: org.clone(),
+                kind,
+                address: address.clone(),
+            },
+        );
         env.events().publish(
-            (symbol_short!("module"), symbol_short!("register")),
-            (org, kind, address),
+            (
+                symbol_short!("module"),
+                symbol_short!("register"),
+                org.clone(),
+                kind,
+            ),
+            address,
         );
         Ok(())
     }
@@ -214,6 +305,8 @@ impl RegistryContract {
     }
 
     /// Remove a module registration. Admin or org owner.
+    /// Remove a module registration. Same gate as `register_module`: admin, org
+    /// owner, or a delegated role that reaches this [`ModuleKind`].
     pub fn remove_module(
         env: Env,
         caller: Address,
@@ -222,8 +315,68 @@ impl RegistryContract {
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
         caller.require_auth();
-        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        Self::require_module_permission(&env, &caller, &org, kind)?;
         let key = DataKey::Module(org.clone(), kind);
+        ensure!(env.storage().persistent().has(&key), Error::NotFound);
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (
+                symbol_short!("module"),
+                symbol_short!("remove"),
+                org.clone(),
+                kind,
+            ),
+            (),
+        );
+        Ok(())
+    }
+
+    /// Delegate `role` over `org` to `account`, replacing any role it already
+    /// held. Only the recorded organization owner or the protocol admin may
+    /// grant, so a delegated role can never be used to widen its own reach or
+    /// to mint further delegations.
+    ///
+    /// Granting to the org owner is refused: the owner already reaches every
+    /// module kind, so the record would be redundant and could only mislead
+    /// anyone reading the delegation list.
+    pub fn grant_role(
+        env: Env,
+        caller: Address,
+        org: String,
+        account: Address,
+        role: RegistryRole,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+        let owner = Self::require_root_owner(&env, &caller, &org)?;
+        if account == owner {
+            return Err(Error::InvalidInput);
+        }
+        let key = DataKey::OrgRole(org.clone(), account.clone());
+        env.storage().persistent().set(&key, &role);
+        Self::bump(&env, &key);
+        env.events().publish(
+            (symbol_short!("role"), symbol_short!("granted")),
+            (org, account, role),
+        );
+        Ok(())
+    }
+
+    /// Revoke whatever role `account` holds over `org`. Only the recorded
+    /// organization owner or the protocol admin may revoke.
+    ///
+    /// Fails with [`Error::NotFound`] when the account holds no delegated role,
+    /// so a revocation is never silently a no-op — an owner who believes they
+    /// have withdrawn access has actually withdrawn it.
+    pub fn revoke_role(
+        env: Env,
+        caller: Address,
+        org: String,
+        account: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_root_owner(&env, &caller, &org)?;
+        let key = DataKey::OrgRole(org.clone(), account.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
         }
@@ -236,10 +389,30 @@ impl RegistryContract {
             env.storage().persistent().remove(&dkey);
         }
         env.events().publish(
-            (symbol_short!("module"), symbol_short!("remove")),
-            (org, kind),
+            (symbol_short!("role"), symbol_short!("revoked")),
+            (org, account),
         );
         Ok(())
+    }
+
+    /// Read the role `account` holds over `org`, or `None` if it holds none.
+    ///
+    /// The org owner is reported as [`RegistryRole::Owner`] even though no
+    /// record is stored for them, so callers see the effective permission
+    /// rather than a storage detail.
+    pub fn get_role(env: Env, org: String, account: Address) -> Option<RegistryRole> {
+        Self::effective_role(&env, &org, &account)
+    }
+
+    /// Whether `account` may register or remove the `kind` module for `org` —
+    /// the same question the entrypoint guard asks, exposed for off-chain use.
+    pub fn can_manage_module(env: Env, org: String, account: Address, kind: ModuleKind) -> bool {
+        if Self::is_admin(&env, &account) {
+            return true;
+        }
+        Self::effective_role(&env, &org, &account)
+            .map(|role| role.may_manage(kind))
+            .unwrap_or(false)
     }
 
     /// Record a contract implementation address for a `(kind, version)` pair and
@@ -253,9 +426,7 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
-        if version == 0 {
-            return Err(Error::InvalidInput);
-        }
+        ensure!(version != 0, Error::InvalidInput);
         let vkey = DataKey::Version(kind, version);
         env.storage().persistent().set(&vkey, &address);
         Self::bump(&env, &vkey);
@@ -267,36 +438,51 @@ impl RegistryContract {
             Self::bump(&env, &lkey);
         }
         env.events().publish(
-            (symbol_short!("version"), symbol_short!("register")),
-            (kind, version, address),
+            (
+                symbol_short!("version"),
+                symbol_short!("register"),
+                kind,
+                version,
+            ),
+            address,
         );
         Ok(())
     }
 
     /// Look up a specific implementation version.
     pub fn get_version(env: Env, kind: ModuleKind, version: u32) -> Result<Address, Error> {
-        env.storage()
+        let key = DataKey::Version(kind, version);
+        let val = env
+            .storage()
             .persistent()
-            .get(&DataKey::Version(kind, version))
-            .ok_or(Error::NotFound)
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
     }
 
     /// Look up the latest implementation address for a kind.
     pub fn get_latest(env: Env, kind: ModuleKind) -> Result<Address, Error> {
+        let key = DataKey::LatestVersion(kind);
         let latest: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::LatestVersion(kind))
+            .get(&key)
             .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
         Self::get_version(env, kind, latest)
     }
 
     /// Read the recorded owner of an organization.
     pub fn get_org_owner(env: Env, org: String) -> Result<Address, Error> {
-        env.storage()
+        let key = DataKey::Org(org);
+        let val = env
+            .storage()
             .persistent()
-            .get(&DataKey::Org(org))
-            .ok_or(Error::NotFound)
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
     }
 
     /// Read the current admin.
@@ -329,10 +515,18 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        if owner != caller && !Self::is_admin(&env, &caller) {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(
+            owner == caller || Self::is_admin(&env, &caller),
+            Error::Unauthorized
+        );
         env.storage().instance().set(&DataKey::Frozen, &true);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryFrozen {
+                org: org.clone(),
+                frozen: true,
+            },
+        );
         env.events()
             .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
         Ok(())
@@ -347,26 +541,77 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        if owner != caller && !Self::is_admin(&env, &caller) {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(
+            owner == caller || Self::is_admin(&env, &caller),
+            Error::Unauthorized
+        );
         env.storage().instance().set(&DataKey::Frozen, &false);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryFrozen {
+                org: org.clone(),
+                frozen: false,
+            },
+        );
         env.events()
             .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
         Ok(())
     }
 
+    /// Record an approved WASM hash for a specific module kind.
+    pub fn add_approved_wasm(
+        env: Env,
+        caller: Address,
+        kind: ModuleKind,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
+        env.storage().persistent().set(&key, &true);
+        Self::bump(&env, &key);
+        env.events().publish(
+            (symbol_short!("wasm"), symbol_short!("approved")),
+            (kind, wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Remove/deprecate a previously approved WASM hash.
+    pub fn remove_approved_wasm(
+        env: Env,
+        caller: Address,
+        kind: ModuleKind,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("wasm"), symbol_short!("removed")),
+            (kind, wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Read-only check to see if a WASM hash is approved for a given kind.
+    pub fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool {
+        let key = DataKey::ApprovedWasm(kind, wasm_hash);
+        env.storage().persistent().get(&key).unwrap_or(false)
+    }
+
     // --- internal helpers ---
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
-        if env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::Frozen)
-            .unwrap_or(false)
-        {
-            return Err(Error::RegistryFrozen);
-        }
+        ensure!(
+            !env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Frozen)
+                .unwrap_or(false),
+            Error::RegistryFrozen
+        );
         Ok(())
     }
 
@@ -384,25 +629,61 @@ impl RegistryContract {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
-        if &admin != caller {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(&admin == caller, Error::Unauthorized);
         Ok(())
     }
 
-    fn require_admin_or_org_owner(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
-        if Self::is_admin(env, caller) {
-            return Ok(());
-        }
+    /// Require the caller to be the *recorded* organization owner (or the
+    /// protocol admin) and return that owner. Used for the root actions that
+    /// are deliberately not delegable, so a delegated role can never administer
+    /// roles or otherwise escalate.
+    fn require_root_owner(env: &Env, caller: &Address, org: &String) -> Result<Address, Error> {
         let owner: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        if &owner != caller {
+        if &owner != caller && !Self::is_admin(env, caller) {
             return Err(Error::Unauthorized);
         }
-        Ok(())
+        Ok(owner)
+    }
+
+    /// Resolve the role `account` effectively holds over `org`, treating the
+    /// recorded owner as an implicit [`RegistryRole::Owner`]. Returns `None`
+    /// for an unknown organization, which the callers report as
+    /// [`Error::Unauthorized`] — a stranger asking about a non-existent org
+    /// learns nothing either way.
+    fn effective_role(env: &Env, org: &String, account: &Address) -> Option<RegistryRole> {
+        let owner: Option<Address> = env.storage().persistent().get(&DataKey::Org(org.clone()));
+        if owner.as_ref() == Some(account) {
+            return Some(RegistryRole::Owner);
+        }
+        env.storage()
+            .persistent()
+            .get(&DataKey::OrgRole(org.clone(), account.clone()))
+    }
+
+    /// Permission guard for the org-scoped module registrations: the protocol
+    /// admin, the org owner, or a delegated role that reaches `kind`.
+    fn require_module_permission(
+        env: &Env,
+        caller: &Address,
+        org: &String,
+        kind: ModuleKind,
+    ) -> Result<(), Error> {
+        if Self::is_admin(env, caller) {
+            return Ok(());
+        }
+        // An unknown organization has no owner and no roles, so it reports
+        // NotFound rather than a permission failure.
+        if !env.storage().persistent().has(&DataKey::Org(org.clone())) {
+            return Err(Error::NotFound);
+        }
+        match Self::effective_role(env, org, caller) {
+            Some(role) if role.may_manage(kind) => Ok(()),
+            _ => Err(Error::Unauthorized),
+        }
     }
 
     fn bump(env: &Env, key: &DataKey) {
@@ -424,6 +705,8 @@ impl RegistryInterface for RegistryContract {
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
         let address: Address = env
+        let key = DataKey::Module(org, kind);
+        let val = env
             .storage()
             .persistent()
             .get(&key)
@@ -438,15 +721,19 @@ impl RegistryInterface for RegistryContract {
             return Err(Error::ModuleDeprecated);
         }
         Ok(address)
+        Self::bump(&env, &key);
+        Ok(val)
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
         Self::check_frozen(&env)?;
+        let key = DataKey::Org(org);
         let recorded: Address = env
             .storage()
             .persistent()
-            .get(&DataKey::Org(org))
+            .get(&key)
             .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
         Ok(recorded == owner)
     }
 }
