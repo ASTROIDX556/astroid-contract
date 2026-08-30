@@ -177,10 +177,33 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 3
                 },
                 {
                   "u64": 5000
+                },
+                {
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -206,7 +229,7 @@
             ],
             "data": {
               "error": {
-                "contract": 64
+                "contract": 63
               }
             }
           }
@@ -227,7 +250,7 @@
               },
               {
                 "error": {
-                  "contract": 64
+                  "contract": 63
                 }
               }
             ],
@@ -252,7 +275,7 @@
               },
               {
                 "error": {
-                  "contract": 64
+                  "contract": 63
                 }
               }
             ],
@@ -292,10 +315,33 @@
                       ]
                     },
                     {
+                      "vec": []
+                    },
+                    {
                       "u32": 3
                     },
                     {
                       "u64": 5000
+                    },
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "deposit"
+                          },
+                          "val": {
+                            "vec": []
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "grace_period"
+                          },
+                          "val": {
+                            "u64": 0
+                          }
+                        }
+                      ]
                     }
                   ]
                 }

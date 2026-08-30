@@ -16,19 +16,41 @@
 //! transaction reference — so the backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
-//! be `Executed` (marked done) and finally `Closed`.
+//! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
+//! off-chain action did not go through is marked `Failed`, a terminal state.
+//!
+//! ## Dependency chaining
+//!
+//! A proposal may declare prerequisite proposals it depends on. `execute` then
+//! refuses to run until every prerequisite has executed, which is what lets a
+//! multi-step protocol upgrade or a staged asset allocation be sequenced
+//! correctly: each step is its own proposal, approved on its own merits, but
+//! the steps can only fire in order.
+//!
+//! ```text
+//! #1 fund escrow ──▶ #2 migrate balances ──▶ #3 retire old module
+//!                    (depends on #1)          (depends on #2)
+//! ```
+//!
+//! The graph is acyclic by construction — see [`ProposalContract::create`] —
+//! and a dependency that would close a cycle is rejected at creation time with
+//! [`Error::CircularDependencyDetected`].
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
-//! `close`.
+//! `fail`, `close`.
 
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
+use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
+    Vec,
+};
 
 /// Proposal lifecycle state.
 #[contracttype]
@@ -42,10 +64,26 @@ pub enum ProposalState {
     Rejected = 5,
     Cancelled = 6,
     Expired = 7,
+    /// Approved, but the action it authorized did not go through. Terminal, and
+    /// deliberately distinct from `Executed` so a dependent proposal stays
+    /// blocked rather than inheriting a broken prerequisite.
+    Failed = 8,
+}
+
+impl ProposalState {
+    /// Whether a proposal in this state has carried out its action, and so can
+    /// satisfy a dependent proposal's prerequisite.
+    ///
+    /// `Closed` counts: it is only reachable from `Executed`, and tidying an
+    /// executed proposal away must not retroactively block its dependents.
+    pub fn has_executed(self) -> bool {
+        matches!(self, ProposalState::Executed | ProposalState::Closed)
+    }
 }
 
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
-/// to approve; `threshold` approvals move it to `Approved`.
+/// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
+/// the ids of proposals that must have executed before this one may execute.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposal {
@@ -56,10 +94,44 @@ pub struct Proposal {
     pub policy: String,
     pub tx_ref: String,
     pub approvers: Vec<Address>,
+    /// Prerequisite proposal ids, deduplicated and each strictly less than this
+    /// proposal's own id. Empty for a proposal with no dependencies.
+    pub dependencies: Vec<u64>,
     pub threshold: u32,
     pub approvals: u32,
     pub state: ProposalState,
+    pub created_at: u64,
+    pub deposit: Vec<AssetAmount>,
     pub expires_at: u64,
+    pub grace_period: u64,
+}
+
+impl Proposal {
+    pub fn is_expired(&self, env: &Env) -> bool {
+        self.expires_at != 0 && env.ledger().timestamp() >= self.expires_at
+    }
+
+    pub fn is_active(&self, env: &Env) -> bool {
+        !self.is_expired(env)
+            && matches!(self.state, ProposalState::Pending | ProposalState::Approved)
+    }
+
+    pub fn can_execute(&self, env: &Env) -> bool {
+        self.is_active(env) && self.state == ProposalState::Approved
+    }
+}
+
+/// Optional creation parameters for [`ProposalContract::create`]. Grouped into
+/// a single argument so the entrypoint stays under the Soroban 10-parameter cap.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateOptions {
+    /// Optional token deposit escrowed by the proposer; refunded when the
+    /// proposal is cancelled, expires, or is otherwise settled.
+    pub deposit: Vec<AssetAmount>,
+    /// Seconds after creation during which the proposer may still cancel.
+    /// `0` disables the grace window.
+    pub grace_period: u64,
 }
 
 #[contracttype]
@@ -89,6 +161,21 @@ impl ProposalContract {
 
     /// Create a proposal in `Pending` state. `proposer` must authorize. The
     /// approver allow-list must be non-empty and `threshold` within its size.
+    ///
+    /// `dependencies` lists prerequisite proposals that must have executed
+    /// before this one may execute; pass an empty vector for an independent
+    /// proposal. Each entry must name an existing proposal, and duplicates are
+    /// collapsed so a prerequisite is read exactly once at execution time.
+    ///
+    /// **Acyclicity.** Proposal ids are assigned from a monotonic counter, and a
+    /// dependency must name a proposal that already exists — so every edge in
+    /// the graph points from a higher id to a strictly lower one, and a cycle
+    /// would require an edge pointing forward. That is exactly what the
+    /// `dependency >= id` check rejects, with
+    /// [`Error::CircularDependencyDetected`]. Self-reference is the degenerate
+    /// case of the same check. Because every edge strictly decreases the id,
+    /// no sequence of edges can return to its starting proposal, so the graph
+    /// is a DAG by construction and no traversal is needed.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         env: Env,
@@ -98,8 +185,10 @@ impl ProposalContract {
         policy: String,
         tx_ref: String,
         approvers: Vec<Address>,
+        dependencies: Vec<u64>,
         threshold: u32,
         expires_at: u64,
+        options: CreateOptions,
     ) -> Result<u64, Error> {
         proposer.require_auth();
         require_non_empty(&org)?;
@@ -110,7 +199,21 @@ impl ProposalContract {
         if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
         }
+        if let Some(dep) = options.deposit.first() {
+            if dep.amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            TokenClient::new(&env, &dep.asset).transfer(
+                &proposer,
+                &env.current_contract_address(),
+                &dep.amount,
+            );
+        }
         if expires_at != 0 && expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
+
+        if dependencies.len() > MAX_DEPENDENCIES {
             return Err(Error::InvalidInput);
         }
 
@@ -122,6 +225,23 @@ impl ProposalContract {
         count = checked_add(count as i128, 1)? as u64;
         let id = count;
 
+        // Validate the declared prerequisites and collapse duplicates, so that
+        // `execute` reads each prerequisite exactly once.
+        let mut deps: Vec<u64> = Vec::new(&env);
+        for dep in dependencies.iter() {
+            // Any edge that does not point strictly backwards would close a
+            // cycle (or be a self-reference); see the acyclicity note above.
+            if dep >= id {
+                return Err(Error::CircularDependencyDetected);
+            }
+            if !env.storage().persistent().has(&DataKey::Proposal(dep)) {
+                return Err(Error::NotFound);
+            }
+            if !deps.contains(dep) {
+                deps.push_back(dep);
+            }
+        }
+
         let proposal = Proposal {
             proposer: proposer.clone(),
             org,
@@ -129,10 +249,14 @@ impl ProposalContract {
             policy,
             tx_ref,
             approvers,
+            dependencies: deps,
             threshold,
             approvals: 0,
+            deposit: options.deposit,
             state: ProposalState::Pending,
+            created_at: env.ledger().timestamp(),
             expires_at,
+            grace_period: options.grace_period,
         };
         env.storage()
             .persistent()
@@ -157,7 +281,9 @@ impl ProposalContract {
     pub fn approve(env: Env, caller: Address, id: u64) -> Result<u32, Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::ensure_not_expired(&env, &proposal)?;
+        if proposal.is_expired(&env) {
+            return Err(Error::ProposalExpired);
+        }
         if proposal.state != ProposalState::Pending {
             return Err(Error::InvalidProposalState);
         }
@@ -193,6 +319,13 @@ impl ProposalContract {
             return Err(Error::NotAnApprover);
         }
         proposal.state = ProposalState::Rejected;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events().publish(
             (symbol_short!("proposal"), symbol_short!("rejected")),
@@ -215,7 +348,19 @@ impl ProposalContract {
         ) {
             return Err(Error::InvalidProposalState);
         }
+        if proposal.grace_period != 0
+            && env.ledger().timestamp() > proposal.created_at + proposal.grace_period
+        {
+            return Err(Error::CancellationWindowClosed);
+        }
         proposal.state = ProposalState::Cancelled;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("cancelled")), id);
@@ -232,10 +377,17 @@ impl ProposalContract {
         ) {
             return Err(Error::InvalidProposalState);
         }
-        if proposal.expires_at == 0 || env.ledger().timestamp() < proposal.expires_at {
+        if !proposal.is_expired(&env) {
             return Err(Error::InvalidProposalState);
         }
         proposal.state = ProposalState::Expired;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("expired")), id);
@@ -244,20 +396,67 @@ impl ProposalContract {
 
     /// Execute an approved proposal. Only the proposer may execute (the actual
     /// value movement happens in the wallet/treasury; this records completion).
+    ///
+    /// Every declared prerequisite must have executed first, otherwise the call
+    /// fails with [`Error::PrerequisiteNotMet`] and nothing changes. This is
+    /// checked after approval and expiry so that a proposal blocked only by its
+    /// chain reports the dependency rather than a less specific error.
+    /// Purge an expired proposal from storage to reclaim space.
+    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+        let proposal = Self::load(&env, id)?;
+        if proposal.expires_at == 0 || env.ledger().timestamp() < proposal.expires_at {
+            return Err(Error::InvalidProposalState);
+        }
+        env.storage().persistent().remove(&DataKey::Proposal(id));
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
+        Ok(())
+    }
+
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::ensure_not_expired(&env, &proposal)?;
+        if proposal.is_expired(&env) {
+            return Err(Error::ProposalExpired);
+        }
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
+        Self::ensure_dependencies_met(&env, &proposal)?;
         proposal.state = ProposalState::Executed;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(&env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
         Self::store(&env, id, &proposal);
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("executed")), id);
+        Ok(())
+    }
+
+    /// Mark an approved proposal as `Failed` (terminal). Only the proposer may
+    /// do so. Recording the failure explicitly keeps a broken step visible to
+    /// anything that depends on it: a `Failed` prerequisite never satisfies a
+    /// dependent proposal, so the chain stops instead of silently continuing.
+    pub fn fail(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut proposal = Self::load(&env, id)?;
+        if caller != proposal.proposer {
+            return Err(Error::Unauthorized);
+        }
+        if proposal.state != ProposalState::Approved {
+            return Err(Error::ProposalNotApproved);
+        }
+        proposal.state = ProposalState::Failed;
+        Self::store(&env, id, &proposal);
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("failed")), id);
         Ok(())
     }
 
@@ -288,6 +487,18 @@ impl ProposalContract {
         Ok(Self::load(&env, id)?.state)
     }
 
+    /// The prerequisite proposal ids this proposal declares.
+    pub fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
+        Ok(Self::load(&env, id)?.dependencies)
+    }
+
+    /// Whether every prerequisite has executed — the same question `execute`
+    /// asks, exposed so callers can check before spending a transaction on it.
+    pub fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
+        let proposal = Self::load(&env, id)?;
+        Ok(Self::ensure_dependencies_met(&env, &proposal).is_ok())
+    }
+
     // --- internal helpers ---
 
     fn load(env: &Env, id: u64) -> Result<Proposal, Error> {
@@ -304,14 +515,20 @@ impl ProposalContract {
         Self::bump(env, id);
     }
 
-    /// Surface [`Error::ProposalExpired`] when the deadline has passed so callers
-    /// fail safely. This deliberately does NOT persist the `Expired` state: on the
-    /// Soroban host, returning `Err` rolls back every storage write from the
-    /// invocation, so the terminal transition is recorded only through the
-    /// permissionless [`ProposalContract::expire`] entrypoint (which returns `Ok`).
-    fn ensure_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
-        if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
-            return Err(Error::ProposalExpired);
+    /// Require that every prerequisite proposal has executed.
+    ///
+    /// Dependencies are deduplicated at creation time and each entry is one
+    /// storage read, so a check costs exactly as many reads as the proposal has
+    /// distinct prerequisites — and short-circuits on the first unmet one. A
+    /// prerequisite that has been cancelled, rejected, expired or explicitly
+    /// marked `Failed` can never become executed, but it is reported the same
+    /// way: the dependent proposal simply cannot run.
+    fn ensure_dependencies_met(env: &Env, proposal: &Proposal) -> Result<(), Error> {
+        for dep in proposal.dependencies.iter() {
+            let prerequisite = Self::load(env, dep)?;
+            if !prerequisite.state.has_executed() {
+                return Err(Error::PrerequisiteNotMet);
+            }
         }
         Ok(())
     }
