@@ -434,3 +434,132 @@ fn category_restricted_event_emitted() {
     );
     assert_event(&env, "PolicyViolation");
 }
+
+// --- Issue #37: Asset whitelist tests ---
+
+#[test]
+fn asset_whitelist_allows_whitelisted_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    let safe = Address::generate(&env);
+
+    // Block the address
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
+
+    // Transfer to blocked address should fail
+    let result = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &blocked, &100);
+    assert!(result.is_err());
+
+    // Transfer to non-blocked address should succeed
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &safe, &100,)
+        .is_ok());
+}
+
+#[test]
+fn blocklist_removal_allows_transfers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Whitelist not enabled (default) — any asset should pass
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &100,)
+        .is_ok());
+}
+
+#[test]
+fn asset_whitelist_add_remove_roundtrip() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
+    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+
+    // Now remove it
+    p.remove_asset_from_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+
+    // validate_asset should fail for a removed asset when whitelist is enabled
+    assert!(p
+        .try_validate_asset(&String::from_str(&env, "max_txn"), &asset)
+        .is_err());
+}
+
+#[test]
+fn asset_whitelist_unauthorized_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let addr = Address::generate(&env);
+
+    let result = p.try_add_to_blocklist(&unauthorized, &String::from_str(&env, "max_txn"), &addr);
+    assert!(result.is_err());
+}
+
+#[test]
+fn asset_whitelist_duplicate_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+
+    let result = p.try_add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    assert!(result.is_err());
+}
+
+#[test]
+fn asset_whitelist_nonexistent_remove_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    let result =
+        p.try_remove_asset_from_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    assert!(result.is_err());
+}
+
+#[test]
+fn asset_whitelist_empty_default_passes_validate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    // Whitelist disabled by default, validate_asset should pass
+    assert!(p
+        .try_validate_asset(&String::from_str(&env, "max_txn"), &asset)
+        .is_ok());
+}
+
+#[test]
+fn asset_whitelist_violation_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
+
+    let _ = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &100);
+    assert_event(&env, "PolicyViolation");
+}
