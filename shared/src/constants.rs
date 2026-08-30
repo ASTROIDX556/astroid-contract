@@ -38,6 +38,11 @@ pub const GOVERNANCE_GRACE_PERIOD: u64 = SECONDS_PER_WEEK;
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
 
+/// Upper bound on how many prerequisite proposals one proposal may depend on.
+/// Every prerequisite is read once when the dependent proposal executes, so
+/// this caps the storage reads a single execution can incur.
+pub const MAX_DEPENDENCIES: u32 = 8;
+
 /// Upper bound on how many discrete calls a single batch may contain (gas safety).
 pub const MAX_BATCH_CALLS: u32 = 16;
 

@@ -116,7 +116,7 @@ fn zero_weight_rejected_on_init() {
     sv.push_back(sw(&Address::generate(&env), 0));
     sv.push_back(sw(&Address::generate(&env), 1));
     let res = client.try_initialize(&sv, &1);
-    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
+    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
 }
 
 #[test]
@@ -533,6 +533,8 @@ fn cannot_add_signer_with_zero_weight() {
         .client
         .try_propose_signer_addition(&h.signers[0], &extra, &0);
     assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
+    let res = h.client.try_add_signer(&h.signers[0], &extra, &0);
+    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
 }
 
 #[test]
