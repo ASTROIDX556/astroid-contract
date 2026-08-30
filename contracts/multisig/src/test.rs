@@ -78,19 +78,42 @@ fn propose_approve_execute_happy_path() {
 }
 
 #[test]
-#[test]
 fn tiered_quorum_selects_amount_brackets() {
     let h = setup(3, 1);
     let mut tiers = Vec::new(&h.env);
-    tiers.push_back(QuorumTier { max_amount: 100, required_weight: 1 });
-    tiers.push_back(QuorumTier { max_amount: 1_000, required_weight: 2 });
-    tiers.push_back(QuorumTier { max_amount: i128::MAX, required_weight: 3 });
+    tiers.push_back(QuorumTier {
+        max_amount: 100,
+        required_weight: 1,
+    });
+    tiers.push_back(QuorumTier {
+        max_amount: 1_000,
+        required_weight: 2,
+    });
+    tiers.push_back(QuorumTier {
+        max_amount: i128::MAX,
+        required_weight: 3,
+    });
     h.client.set_quorum_tiers(&h.signers[0], &tiers);
 
-    let low = h.client.propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &100, &0);
+    let low = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &100,
+        &0,
+    );
     h.client.execute(&h.signers[1], &low);
-    let high = h.client.propose(&h.signers[0], &symbol_short!("payment"), &payload(&h.env), &101, &0);
-    assert_eq!(h.client.try_execute(&h.signers[0], &high), Err(Ok(Error::InsufficientTierWeight)));
+    let high = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &101,
+        &0,
+    );
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &high),
+        Err(Ok(Error::InsufficientTierWeight))
+    );
 }
 
 #[test]
@@ -112,9 +135,13 @@ fn execute_below_threshold_fails() {
 fn non_signer_cannot_propose_or_approve() {
     let h = setup(3, 2);
     let stranger = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_propose(&stranger, &symbol_short!("payment"), &payload(&h.env), &0);
+    let res = h.client.try_propose(
+        &stranger,
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+        &0,
+    );
     assert_eq!(res, Err(Ok(Error::NotASigner)));
 }
 
@@ -142,6 +169,7 @@ fn time_lock_blocks_early_execution() {
         &h.signers[0],
         &symbol_short!("payment"),
         &payload(&h.env),
+        &0,
         &unlock,
     );
     h.client.approve(&h.signers[1], &id);

@@ -67,6 +67,7 @@ impl PolicyContract {
 
     /// Register a policy. `owner` gates subsequent rotations. Cheap scalar gates
     /// are stored on-chain; the full configuration is hashed for tamper-evidence.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_policy(
         env: Env,
         owner: Address,
@@ -214,6 +215,7 @@ impl PolicyContract {
 }
 
 /// Allow the interface trait to call `check_transfer` on this contract.
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl PolicyInterface for PolicyContract {
     /// Evaluate a transfer request against the named policy. All gates must pass.

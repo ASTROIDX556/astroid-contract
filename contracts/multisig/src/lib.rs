@@ -174,7 +174,11 @@ impl MultiSigContract {
     }
 
     /// Configure ascending amount tiers. The final tier must use `i128::MAX`.
-    pub fn set_quorum_tiers(env: Env, caller: Address, tiers: Vec<QuorumTier>) -> Result<(), Error> {
+    pub fn set_quorum_tiers(
+        env: Env,
+        caller: Address,
+        tiers: Vec<QuorumTier>,
+    ) -> Result<(), Error> {
         Self::require_signer(&env, &caller)?;
         if tiers.is_empty() || tiers.get(tiers.len() - 1).unwrap().max_amount != i128::MAX {
             return Err(Error::InvalidInput);
@@ -184,25 +188,39 @@ impl MultiSigContract {
         let mut i = 0;
         while i < tiers.len() {
             let tier = tiers.get(i).unwrap();
-            if tier.max_amount < 0 || tier.required_weight == 0 || tier.required_weight > signer_count
-                || previous.map(|max| tier.max_amount <= max).unwrap_or(false) {
+            if tier.max_amount < 0
+                || tier.required_weight == 0
+                || tier.required_weight > signer_count
+                || previous.map(|max| tier.max_amount <= max).unwrap_or(false)
+            {
                 return Err(Error::InvalidInput);
             }
             env.storage().instance().set(&DataKey::Tier(i), &tier);
             previous = Some(tier.max_amount);
             i += 1;
         }
-        env.storage().instance().set(&DataKey::TierCount, &tiers.len());
+        env.storage()
+            .instance()
+            .set(&DataKey::TierCount, &tiers.len());
         Self::bump_instance(&env);
         Ok(())
     }
 
     pub fn get_quorum_tiers(env: Env) -> Result<Vec<QuorumTier>, Error> {
-        let count: u32 = env.storage().instance().get(&DataKey::TierCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TierCount)
+            .unwrap_or(0);
         let mut tiers = Vec::new(&env);
         let mut i = 0;
         while i < count {
-            tiers.push_back(env.storage().instance().get(&DataKey::Tier(i)).ok_or(Error::NotInitialized)?);
+            tiers.push_back(
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Tier(i))
+                    .ok_or(Error::NotInitialized)?,
+            );
             i += 1;
         }
         Ok(tiers)
@@ -360,14 +378,26 @@ impl MultiSigContract {
     }
 
     fn has_tiers(env: &Env) -> bool {
-        env.storage().instance().get::<_, u32>(&DataKey::TierCount).unwrap_or(0) > 0
+        env.storage()
+            .instance()
+            .get::<_, u32>(&DataKey::TierCount)
+            .unwrap_or(0)
+            > 0
     }
 
     fn tier_for_amount(env: &Env, amount: i128) -> Result<Option<QuorumTier>, Error> {
-        let count: u32 = env.storage().instance().get(&DataKey::TierCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TierCount)
+            .unwrap_or(0);
         let mut i = 0;
         while i < count {
-            let tier: QuorumTier = env.storage().instance().get(&DataKey::Tier(i)).ok_or(Error::NotInitialized)?;
+            let tier: QuorumTier = env
+                .storage()
+                .instance()
+                .get(&DataKey::Tier(i))
+                .ok_or(Error::NotInitialized)?;
             if amount <= tier.max_amount {
                 return Ok(Some(tier));
             }
