@@ -21,8 +21,9 @@
 //! the fee of one transaction. If any leg fails, the host reverts the entire
 //! invocation and no recipient is paid.
 //!
-//! Functions: `initialize`, `set_policy`, `set_budget`, `freeze`, `unfreeze`,
-//! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`, `holding`.
+//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
+//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`,
+//! `holding`.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -44,6 +45,8 @@ use soroban_sdk::{
 pub struct Treasury {
     pub org: String,
     pub admin: Address,
+    /// Organization's multisig contract — authorized for emergency freeze/unfreeze.
+    pub multisig: Option<Address>,
     /// Organization's Policy contract — consulted on every spend.
     pub policy: Option<Address>,
     /// Organization's Budget contract root.
@@ -68,6 +71,8 @@ pub struct Holding {
 enum DataKey {
     Treasury,
     Holding(Address),
+    /// Emergency circuit breaker freeze flag (persistent).
+    Frozen,
 }
 
 #[contract]
@@ -86,6 +91,7 @@ impl TreasuryContract {
             &Treasury {
                 org: org.clone(),
                 admin: admin.clone(),
+                multisig: None,
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
@@ -132,16 +138,33 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Freeze the treasury; all outflows are rejected while frozen.
-    pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
+    /// Wire the multisig contract authorized for emergency freeze/unfreeze.
+    pub fn set_multisig(env: Env, caller: Address, multisig: Address) -> Result<(), Error> {
         let mut t = Self::require_admin(&env, &caller)?;
-        t.state = ResourceState::Frozen;
+        t.multisig = Some(multisig);
         Self::store(&env, &t);
         events::publish(
             &env,
             events::ContractEvent::TreasuryConfigUpdated {
                 org: t.org.clone(),
-                action: symbol_short!("frozen"),
+                action: symbol_short!("multisig"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("multisig")), ());
+        Ok(())
+    }
+
+    /// Emergency freeze — only the registry-verified multisig can freeze.
+    /// Sets a dedicated frozen flag in persistent storage that blocks all outbound transfers.
+    pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
+        let t = Self::require_multisig(&env, &caller)?;
+        env.storage().persistent().set(&DataKey::Frozen, &true);
+        Self::bump_frozen(&env);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryFrozen {
+                org: t.org.clone(),
             },
         );
         env.events()
@@ -149,19 +172,24 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Unfreeze back to active.
+    /// Emergency unfreeze — only the registry-verified multisig can unfreeze.
+    /// Clears the frozen flag to restore outbound transfers.
     pub fn unfreeze(env: Env, caller: Address) -> Result<(), Error> {
-        let mut t = Self::require_admin(&env, &caller)?;
-        if t.state != ResourceState::Frozen {
+        let t = Self::require_multisig(&env, &caller)?;
+        let frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false);
+        if !frozen {
             return Err(Error::InvalidState);
         }
-        t.state = ResourceState::Active;
-        Self::store(&env, &t);
+        env.storage().persistent().set(&DataKey::Frozen, &false);
+        Self::bump_frozen(&env);
         events::publish(
             &env,
-            events::ContractEvent::TreasuryConfigUpdated {
+            events::ContractEvent::TreasuryUnfrozen {
                 org: t.org.clone(),
-                action: symbol_short!("unfrozen"),
             },
         );
         env.events()
@@ -218,6 +246,7 @@ impl TreasuryContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
+        Self::check_frozen(&env)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
         if t.admin != caller {
@@ -288,6 +317,7 @@ impl TreasuryContract {
         if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
             return Err(Error::InvalidInput);
         }
+        Self::check_frozen(&env)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
         if t.admin != caller {
@@ -388,6 +418,37 @@ impl TreasuryContract {
         }
         caller.require_auth();
         Ok(t)
+    }
+
+    fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
+        let t = Self::load(env);
+        match &t.multisig {
+            Some(multisig) if multisig == caller => {
+                caller.require_auth();
+                Ok(t)
+            }
+            _ => Err(Error::Unauthorized),
+        }
+    }
+
+    fn check_frozen(env: &Env) -> Result<(), Error> {
+        let frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false);
+        if frozen {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn bump_frozen(env: &Env) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Frozen,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn require_active(t: &Treasury) -> Result<(), Error> {
