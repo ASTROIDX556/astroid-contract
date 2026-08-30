@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{CreateOptions, ProposalContract, ProposalContractClient, ProposalState};
+use crate::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -55,15 +55,12 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
         &String::from_str(&h.env, "acme"),
         &String::from_str(&h.env, "wallet-1"),
         &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(h),
         &dep_vec(h, deps),
         &threshold,
+        &soroban_sdk::vec![&h.env],
         &expires_at,
-        &CreateOptions {
-            deposit: soroban_sdk::vec![&h.env],
-            grace_period: 0,
-        },
+        &0,
     )
 }
 
@@ -75,15 +72,12 @@ fn try_create_with_deps(h: &Harness, deps: &[u64]) -> Result<u64, Error> {
             &String::from_str(&h.env, "acme"),
             &String::from_str(&h.env, "wallet-1"),
             &String::from_str(&h.env, "policy-1"),
-            &String::from_str(&h.env, "tx-ref-1"),
             &approver_vec(h),
             &dep_vec(h, deps),
             &2,
-            &5_000,
-            &CreateOptions {
-                deposit: soroban_sdk::vec![&h.env],
-                grace_period: 0,
-            },
+            &soroban_sdk::vec![&h.env],
+            &0,
+            &0,
         )
         .map(|ok| ok.unwrap())
         .map_err(|err| err.unwrap())
@@ -212,15 +206,12 @@ fn create_with_bad_threshold_fails() {
         &String::from_str(&h.env, "acme"),
         &String::from_str(&h.env, "wallet-1"),
         &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &3,
+        &soroban_sdk::vec![&h.env],
         &5_000,
-        &CreateOptions {
-            deposit: soroban_sdk::vec![&h.env],
-            grace_period: 0,
-        },
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
@@ -233,15 +224,12 @@ fn create_with_past_expiry_fails() {
         &String::from_str(&h.env, "acme"),
         &String::from_str(&h.env, "wallet-1"),
         &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &1,
+        &soroban_sdk::vec![&h.env],
         &500, // in the past (now = 1000)
-        &CreateOptions {
-            deposit: soroban_sdk::vec![&h.env],
-            grace_period: 0,
-        },
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
 }
@@ -467,15 +455,12 @@ fn test_cancellation_grace_window() {
         &String::from_str(&h.env, "org"),
         &String::from_str(&h.env, "w1"),
         &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &2,
+        &soroban_sdk::vec![&h.env],
         &0,
-        &CreateOptions {
-            deposit: soroban_sdk::vec![&h.env],
-            grace_period: 50, // 50 seconds grace period
-        },
+        &50, // 50 seconds grace period
     );
 
     // Fast forward 51 seconds
@@ -491,15 +476,12 @@ fn test_cancellation_grace_window() {
         &String::from_str(&h.env, "org"),
         &String::from_str(&h.env, "w1"),
         &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &2,
+        &soroban_sdk::vec![&h.env],
         &0,
-        &CreateOptions {
-            deposit: soroban_sdk::vec![&h.env],
-            grace_period: 50,
-        },
+        &50,
     );
 
     h.env.ledger().set_timestamp(160);

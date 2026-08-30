@@ -2,8 +2,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::Address as _, testutils::Events, token, vec, Address, Env, IntoVal, String, Symbol,
-    Val, Vec,
+    testutils::{Address as _, Events, Ledger},
+    token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use astroid_shared::constants::MAX_BATCH_PAYMENTS;
@@ -144,6 +144,69 @@ fn prepare_holds_state() {
     let h = setup("vault", 0);
     let state = h.client.get();
     assert_eq!(state.org, String::from_str(&h.env, "vault"));
+}
+
+#[test]
+fn allowance_caps_withdrawal_and_accumulates() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    // Approve a 500 ceiling for admin -> recipient in this asset.
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &500, &0);
+
+    // First withdrawal within the ceiling succeeds and is deducted.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
+    let al = h.client.allowance(&h.admin, &recipient, &h.asset);
+    assert_eq!(al.spent, 400);
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // Second withdrawal exceeds the remaining 100 -> rejected at the allowance gate.
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // A different recipient is not under the allowance, so it is allowed.
+    let other = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &other, &100);
+    assert_eq!(token_balance(&h, &other), 100);
+}
+
+#[test]
+fn expired_allowance_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &id);
+    client.initialize(&String::from_str(&env, "vault"), &admin);
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000);
+    client.deposit(&admin, &asset, &1_000);
+
+    // Allowance already expired (expires_at in the past).
+    let recipient = Address::generate(&env);
+    client.set_allowance(&admin, &admin, &recipient, &asset, &500, &5_000);
+    let res = client.try_withdraw(&admin, &asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::AllowanceExpired)));
+}
+
+#[test]
+fn remove_allowance_clears_cap() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &0);
+    h.client
+        .remove_allowance(&h.admin, &h.admin, &recipient, &h.asset);
+    // With no allowance in place the full balance may be withdrawn.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
+    assert_eq!(token_balance(&h, &recipient), 1_000);
 }
 
 #[test]

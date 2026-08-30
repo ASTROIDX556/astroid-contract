@@ -27,9 +27,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -49,27 +46,13 @@
                   "u32": 2
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u64": 5000
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    }
-                  ]
+                  "u64": 0
                 }
               ]
             }
@@ -233,14 +216,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
                       }
                     },
                     {
@@ -440,9 +415,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -462,27 +434,13 @@
                   "u32": 2
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u64": 5000
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    }
-                  ]
+                  "u64": 0
                 }
               ]
             }
@@ -587,7 +545,7 @@
             ],
             "data": {
               "error": {
-                "contract": 71
+                "contract": 72
               }
             }
           }
@@ -608,7 +566,7 @@
               },
               {
                 "error": {
-                  "contract": 71
+                  "contract": 72
                 }
               }
             ],
@@ -633,7 +591,7 @@
               },
               {
                 "error": {
-                  "contract": 71
+                  "contract": 72
                 }
               }
             ],

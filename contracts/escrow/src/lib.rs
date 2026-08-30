@@ -40,6 +40,15 @@
 //! greater one, which makes a captured signature unusable a second time
 //! (replay protection).
 //!
+//! ## Milestone-based progressive release
+//!
+//! An escrow may optionally be funded via [`EscrowContract::deposit_with_milestones`]
+//! with a list of basis-point-weighted milestones. Instead of a single arbiter
+//! release, the arbiter approves each milestone individually via
+//! [`EscrowContract::release_milestone`], disbursing funds proportionally. The
+//! final milestone pays the dust-free remainder so the full amount is disbursed.
+//! Plain `release` is blocked on milestone escrows to enforce phased settlement.
+//!
 //! ## Time-lock release schedules
 //!
 //! Escrows support configurable time-locks and gradual release schedules:
@@ -58,6 +67,7 @@ pub use storage::{
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events::{self, ContractEvent};
@@ -66,8 +76,8 @@ use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, String,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes, BytesN, Env,
+    String, Vec,
 };
 
 /// Calculate vested amount according to a ReleaseSchedule at a given ledger timestamp.
@@ -142,6 +152,35 @@ pub fn calculate_claimable_amount(escrow: &Escrow, current_time: u64) -> Result<
 pub struct OverrideSignature {
     pub public_key: BytesN<32>,
     pub signature: BytesN<64>,
+}
+
+/// A single milestone within a milestone-based escrow. `release_bps` is the
+/// proportion of the total escrow amount (in basis points, 10_000 = 100%) that
+/// is disbursed to the recipient when this milestone is approved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub index: u32,
+    pub description: String,
+    pub release_bps: u32,
+    pub released: bool,
+}
+
+/// Input describing a milestone when the escrow is created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSpec {
+    pub description: String,
+    pub release_bps: u32,
+}
+
+/// Aggregate milestone state for an escrow: the ordered milestones and the total
+/// amount disbursed so far (used to compute the final, dust-free payout).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSet {
+    pub milestones: Vec<Milestone>,
+    pub released_amount: i128,
 }
 
 #[contract]
@@ -608,6 +647,9 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
+        if env.storage().persistent().has(&DataKey::Milestones(id)) {
+            return Err(Error::InvalidState);
+        }
         if env.ledger().timestamp() >= escrow.deadline {
             return Err(Error::EscrowExpired);
         }
@@ -822,6 +864,200 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Fund an escrow with a milestone-based progressive release schedule.
+    /// `milestones` is an ordered list of basis-point-weighted milestones whose
+    /// weights must sum to exactly 10_000 (100%). The arbiter approves each
+    /// milestone individually via [`EscrowContract::release_milestone`]; plain
+    /// `release` is blocked on milestone escrows to enforce phased settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deposit_with_milestones(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        asset: Address,
+        amount: i128,
+        deadline: u64,
+        memo: String,
+        milestones: Vec<MilestoneSpec>,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        require_positive_amount(amount)?;
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        if deadline <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
+        if milestones.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+
+        let mut total_bps: u32 = 0;
+        for spec in milestones.iter() {
+            total_bps = total_bps
+                .checked_add(spec.release_bps)
+                .ok_or(Error::Overflow)?;
+        }
+        if total_bps != 10_000 {
+            return Err(Error::InvalidInput);
+        }
+
+        let id = increment_count(&env)?;
+
+        token::TokenClient::new(&env, &asset).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let mut items: Vec<Milestone> = Vec::new(&env);
+        for (i, spec) in milestones.iter().enumerate() {
+            items.push_back(Milestone {
+                index: i as u32,
+                description: spec.description.clone(),
+                release_bps: spec.release_bps,
+                released: false,
+            });
+        }
+        let set = MilestoneSet {
+            milestones: items,
+            released_amount: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Milestones(id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let asset_amounts = vec![
+            &env,
+            AssetAmount {
+                asset: asset.clone(),
+                amount,
+            },
+        ];
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            assets: asset_amounts,
+            state: EscrowState::Funded,
+            deadline,
+            funded_amount: amount,
+            memo,
+            schedule: ReleaseSchedule::none(),
+            released_amount: 0,
+            override_signers: Vec::new(&env),
+            override_threshold: 0,
+            override_nonce: 0,
+        };
+        store_escrow(&env, id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("milestone")),
+            (id, sender, recipient, asset, amount),
+        );
+        Ok(id)
+    }
+
+    /// Approve and release a single milestone's proportional payout. Only the
+    /// arbiter may approve; a milestone may be released at most once. The final
+    /// milestone pays the dust-free remainder so the full amount is disbursed.
+    pub fn release_milestone(env: Env, caller: Address, id: u64, index: u32) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.arbiter != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Released) {
+            return Err(Error::InvalidState);
+        }
+
+        let mut set: MilestoneSet = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)?;
+
+        let mut found_idx: usize = 0;
+        let mut target: Option<Milestone> = None;
+        for (i, m) in set.milestones.iter().enumerate() {
+            if m.index == index {
+                found_idx = i;
+                target = Some(m.clone());
+            }
+        }
+        let milestone = target.ok_or(Error::InvalidInput)?;
+        if milestone.released {
+            return Err(Error::InvalidState);
+        }
+
+        let total_amount = Self::total_amount(&escrow.assets);
+        let mut unreleased: u32 = 0;
+        for m in set.milestones.iter() {
+            if !m.released {
+                unreleased = unreleased.saturating_add(1);
+            }
+        }
+        let gross = checked_div(
+            checked_mul(total_amount, milestone.release_bps as i128)?,
+            10_000,
+        )?;
+        let remaining = checked_sub(total_amount, set.released_amount)?;
+        let payout = if unreleased == 1 { remaining } else { gross };
+
+        let primary_asset = &escrow.assets.get_unchecked(0).asset;
+        token::TokenClient::new(&env, primary_asset).transfer(
+            &env.current_contract_address(),
+            &escrow.recipient,
+            &payout,
+        );
+        events::transfer_executed(
+            &env,
+            &escrow.sender,
+            &escrow.recipient,
+            primary_asset,
+            payout,
+        );
+
+        set.released_amount = checked_add(set.released_amount, payout)?;
+        let updated = Milestone {
+            index: milestone.index,
+            description: milestone.description,
+            release_bps: milestone.release_bps,
+            released: true,
+        };
+        set.milestones.set(found_idx as u32, updated);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+
+        let all_released = set.milestones.iter().all(|m| m.released);
+        if all_released {
+            escrow.state = EscrowState::Released;
+            store_escrow(&env, id, &escrow);
+        }
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ms_rel")),
+            (id, caller, index, payout),
+        );
+        Ok(())
+    }
+
+    /// Read the milestone state for an escrow.
+    pub fn milestones(env: Env, id: u64) -> Result<MilestoneSet, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)
+    }
+
     // --- views ---
 
     pub fn get(env: Env, id: u64) -> Result<Escrow, Error> {
@@ -856,6 +1092,16 @@ impl EscrowContract {
                 &a.amount,
             );
         }
+    }
+
+    /// Sum the amounts across every listed asset (single-asset milestone
+    /// escrows simply return that asset's amount).
+    fn total_amount(assets: &Vec<AssetAmount>) -> i128 {
+        let mut total: i128 = 0;
+        for a in assets.iter() {
+            total += a.amount;
+        }
+        total
     }
 
     /// Validate a multi-asset list: non-empty, within the size cap, every

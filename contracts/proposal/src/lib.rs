@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
@@ -92,7 +92,6 @@ pub struct Proposal {
     /// Links (opaque references owned by the backend / other contracts).
     pub wallet: String,
     pub policy: String,
-    pub tx_ref: String,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
@@ -119,19 +118,6 @@ impl Proposal {
     pub fn can_execute(&self, env: &Env) -> bool {
         self.is_active(env) && self.state == ProposalState::Approved
     }
-}
-
-/// Optional creation parameters for [`ProposalContract::create`]. Grouped into
-/// a single argument so the entrypoint stays under the Soroban 10-parameter cap.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateOptions {
-    /// Optional token deposit escrowed by the proposer; refunded when the
-    /// proposal is cancelled, expires, or is otherwise settled.
-    pub deposit: Vec<AssetAmount>,
-    /// Seconds after creation during which the proposer may still cancel.
-    /// `0` disables the grace window.
-    pub grace_period: u64,
 }
 
 #[contracttype]
@@ -183,12 +169,12 @@ impl ProposalContract {
         org: String,
         wallet: String,
         policy: String,
-        tx_ref: String,
         approvers: Vec<Address>,
         dependencies: Vec<u64>,
         threshold: u32,
+        deposit: Vec<AssetAmount>,
         expires_at: u64,
-        options: CreateOptions,
+        grace_period: u64,
     ) -> Result<u64, Error> {
         proposer.require_auth();
         require_non_empty(&org)?;
@@ -199,7 +185,7 @@ impl ProposalContract {
         if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
         }
-        if let Some(dep) = options.deposit.first() {
+        if let Some(dep) = deposit.first() {
             if dep.amount <= 0 {
                 return Err(Error::InvalidAmount);
             }
@@ -247,16 +233,15 @@ impl ProposalContract {
             org,
             wallet,
             policy,
-            tx_ref,
             approvers,
             dependencies: deps,
             threshold,
             approvals: 0,
-            deposit: options.deposit,
+            deposit,
             state: ProposalState::Pending,
             created_at: env.ledger().timestamp(),
             expires_at,
-            grace_period: options.grace_period,
+            grace_period,
         };
         env.storage()
             .persistent()
