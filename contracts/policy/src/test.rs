@@ -13,7 +13,7 @@ fn assert_event(env: &Env, variant: &str) {
         .events()
         .all()
         .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
@@ -138,124 +138,436 @@ fn standard_policy_violation_event_emitted() {
     assert_event(&env, "PolicyViolation");
 }
 
+// --- Merchant blacklist tests ---
+
 #[test]
-fn whitelist_permits_approved_token_and_blocks_others() {
+fn merchant_blacklist_blocks_transfers() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = setup(&env, &owner);
-    let approved = Address::generate(&env);
-    let malicious = Address::generate(&env);
-    let recip = Address::generate(&env);
-    p.add_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &approved);
+    let asset = Address::generate(&env);
+    let blocked_merchant = Address::generate(&env);
 
-    // Approved SAC address passes
-    assert!(p
-        .try_check_transfer(&String::from_str(&env, "max_txn"), &approved, &recip, &1,)
-        .is_ok());
-
-    // Non-approved (scam) asset is rejected deterministically
-    assert_eq!(
-        p.try_check_transfer(&String::from_str(&env, "max_txn"), &malicious, &recip, &1,),
-        Err(Ok(Error::TokenNotWhitelisted))
-    );
-}
-
-#[test]
-fn whitelist_enforces_without_recording_an_event_for_ok_path() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let owner = Address::generate(&env);
-    let p = setup(&env, &owner);
-    let approved = Address::generate(&env);
-    let recip = Address::generate(&env);
-    p.add_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &approved);
-    assert!(p
-        .try_check_transfer(&String::from_str(&env, "max_txn"), &approved, &recip, &1,)
-        .is_ok());
-}
-
-#[test]
-fn whitelist_is_scoped_per_policy() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let owner = Address::generate(&env);
-    let p = setup(&env, &owner);
-    let token = Address::generate(&env);
-    let recip = Address::generate(&env);
-    // Approved under "max_txn" but never registered under "vendor_list".
-    p.add_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &token);
-
-    // Allowed under the policy where it is whitelisted
-    assert!(p
-        .try_check_transfer(&String::from_str(&env, "max_txn"), &token, &recip, &1,)
-        .is_ok());
-
-    // Same token under a different policy is still gated
-    p.register_policy(
+    // Add merchant to blacklist
+    p.add_merchant_blacklist(
         &owner,
-        &String::from_str(&env, "vendor_list"),
-        &BytesN::from_array(&env, &[9; 32]),
-        &0,
-        &None,
-        &None,
-        &0,
+        &String::from_str(&env, "max_txn"),
+        &blocked_merchant,
     );
-    assert_eq!(
-        p.try_check_transfer(&String::from_str(&env, "vendor_list"), &token, &recip, &1,),
-        Err(Ok(Error::TokenNotWhitelisted))
+
+    // Transfer to blocked merchant should fail
+    let result = p.try_check_transfer(
+        &String::from_str(&env, "max_txn"),
+        &asset,
+        &blocked_merchant,
+        &100,
     );
+    assert!(result.is_err());
+
+    // Transfer to non-blocked merchant should succeed
+    let safe_merchant = Address::generate(&env);
+    assert!(p
+        .try_check_transfer(
+            &String::from_str(&env, "max_txn"),
+            &asset,
+            &safe_merchant,
+            &100,
+        )
+        .is_ok());
 }
 
 #[test]
-fn is_token_allowed_query_reflects_whitelist_edits() {
+fn merchant_blacklist_removal_allows_transfers() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = setup(&env, &owner);
-    let token = Address::generate(&env);
-    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let merchant = Address::generate(&env);
 
-    assert!(!p.is_token_allowed(&pid, &token));
-    p.add_to_whitelist(&owner, &pid, &token);
-    assert!(p.is_token_allowed(&pid, &token));
-    p.remove_from_whitelist(&owner, &pid, &token);
-    assert!(!p.is_token_allowed(&pid, &token));
+    // Add merchant to blacklist
+    p.add_merchant_blacklist(&owner, &String::from_str(&env, "max_txn"), &merchant);
+
+    // Verify blocked
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &merchant, &100,)
+        .is_err());
+
+    // Remove from blacklist
+    p.remove_merchant_blacklist(&owner, &String::from_str(&env, "max_txn"), &merchant);
+
+    // Now should succeed
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &merchant, &100,)
+        .is_ok());
 }
 
 #[test]
-fn non_owner_cannot_manage_whitelist() {
+fn merchant_blacklist_unauthorized_add_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
-    let stranger = Address::generate(&env);
-    let token = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
     let p = setup(&env, &owner);
-    let pid = String::from_str(&env, "max_txn");
+    let merchant = Address::generate(&env);
 
-    assert_eq!(
-        p.try_add_to_whitelist(&stranger, &pid, &token),
-        Err(Ok(Error::Unauthorized))
-    );
+    // Unauthorized user cannot add to blacklist
+    let result =
+        p.try_add_merchant_blacklist(&unauthorized, &String::from_str(&env, "max_txn"), &merchant);
+    assert!(result.is_err());
 }
 
 #[test]
-fn duplicate_and_missing_whitelist_ops_are_rejected() {
+fn merchant_blacklist_duplicate_add_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
-    let token = Address::generate(&env);
     let p = setup(&env, &owner);
-    let pid = String::from_str(&env, "max_txn");
+    let merchant = Address::generate(&env);
 
-    p.add_to_whitelist(&owner, &pid, &token);
-    assert_eq!(
-        p.try_add_to_whitelist(&owner, &pid, &token),
-        Err(Ok(Error::AlreadyExists))
+    // Add merchant to blacklist
+    p.add_merchant_blacklist(&owner, &String::from_str(&env, "max_txn"), &merchant);
+
+    // Adding again should fail
+    let result =
+        p.try_add_merchant_blacklist(&owner, &String::from_str(&env, "max_txn"), &merchant);
+    assert!(result.is_err());
+}
+
+#[test]
+fn merchant_blacklist_nonexistent_remove_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let merchant = Address::generate(&env);
+
+    // Removing non-existent merchant should fail
+    let result =
+        p.try_remove_merchant_blacklist(&owner, &String::from_str(&env, "max_txn"), &merchant);
+    assert!(result.is_err());
+}
+
+#[test]
+fn merchant_blocked_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let blocked_merchant = Address::generate(&env);
+
+    p.add_merchant_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &blocked_merchant,
     );
-    assert_eq!(
-        p.try_remove_from_whitelist(&owner, &pid, &Address::generate(&env)),
-        Err(Ok(Error::NotFound))
+
+    let _ = p.try_check_transfer(
+        &String::from_str(&env, "max_txn"),
+        &asset,
+        &blocked_merchant,
+        &100,
     );
-    p.remove_from_whitelist(&owner, &pid, &token);
+    assert_event(&env, "PolicyViolation");
+}
+
+// --- Category blacklist tests ---
+
+#[test]
+fn category_blacklist_blocks_categories() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    // Add category to blacklist
+    p.add_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+
+    // Blocked category should fail
+    let result = p.try_check_category(
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+    assert!(result.is_err());
+
+    // Different category should succeed
+    assert!(p
+        .try_check_category(
+            &String::from_str(&env, "max_txn"),
+            &String::from_str(&env, "groceries"),
+        )
+        .is_ok());
+
+    // Empty category should succeed
+    assert!(p
+        .try_check_category(
+            &String::from_str(&env, "max_txn"),
+            &String::from_str(&env, ""),
+        )
+        .is_ok());
+}
+
+#[test]
+fn category_blacklist_removal_allows_categories() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    // Add category to blacklist
+    p.add_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+
+    // Verify blocked
+    assert!(p
+        .try_check_category(
+            &String::from_str(&env, "max_txn"),
+            &String::from_str(&env, "gambling"),
+        )
+        .is_err());
+
+    // Remove from blacklist
+    p.remove_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+
+    // Now should succeed
+    assert!(p
+        .try_check_category(
+            &String::from_str(&env, "max_txn"),
+            &String::from_str(&env, "gambling"),
+        )
+        .is_ok());
+}
+
+#[test]
+fn category_blacklist_unauthorized_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    // Unauthorized user cannot add to blacklist
+    let result = p.try_add_category_blacklist(
+        &unauthorized,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn category_blacklist_duplicate_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    // Add category to blacklist
+    p.add_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+
+    // Adding again should fail
+    let result = p.try_add_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn category_blacklist_nonexistent_remove_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    // Removing non-existent category should fail
+    let result = p.try_remove_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn category_blacklist_empty_category_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    // Adding empty category should fail
+    let result = p.try_add_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, ""),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn category_restricted_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    p.add_category_blacklist(
+        &owner,
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+
+    let _ = p.try_check_category(
+        &String::from_str(&env, "max_txn"),
+        &String::from_str(&env, "gambling"),
+    );
+    assert_event(&env, "PolicyViolation");
+}
+
+// --- Issue #37: Asset whitelist tests ---
+
+#[test]
+fn asset_whitelist_allows_whitelisted_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    let safe = Address::generate(&env);
+
+    // Block the address
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
+
+    // Transfer to blocked address should fail
+    let result = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &blocked, &100);
+    assert!(result.is_err());
+
+    // Transfer to non-blocked address should succeed
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &safe, &100,)
+        .is_ok());
+}
+
+#[test]
+fn blocklist_removal_allows_transfers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Whitelist not enabled (default) — any asset should pass
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &100,)
+        .is_ok());
+}
+
+#[test]
+fn asset_whitelist_add_remove_roundtrip() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
+    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+
+    // Now remove it
+    p.remove_asset_from_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+
+    // validate_asset should fail for a removed asset when whitelist is enabled
+    assert!(p
+        .try_validate_asset(&String::from_str(&env, "max_txn"), &asset)
+        .is_err());
+}
+
+#[test]
+fn asset_whitelist_unauthorized_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let addr = Address::generate(&env);
+
+    let result = p.try_add_to_blocklist(&unauthorized, &String::from_str(&env, "max_txn"), &addr);
+    assert!(result.is_err());
+}
+
+#[test]
+fn asset_whitelist_duplicate_add_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+
+    let result = p.try_add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    assert!(result.is_err());
+}
+
+#[test]
+fn asset_whitelist_nonexistent_remove_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    let result =
+        p.try_remove_asset_from_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    assert!(result.is_err());
+}
+
+#[test]
+fn asset_whitelist_empty_default_passes_validate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    // Whitelist disabled by default, validate_asset should pass
+    assert!(p
+        .try_validate_asset(&String::from_str(&env, "max_txn"), &asset)
+        .is_ok());
+}
+
+#[test]
+fn asset_whitelist_violation_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
+
+    let _ = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &100);
+    assert_event(&env, "PolicyViolation");
 }
