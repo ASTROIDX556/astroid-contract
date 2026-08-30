@@ -715,7 +715,7 @@ impl TreasuryContract {
         if frozen {
             return Err(Error::InvalidState);
         }
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 
@@ -746,7 +746,7 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .set(&DataKey::ReentrancyLock, &true);
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 

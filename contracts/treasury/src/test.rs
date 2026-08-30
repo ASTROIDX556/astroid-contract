@@ -30,7 +30,7 @@ struct Harness<'a> {
     admin: Address,
     multisig: Address,
     asset: Address,
-    second_asset: Address,
+    _second_asset: Address,
 }
 
 /// Register a treasury plus a test SAC token, and mint `funded` of the asset to
@@ -66,7 +66,7 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         admin,
         multisig,
         asset,
-        second_asset,
+        _second_asset: second_asset,
     }
 }
 
