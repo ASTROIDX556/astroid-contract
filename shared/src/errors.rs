@@ -72,13 +72,25 @@ pub enum Error {
     InsufficientWeight = 40,
 
     // --- Proposal (70-79) ---
-    ProposalExpired = 41,
-    InvalidProposalState = 42,
-    ProposalNotApproved = 43,
-    NotAnApprover = 44,
-    CancellationWindowClosed = 45,
-    MathOverflow = 46,
-    DivisionByZero = 47,
+    ProposalExpired = 70,
+    InvalidProposalState = 71,
+    ProposalNotApproved = 72,
+    NotAnApprover = 73,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 74,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 75,
+    CancellationWindowClosed = 74,
+    MathOverflow = 75,
+    DivisionByZero = 76,
+    ProposalExpired = 39,
+    InvalidProposalState = 40,
+    ProposalNotApproved = 41,
+    NotAnApprover = 42,
+    CancellationWindowClosed = 43,
+    MathOverflow = 44,
+    DivisionByZero = 45,
 
     // --- Escrow (80-89) ---
     EscrowExpired = 48,
