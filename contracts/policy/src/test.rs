@@ -449,30 +449,16 @@ fn asset_whitelist_allows_whitelisted_asset() {
 
     // Enable whitelist and add asset_a
     p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
-    p.add_asset_to_whitelist(
-        &owner,
-        &String::from_str(&env, "max_txn"),
-        &asset_a,
-    );
+    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset_a);
 
     // asset_a should pass
     assert!(p
-        .try_check_transfer(
-            &String::from_str(&env, "max_txn"),
-            &asset_a,
-            &recip,
-            &100,
-        )
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset_a, &recip, &100,)
         .is_ok());
 
     // asset_b (not whitelisted) should fail
     assert!(p
-        .try_check_transfer(
-            &String::from_str(&env, "max_txn"),
-            &asset_b,
-            &recip,
-            &100,
-        )
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset_b, &recip, &100,)
         .is_err());
 }
 
@@ -487,12 +473,7 @@ fn asset_whitelist_disabled_allows_all() {
 
     // Whitelist not enabled (default) — any asset should pass
     assert!(p
-        .try_check_transfer(
-            &String::from_str(&env, "max_txn"),
-            &asset,
-            &recip,
-            &100,
-        )
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &100,)
         .is_ok());
 }
 
@@ -505,18 +486,10 @@ fn asset_whitelist_add_remove_roundtrip() {
     let asset = Address::generate(&env);
 
     p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
-    p.add_asset_to_whitelist(
-        &owner,
-        &String::from_str(&env, "max_txn"),
-        &asset,
-    );
+    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
 
     // Now remove it
-    p.remove_asset_from_whitelist(
-        &owner,
-        &String::from_str(&env, "max_txn"),
-        &asset,
-    );
+    p.remove_asset_from_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
 
     // validate_asset should fail for a removed asset when whitelist is enabled
     assert!(p
@@ -533,11 +506,8 @@ fn asset_whitelist_unauthorized_add_fails() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
 
-    let result = p.try_add_asset_to_whitelist(
-        &unauthorized,
-        &String::from_str(&env, "max_txn"),
-        &asset,
-    );
+    let result =
+        p.try_add_asset_to_whitelist(&unauthorized, &String::from_str(&env, "max_txn"), &asset);
     assert!(result.is_err());
 }
 
@@ -549,17 +519,9 @@ fn asset_whitelist_duplicate_add_fails() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
 
-    p.add_asset_to_whitelist(
-        &owner,
-        &String::from_str(&env, "max_txn"),
-        &asset,
-    );
+    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
 
-    let result = p.try_add_asset_to_whitelist(
-        &owner,
-        &String::from_str(&env, "max_txn"),
-        &asset,
-    );
+    let result = p.try_add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
     assert!(result.is_err());
 }
 
@@ -571,11 +533,8 @@ fn asset_whitelist_nonexistent_remove_fails() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
 
-    let result = p.try_remove_asset_from_whitelist(
-        &owner,
-        &String::from_str(&env, "max_txn"),
-        &asset,
-    );
+    let result =
+        p.try_remove_asset_from_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
     assert!(result.is_err());
 }
 
@@ -604,11 +563,6 @@ fn asset_whitelist_violation_event_emitted() {
 
     p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
 
-    let _ = p.try_check_transfer(
-        &String::from_str(&env, "max_txn"),
-        &asset,
-        &recip,
-        &100,
-    );
+    let _ = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &100);
     assert_event(&env, "PolicyViolation");
 }
