@@ -34,7 +34,6 @@ pub enum Error {
     PolicyCategoryRestricted = 16,
     /// The asset is not in the organization's whitelist.
     AssetNotWhitelisted = 17,
-    FeeLimitExceeded = 18,
     /// The transfer's asset is on the policy's asset blacklist.
     AssetBlacklisted = 48,
 
@@ -80,6 +79,11 @@ pub enum Error {
     CancellationWindowClosed = 43,
     MathOverflow = 44,
     DivisionByZero = 45,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 51,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 52,
 
     // --- Escrow (80-89) ---
     EscrowExpired = 46,
