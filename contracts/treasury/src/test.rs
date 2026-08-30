@@ -2,8 +2,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::Address as _, testutils::Events, token, vec, Address, Env, IntoVal, String, Symbol,
-    Val, Vec,
+    testutils::{Address as _, Events, Ledger},
+    token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use astroid_shared::constants::MAX_BATCH_PAYMENTS;
@@ -20,7 +20,7 @@ fn assert_event(env: &Env, variant: &str) {
         .events()
         .all()
         .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
@@ -28,7 +28,9 @@ struct Harness<'a> {
     env: Env,
     client: TreasuryContractClient<'a>,
     admin: Address,
+    multisig: Address,
     asset: Address,
+    second_asset: Address,
 }
 
 /// Register a treasury plus a test SAC token, and mint `funded` of the asset to
@@ -37,15 +39,23 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
+    let multisig = Address::generate(&env);
 
     let id = env.register_contract(None, TreasuryContract);
     let client = TreasuryContractClient::new(&env, &id);
     client.initialize(&String::from_str(&env, org), &admin);
+    client.set_multisig(&admin, &multisig);
 
     let token_admin = Address::generate(&env);
     let asset = env
         .register_stellar_asset_contract_v2(token_admin)
         .address();
+
+    let token_admin2 = Address::generate(&env);
+    let second_asset = env
+        .register_stellar_asset_contract_v2(token_admin2)
+        .address();
+
     if funded > 0 {
         token::StellarAssetClient::new(&env, &asset).mint(&admin, &funded);
     }
@@ -54,7 +64,9 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         env,
         client,
         admin,
+        multisig,
         asset,
+        second_asset,
     }
 }
 
@@ -115,7 +127,7 @@ fn withdraw_overdraws() {
 fn frozen_treasury_rejects_withdrawals() {
     let h = setup("vault", 1_000);
     h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.freeze(&h.admin);
+    h.client.freeze(&h.multisig);
 
     let res = h
         .client
@@ -125,13 +137,14 @@ fn frozen_treasury_rejects_withdrawals() {
 }
 
 #[test]
-fn deposit_into_frozen_treasury_rejected() {
+fn deposit_into_frozen_treasury_allowed() {
     let h = setup("vault", 1_000);
-    h.client.freeze(&h.admin);
-    let res = h.client.try_deposit(&h.admin, &h.asset, &100);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-    // No value moved on the rejected deposit.
-    assert_eq!(token_balance(&h, &h.admin), 1_000);
+    h.client.freeze(&h.multisig);
+    // Deposits should be allowed even when frozen (only outbound transfers are blocked)
+    h.client.deposit(&h.admin, &h.asset, &100);
+    // Value moved into the treasury despite being frozen.
+    assert_eq!(token_balance(&h, &h.admin), 900);
+    assert_eq!(token_balance(&h, &h.client.address), 100);
 }
 
 #[test]
@@ -139,6 +152,111 @@ fn prepare_holds_state() {
     let h = setup("vault", 0);
     let state = h.client.get();
     assert_eq!(state.org, String::from_str(&h.env, "vault"));
+}
+
+#[test]
+fn allowance_caps_withdrawal_and_accumulates() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    // Approve a 500 ceiling for admin -> recipient in this asset.
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &500, &0);
+
+    // First withdrawal within the ceiling succeeds and is deducted.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
+    let al = h.client.allowance(&h.admin, &recipient, &h.asset);
+    assert_eq!(al.spent, 400);
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // Second withdrawal exceeds the remaining 100 -> rejected at the allowance gate.
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // A different recipient is not under the allowance, so it is allowed.
+    let other = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &other, &100);
+    assert_eq!(token_balance(&h, &other), 100);
+}
+
+#[test]
+fn expired_allowance_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &id);
+    client.initialize(&String::from_str(&env, "vault"), &admin);
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000);
+    client.deposit(&admin, &asset, &1_000);
+
+    // Allowance already expired (expires_at in the past).
+    let recipient = Address::generate(&env);
+    client.set_allowance(&admin, &admin, &recipient, &asset, &500, &5_000);
+    let res = client.try_withdraw(&admin, &asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::AllowanceExpired)));
+}
+
+#[test]
+fn remove_allowance_clears_cap() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &0);
+    h.client
+        .remove_allowance(&h.admin, &h.admin, &recipient, &h.asset);
+    // With no allowance in place the full balance may be withdrawn.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
+    assert_eq!(token_balance(&h, &recipient), 1_000);
+}
+
+#[test]
+fn test_milestone_releases() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &contract_id);
+    client.initialize(&soroban_sdk::String::from_str(&env, "org"), &admin);
+
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    let token_client = token::TokenClient::new(&env, &token);
+
+    let to = Address::generate(&env);
+
+    let mid = client.init_milestone_disbursement(&admin, &token, &to, &1000, &3);
+    assert_eq!(mid, 1);
+
+    // Deposit 1000 into treasury so we have funds
+    token_admin.mint(&admin, &1000);
+    client.deposit(&admin, &token, &1000);
+
+    // release milestone 1
+    client.release_next_milestone(&admin, &mid);
+    assert_eq!(token_client.balance(&to), 333); // 1000 / 3
+
+    // release milestone 2
+    client.release_next_milestone(&admin, &mid);
+    assert_eq!(token_client.balance(&to), 666);
+
+    // release milestone 3 (final, catches remainder)
+    client.release_next_milestone(&admin, &mid);
+    assert_eq!(token_client.balance(&to), 1000);
+
+    // releasing beyond fails
+    let res = client.try_release_next_milestone(&admin, &mid);
+    assert!(res.is_err());
 }
 
 #[test]
@@ -256,7 +374,7 @@ fn batch_transfer_rejected_when_not_admin() {
 fn batch_transfer_rejected_when_frozen() {
     let h = setup("vault", 500);
     h.client.deposit(&h.admin, &h.asset, &500);
-    h.client.freeze(&h.admin);
+    h.client.freeze(&h.multisig);
 
     let recipient = Address::generate(&h.env);
     let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 10)];
@@ -310,4 +428,128 @@ fn batch_transfer_at_the_maximum_size_succeeds() {
     let holding = h.client.holding(&h.asset);
     assert_eq!(holding.total_out, 5 * MAX_BATCH_PAYMENTS as i128);
     assert_eq!(holding.total_in, 1_000 - 5 * MAX_BATCH_PAYMENTS as i128);
+}
+
+#[test]
+fn emergency_freeze_rejected_by_non_multisig() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // Admin should not be able to freeze - only multisig
+    let res = h.client.try_freeze(&h.admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+    // Random address should also be rejected
+    let intruder = Address::generate(&h.env);
+    let res = h.client.try_freeze(&intruder);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+    // Ensure transfers still work
+    let recipient = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+}
+
+#[test]
+fn emergency_freeze_by_multisig_blocks_transfers() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // Multisig can freeze
+    h.client.freeze(&h.multisig);
+
+    // All outbound transfers should be blocked
+    let recipient = Address::generate(&h.env);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+
+    let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 50)];
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+
+    // Verify funds are still in treasury
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+}
+
+#[test]
+fn emergency_unfreeze_restores_transfers() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // Freeze with multisig
+    h.client.freeze(&h.multisig);
+
+    // Verify frozen state blocks transfers
+    let recipient = Address::generate(&h.env);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+
+    // Unfreeze with multisig
+    h.client.unfreeze(&h.multisig);
+
+    // Transfers should work again
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+    assert_eq!(token_balance(&h, &h.client.address), 900);
+}
+
+#[test]
+fn emergency_unfreeze_rejected_by_non_multisig() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // Freeze with multisig
+    h.client.freeze(&h.multisig);
+
+    // Admin should not be able to unfreeze
+    let res = h.client.try_unfreeze(&h.admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+    // Random address should also be rejected
+    let intruder = Address::generate(&h.env);
+    let res = h.client.try_unfreeze(&intruder);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+    // Should still be frozen
+    let recipient = Address::generate(&h.env);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+}
+
+#[test]
+fn emergency_unfreeze_without_freeze_fails() {
+    let h = setup("vault", 1_000);
+
+    // Trying to unfreeze when not frozen should fail
+    let res = h.client.try_unfreeze(&h.multisig);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+}
+
+#[test]
+fn treasury_frozen_and_unfrozen_events_emitted() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // Freeze should emit TreasuryFrozen event
+    h.client.freeze(&h.multisig);
+    assert_event(&h.env, "TreasuryFrozen");
+
+    // Unfreeze should emit TreasuryUnfrozen event
+    h.client.unfreeze(&h.multisig);
+    assert_event(&h.env, "TreasuryUnfrozen");
+}
+
+#[test]
+fn freeze_without_multisig_configured_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    let id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &id);
+    client.initialize(&String::from_str(&env, "vault"), &admin);
+
+    // Try to freeze without setting multisig - should fail
+    let res = client.try_freeze(&admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
