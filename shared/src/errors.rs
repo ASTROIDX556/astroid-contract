@@ -37,6 +37,8 @@ pub enum Error {
     FeeLimitExceeded = 18,
 
     // --- Registry (30-39) ---
+    RegistryFrozen = 30,
+    ModuleDeprecated = 31,
     RegistryFrozen = 19,
 
     // --- Budget (40-49) ---
