@@ -124,11 +124,6 @@ impl RegistryContract {
 
     /// Register (or update) a module address for an organization. Callable by
     /// the admin or the organization owner.
-    ///
-    /// Validates that `address` is a non-zero, properly-formed Soroban address
-    /// before persisting it, preventing accidental registration of uninitialized
-    /// or null contract addresses that would cause downstream calls to fail
-    /// unpredictably (Issue #43).
     pub fn register_module(
         env: Env,
         caller: Address,
@@ -138,7 +133,6 @@ impl RegistryContract {
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
         caller.require_auth();
-        Self::require_valid_module_address(&env, &address)?;
         Self::require_admin_or_org_owner(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
@@ -201,7 +195,6 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
-        Self::require_valid_module_address(&env, &address)?;
         if version == 0 {
             return Err(Error::InvalidInput);
         }
@@ -335,20 +328,6 @@ impl RegistryContract {
     }
 
     // --- internal helpers ---
-
-    /// Validate that `address` is a properly-formed module address.
-    ///
-    /// On-chain, a zero address means no contract is deployed at that
-    /// location, so registering it would cause downstream cross-contract
-    /// calls to fail.  Unfortunately `soroban_sdk::Address` is an opaque
-    /// host handle on wasm32 and cannot be introspected from guest code,
-    /// so we cannot perform a zero-byte check here yet.  The function is
-    /// kept as an extension point; the [`Error::InvalidModuleAddress`]
-    /// variant is available for stricter checks once the SDK exposes the
-    /// necessary API on wasm targets.
-    fn require_valid_module_address(_env: &Env, _address: &Address) -> Result<(), Error> {
-        Ok(())
-    }
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
         if env

@@ -165,28 +165,6 @@ fn admin_rotation() {
     );
 }
 
-// --- Issue #43: Contract dependency validation ---
-
-#[test]
-fn register_module_accepts_valid_address() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-
-    let wallet = Address::generate(&env);
-    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
-    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
-}
-
-#[test]
-fn register_version_accepts_valid_address() {
-    let (env, client, admin) = setup();
-    let addr = Address::generate(&env);
-    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr);
-    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
-}
-
 #[test]
 fn standard_events_emitted() {
     let (env, client, admin) = setup();

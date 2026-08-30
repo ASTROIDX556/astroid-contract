@@ -35,8 +35,6 @@ pub enum Error {
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
-    /// The module address is invalid (e.g. zero address or malformed).
-    InvalidModuleAddress = 31,
 
     // --- Budget (40-49) ---
     BudgetExceeded = 40,
