@@ -7,9 +7,7 @@ use soroban_sdk::{
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 
-use crate::{
-    EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, OverrideSignature,
-};
+use crate::{EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, OverrideSignature};
 
 const START: u64 = 1_000;
 
