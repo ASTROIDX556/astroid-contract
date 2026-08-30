@@ -46,13 +46,35 @@
                   "u32": 2
                 },
                 {
-                  "vec": []
-                },
-                {
                   "u64": 0
                 },
                 {
-                  "u64": 50
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 50
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -103,13 +125,35 @@
                   "u32": 2
                 },
                 {
-                  "vec": []
-                },
-                {
                   "u64": 0
                 },
                 {
-                  "u64": 50
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 50
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -221,6 +265,14 @@
                       },
                       "val": {
                         "u64": 100
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
                       }
                     },
                     {
@@ -381,6 +433,14 @@
                       },
                       "val": {
                         "u64": 151
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
                       }
                     },
                     {
@@ -737,13 +797,35 @@
                   "u32": 2
                 },
                 {
-                  "vec": []
-                },
-                {
                   "u64": 0
                 },
                 {
-                  "u64": 50
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 50
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -982,13 +1064,35 @@
                   "u32": 2
                 },
                 {
-                  "vec": []
-                },
-                {
                   "u64": 0
                 },
                 {
-                  "u64": 50
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 50
+                      }
+                    }
+                  ]
                 }
               ]
             }

@@ -27,16 +27,14 @@ pub enum Error {
 
     // --- Policy (20-29) ---
     PolicyDenied = 11,
-    PolicyHashMismatch = 12,
-    EmergencyLock = 13,
-    PolicyRecipientRestricted = 14,
-    PolicyMerchantBlocked = 15,
-    PolicyCategoryRestricted = 16,
+    EmergencyLock = 12,
+    PolicyRecipientRestricted = 13,
+    PolicyMerchantBlocked = 14,
+    PolicyCategoryRestricted = 15,
     /// The asset is not in the organization's whitelist.
-    AssetNotWhitelisted = 17,
-    FeeLimitExceeded = 18,
+    AssetNotWhitelisted = 16,
     /// A conditional policy rule denied the transaction.
-    RuleDenied = 19,
+    RuleDenied = 17,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 20,
@@ -83,6 +81,13 @@ pub enum Error {
     // --- Escrow (80-89) ---
     EscrowExpired = 48,
     TimeLockActive = 49,
+
+    // --- Dependency tracking ---
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 50,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 51,
 
     // --- Interface versioning (95-99) ---
     /// The remote contract's interface version is older than the minimum
