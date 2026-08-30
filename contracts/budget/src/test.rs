@@ -539,5 +539,4 @@ fn deficit_surplus_rollover_combined() {
     assert_eq!(b.deficit_amount, 0);
     assert_eq!(b.rollover_credit, 400);
     assert_eq!(b.spent, 0);
-
 }
