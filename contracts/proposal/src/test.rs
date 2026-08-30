@@ -20,7 +20,30 @@ fn setup(num_approvers: u32) -> Harness {
     env.ledger().set_timestamp(1_000);
     let contract_id = env.register_contract(None, ProposalContract);
     let client = ProposalContractClient::new(&env, &contract_id);
-    client.initialize();
+    client.initialize(&0);
+
+    let proposer = Address::generate(&env);
+    let mut approvers = std::vec::Vec::new();
+    for _ in 0..num_approvers {
+        approvers.push(Address::generate(&env));
+    }
+    Harness {
+        env,
+        client,
+        proposer,
+        approvers,
+    }
+}
+
+/// Like [`setup`], but with a mandatory non-zero timelock configured at
+/// initialization.
+fn setup_timelocked(num_approvers: u32, timelock: u64) -> Harness {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let contract_id = env.register_contract(None, ProposalContract);
+    let client = ProposalContractClient::new(&env, &contract_id);
+    client.initialize(&timelock);
 
     let proposer = Address::generate(&env);
     let mut approvers = std::vec::Vec::new();
@@ -559,4 +582,100 @@ fn test_cancellation_grace_window() {
     h.client.cancel(&h.proposer, &id2); // works since 160 < 151 + 50 (created at 151)
 
     assert_eq!(h.client.state(&id2), crate::ProposalState::Cancelled);
+}
+
+// ------------------------------------------------------------- timelock ----
+
+/// Full approval, then a `get` view handy for timelock assertions.
+fn approve_to_threshold(h: &Harness, id: u64) {
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn approval_records_timestamp_used_by_the_timelock() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    assert_eq!(h.client.get(&id).approved_at, 0);
+
+    // Ledger time is 1_000 from setup: approval stamps exactly that moment.
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+
+    // Execution is refused well inside the 100s window.
+    h.env.ledger().set_timestamp(1_050);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // approved_at survives execution, recorded in the executed state too.
+    h.env.ledger().set_timestamp(1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+}
+
+#[test]
+fn execute_within_timelock_window_is_refused() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // One second before the delay elapses the proposal is still locked.
+    h.env.ledger().set_timestamp(1_099);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Exactly at release time execution is allowed (gate is `< release_at`).
+    h.env.ledger().set_timestamp(1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execute_after_timelock_window_succeeds() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // Long past the window, execution proceeds normally and emits "executed".
+    h.env.ledger().set_timestamp(5_000);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+
+    // Close still works from the executed state (timelock is behind us).
+    h.client.close(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Closed);
+}
+
+#[test]
+fn zero_timelock_allows_immediate_execution() {
+    let h = setup(3); // timelock 0 — the historical behaviour.
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn timelock_only_gates_execution_not_state_transitions() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // The timelock does not affect dependency queries or the completion view.
+    assert!(h.client.dependencies_met(&id));
+    assert!(!h.client.is_executed(&id));
+
+    // Marking the proposal failed inside the window is still permitted.
+    h.env.ledger().set_timestamp(1_050);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+    assert!(!h.client.is_executed(&id));
 }
