@@ -543,6 +543,31 @@ fn set_threshold_overwrites_pending_change() {
 }
 
 #[test]
+fn finalize_threshold_revalidates_against_live_state() {
+    // Set up three signers with weights 1,1,1 and threshold 2.
+    let h = setup(&[1, 1, 1], 2);
+    // Propose a pending threshold of 3 (requires total weight 3).
+    h.env.ledger().set_sequence_number(100);
+    h.client.set_threshold(&h.signers[0], &3);
+
+    // Now remove one signer via the timelocked governance flow so total weight
+    // drops to 2 before finalization.
+    let remove = h.client.propose_signer_removal(&h.signers[0], &h.signers[2]);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &remove);
+
+    // Attempt to finalize the pending threshold change: should re-validate and
+    // fail because total active weight (2) < pending threshold (3).
+    h.env
+        .ledger()
+        .set_sequence_number(100 + THRESHOLD_CHANGE_DELAY_LEDGERS);
+    let res = h.client.try_finalize_threshold(&h.signers[0]);
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    // Ensure threshold remains unchanged.
+    assert_eq!(h.client.get_threshold(), 2);
+}
+
+#[test]
 fn non_signer_cannot_set_or_finalize_threshold() {
     let h = setup(&[1, 1, 1], 2);
     let stranger = Address::generate(&h.env);

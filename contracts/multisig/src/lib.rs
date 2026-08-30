@@ -326,6 +326,13 @@ impl MultiSigContract {
             return Err(Error::TimelockNotExpired);
         }
 
+        // Re-validate against the live signer set: signers may have changed
+        // since the pending change was created and could make the new
+        // threshold unsatisfiable. This mirrors the re-validation done for
+        // timelocked GovernanceChange execution.
+        let signers = Self::signers(&env)?;
+        Self::validate_threshold(pending.new_threshold, Self::total_weight(&signers)?)?;
+
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &pending.new_threshold);
