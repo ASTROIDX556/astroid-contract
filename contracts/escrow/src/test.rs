@@ -150,7 +150,7 @@ fn full_cycle_create_release() {
     assert_eq!(balance(&h, &h.asset_b, &h.client.address), 5_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
 
-    h.client.release(&h.arbiter, &id);
+    h.client.release(&h.arbiter, &id, &10_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
     assert_eq!(balance(&h, &h.asset_b, &h.recipient), 5_000);
@@ -167,7 +167,7 @@ fn non_arbiter_cannot_release() {
     let id = create(&h, &one_asset(&h, 5_000), START + 100);
     let intruder = Address::generate(&h.env);
 
-    let res = h.client.try_release(&intruder, &id);
+    let res = h.client.try_release(&intruder, &id, &5_000);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
@@ -179,7 +179,7 @@ fn release_after_deadline_is_refused() {
     let id = create(&h, &one_asset(&h, 5_000), START + 100);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    let res = h.client.try_release(&h.arbiter, &id);
+    let res = h.client.try_release(&h.arbiter, &id, &5_000);
     assert_eq!(res, Err(Ok(Error::EscrowExpired)));
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
