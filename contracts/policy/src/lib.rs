@@ -233,8 +233,11 @@ impl PolicyContract {
     /// enabled and the asset is not present.
     pub fn validate_asset(env: Env, policy_id: String, asset: Address) -> Result<(), Error> {
         let enabled_key = DataKey::AssetWhitelistEnabled(policy_id.clone());
-        let whitelist_enabled: bool =
-            env.storage().persistent().get(&enabled_key).unwrap_or(false);
+        let whitelist_enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&enabled_key)
+            .unwrap_or(false);
         if !whitelist_enabled {
             return Ok(());
         }
