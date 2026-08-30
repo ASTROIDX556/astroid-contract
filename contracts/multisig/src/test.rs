@@ -273,9 +273,10 @@ fn advance(h: &Harness, seconds: u64) {
 fn assert_event(env: &Env, category: Symbol, action: Symbol) {
     let want_category: Val = category.into_val(env);
     let want_action: Val = action.into_val(env);
-    let found = env.events().all().iter().any(|(_id, topics, _data)| {
-        topics.contains(&want_category) && topics.contains(&want_action)
-    });
+    let found =
+        env.events().all().iter().any(|(_id, topics, _data)| {
+            topics.contains(want_category) && topics.contains(want_action)
+        });
     assert!(found, "expected a matching event to be emitted");
 }
 
@@ -560,7 +561,7 @@ fn non_signer_cannot_set_or_finalize_threshold() {
 fn non_signer_cannot_change_config() {
     let h = setup(&[1, 1, 1], 2);
     let stranger = Address::generate(&h.env);
-    let extra = Address::generate(&h.env);
+    let _extra = Address::generate(&h.env);
     assert_eq!(
         h.client.try_set_threshold(&stranger, &3),
         Err(Ok(Error::NotASigner))
@@ -570,8 +571,7 @@ fn non_signer_cannot_change_config() {
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
-        h.client
-            .try_execute_threshold_change(&stranger, &1),
+        h.client.try_execute_threshold_change(&stranger, &1),
         Err(Ok(Error::UnauthorizedModification))
     );
 }

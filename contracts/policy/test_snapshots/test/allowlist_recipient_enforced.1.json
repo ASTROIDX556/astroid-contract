@@ -246,6 +246,22 @@
                     },
                     {
                       "key": {
+                        "symbol": "time_window_end"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "time_window_start"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "whitelist_enabled"
                       },
                       "val": {

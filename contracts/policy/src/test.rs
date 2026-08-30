@@ -103,14 +103,16 @@ fn allowlist_recipient_enforced() {
 fn register<'a>(env: &'a Env, owner: &Address, policy_id: &str) -> PolicyContractClient<'a> {
     let id = env.register_contract(None, PolicyContract);
     let client = PolicyContractClient::new(env, &id);
-    client.initialize();
+    client.initialize(owner);
     client.register_policy(
         owner,
         &String::from_str(env, policy_id),
         &BytesN::from_array(env, &[9; 32]),
         &0,
         &None,
-        &None,
+        &soroban_sdk::vec![env],
+        &0,
+        &0,
         &0,
     );
     client

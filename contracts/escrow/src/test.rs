@@ -258,8 +258,8 @@ fn cannot_close_while_expired() {
 
 #[test]
 fn cancel_after_deadline_claws_back_to_depositor() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     // Premature cancellation is refused with the dedicated error.
     let early = h.client.try_cancel(&h.sender, &id);
@@ -270,8 +270,8 @@ fn cancel_after_deadline_claws_back_to_depositor() {
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.cancel(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
 
     // The cancelled escrow can be closed, and cannot be refunded again.
     h.client.close(&h.sender, &id);
@@ -280,42 +280,42 @@ fn cancel_after_deadline_claws_back_to_depositor() {
 
 #[test]
 fn cancel_after_release_is_refused_already_settled() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    h.client.release(&h.arbiter, &id);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+    h.client.release(&h.arbiter, &id, &5_000);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_cancel(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::EscrowAlreadySettled)));
     // The recipient keeps the released funds; nothing was clawed back.
-    assert_eq!(balance(&h, &h.recipient), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
 }
 
 #[test]
 fn only_depositor_can_cancel() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
 
     let intruder = Address::generate(&h.env);
     let res = h.client.try_cancel(&intruder, &id);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    assert_eq!(balance(&h, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
 #[test]
 fn cancel_on_expired_escrow_returns_funds() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.expire(&id);
     assert_eq!(h.client.get(&id).state, EscrowState::Expired);
 
     h.client.cancel(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
 }
 
 #[test]
@@ -1074,35 +1074,48 @@ fn refund_returns_funds_after_grace() {
 }
 
 #[test]
-fn cancel_by_sender_before_deadline_returns_funds() {
+fn cancel_refused_before_deadline() {
     let h = setup(5_000, 0);
     let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
 
+    // Cancelling before the deadline would break the arbiter's release path.
+    let res = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::EscrowNotExpired)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn only_sender_may_cancel() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 200 + GRACE);
+    let res = h.client.try_cancel(&h.arbiter, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn cancel_after_grace_returns_funds() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    // During the grace window the counterparty may still fulfill.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 150);
+    let early = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(early, Err(Ok(Error::GraceActive)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+
+    // Once the grace window has fully elapsed the sender claws the funds back.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 200 + GRACE);
     h.client.cancel(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(h.client.get(&id).state, EscrowState::Cancelled);
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-}
-
-#[test]
-fn arbiter_may_also_cancel_before_deadline() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
-
-    h.client.cancel(&h.arbiter, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
-}
-
-#[test]
-fn cancel_rejected_after_deadline() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 150);
-    let res = h.client.try_cancel(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
 #[test]
