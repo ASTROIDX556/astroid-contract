@@ -719,13 +719,35 @@ impl TreasuryContract {
                 budget_id: None,
             })
     }
-
     fn store_holding(env: &Env, asset: &Address, h: &Holding) {
         env.storage()
             .persistent()
             .set(&DataKey::Holding(asset.clone()), h);
         env.storage().persistent().extend_ttl(
             &DataKey::Holding(asset.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn load_allowance(env: &Env, agent: &Address, asset: &Address) -> Allowance {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(agent.clone(), asset.clone()))
+            .unwrap_or(Allowance {
+                agent: agent.clone(),
+                asset: asset.clone(),
+                limit: 0,
+                consumed: 0,
+            })
+    }
+
+    fn store_allowance(env: &Env, agent: &Address, asset: &Address, a: &Allowance) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(agent.clone(), asset.clone()), a);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(agent.clone(), asset.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
