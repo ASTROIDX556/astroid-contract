@@ -31,8 +31,8 @@
 //! resuming operations requires a threshold of signers.
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
-//! `emergency_unpause`, `set_guardian`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `batch_execute`,
+//! `emergency_pause`, `emergency_unpause`, `set_guardian`.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
 //! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
@@ -61,13 +61,13 @@ use crate::access::Role;
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
-use astroid_shared::math::{checked_add, checked_mul, checked_sub};
+use astroid_shared::math::{checked_mul, checked_sub};
 use astroid_shared::math::{SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Val,
 };
 
 pub mod access;
@@ -101,7 +101,7 @@ enum DataKey {
 pub struct ContractCall {
     pub contract_addr: Address,
     pub fn_name: Symbol,
-    pub args: soroban_sdk::Vec<soroban_sdk::RawVal>,
+    pub args: soroban_sdk::Vec<soroban_sdk::Val>,
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -359,6 +359,55 @@ impl WalletContract {
         Ok(())
     }
 
+    /// Execute a batch of sub-calls atomically. If any sub-call returns an
+    /// error the Soroban runtime rolls back all state changes made during the
+    /// entire batch, guaranteeing atomicity. The `caller` is the executing
+    /// agent ([`Role::Agent`] is sufficient, matching `transfer`), and the
+    /// contract-wide circuit breaker must be reset.
+    pub fn batch_execute(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        calls: soroban_sdk::Vec<ContractCall>,
+    ) -> Result<(), Error> {
+        Self::when_not_paused(&env)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
+        Self::require_active(&wallet)?;
+
+        if calls.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        if calls.len() > constants::MAX_BATCH_CALLS {
+            return Err(Error::InvalidInput);
+        }
+
+        let n = calls.len();
+        for call in calls.into_iter() {
+            Self::execute_call(&env, &call)?;
+        }
+
+        events::wallet_batch_executed(&env, wallet_id, n);
+        Ok(())
+    }
+
+    /// Invoke a single batch call so a callee failure surfaces as its own
+    /// contract error, reverting the whole batch atomically; system-level
+    /// failures are reported as [`Error::BatchCallFailed`].
+    fn execute_call(env: &Env, call: &ContractCall) -> Result<(), Error> {
+        match env.try_invoke_contract::<Val, Error>(
+            &call.contract_addr,
+            &call.fn_name,
+            call.args.clone(),
+        ) {
+            Ok(_) => Ok(()),
+            // A raw `Val` always decodes, so this arm is unreachable in
+            // practice; kept for exhaustiveness.
+            Err(Ok(e)) => Err(e),
+            // System-level failure (panic / abort / unknown error code).
+            Err(Err(_)) => Err(Error::BatchCallFailed),
+        }
+    }
+
     /// Set the minimum collateral reserve ratio for a wallet/asset pair (owner
     /// only). `ratio_bps` is in basis points (0..=10000); 0 disables the check.
     /// Once set, every outbound transfer/withdrawal must leave at least
@@ -371,7 +420,7 @@ impl WalletContract {
         asset: Address,
         ratio_bps: u32,
     ) -> Result<(), Error> {
-        Self::require_owner(&env, wallet_id, &caller)?;
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         if ratio_bps > MAX_RESERVE_RATIO_BPS {
             return Err(Error::InvalidInput);
         }
@@ -499,6 +548,8 @@ impl WalletContract {
             .persistent()
             .get(&DataKey::MinReserve(wallet_id, asset))
             .unwrap_or(0)
+    }
+
     /// Whether the contract-wide circuit breaker is currently tripped.
     pub fn is_paused(env: Env) -> bool {
         Self::paused(&env)
