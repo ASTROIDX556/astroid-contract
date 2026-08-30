@@ -20,62 +20,62 @@ pub enum Error {
     AlreadyInitialized = 6,
 
     // --- Value / arithmetic (10-19) ---
-    InsufficientFunds = 10,
-    Overflow = 11,
-    Underflow = 12,
-    InvalidAmount = 13,
+    InsufficientFunds = 7,
+    Overflow = 8,
+    Underflow = 9,
+    InvalidAmount = 10,
 
     // --- Policy (20-29) ---
-    PolicyDenied = 20,
-    PolicyHashMismatch = 21,
-    EmergencyLock = 22,
-    PolicyRecipientRestricted = 23,
-    PolicyMerchantBlocked = 24,
-    PolicyCategoryRestricted = 25,
+    PolicyDenied = 11,
+    PolicyHashMismatch = 12,
+    EmergencyLock = 13,
+    PolicyRecipientRestricted = 14,
+    PolicyMerchantBlocked = 15,
+    PolicyCategoryRestricted = 16,
     /// The asset is not in the organization's whitelist.
-    AssetNotWhitelisted = 26,
+    AssetNotWhitelisted = 17,
+    FeeLimitExceeded = 18,
 
     // --- Registry (30-39) ---
-    RegistryFrozen = 30,
+    RegistryFrozen = 19,
 
     // --- Budget (40-49) ---
-    BudgetExceeded = 40,
-    BudgetFrozen = 41,
-    BudgetArchived = 42,
-    AssetNotAuthorized = 43,
-    BudgetExpired = 44,
+    BudgetExceeded = 20,
+    BudgetFrozen = 21,
+    BudgetArchived = 22,
+    AssetNotAuthorized = 23,
+    BudgetExpired = 24,
 
     // --- Wallet (50-59) ---
-    WalletFrozen = 50,
-    WalletArchived = 51,
-    WalletPaused = 52,
-    InvalidState = 53,
+    WalletFrozen = 25,
+    WalletArchived = 26,
+    WalletPaused = 27,
+    InvalidState = 28,
 
     // --- Multisig / approvals (60-69) ---
-    InvalidSignature = 60,
-    ThresholdNotMet = 61,
-    AlreadySigned = 62,
-    NotASigner = 63,
-    InvalidThreshold = 64,
-    TimeLocked = 65,
-    TooManySigners = 66,
+    ThresholdNotMet = 29,
+    AlreadySigned = 30,
+    NotASigner = 31,
+    InvalidThreshold = 32,
+    TimeLocked = 33,
+    TooManySigners = 34,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
-    BatchCallFailed = 67,
+    BatchCallFailed = 35,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
-    InvalidNonce = 68,
+    InvalidNonce = 36,
     /// A signer with zero (or otherwise invalid) voting weight was supplied.
-    InvalidSignerWeight = 69,
+    InvalidSignerWeight = 37,
     /// Accumulated approval weight is below the configured threshold.
-    InsufficientWeight = 90,
+    InsufficientWeight = 38,
 
     // --- Proposal (70-79) ---
-    ProposalExpired = 70,
-    InvalidProposalState = 71,
-    ProposalNotApproved = 72,
-    NotAnApprover = 73,
-    CancellationWindowClosed = 74,
-    MathOverflow = 75,
-    DivisionByZero = 76,
+    ProposalExpired = 39,
+    InvalidProposalState = 40,
+    ProposalNotApproved = 41,
+    NotAnApprover = 42,
+    CancellationWindowClosed = 43,
+    MathOverflow = 44,
+    DivisionByZero = 45,
 
     // --- Escrow (80-89) ---
     ConditionNotMet = 80,
@@ -87,4 +87,6 @@ pub enum Error {
     RefundWindowNotOpen = 85,
     /// A refund was attempted after the escrow's refund window closed.
     RefundWindowClosed = 86,
+    EscrowExpired = 46,
+    TimeLockActive = 47,
 }
