@@ -38,6 +38,8 @@ pub enum Error {
 
     // --- Registry (30-39) ---
     RegistryFrozen = 19,
+    /// The module is deprecated: it stays readable but no longer routes.
+    ModuleDeprecated = 50,
 
     // --- Budget (40-49) ---
     BudgetExceeded = 20,
