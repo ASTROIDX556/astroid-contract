@@ -228,6 +228,14 @@
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "whitelist_enabled"
+                      },
+                      "val": {
+                        "bool": false
+                      }
                     }
                   ]
                 }
