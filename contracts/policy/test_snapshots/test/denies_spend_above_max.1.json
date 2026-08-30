@@ -241,18 +241,10 @@
                     },
                     {
                       "key": {
-                        "symbol": "time_window_end"
+                        "symbol": "whitelist_enabled"
                       },
                       "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "time_window_start"
-                      },
-                      "val": {
-                        "u64": 0
+                        "bool": false
                       }
                     }
                   ]

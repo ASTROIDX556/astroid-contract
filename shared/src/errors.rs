@@ -31,6 +31,7 @@ pub enum Error {
     PolicyMerchantBlocked = 23,
     PolicyCategoryRestricted = 24,
     AssetNotWhitelisted = 25,
+    PolicyPaused = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -43,11 +44,17 @@ pub enum Error {
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
 
+    // --- Wallet (50-59) ---
     // --- Wallet (50-53) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    ReserveViolation = 54,
+    WalletFrozen = 25,
+    WalletArchived = 26,
+    WalletPaused = 27,
+    InvalidState = 28,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
@@ -81,6 +88,17 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
+    // --- Escrow (80-89) ---
+    ConditionNotMet = 80,
+    EscrowNotFunded = 81,
+    EscrowExpired = 82,
+    InvalidCondition = 83,
+    TimeLockActive = 84,
+    EscrowNotExpired = 85,
+    EscrowAlreadySettled = 86,
+    EscrowExpired = 46,
+    TimeLockActive = 47,
+    // --- Escrow (80-81) ---
     // --- Escrow (80-82) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
@@ -89,5 +107,4 @@ pub enum Error {
     // --- Treasury allowances (83-85) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
-    AllowanceNotFound = 85,
 }
