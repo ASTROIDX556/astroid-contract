@@ -16,6 +16,10 @@ jobs:
         with:
           targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
+      # Install the stellar-cli 28.0.0 prebuilt binary instead of compiling
+      # from source: a from-source `cargo install` takes ~10 minutes and OOMs
+      # on the 2-core/7 GB GitHub runner. The release asset is checksum-pinned.
+      # 28.x builds protocol-21 contracts out of the box.
       - name: Install Stellar CLI
         run: cargo install --locked stellar-cli --no-default-features
       - name: Build contracts
