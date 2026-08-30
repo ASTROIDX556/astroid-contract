@@ -33,3 +33,11 @@ pub const MAX_DEPENDENCIES: u32 = 8;
 
 /// Upper bound on how many discrete calls a single batch may contain (gas safety).
 pub const MAX_BATCH_CALLS: u32 = 16;
+
+/// Upper bound on how many recipients a single batch payment may pay out to.
+/// Batches are executed atomically, so this caps the worst-case cost of one
+/// invocation (and therefore the cost of the revert when a leg fails).
+pub const MAX_BATCH_PAYMENTS: u32 = 32;
+
+/// Upper bound on how many distinct assets a single escrow agreement may hold.
+pub const MAX_ESCROW_ASSETS: u32 = 10;
