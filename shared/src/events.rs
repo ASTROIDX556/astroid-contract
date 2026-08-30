@@ -20,8 +20,8 @@
 //! The two layers are emitted together on key state transitions so neither
 //! existing nor new consumers break.
 
-use crate::types::ModuleKind;
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
+use crate::types::{AssetAmount, ModuleKind};
+use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -64,6 +64,10 @@ pub enum ContractEvent {
     },
     /// A treasury configuration field was updated (`action` is e.g. `policy`).
     TreasuryConfigUpdated { org: String, action: Symbol },
+    /// A treasury was frozen by the multisig.
+    TreasuryFrozen { org: String },
+    /// A treasury was unfrozen by the multisig.
+    TreasuryUnfrozen { org: String },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -72,6 +76,13 @@ pub enum ContractEvent {
     },
     /// A policy rejected a transfer.
     PolicyViolation { policy_id: String, reason: Symbol },
+    /// An escrow's held assets were released to its recipient, whether via the
+    /// standard arbiter path or a signature-based manual override.
+    EscrowReleased {
+        escrow_id: u64,
+        recipient: Address,
+        assets: Vec<AssetAmount>,
+    },
 }
 
 /// Publish a [`ContractEvent`] using the canonical schema.
@@ -144,6 +155,24 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::PolicyViolation { policy_id, reason } => {
             env.events()
                 .publish((Symbol::new(env, "PolicyViolation"),), (policy_id, reason));
+        }
+        ContractEvent::TreasuryFrozen { org } => {
+            env.events()
+                .publish((Symbol::new(env, "TreasuryFrozen"),), org);
+        }
+        ContractEvent::TreasuryUnfrozen { org } => {
+            env.events()
+                .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
+        }
+        ContractEvent::EscrowReleased {
+            escrow_id,
+            recipient,
+            assets,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "EscrowReleased"),),
+                (escrow_id, recipient, assets),
+            );
         }
     }
 }
