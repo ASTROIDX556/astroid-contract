@@ -80,6 +80,5 @@ fn constants_are_sane() {
     };
     const _: () = {
         assert!(MAX_SIGNERS >= 1);
-
     };
 }
