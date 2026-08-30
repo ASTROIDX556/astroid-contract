@@ -176,16 +176,11 @@ fn register_module_rejects_zero_address() {
     client.register_org(&admin, &org, &owner);
 
     // Construct a zero address via xdr (all 32 bytes zero)
-    let zero_sc = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
-        Uint256([0u8; 32]),
-    )));
+    let zero_sc = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        [0u8; 32],
+    ))));
     let zero_addr = Address::try_from_val(&env, &zero_sc).unwrap();
-    let res = client.try_register_module(
-        &owner,
-        &org,
-        &ModuleKind::Wallet,
-        &zero_addr,
-    );
+    let res = client.try_register_module(&owner, &org, &ModuleKind::Wallet, &zero_addr);
     assert_eq!(res, Err(Ok(Error::InvalidModuleAddress)));
 }
 
@@ -205,16 +200,11 @@ fn register_module_accepts_valid_address() {
 fn register_version_rejects_zero_address() {
     let (env, client, admin) = setup();
     // Construct a zero address via xdr (all 32 bytes zero)
-    let zero_sc = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
-        Uint256([0u8; 32]),
-    )));
+    let zero_sc = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        [0u8; 32],
+    ))));
     let zero_addr = Address::try_from_val(&env, &zero_sc).unwrap();
-    let res = client.try_register_version(
-        &admin,
-        &ModuleKind::Wallet,
-        &1,
-        &zero_addr,
-    );
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &zero_addr);
     assert_eq!(res, Err(Ok(Error::InvalidModuleAddress)));
 }
 
