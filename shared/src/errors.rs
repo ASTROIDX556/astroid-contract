@@ -31,7 +31,6 @@ pub enum Error {
     PolicyMerchantBlocked = 23,
     PolicyCategoryRestricted = 24,
     AssetNotWhitelisted = 25,
-    PolicyPaused = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -82,9 +81,10 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-81) ---
+    // --- Escrow (80-82) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
+    GraceActive = 82,
 
     // --- Treasury allowances (83-85) ---
     AllowanceExceeded = 83,

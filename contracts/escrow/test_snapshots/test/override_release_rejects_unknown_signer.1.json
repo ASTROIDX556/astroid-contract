@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 9,
+    "address": 8,
     "nonce": 0
   },
   "auth": [
@@ -114,19 +114,23 @@
                   ]
                 },
                 {
-                  "u64": 1100
+                  "u64": 2000
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "string": "payment"
+                  "string": "override"
                 },
                 {
-                  "vec": []
+                  "vec": [
+                    {
+                      "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                    }
+                  ]
                 },
                 {
-                  "u32": 0
+                  "u32": 1
                 }
               ]
             }
@@ -159,7 +163,6 @@
         }
       ]
     ],
-    [],
     [],
     []
   ],
@@ -377,7 +380,7 @@
                         "symbol": "deadline"
                       },
                       "val": {
-                        "u64": 1100
+                        "u64": 2000
                       }
                     },
                     {
@@ -404,7 +407,7 @@
                         "symbol": "memo"
                       },
                       "val": {
-                        "string": "payment"
+                        "string": "override"
                       }
                     },
                     {
@@ -420,7 +423,11 @@
                         "symbol": "override_signers"
                       },
                       "val": {
-                        "vec": []
+                        "vec": [
+                          {
+                            "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                          }
+                        ]
                       }
                     },
                     {
@@ -428,7 +435,7 @@
                         "symbol": "override_threshold"
                       },
                       "val": {
-                        "u32": 0
+                        "u32": 1
                       }
                     },
                     {
@@ -1452,19 +1459,23 @@
                   ]
                 },
                 {
-                  "u64": 1100
+                  "u64": 2000
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "string": "payment"
+                  "string": "override"
                 },
                 {
-                  "vec": []
+                  "vec": [
+                    {
+                      "bytes": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+                    }
+                  ]
                 },
                 {
-                  "u32": 0
+                  "u32": 1
                 }
               ]
             }
@@ -1663,22 +1674,40 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "release"
+                "symbol": "override_release"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
+                  "u64": 1
                 },
                 {
                   "u64": 1
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 5000
-                  }
+                  "vec": [
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "public_key"
+                          },
+                          "val": {
+                            "bytes": "a7f6dfaf8f38b89ba8ce649b594f91e4d01fdc57f9c9493df43b5e50a9987367"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "signature"
+                          },
+                          "val": {
+                            "bytes": "0490ebd2ed025a2959bb7f69a4542a66220219886f28fdc93dd3e245cb0f8be37f7ce2df579ba0bf01ac7b32050645894dad7cca0117f79766ddb91795f3250b"
+                          }
+                        }
+                      ]
+                    }
+                  ]
                 }
               ]
             }
@@ -1699,12 +1728,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "release"
+                "symbol": "override_release"
               }
             ],
             "data": {
               "error": {
-                "contract": 3
+                "contract": 63
               }
             }
           }
@@ -1725,7 +1754,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 63
                 }
               }
             ],
@@ -1750,7 +1779,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 63
                 }
               }
             ],
@@ -1760,129 +1789,43 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "release"
+                  "symbol": "override_release"
                 },
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
+                      "u64": 1
                     },
                     {
                       "u64": 1
                     },
                     {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 5000
-                      }
+                      "vec": [
+                        {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "public_key"
+                              },
+                              "val": {
+                                "bytes": "a7f6dfaf8f38b89ba8ce649b594f91e4d01fdc57f9c9493df43b5e50a9987367"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "signature"
+                              },
+                              "val": {
+                                "bytes": "0490ebd2ed025a2959bb7f69a4542a66220219886f28fdc93dd3e245cb0f8be37f7ce2df579ba0bf01ac7b32050645894dad7cca0117f79766ddb91795f3250b"
+                              }
+                            }
+                          ]
+                        }
+                      ]
                     }
                   ]
                 }
               ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 5000
-              }
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "692c360a04a982db02db346a106cbf008ad9e058c384bdaaf77bc0c48799b3a4",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 0
-              }
             }
           }
         }
