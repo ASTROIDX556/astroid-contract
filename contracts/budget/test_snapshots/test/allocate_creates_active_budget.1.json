@@ -28,6 +28,12 @@
                 },
                 {
                   "u32": 0
+                },
+                {
+                  "bool": false
+                },
+                {
+                  "u64": 0
                 }
               ]
             }
@@ -88,6 +94,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "expires_at"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "limit"
                       },
                       "val": {
@@ -111,6 +125,25 @@
                       },
                       "val": {
                         "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "rollover_credit"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "rollover_enabled"
+                      },
+                      "val": {
+                        "bool": false
                       }
                     },
                     {
@@ -332,6 +365,12 @@
                 },
                 {
                   "u32": 0
+                },
+                {
+                  "bool": false
+                },
+                {
+                  "u64": 0
                 }
               ]
             }
@@ -442,6 +481,14 @@
               "map": [
                 {
                   "key": {
+                    "symbol": "expires_at"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "limit"
                   },
                   "val": {
@@ -465,6 +512,25 @@
                   },
                   "val": {
                     "u32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "rollover_credit"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "rollover_enabled"
+                  },
+                  "val": {
+                    "bool": false
                   }
                 },
                 {
