@@ -45,7 +45,9 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -66,6 +68,8 @@ enum DataKey {
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+    /// Approved WASM hashes: (kind, hash) -> bool.
+    ApprovedWasm(ModuleKind, BytesN<32>),
 }
 
 /// A delegated administrative role over one organization's registry records.
@@ -467,6 +471,50 @@ impl RegistryContract {
         env.events()
             .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
         Ok(())
+    }
+
+    /// Record an approved WASM hash for a specific module kind.
+    pub fn add_approved_wasm(
+        env: Env,
+        caller: Address,
+        kind: ModuleKind,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
+        env.storage().persistent().set(&key, &true);
+        Self::bump(&env, &key);
+        env.events().publish(
+            (symbol_short!("wasm"), symbol_short!("approved")),
+            (kind, wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Remove/deprecate a previously approved WASM hash.
+    pub fn remove_approved_wasm(
+        env: Env,
+        caller: Address,
+        kind: ModuleKind,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("wasm"), symbol_short!("removed")),
+            (kind, wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Read-only check to see if a WASM hash is approved for a given kind.
+    pub fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool {
+        let key = DataKey::ApprovedWasm(kind, wasm_hash);
+        env.storage().persistent().get(&key).unwrap_or(false)
     }
 
     // --- internal helpers ---
