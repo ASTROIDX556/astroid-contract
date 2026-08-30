@@ -139,7 +139,7 @@ impl RegistryContract {
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
         caller.require_auth();
-        Self::require_valid_module_address(&address)?;
+        Self::require_valid_module_address(&env, &address)?;
         Self::require_admin_or_org_owner(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
@@ -202,7 +202,7 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
-        Self::require_valid_module_address(&address)?;
+        Self::require_valid_module_address(&env, &address)?;
         if version == 0 {
             return Err(Error::InvalidInput);
         }
@@ -340,8 +340,9 @@ impl RegistryContract {
     /// Reject a zero-address (all bytes zero). On-chain, a zero address means
     /// no contract is deployed at that location, so registering it would cause
     /// every downstream cross-contract call to fail silently or panic.
-    fn require_valid_module_address(address: &Address) -> Result<(), Error> {
-        let sc_addr: ScAddress = address.clone().into();
+    fn require_valid_module_address(_env: &Env, address: &Address) -> Result<(), Error> {
+        // Use the reference-based From impl which works on both native and wasm targets.
+        let sc_addr: ScAddress = address.into();
         let is_zero = match sc_addr {
             ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) => {
                 bytes == [0u8; 32]
