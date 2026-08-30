@@ -34,8 +34,9 @@ pub enum Error {
     PolicyPaused = 26,
     PauseDurationExceeded = 27,
 
-    // --- Registry (30) ---
+    // --- Registry (30-39) ---
     RegistryFrozen = 30,
+    ModuleDeprecated = 31,
 
     // --- Budget (40-44) ---
     BudgetExceeded = 40,
@@ -50,8 +51,7 @@ pub enum Error {
     WalletPaused = 52,
     InvalidState = 53,
 
-    // --- Multisig / approvals (60-69) ---
-    InvalidSignature = 60,
+    // --- Multisig / approvals (61-69) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
