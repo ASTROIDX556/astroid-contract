@@ -31,6 +31,7 @@ pub enum Error {
     PolicyMerchantBlocked = 23,
     PolicyCategoryRestricted = 24,
     AssetNotWhitelisted = 25,
+    PolicyPaused = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -106,5 +107,4 @@ pub enum Error {
     // --- Treasury allowances (83-85) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
-    AllowanceNotFound = 85,
 }
