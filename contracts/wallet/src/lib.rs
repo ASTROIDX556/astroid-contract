@@ -46,6 +46,7 @@ use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 
 use crate::access::Role;
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
+use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::{ModuleKind, ResourceState};
@@ -138,9 +139,10 @@ impl WalletContract {
         from.require_auth();
         let wallet = Self::load_wallet(&env, wallet_id)?;
         // Deposits are refused into archived wallets; other states may receive.
-        if wallet.state == ResourceState::Archived {
-            return Err(Error::WalletArchived);
-        }
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
         // Move real tokens into the contract's custody, then credit internally.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -216,6 +218,7 @@ impl WalletContract {
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
+
         wallet.state = ResourceState::Frozen;
         Self::store_wallet(&env, wallet_id, &wallet);
         events::wallet_frozen(&env, wallet_id, &caller);
@@ -235,6 +238,7 @@ impl WalletContract {
         if wallet.state != ResourceState::Frozen {
             return Err(Error::InvalidState);
         }
+
         wallet.state = ResourceState::Active;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("unfrozen"));
@@ -247,6 +251,7 @@ impl WalletContract {
         if wallet.state != ResourceState::Active {
             return Err(Error::InvalidState);
         }
+
         wallet.state = ResourceState::Paused;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("paused"));
@@ -259,6 +264,7 @@ impl WalletContract {
         if wallet.state != ResourceState::Paused {
             return Err(Error::InvalidState);
         }
+
         wallet.state = ResourceState::Active;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("unpaused"));
@@ -272,6 +278,7 @@ impl WalletContract {
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
+
         wallet.state = ResourceState::Archived;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("archived"));
@@ -425,6 +432,7 @@ impl WalletContract {
         caller.require_auth();
         let wallet = Self::load_wallet(env, id)?;
         access::require_role(env, id, &wallet.owner, caller, required)?;
+
         Ok(wallet)
     }
 
@@ -443,16 +451,18 @@ impl WalletContract {
             return Ok(wallet);
         }
         access::require_role(env, id, &wallet.owner, caller, required)?;
+
         Ok(wallet)
     }
 
     fn require_active(wallet: &WalletData) -> Result<(), Error> {
-        match wallet.state {
-            ResourceState::Active => Ok(()),
-            ResourceState::Frozen => Err(Error::WalletFrozen),
-            ResourceState::Paused => Err(Error::WalletPaused),
-            ResourceState::Archived => Err(Error::WalletArchived),
-        }
+        ensure!(wallet.state != ResourceState::Frozen, Error::WalletFrozen);
+        ensure!(wallet.state != ResourceState::Paused, Error::WalletPaused);
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
+        Ok(())
     }
 
     fn credit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
@@ -475,6 +485,7 @@ impl WalletContract {
             return Err(Error::InsufficientFunds);
         }
         let updated = current.safe_sub(amount)?;
+
         env.storage().persistent().set(&key, &updated);
         env.storage().persistent().extend_ttl(
             &key,

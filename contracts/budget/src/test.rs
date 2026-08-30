@@ -444,6 +444,35 @@ fn upgrade_is_gated_by_the_configured_authority() {
         client.try_set_upgrade_authority(&stranger, &stranger, &registry),
         Err(Ok(astroid_shared::errors::Error::Unauthorized))
     );
+#[test]
+fn test_rollover_prevention() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = Address::generate(&env);
+    let contract_id = env.register_contract(None, BudgetContract);
+    let client = BudgetContractClient::new(&env, &contract_id);
+
+    let token = Address::generate(&env);
+    let b_id = soroban_sdk::String::from_str(&env, "b1");
+
+    client.allocate(&owner, &b_id, &1000, &crate::Period::None, &false, &0);
+    client.set_budget_limit(&owner, &b_id, &token, &100, &3600); // 1 hour window
+
+    env.ledger().set_timestamp(100);
+    client.check_and_record_spend(&owner, &b_id, &token, &60);
+
+    // if they spend 50 more in same window, it should fail
+    let res = client.try_check_and_record_spend(&owner, &b_id, &token, &50);
+    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+
+    // fast forward 1 hour (3600 seconds)
+    env.ledger().set_timestamp(100 + 3600 + 1);
+
+    // Now it should succeed because window resets!
+    client.check_and_record_spend(&owner, &b_id, &token, &50);
+}
+
 // --- Issue #35: Deficit carryforward tests ---
 
 #[test]

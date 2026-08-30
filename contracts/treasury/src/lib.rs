@@ -32,6 +32,9 @@
 //! [`astroid_interfaces::upgrade`]; anything else is refused with
 //! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
 //! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`, `holding`.
+//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
+//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`,
+//! `holding`.
 
 use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 use astroid_interfaces::PolicyClient;
@@ -58,6 +61,8 @@ use soroban_sdk::{
 pub struct Treasury {
     pub org: String,
     pub admin: Address,
+    /// Organization's multisig contract — authorized for emergency freeze/unfreeze.
+    pub multisig: Option<Address>,
     /// Organization's Policy contract — consulted on every spend.
     pub policy: Option<Address>,
     /// Organization's Budget contract root.
@@ -67,6 +72,18 @@ pub struct Treasury {
 }
 
 /// Per-asset accounting within the treasury.
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneDisbursement {
+    pub total_amount: i128,
+    pub milestones: u32,
+    pub disbursed: u32,
+    pub amount_per_milestone: i128,
+    pub asset: Address,
+    pub to: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holding {
@@ -82,6 +99,10 @@ pub struct Holding {
 enum DataKey {
     Treasury,
     Holding(Address),
+    /// Emergency circuit breaker freeze flag (persistent).
+    Frozen,
+    Milestone(u64),
+    MilestoneCount,
 }
 
 #[contract]
@@ -100,6 +121,7 @@ impl TreasuryContract {
             &Treasury {
                 org: org.clone(),
                 admin: admin.clone(),
+                multisig: None,
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
@@ -146,37 +168,55 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Freeze the treasury; all outflows are rejected while frozen.
-    pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
+    /// Wire the multisig contract authorized for emergency freeze/unfreeze.
+    pub fn set_multisig(env: Env, caller: Address, multisig: Address) -> Result<(), Error> {
         let mut t = Self::require_admin(&env, &caller)?;
-        t.state = ResourceState::Frozen;
+        t.multisig = Some(multisig);
         Self::store(&env, &t);
         events::publish(
             &env,
             events::ContractEvent::TreasuryConfigUpdated {
                 org: t.org.clone(),
-                action: symbol_short!("frozen"),
+                action: symbol_short!("multisig"),
             },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("multisig")), ());
+        Ok(())
+    }
+
+    /// Emergency freeze — only the registry-verified multisig can freeze.
+    /// Sets a dedicated frozen flag in persistent storage that blocks all outbound transfers.
+    pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
+        let t = Self::require_multisig(&env, &caller)?;
+        env.storage().persistent().set(&DataKey::Frozen, &true);
+        Self::bump_frozen(&env);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryFrozen { org: t.org.clone() },
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("frozen")), ());
         Ok(())
     }
 
-    /// Unfreeze back to active.
+    /// Emergency unfreeze — only the registry-verified multisig can unfreeze.
+    /// Clears the frozen flag to restore outbound transfers.
     pub fn unfreeze(env: Env, caller: Address) -> Result<(), Error> {
-        let mut t = Self::require_admin(&env, &caller)?;
-        if t.state != ResourceState::Frozen {
+        let t = Self::require_multisig(&env, &caller)?;
+        let frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false);
+        if !frozen {
             return Err(Error::InvalidState);
         }
-        t.state = ResourceState::Active;
-        Self::store(&env, &t);
+        env.storage().persistent().set(&DataKey::Frozen, &false);
+        Self::bump_frozen(&env);
         events::publish(
             &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("unfrozen"),
-            },
+            events::ContractEvent::TreasuryUnfrozen { org: t.org.clone() },
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("unfrozen")), ());
@@ -232,6 +272,7 @@ impl TreasuryContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
+        Self::check_frozen(&env)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
         if t.admin != caller {
@@ -340,6 +381,7 @@ impl TreasuryContract {
         if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
             return Err(Error::InvalidInput);
         }
+        Self::check_frozen(&env)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
         if t.admin != caller {
@@ -409,6 +451,110 @@ impl TreasuryContract {
 
     // --- views ---
 
+    /// Initialize a milestone-based disbursement.
+    pub fn init_milestone_disbursement(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        to: Address,
+        total_amount: i128,
+        milestones: u32,
+    ) -> Result<u64, Error> {
+        let _t = Self::require_admin(&env, &caller)?;
+        require_positive_amount(total_amount)?;
+        if milestones == 0 {
+            return Err(Error::InvalidInput);
+        }
+
+        let amount_per_milestone = total_amount / (milestones as i128);
+
+        let count_key = DataKey::MilestoneCount;
+        let mut count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
+        count += 1;
+
+        let disbursement = MilestoneDisbursement {
+            total_amount,
+            milestones,
+            disbursed: 0,
+            amount_per_milestone,
+            asset,
+            to,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestone(count), &disbursement);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Milestone(count),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().instance().set(&count_key, &count);
+        env.events().publish(
+            (symbol_short!("milestone"), symbol_short!("init")),
+            (count, total_amount, milestones),
+        );
+        Ok(count)
+    }
+
+    /// Release the next milestone payout.
+    pub fn release_next_milestone(
+        env: Env,
+        caller: Address,
+        milestone_id: u64,
+    ) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::Milestone(milestone_id);
+        let mut d: MilestoneDisbursement = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+
+        if d.disbursed >= d.milestones {
+            return Err(Error::InvalidState);
+        }
+
+        let mut amount = d.amount_per_milestone;
+        if d.disbursed == d.milestones - 1 {
+            let disbursed_so_far = d.amount_per_milestone * (d.milestones - 1) as i128;
+            amount = d.total_amount - disbursed_so_far;
+        }
+
+        d.disbursed += 1;
+        env.storage().persistent().set(&key, &d);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Execute withdrawal logic
+        let mut holding = Self::load_holding(&env, &d.asset);
+        if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
+            astroid_interfaces::BudgetClient::new(&env, budget_addr)
+                .consume(&caller, budget_id, &amount);
+        }
+
+        if holding.total_in < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        holding.total_in = checked_sub(holding.total_in, amount)?;
+        holding.total_out = checked_add(holding.total_out, amount)?;
+        Self::store_holding(&env, &d.asset, &holding);
+
+        token::TokenClient::new(&env, &d.asset).transfer(
+            &env.current_contract_address(),
+            &d.to,
+            &amount,
+        );
+        env.events().publish(
+            (symbol_short!("milestone"), symbol_short!("disbursed")),
+            (milestone_id, d.disbursed, amount),
+        );
+        Ok(())
+    }
+
     pub fn get(env: Env) -> Treasury {
         Self::load(&env)
     }
@@ -440,6 +586,37 @@ impl TreasuryContract {
         }
         caller.require_auth();
         Ok(t)
+    }
+
+    fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
+        let t = Self::load(env);
+        match &t.multisig {
+            Some(multisig) if multisig == caller => {
+                caller.require_auth();
+                Ok(t)
+            }
+            _ => Err(Error::Unauthorized),
+        }
+    }
+
+    fn check_frozen(env: &Env) -> Result<(), Error> {
+        let frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false);
+        if frozen {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn bump_frozen(env: &Env) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Frozen,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn require_active(t: &Treasury) -> Result<(), Error> {

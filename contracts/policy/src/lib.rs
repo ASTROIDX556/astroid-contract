@@ -75,6 +75,7 @@ enum DataKey {
 pub struct PolicyContract;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl PolicyContract {
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
@@ -596,6 +597,15 @@ impl PolicyInterface for PolicyContract {
         {
             events_policy_violation(&env, &policy_id, "blacklisted");
             return Err(Error::PolicyRecipientRestricted);
+        }
+        // Check merchant blacklist
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "merchant_blocked");
+            return Err(Error::PolicyMerchantBlocked);
         }
         // Check merchant blacklist
         if env
