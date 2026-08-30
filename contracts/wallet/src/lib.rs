@@ -499,6 +499,8 @@ impl WalletContract {
             .persistent()
             .get(&DataKey::MinReserve(wallet_id, asset))
             .unwrap_or(0)
+    }
+
     /// Whether the contract-wide circuit breaker is currently tripped.
     pub fn is_paused(env: Env) -> bool {
         Self::paused(&env)
