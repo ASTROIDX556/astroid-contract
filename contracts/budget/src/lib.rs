@@ -112,7 +112,6 @@ pub struct AssetBudget {
     /// Window length in seconds; 0 means the limit never auto-resets.
     pub window_seconds: u64,
     pub window_start: u64,
-    pub window_seconds: u64,
 }
 
 #[contracttype]
@@ -420,7 +419,6 @@ impl BudgetContract {
             spent: 0,
             window_seconds,
             window_start: env.ledger().timestamp(),
-            window_seconds,
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
@@ -451,18 +449,6 @@ impl BudgetContract {
             .ok_or(Error::AssetNotAuthorized)?;
         // Recurring per-asset limits replenish lazily, on the spend itself.
         Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &token, true);
-
-        // Window rollover check
-        let now = env.ledger().timestamp();
-        if asset_budget.window_seconds > 0
-            && now
-                >= asset_budget
-                    .window_start
-                    .saturating_add(asset_budget.window_seconds)
-        {
-            asset_budget.spent = 0;
-            asset_budget.window_start = now;
-        }
 
         // Check if within limit
         let new_spent = checked_add(asset_budget.spent, amount)?;
@@ -619,28 +605,19 @@ impl BudgetContract {
             budget.rollover_credit = Self::apply_cap(credit, budget.rollover_cap);
         } else {
             budget.rollover_credit = 0;
+        }
         let spent = budget.spent;
         if spent > capacity && budget.allow_deficit {
             // Deficit: spent exceeded capacity. Track the deficit and carry it
-            // forward. The deficit reduces the next period's effective limit.
+            // forward; a deficit means there is no surplus to roll over.
             let deficit = checked_sub(spent, capacity)?;
             budget.deficit_amount = checked_add(budget.deficit_amount, deficit)?;
-            if budget.rollover_enabled {
-                budget.rollover_credit = 0; // No surplus to roll over
-            } else {
-                budget.rollover_credit = 0;
-            }
-        } else if spent <= capacity {
-            // Surplus: leftover carries forward if rollover is enabled.
-            let leftover = checked_sub(capacity, spent)?;
-            if budget.rollover_enabled {
-                budget.rollover_credit = checked_add(budget.rollover_credit, leftover)?;
-            } else {
-                budget.rollover_credit = 0;
-            }
+            budget.rollover_credit = 0;
         }
-        // else: spent > capacity but !allow_deficit — this shouldn't happen
-        // because consume would have rejected it, but handle defensively.
+        // else: spent <= capacity — the surplus was already folded into
+        // `rollover_credit` above (or dropped when rollover is disabled).
+        // spent > capacity without allow_deficit cannot happen: consume
+        // rejects it, but handle defensively.
         budget.spent = 0;
         // Re-anchor to the period boundary, not to `now`, so windows never
         // drift away from the schedule the budget was granted on.
@@ -662,8 +639,6 @@ impl BudgetContract {
             };
             env.events().publish(
                 (symbol_short!("budget"), action.clone()),
-                (budget_id.clone(), leftover),
-                (symbol_short!("budget"), action),
                 (budget_id.clone(), amount),
             );
             events::publish(
@@ -671,7 +646,7 @@ impl BudgetContract {
                 ContractEvent::BudgetUpdated {
                     budget_id: budget_id.clone(),
                     action,
-                    amount: leftover,
+                    amount,
                 },
             );
         }
