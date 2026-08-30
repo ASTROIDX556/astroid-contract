@@ -71,6 +71,18 @@ pub enum Error {
     InsufficientWeight = 38,
 
     // --- Proposal (70-79) ---
+    ProposalExpired = 70,
+    InvalidProposalState = 71,
+    ProposalNotApproved = 72,
+    NotAnApprover = 73,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 74,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 75,
+    CancellationWindowClosed = 74,
+    MathOverflow = 75,
+    DivisionByZero = 76,
     ProposalExpired = 39,
     InvalidProposalState = 40,
     ProposalNotApproved = 41,
