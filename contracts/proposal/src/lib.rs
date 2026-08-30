@@ -36,8 +36,14 @@
 //! and a dependency that would close a cycle is rejected at creation time with
 //! [`Error::CircularDependencyDetected`].
 //!
+//! Every time a chain is validated, the contract publishes a structured event
+//! so watchers can follow dependency resolution: `("proposal", "dep_ok")` when
+//! all prerequisites have executed, or `("proposal", "dep_fail")` with the id
+//! of the first unmet prerequisite when the chain is blocked.
+//!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
-//! `fail`, `close`.
+//! `fail`, `close`, `cleanup_expired`, and views `get`, `state`,
+//! `dependencies`, `dependencies_met`, `is_executed`.
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
@@ -410,7 +416,7 @@ impl ProposalContract {
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
-        Self::ensure_dependencies_met(&env, &proposal)?;
+        Self::ensure_dependencies_met(&env, id, &proposal)?;
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -472,6 +478,14 @@ impl ProposalContract {
         Ok(Self::load(&env, id)?.state)
     }
 
+    /// Whether the proposal has completed its action — `Executed` or `Closed`
+    /// (the only terminal states reachable from a successful run). This is the
+    /// completion check downstream contracts should read before chaining onto a
+    /// proposal, so dependency resolution needs no private state.
+    pub fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
+        Ok(Self::load(&env, id)?.state.has_executed())
+    }
+
     /// The prerequisite proposal ids this proposal declares.
     pub fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
         Ok(Self::load(&env, id)?.dependencies)
@@ -481,7 +495,7 @@ impl ProposalContract {
     /// asks, exposed so callers can check before spending a transaction on it.
     pub fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
         let proposal = Self::load(&env, id)?;
-        Ok(Self::ensure_dependencies_met(&env, &proposal).is_ok())
+        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
     }
 
     // --- internal helpers ---
@@ -508,13 +522,26 @@ impl ProposalContract {
     /// prerequisite that has been cancelled, rejected, expired or explicitly
     /// marked `Failed` can never become executed, but it is reported the same
     /// way: the dependent proposal simply cannot run.
-    fn ensure_dependencies_met(env: &Env, proposal: &Proposal) -> Result<(), Error> {
+    ///
+    /// Dependency resolution is observable: validation publishes
+    /// `("proposal", "dep_ok")` when the whole chain is satisfied, or
+    /// `("proposal", "dep_fail")` carrying the id of the first unmet
+    /// prerequisite when it is not.
+    fn ensure_dependencies_met(env: &Env, id: u64, proposal: &Proposal) -> Result<(), Error> {
         for dep in proposal.dependencies.iter() {
             let prerequisite = Self::load(env, dep)?;
             if !prerequisite.state.has_executed() {
+                env.events().publish(
+                    (symbol_short!("proposal"), symbol_short!("dep_fail")),
+                    (id, dep),
+                );
                 return Err(Error::PrerequisiteNotMet);
             }
         }
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("dep_ok")),
+            (id, proposal.dependencies.clone()),
+        );
         Ok(())
     }
 
