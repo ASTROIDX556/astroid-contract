@@ -20,73 +20,67 @@ pub enum Error {
     AlreadyInitialized = 6,
 
     // --- Value / arithmetic (10-19) ---
-    InsufficientFunds = 7,
-    Overflow = 8,
-    Underflow = 9,
-    InvalidAmount = 10,
+    InsufficientFunds = 10,
+    Overflow = 11,
+    Underflow = 12,
+    InvalidAmount = 13,
+    MathOverflow = 14,
+    DivisionByZero = 15,
 
     // --- Policy (20-29) ---
-    PolicyDenied = 11,
-    PolicyHashMismatch = 12,
-    EmergencyLock = 13,
-    PolicyRecipientRestricted = 14,
-    PolicyMerchantBlocked = 15,
-    PolicyCategoryRestricted = 16,
+    PolicyDenied = 20,
+    EmergencyLock = 21,
+    PolicyRecipientRestricted = 22,
+    PolicyMerchantBlocked = 23,
+    PolicyCategoryRestricted = 24,
     /// The asset is not in the organization's whitelist.
-    AssetNotWhitelisted = 17,
-    FeeLimitExceeded = 18,
+    AssetNotWhitelisted = 25,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
-    RegistryFrozen = 19,
 
     // --- Budget (40-49) ---
-    BudgetExceeded = 20,
-    BudgetFrozen = 21,
-    BudgetArchived = 22,
-    AssetNotAuthorized = 23,
-    BudgetExpired = 24,
+    BudgetExceeded = 40,
+    BudgetFrozen = 41,
+    BudgetArchived = 42,
+    AssetNotAuthorized = 43,
+    BudgetExpired = 44,
 
     // --- Wallet (50-59) ---
-    WalletFrozen = 25,
-    WalletArchived = 26,
-    WalletPaused = 27,
-    InvalidState = 28,
+    WalletFrozen = 50,
+    WalletArchived = 51,
+    WalletPaused = 52,
+    InvalidState = 53,
 
     // --- Multisig / approvals (60-69) ---
-    ThresholdNotMet = 29,
-    AlreadySigned = 30,
-    NotASigner = 31,
-    InvalidThreshold = 32,
-    TimeLocked = 33,
-    TooManySigners = 34,
+    InvalidSignature = 60,
+    ThresholdNotMet = 61,
+    AlreadySigned = 62,
+    NotASigner = 63,
+    InvalidThreshold = 64,
+    TimeLocked = 65,
+    TooManySigners = 66,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
-    BatchCallFailed = 35,
+    BatchCallFailed = 67,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
-    InvalidNonce = 36,
+    InvalidNonce = 68,
     /// A signer with zero (or otherwise invalid) voting weight was supplied.
-    InvalidSignerWeight = 37,
+    InvalidSignerWeight = 69,
     /// Accumulated approval weight is below the configured threshold.
-    InsufficientWeight = 38,
+    InsufficientWeight = 70,
 
-    // --- Proposal (70-79) ---
-    ProposalExpired = 70,
-    InvalidProposalState = 71,
-    ProposalNotApproved = 72,
-    NotAnApprover = 73,
+    // --- Proposal (71-79) ---
+    ProposalExpired = 71,
+    InvalidProposalState = 72,
+    ProposalNotApproved = 73,
+    NotAnApprover = 74,
     /// The aggregated count of verified approver signatures did not reach the
     /// configured threshold at execution time.
-    QuorumNotMet = 74,
-    ProposalExpired = 39,
-    InvalidProposalState = 40,
-    ProposalNotApproved = 41,
-    NotAnApprover = 42,
-    CancellationWindowClosed = 43,
-    MathOverflow = 44,
-    DivisionByZero = 45,
+    QuorumNotMet = 75,
+    CancellationWindowClosed = 76,
 
     // --- Escrow (80-89) ---
-    EscrowExpired = 46,
-    TimeLockActive = 47,
+    EscrowExpired = 80,
+    TimeLockActive = 81,
 }

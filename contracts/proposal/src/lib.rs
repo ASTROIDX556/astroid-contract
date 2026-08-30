@@ -35,9 +35,8 @@ use astroid_shared::math::checked_add;
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, String, Vec,
-    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, vec, Address, Env,
+    IntoVal, String, Vec,
 };
 
 /// Proposal lifecycle state.
@@ -339,30 +338,11 @@ impl ProposalContract {
     ) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::ensure_not_expired(&env, &proposal)?;
-        // Double-execution guard: only `Approved` may transition to `Executed`;
-        // an `Executed`/`Closed`/`Rejected`/... proposal never qualifies again.
-    /// Purge an expired proposal from storage to reclaim space.
-    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
-        let proposal = Self::load(&env, id)?;
-        if proposal.expires_at == 0 || env.ledger().timestamp() < proposal.expires_at {
-            return Err(Error::InvalidProposalState);
-        }
-        env.storage().persistent().remove(&DataKey::Proposal(id));
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
-        Ok(())
-    }
-
-    pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
-        caller.require_auth();
-        let mut proposal = Self::load(&env, id)?;
         if proposal.is_expired(&env) {
             return Err(Error::ProposalExpired);
         }
-        if caller != proposal.proposer {
-            return Err(Error::Unauthorized);
-        }
+        // Double-execution guard: only `Approved` may transition to `Executed`;
+        // an `Executed`/`Closed`/`Rejected`/... proposal never qualifies again.
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
@@ -404,6 +384,18 @@ impl ProposalContract {
             (symbol_short!("proposal"), symbol_short!("executed")),
             (id, execution_id, caller),
         );
+        Ok(())
+    }
+
+    /// Purge an expired proposal from storage to reclaim space.
+    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+        let proposal = Self::load(&env, id)?;
+        if proposal.expires_at == 0 || env.ledger().timestamp() < proposal.expires_at {
+            return Err(Error::InvalidProposalState);
+        }
+        env.storage().persistent().remove(&DataKey::Proposal(id));
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
         Ok(())
     }
 
