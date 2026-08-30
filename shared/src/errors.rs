@@ -27,14 +27,12 @@ pub enum Error {
 
     // --- Policy (20-29) ---
     PolicyDenied = 11,
-    PolicyHashMismatch = 12,
     EmergencyLock = 13,
     PolicyRecipientRestricted = 14,
     PolicyMerchantBlocked = 15,
     PolicyCategoryRestricted = 16,
     /// The asset is not in the organization's whitelist.
     AssetNotWhitelisted = 17,
-    FeeLimitExceeded = 18,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 19,
@@ -78,6 +76,11 @@ pub enum Error {
     CancellationWindowClosed = 43,
     MathOverflow = 44,
     DivisionByZero = 45,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 51,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 52,
 
     // --- Escrow (80-89) ---
     EscrowExpired = 46,
