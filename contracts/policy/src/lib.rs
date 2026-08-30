@@ -559,6 +559,15 @@ impl PolicyInterface for PolicyContract {
             events_policy_violation(&env, &policy_id, "merchant_blocked");
             return Err(Error::PolicyMerchantBlocked);
         }
+        // Check merchant blacklist
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "merchant_blocked");
+            return Err(Error::PolicyMerchantBlocked);
+        }
         Ok(())
     }
 }

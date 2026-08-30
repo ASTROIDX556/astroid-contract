@@ -81,4 +81,10 @@ fn constants_are_sane() {
     const _: () = {
         assert!(MAX_SIGNERS >= 1);
     };
+    const _: () = {
+        assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
+    };
+    const _: () = {
+        assert!(MAX_SIGNERS >= 1);
+    };
 }
