@@ -394,6 +394,56 @@ impl PolicyContract {
         Ok(())
     }
 
+    /// Add a recipient address to the blocklist (owner only). Blocked
+    /// addresses are rejected immediately in `check_transfer` before any
+    /// other policy gate is evaluated (Issue #32).
+    pub fn add_to_blocklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Blacklist(address.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &policy_id);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("blk_add")),
+            (policy_id, address),
+        );
+        Ok(())
+    }
+
+    /// Remove a recipient address from the blocklist (owner only).
+    pub fn remove_from_blocklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Blacklist(address.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("blk_rem")),
+            (policy_id, address),
+        );
+        Ok(())
+    }
+
     /// Check if a spending category is restricted. Returns Ok(()) if the category
     /// is allowed, or PolicyCategoryRestricted if it's blacklisted.
     pub fn check_category(env: Env, policy_id: String, category: String) -> Result<(), Error> {
@@ -433,6 +483,10 @@ impl PolicyContract {
 #[contractimpl]
 impl PolicyInterface for PolicyContract {
     /// Evaluate a transfer request against the named policy. All gates must pass.
+    ///
+    /// Blocklist checks run **first** so that compromised or malicious
+    /// addresses are rejected immediately, before any allowance, asset or
+    /// amount evaluation (Issue #32).
     fn check_transfer(
         env: Env,
         policy_id: String,
@@ -446,6 +500,24 @@ impl PolicyInterface for PolicyContract {
             events_policy_violation(&env, &policy_id, "disabled");
             return Err(Error::PolicyDenied);
         }
+        // --- Blocklist checks (Issue #32) — evaluated first ---
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "blacklisted");
+            return Err(Error::PolicyRecipientRestricted);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "merchant_blocked");
+            return Err(Error::PolicyMerchantBlocked);
+        }
+        // --- Allowance / amount gates ---
         if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
             events_policy_violation(&env, &policy_id, "expired");
             return Err(Error::PolicyDenied);

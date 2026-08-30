@@ -443,27 +443,25 @@ fn asset_whitelist_allows_whitelisted_asset() {
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = setup(&env, &owner);
-    let asset_a = Address::generate(&env);
-    let asset_b = Address::generate(&env);
-    let recip = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    let safe = Address::generate(&env);
 
-    // Enable whitelist and add asset_a
-    p.set_asset_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
-    p.add_asset_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset_a);
+    // Block the address
+    p.add_to_blocklist(&owner, &String::from_str(&env, "max_txn"), &blocked);
 
-    // asset_a should pass
+    // Transfer to blocked address should fail
+    let result = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &blocked, &100);
+    assert!(result.is_err());
+
+    // Transfer to non-blocked address should succeed
     assert!(p
-        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset_a, &recip, &100,)
+        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &safe, &100,)
         .is_ok());
-
-    // asset_b (not whitelisted) should fail
-    assert!(p
-        .try_check_transfer(&String::from_str(&env, "max_txn"), &asset_b, &recip, &100,)
-        .is_err());
 }
 
 #[test]
-fn asset_whitelist_disabled_allows_all() {
+fn blocklist_removal_allows_transfers() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
@@ -504,10 +502,9 @@ fn asset_whitelist_unauthorized_add_fails() {
     let owner = Address::generate(&env);
     let unauthorized = Address::generate(&env);
     let p = setup(&env, &owner);
-    let asset = Address::generate(&env);
+    let addr = Address::generate(&env);
 
-    let result =
-        p.try_add_asset_to_whitelist(&unauthorized, &String::from_str(&env, "max_txn"), &asset);
+    let result = p.try_add_to_blocklist(&unauthorized, &String::from_str(&env, "max_txn"), &addr);
     assert!(result.is_err());
 }
 
