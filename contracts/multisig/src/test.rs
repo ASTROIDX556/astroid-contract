@@ -570,8 +570,7 @@ fn non_signer_cannot_change_config() {
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
-        h.client
-            .try_execute_threshold_change(&stranger, &1),
+        h.client.try_execute_threshold_change(&stranger, &1),
         Err(Ok(Error::UnauthorizedModification))
     );
 }

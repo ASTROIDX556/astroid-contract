@@ -394,11 +394,7 @@ impl RegistryContract {
 
     /// Read the migration target configured for a module, or [`Error::NotFound`]
     /// when none has been set.
-    pub fn get_module_migration(
-        env: Env,
-        org: String,
-        kind: ModuleKind,
-    ) -> Result<Address, Error> {
+    pub fn get_module_migration(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         let gkey = DataKey::ModuleMigration(org, kind);
         let val = env
             .storage()
