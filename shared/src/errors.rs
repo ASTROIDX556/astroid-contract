@@ -11,7 +11,7 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    // --- Generic / lifecycle (1-9) ---
+    // --- Generic / lifecycle (1-6) ---
     NotFound = 1,
     AlreadyExists = 2,
     Unauthorized = 3,
@@ -19,36 +19,33 @@ pub enum Error {
     NotInitialized = 5,
     AlreadyInitialized = 6,
 
-    // --- Value / arithmetic (10-19) ---
-    InsufficientFunds = 7,
-    Overflow = 8,
-    Underflow = 9,
-    InvalidAmount = 10,
+    // --- Value / arithmetic (10-12) ---
+    InsufficientFunds = 10,
+    Overflow = 11,
+    InvalidAmount = 12,
 
-    // --- Policy (20-29) ---
-    PolicyDenied = 11,
-    PolicyHashMismatch = 12,
-    EmergencyLock = 13,
-    PolicyRecipientRestricted = 14,
-    PolicyMerchantBlocked = 15,
-    PolicyCategoryRestricted = 16,
-    /// The asset is not in the organization's whitelist.
-    AssetNotWhitelisted = 17,
-    FeeLimitExceeded = 18,
+    // --- Policy (20-27) ---
+    PolicyDenied = 20,
+    EmergencyLock = 21,
+    PolicyRecipientRestricted = 22,
+    PolicyMerchantBlocked = 23,
+    PolicyCategoryRestricted = 24,
+    AssetNotWhitelisted = 25,
+    PolicyPaused = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
-    RegistryFrozen = 19,
 
-    // --- Budget (40-49) ---
-    BudgetExceeded = 20,
-    BudgetFrozen = 21,
-    BudgetArchived = 22,
-    AssetNotAuthorized = 23,
-    BudgetExpired = 24,
+    // --- Budget (40-44) ---
+    BudgetExceeded = 40,
+    BudgetFrozen = 41,
+    BudgetArchived = 42,
+    AssetNotAuthorized = 43,
+    BudgetExpired = 44,
 
     // --- Wallet (50-59) ---
+    // --- Wallet (50-53) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
@@ -59,30 +56,43 @@ pub enum Error {
     WalletPaused = 27,
     InvalidState = 28,
 
-    // --- Multisig / approvals (60-69) ---
-    ThresholdNotMet = 29,
-    AlreadySigned = 30,
-    NotASigner = 31,
-    InvalidThreshold = 32,
-    TimeLocked = 33,
-    TooManySigners = 34,
+    // --- Multisig / approvals (61-69) ---
+    ThresholdNotMet = 61,
+    AlreadySigned = 62,
+    NotASigner = 63,
+    InvalidThreshold = 64,
+    TimeLocked = 65,
+    TooManySigners = 66,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
-    BatchCallFailed = 35,
+    BatchCallFailed = 67,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
-    InvalidNonce = 36,
+    InvalidNonce = 68,
     /// A signer with zero (or otherwise invalid) voting weight was supplied.
-    InvalidSignerWeight = 37,
+    InvalidSignerWeight = 69,
     /// Accumulated approval weight is below the configured threshold.
-    InsufficientWeight = 38,
+    InsufficientWeight = 90,
+    /// A timelocked governance change was executed before its delay elapsed.
+    TimelockNotExpired = 91,
+    /// A caller without governance rights attempted to modify signers,
+    /// weights or the threshold.
+    UnauthorizedModification = 92,
+    InvalidNonce = 67,
+    BatchCallFailed = 68,
+    InsufficientWeight = 69,
 
-    // --- Proposal (70-79) ---
-    ProposalExpired = 39,
-    InvalidProposalState = 40,
-    ProposalNotApproved = 41,
-    NotAnApprover = 42,
-    CancellationWindowClosed = 43,
-    MathOverflow = 44,
-    DivisionByZero = 45,
+    // --- Proposal (71-79) ---
+    ProposalExpired = 71,
+    InvalidProposalState = 72,
+    ProposalNotApproved = 73,
+    NotAnApprover = 74,
+    CancellationWindowClosed = 75,
+    MathOverflow = 76,
+    DivisionByZero = 77,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 78,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 79,
 
     // --- Escrow (80-89) ---
     ConditionNotMet = 80,
@@ -94,4 +104,12 @@ pub enum Error {
     EscrowAlreadySettled = 86,
     EscrowExpired = 46,
     TimeLockActive = 47,
+    // --- Escrow (80-81) ---
+    EscrowExpired = 80,
+    TimeLockActive = 81,
+
+    // --- Treasury allowances (83-85) ---
+    AllowanceExceeded = 83,
+    AllowanceExpired = 84,
+    AllowanceNotFound = 85,
 }

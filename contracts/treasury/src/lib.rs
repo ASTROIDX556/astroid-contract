@@ -22,8 +22,9 @@
 //! invocation and no recipient is paid.
 //!
 //! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
-//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`,
-//! `holding`.
+//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`,
+//! `set_allowance`, `remove_allowance`, `allowance`, `init_milestone_disbursement`,
+//! `release_next_milestone`, `get`, `holding`.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -76,6 +77,58 @@ pub struct Holding {
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
+    /// Sum of all active allowances for this asset.
+    pub total_allowances: i128,
+    /// Sum of all active reserves for this asset.
+    pub total_reserves: i128,
+}
+
+/// A spending allowance granted by the admin to a specific spender. The
+/// allowance caps how much the spender may reserve from the treasury.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Allowance {
+    pub asset: Address,
+    pub spender: Address,
+    pub amount: i128,
+    /// Amount of the allowance that has been reserved.
+    pub used: i128,
+}
+
+/// A token reservation created within an allowance. Reserves deduct from
+//! the treasury's available balance until explicitly released.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reserve {
+    pub asset: Address,
+    pub spender: Address,
+    pub amount: i128,
+}
+
+/// Composite key identifying a withdrawal allowance scoped to a specific agent
+/// (the caller that may spend), recipient and asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowanceId {
+    pub agent: Address,
+    pub recipient: Address,
+    pub asset: Address,
+}
+
+/// Active withdrawal allowance restricting agent-driven expenditures against a
+/// specific recipient/asset to a pre-approved `limit` over a time window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Allowance {
+    pub agent: Address,
+    pub recipient: Address,
+    pub asset: Address,
+    /// Maximum cumulative amount that may be withdrawn under this allowance.
+    pub limit: i128,
+    /// Amount already consumed against the allowance.
+    pub spent: i128,
+    /// Unix timestamp after which the allowance can no longer be used (0 = never).
+    pub expires_at: u64,
 }
 
 #[contracttype]
@@ -87,6 +140,7 @@ enum DataKey {
     Frozen,
     Milestone(u64),
     MilestoneCount,
+    Allowance(AllowanceId),
 }
 
 #[contract]
@@ -246,6 +300,89 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Create or update a withdrawal allowance capping how much `agent` may send
+    /// to `recipient` in `asset`. `limit` is the cumulative ceiling; `expires_at`
+    /// is an optional unix expiry (0 = no expiry). Admin only.
+    pub fn set_allowance(
+        env: Env,
+        admin: Address,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+        limit: i128,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &admin)?;
+        require_positive_amount(limit)?;
+        if agent == recipient {
+            return Err(Error::InvalidInput);
+        }
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        let allowance = Allowance {
+            agent: id.agent.clone(),
+            recipient: id.recipient.clone(),
+            asset: id.asset.clone(),
+            limit,
+            spent: 0,
+            expires_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(id), &allowance);
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allow")), ());
+        Ok(())
+    }
+
+    /// Remove an active withdrawal allowance (admin only).
+    pub fn remove_allowance(
+        env: Env,
+        admin: Address,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+    ) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &admin)?;
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Allowance(id.clone()))
+        {
+            return Err(Error::AllowanceNotFound);
+        }
+        env.storage().persistent().remove(&DataKey::Allowance(id));
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allowrm")), ());
+        Ok(())
+    }
+
+    /// Read the current state of a withdrawal allowance.
+    pub fn allowance(
+        env: Env,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+    ) -> Result<Allowance, Error> {
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(id))
+            .ok_or(Error::AllowanceNotFound)
+    }
+
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
     /// must clear policy and budget gates before the ledger is debited.
     pub fn withdraw(
@@ -281,7 +418,32 @@ impl TreasuryContract {
                 .consume(&caller, budget_id, &amount);
         }
 
-        // 3. Debit the internal ledger, then move real tokens out of custody.
+        // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
+        //    pre-approved periodic ceilings per (agent, recipient, asset).
+        let allowance_id = AllowanceId {
+            agent: caller.clone(),
+            recipient: to.clone(),
+            asset: asset.clone(),
+        };
+        if let Some(mut al) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Allowance>(&DataKey::Allowance(allowance_id.clone()))
+        {
+            if al.expires_at != 0 && env.ledger().timestamp() >= al.expires_at {
+                return Err(Error::AllowanceExpired);
+            }
+            let remaining = checked_sub(al.limit, al.spent)?;
+            if amount > remaining {
+                return Err(Error::AllowanceExceeded);
+            }
+            al.spent = checked_add(al.spent, amount)?;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Allowance(allowance_id), &al);
+        }
+
+        // 4. Debit the internal ledger, then move real tokens out of custody.
         if holding.total_in < amount {
             return Err(Error::InsufficientFunds);
         }
@@ -391,6 +553,208 @@ impl TreasuryContract {
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("batchpay")),
             (asset, payments.len(), total),
+        );
+        Ok(())
+    }
+
+    // --- allowance / reserve ---
+
+    /// Create a spending allowance for `spender` on `asset`. The allowance
+    /// caps how much the spender may reserve. Only the admin may call.
+    pub fn create_allowance(
+        env: Env,
+        caller: Address,
+        spender: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let _t = Self::require_admin(&env, &caller)?;
+
+        // Reject duplicate allowance.
+        let key = DataKey::Allowance(asset.clone(), spender.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AllowanceAlreadyExists);
+        }
+
+        // Ensure enough unreserved balance is available.
+        let h = Self::load_holding(&env, &asset);
+        let unreserved = checked_sub(h.total_in, h.total_reserves)?;
+        let available = checked_sub(unreserved, h.total_allowances)?;
+        if available < amount {
+            return Err(Error::AllowanceExceeded);
+        }
+
+        let allowance = Allowance {
+            asset: asset.clone(),
+            spender: spender.clone(),
+            amount,
+            used: 0,
+        };
+        env.storage().persistent().set(&key, &allowance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let mut h = Self::load_holding(&env, &asset);
+        h.total_allowances = checked_add(h.total_allowances, amount)?;
+        Self::store_holding(&env, &asset, &h);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("allowance")),
+            (spender, asset, amount),
+        );
+        Ok(())
+    }
+
+    /// Revoke a previously created allowance. The unused portion returns to
+    /// the available balance. Only the admin may call.
+    pub fn revoke_allowance(
+        env: Env,
+        caller: Address,
+        spender: Address,
+        asset: Address,
+    ) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &caller)?;
+
+        let key = DataKey::Allowance(asset.clone(), spender.clone());
+        let allowance: Allowance = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::AllowanceNotFound)?;
+
+        let unused = checked_sub(allowance.amount, allowance.used)?;
+        env.storage().persistent().remove(&key);
+
+        let mut h = Self::load_holding(&env, &asset);
+        h.total_allowances = checked_sub(h.total_allowances, unused)?;
+        Self::store_holding(&env, &asset, &h);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("revoke")),
+            (spender, asset, unused),
+        );
+        Ok(())
+    }
+
+    /// Create a token reservation within the caller's allowance. The reserved
+    /// amount is deducted from the treasury's available balance. The caller
+    /// must be a spender with an active allowance that has remaining capacity.
+    pub fn create_reserve(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<u64, Error> {
+        require_positive_amount(amount)?;
+        caller.require_auth();
+
+        // Load and validate allowance.
+        let akey = DataKey::Allowance(asset.clone(), caller.clone());
+        let mut allowance: Allowance = env
+            .storage()
+            .persistent()
+            .get(&akey)
+            .ok_or(Error::AllowanceNotFound)?;
+
+        let remaining = checked_sub(allowance.amount, allowance.used)?;
+        if amount > remaining {
+            return Err(Error::AllowanceExceeded);
+        }
+
+        // Ensure the treasury has enough unreserved, un-allowed tokens.
+        let h = Self::load_holding(&env, &asset);
+        let unreserved = checked_sub(h.total_in, h.total_reserves)?;
+        let available = checked_sub(unreserved, h.total_allowances)?;
+        if amount > available {
+            return Err(Error::AllowanceExceeded);
+        }
+
+        // Create the reserve.
+        let rcount = Self::next_reserve_id(&env, &asset);
+        let reserve = Reserve {
+            asset: asset.clone(),
+            spender: caller.clone(),
+            amount,
+        };
+        let rkey = DataKey::Reserve(asset.clone(), rcount);
+        env.storage().persistent().set(&rkey, &reserve);
+        env.storage().persistent().extend_ttl(
+            &rkey,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Update counters.
+        allowance.used = checked_add(allowance.used, amount)?;
+        env.storage().persistent().set(&akey, &allowance);
+        env.storage().persistent().extend_ttl(
+            &akey,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let mut h = Self::load_holding(&env, &asset);
+        h.total_reserves = checked_add(h.total_reserves, amount)?;
+        Self::store_holding(&env, &asset, &h);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("reserved")),
+            (caller, asset, amount, rcount),
+        );
+        Ok(rcount)
+    }
+
+    /// Release a previously created reservation. The reserved tokens return to
+    /// the treasury's available balance. The caller must be the spender who
+    /// created the reservation.
+    pub fn release_reserve(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        reserve_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let rkey = DataKey::Reserve(asset.clone(), reserve_id);
+        let reserve: Reserve = env
+            .storage()
+            .persistent()
+            .get(&rkey)
+            .ok_or(Error::ReserveNotFound)?;
+
+        if reserve.spender != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage().persistent().remove(&rkey);
+
+        // Reduce the allowance's used amount.
+        let akey = DataKey::Allowance(asset.clone(), caller.clone());
+        let mut allowance: Allowance = env
+            .storage()
+            .persistent()
+            .get(&akey)
+            .ok_or(Error::AllowanceNotFound)?;
+        allowance.used = checked_sub(allowance.used, reserve.amount)?;
+        env.storage().persistent().set(&akey, &allowance);
+        env.storage().persistent().extend_ttl(
+            &akey,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Reduce the total reserves counter.
+        let mut h = Self::load_holding(&env, &asset);
+        h.total_reserves = checked_sub(h.total_reserves, reserve.amount)?;
+        Self::store_holding(&env, &asset, &h);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("released")),
+            (caller, asset, reserve.amount, reserve_id),
         );
         Ok(())
     }
@@ -509,6 +873,22 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
+    pub fn get_allowance(env: Env, asset: Address, spender: Address) -> Result<Allowance, Error> {
+        let key = DataKey::Allowance(asset, spender);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::AllowanceNotFound)
+    }
+
+    pub fn get_reserve(env: Env, asset: Address, reserve_id: u64) -> Result<Reserve, Error> {
+        let key = DataKey::Reserve(asset, reserve_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::ReserveNotFound)
+    }
+
     // --- internals ---
 
     fn load(env: &Env) -> Treasury {
@@ -581,15 +961,39 @@ impl TreasuryContract {
                 total_in: 0,
                 total_out: 0,
                 budget_id: None,
+                total_allowances: 0,
+                total_reserves: 0,
             })
     }
-
     fn store_holding(env: &Env, asset: &Address, h: &Holding) {
         env.storage()
             .persistent()
             .set(&DataKey::Holding(asset.clone()), h);
         env.storage().persistent().extend_ttl(
             &DataKey::Holding(asset.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn load_allowance(env: &Env, agent: &Address, asset: &Address) -> Allowance {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(agent.clone(), asset.clone()))
+            .unwrap_or(Allowance {
+                agent: agent.clone(),
+                asset: asset.clone(),
+                limit: 0,
+                consumed: 0,
+            })
+    }
+
+    fn store_allowance(env: &Env, agent: &Address, asset: &Address, a: &Allowance) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(agent.clone(), asset.clone()), a);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(agent.clone(), asset.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
