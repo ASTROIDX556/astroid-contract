@@ -116,7 +116,16 @@ impl BudgetContract {
         rollover_enabled: bool,
         expires_at: u64,
     ) -> Result<(), Error> {
-        Self::allocate_with_deficit(env, owner, budget_id, limit, period, rollover_enabled, false, expires_at)
+        Self::allocate_with_deficit(
+            env,
+            owner,
+            budget_id,
+            limit,
+            period,
+            rollover_enabled,
+            false,
+            expires_at,
+        )
     }
 
     /// Extended allocation with deficit support (Issue #35).
