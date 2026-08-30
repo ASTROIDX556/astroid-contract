@@ -91,6 +91,19 @@ enum DataKey {
     MinReserve(u64, Address),
 }
 
+/// A single sub-call to be executed as part of a batch. `contract_addr` is the
+/// target contract, `fn_name` is the entry-point symbol, and `args` are the
+/// serialized arguments. The batch executor invokes each sub-call sequentially;
+/// if any fails the entire transaction is atomically reverted by the Soroban
+/// runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractCall {
+    pub contract_addr: Address,
+    pub fn_name: Symbol,
+    pub args: soroban_sdk::Vec<soroban_sdk::RawVal>,
+}
+
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
