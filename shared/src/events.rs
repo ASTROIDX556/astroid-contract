@@ -20,8 +20,8 @@
 //! The two layers are emitted together on key state transitions so neither
 //! existing nor new consumers break.
 
-use crate::types::ModuleKind;
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
+use crate::types::{AssetAmount, ModuleKind};
+use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -53,6 +53,15 @@ pub enum ContractEvent {
         asset: Address,
         amount: i128,
     },
+    /// Value moved out of a contract to several recipients in one atomic batch.
+    /// Emitted once per batch (not once per leg) to keep the log concise; the
+    /// individual token transfers remain visible as SAC events.
+    BatchTransferExecuted {
+        from: Address,
+        asset: Address,
+        count: u32,
+        total: i128,
+    },
     /// A treasury configuration field was updated (`action` is e.g. `policy`).
     TreasuryConfigUpdated { org: String, action: Symbol },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
@@ -63,6 +72,13 @@ pub enum ContractEvent {
     },
     /// A policy rejected a transfer.
     PolicyViolation { policy_id: String, reason: Symbol },
+    /// An escrow's held assets were released to its recipient, whether via the
+    /// standard arbiter path or a signature-based manual override.
+    EscrowReleased {
+        escrow_id: u64,
+        recipient: Address,
+        assets: Vec<AssetAmount>,
+    },
 }
 
 /// Publish a [`ContractEvent`] using the canonical schema.
@@ -107,6 +123,17 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (from, to, asset, amount),
             );
         }
+        ContractEvent::BatchTransferExecuted {
+            from,
+            asset,
+            count,
+            total,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "BatchTransferExecuted"),),
+                (from, asset, count, total),
+            );
+        }
         ContractEvent::TreasuryConfigUpdated { org, action } => {
             env.events()
                 .publish((Symbol::new(env, "TreasuryConfigUpdated"),), (org, action));
@@ -124,6 +151,16 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::PolicyViolation { policy_id, reason } => {
             env.events()
                 .publish((Symbol::new(env, "PolicyViolation"),), (policy_id, reason));
+        }
+        ContractEvent::EscrowReleased {
+            escrow_id,
+            recipient,
+            assets,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "EscrowReleased"),),
+                (escrow_id, recipient, assets),
+            );
         }
     }
 }
