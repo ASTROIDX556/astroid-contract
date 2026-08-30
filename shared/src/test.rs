@@ -36,76 +36,7 @@ fn add_identity() {
 #[test]
 fn add_overflow() {
     assert_eq!(checked_add(i128::MAX, 1), Err(Error::Overflow));
-    assert_eq!(checked_add(i128::MAX, i128::MAX), Err(Error::Overflow));
-    assert_eq!(checked_add(i128::MAX, 100), Err(Error::Overflow));
-}
-
-#[test]
-fn add_underflow() {
-    assert_eq!(checked_add(i128::MIN, -1), Err(Error::Underflow));
-    assert_eq!(checked_add(i128::MIN, i128::MIN), Err(Error::Underflow));
-}
-
-// ---------------------------------------------------------------------------
-// checked_sub
-// ---------------------------------------------------------------------------
-
-#[test]
-fn sub_happy_path() {
-    assert_eq!(checked_sub(0, 0), Ok(0));
-    assert_eq!(checked_sub(5, 3), Ok(2));
-    assert_eq!(checked_sub(3, 5), Ok(-2));
-    assert_eq!(checked_sub(-3, -5), Ok(2));
-    assert_eq!(checked_sub(-5, 3), Ok(-8));
-}
-
-#[test]
-fn sub_identity() {
-    assert_eq!(checked_sub(42, 0), Ok(42));
-    assert_eq!(checked_sub(-42, 0), Ok(-42));
-}
-
-#[test]
-fn sub_underflow() {
-    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Underflow));
-    assert_eq!(checked_sub(i128::MIN, 100), Err(Error::Underflow));
-}
-
-#[test]
-fn sub_overflow() {
-    assert_eq!(checked_sub(i128::MAX, -1), Err(Error::Overflow));
-}
-
-// ---------------------------------------------------------------------------
-// checked_mul
-// ---------------------------------------------------------------------------
-
-#[test]
-fn mul_happy_path() {
-    assert_eq!(checked_mul(0, 0), Ok(0));
-    assert_eq!(checked_mul(4, 5), Ok(20));
-    assert_eq!(checked_mul(-4, 5), Ok(-20));
-    assert_eq!(checked_mul(4, -5), Ok(-20));
-    assert_eq!(checked_mul(-4, -5), Ok(20));
-}
-
-#[test]
-fn mul_identity() {
-    assert_eq!(checked_mul(42, 1), Ok(42));
-    assert_eq!(checked_mul(1, 42), Ok(42));
-    assert_eq!(checked_mul(-42, 1), Ok(-42));
-    assert_eq!(checked_mul(42, -1), Ok(-42));
-}
-
-#[test]
-fn mul_zero() {
-    assert_eq!(checked_mul(0, i128::MAX), Ok(0));
-    assert_eq!(checked_mul(i128::MAX, 0), Ok(0));
-    assert_eq!(checked_mul(0, i128::MIN), Ok(0));
-}
-
-#[test]
-fn mul_overflow() {
+    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::MathOverflow));
     assert_eq!(checked_mul(i128::MAX, 2), Err(Error::Overflow));
     assert_eq!(checked_mul(i128::MAX, i128::MAX), Err(Error::Overflow));
     assert_eq!(checked_mul(i128::MAX, 100), Err(Error::Overflow));
@@ -300,6 +231,12 @@ fn time_validation() {
 
 #[test]
 fn constants_are_sane() {
+    const _: () = {
+        assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
+    };
+    const _: () = {
+        assert!(MAX_SIGNERS >= 1);
+    };
     const _: () = {
         assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
     };

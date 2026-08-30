@@ -38,7 +38,7 @@ impl SafeAdd for i128 {
 
 impl SafeSub for i128 {
     fn safe_sub(self, other: i128) -> Result<i128, Error> {
-        self.checked_sub(other).ok_or(Error::Underflow)
+        self.checked_sub(other).ok_or(Error::MathOverflow)
     }
 }
 
