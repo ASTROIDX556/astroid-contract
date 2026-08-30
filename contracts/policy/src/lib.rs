@@ -552,7 +552,7 @@ impl PolicyInterface for PolicyContract {
                 return Err(Error::PolicyDenied);
             }
         }
-        if policy.allowed_assets.len() > 0 {
+        if !policy.allowed_assets.is_empty() {
             let mut found = false;
             for a in policy.allowed_assets.iter() {
                 if a == asset {

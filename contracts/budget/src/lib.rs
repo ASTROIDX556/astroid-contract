@@ -17,7 +17,6 @@
 //!
 //! Functions: `allocate`, `consume`, `reset`, `freeze`, `unfreeze`, `archive`,
 //! `transfer_allocation`.
-
 use astroid_interfaces::BudgetInterface;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
@@ -31,7 +30,6 @@ use astroid_shared::validation::{
 };
 use astroid_shared::{constants, events};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
-
 /// Reset period for a recurring budget. `None` means one-shot (no auto-reset).
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,7 +39,6 @@ pub enum Period {
     Weekly = 2,
     Monthly = 3,
 }
-
 /// Stored budget record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,7 +61,6 @@ pub struct Budget {
     pub expires_at: u64,
     pub state: ResourceState,
 }
-
 /// Per-asset budget tracking.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,7 +69,6 @@ pub struct AssetBudget {
     pub spent: i128,
     pub window_start: u64,
 }
-
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -81,10 +76,8 @@ enum DataKey {
     Budget(String),
     AssetBudget(String, Address),
 }
-
 #[contract]
 pub struct BudgetContract;
-
 #[contractimpl]
 impl BudgetContract {
     /// Initialize with an admin (used only for protocol-level bookkeeping; all
@@ -99,7 +92,6 @@ impl BudgetContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
-
     /// Allocate (create) a budget with a spending `limit` and optional reset
     /// `period`. `owner` authorizes and becomes the budget's controller.
     /// `rollover_enabled` carries unspent allowance into the next period;
@@ -127,7 +119,6 @@ impl BudgetContract {
             expires_at,
         )
     }
-
     /// Extended allocation with deficit support (Issue #35).
     pub fn allocate_with_deficit(
         env: Env,
@@ -171,7 +162,6 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     /// Reset the spent counter to zero (owner-gated). Also refreshes the window.
     /// Rejects expired budgets.
     pub fn reset(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
@@ -185,7 +175,6 @@ impl BudgetContract {
             .publish((symbol_short!("budget"), symbol_short!("reset")), budget_id);
         Ok(())
     }
-
     /// Force a period transition for a budget (owner-gated). Rolls unspent
     /// allowance over into the next period when `rollover_enabled`, otherwise
     /// clears it. Carries forward any deficit. Rejects expired budgets. This is
@@ -197,7 +186,6 @@ impl BudgetContract {
         Self::store(&env, &budget_id, &budget);
         Ok(())
     }
-
     /// Change a budget's limit (owner-gated). New limit must be >= amount spent
     /// in the current window. Applies any pending period transition first.
     pub fn set_limit(
@@ -220,7 +208,6 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     /// Freeze a budget (owner-gated). Frozen budgets reject consumption.
     pub fn freeze(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
@@ -235,7 +222,6 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     /// Unfreeze a budget back to active (owner-gated).
     pub fn unfreeze(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
@@ -250,7 +236,6 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     /// Archive a budget (owner-gated, terminal). Rejects further consumption.
     pub fn archive(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
@@ -262,7 +247,6 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     /// Move unused allocation from one budget to another. Both must share the
     /// same owner, who authorizes. Reduces `from`'s limit and increases `to`'s.
     pub fn transfer_allocation(
@@ -299,7 +283,6 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     /// Set budget limit for a specific token (owner-gated).
     pub fn set_budget_limit(
         env: Env,
@@ -312,7 +295,6 @@ impl BudgetContract {
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
         require_non_negative_amount(limit)?;
-
         let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
         let asset_budget = AssetBudget {
             limit,
@@ -327,7 +309,6 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     /// Check and record spend for a specific token.
     pub fn check_and_record_spend(
         env: Env,
@@ -339,20 +320,17 @@ impl BudgetContract {
         require_positive_amount(amount)?;
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
-
         let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
         let mut asset_budget: AssetBudget = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(Error::AssetNotAuthorized)?;
-
         // Check if within limit
         let new_spent = checked_add(asset_budget.spent, amount)?;
         if new_spent > asset_budget.limit {
             return Err(Error::BudgetExceeded);
         }
-
         asset_budget.spent = new_spent;
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
@@ -362,29 +340,23 @@ impl BudgetContract {
         );
         Ok(())
     }
-
     // --- views ---
-
     pub fn get(env: Env, budget_id: String) -> Result<Budget, Error> {
         Self::load(&env, &budget_id)
     }
-
     // --- internal helpers ---
-
     fn load(env: &Env, id: &String) -> Result<Budget, Error> {
         env.storage()
             .persistent()
             .get(&DataKey::Budget(id.clone()))
             .ok_or(Error::NotFound)
     }
-
     fn store(env: &Env, id: &String, budget: &Budget) {
         env.storage()
             .persistent()
             .set(&DataKey::Budget(id.clone()), budget);
         Self::bump(env, id);
     }
-
     fn require_owner(env: &Env, id: &String, caller: &Address) -> Result<Budget, Error> {
         caller.require_auth();
         let budget = Self::load(env, id)?;
@@ -393,7 +365,6 @@ impl BudgetContract {
         }
         Ok(budget)
     }
-
     fn require_active(budget: &Budget) -> Result<(), Error> {
         match budget.state {
             ResourceState::Active => Ok(()),
@@ -401,7 +372,6 @@ impl BudgetContract {
             ResourceState::Archived => Err(Error::BudgetArchived),
         }
     }
-
     /// Apply the pending period transition (auto-reset / rollover) and check
     /// expiration. Mutates `budget` in place. When `publish` is true, emits the
     /// `rollover`/`reset`/`expired` events. Returns [`Error::BudgetExpired`] if
@@ -478,7 +448,6 @@ impl BudgetContract {
         }
         Ok(())
     }
-
     /// Guard that rejects an expired budget.
     fn require_not_expired(env: &Env, budget: &Budget) -> Result<(), Error> {
         let now = env.ledger().timestamp();
@@ -487,7 +456,6 @@ impl BudgetContract {
         }
         Ok(())
     }
-
     fn bump(env: &Env, id: &String) {
         env.storage().persistent().extend_ttl(
             &DataKey::Budget(id.clone()),
@@ -495,7 +463,6 @@ impl BudgetContract {
             PERSISTENT_BUMP_AMOUNT,
         );
     }
-
     fn bump_asset(env: &Env, budget_id: &String, token: &Address) {
         env.storage().persistent().extend_ttl(
             &DataKey::AssetBudget(budget_id.clone(), token.clone()),
@@ -504,7 +471,6 @@ impl BudgetContract {
         );
     }
 }
-
 // ---------------------------------------------------------------------------
 // Shared interface implementation used by other contracts (e.g. Treasury).
 // ---------------------------------------------------------------------------
@@ -518,7 +484,6 @@ impl BudgetInterface for BudgetContract {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
         Self::window_transition(&env, &mut budget, &budget_id, true)?;
-
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         // When a deficit exists from prior periods, the effective spending
         // ceiling is reduced.  When no deficit exists yet, `allow_deficit`
@@ -556,9 +521,7 @@ impl BudgetInterface for BudgetContract {
         );
         Ok(remaining)
     }
-
     /// Read remaining allocation, accounting for a pending period transition.
-
     fn release(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
@@ -572,7 +535,6 @@ impl BudgetInterface for BudgetContract {
         let capacity = astroid_shared::math::checked_add(budget.limit, budget.rollover_credit)?;
         astroid_shared::math::checked_sub(capacity, budget.spent)
     }
-
     fn remaining(env: Env, budget_id: String) -> Result<i128, Error> {
         let mut budget = Self::load(&env, &budget_id)?;
         // Don't emit events from a read-only view, but persist the period
@@ -591,6 +553,5 @@ impl BudgetInterface for BudgetContract {
         }
     }
 }
-
 #[cfg(test)]
 mod test;

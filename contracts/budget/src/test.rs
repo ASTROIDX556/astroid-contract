@@ -422,7 +422,6 @@ fn test_rollback_budget() {
     // rollback more than spent fails
     let res = client.try_release(&owner, &b_id, &300);
     assert_eq!(res, Err(Ok(Error::Underflow)));
-
 }
 // --- Issue #35: Deficit carryforward tests ---
 
@@ -534,5 +533,4 @@ fn deficit_surplus_rollover_combined() {
     assert_eq!(b.deficit_amount, 0);
     assert_eq!(b.rollover_credit, 400);
     assert_eq!(b.spent, 0);
-
 }
