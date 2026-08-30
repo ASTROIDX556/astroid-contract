@@ -681,3 +681,173 @@ fn asset_whitelist_violation_event_emitted() {
     let _ = p.try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &100);
     assert_event(&env, "PolicyViolation");
 }
+
+#[test]
+fn set_and_get_allowance_per_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let xlm = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+    // Initially 0 for both assets.
+    assert_eq!(p.get_allowance(&pid, &xlm), 0);
+    assert_eq!(p.get_allowance(&pid, &usdc), 0);
+
+    p.set_allowance(&owner, &pid, &xlm, &5000);
+    p.set_allowance(&owner, &pid, &usdc, &10000);
+    assert_eq!(p.get_allowance(&pid, &xlm), 5000);
+    assert_eq!(p.get_allowance(&pid, &usdc), 10000);
+
+    // Overwrite one without affecting the other.
+    p.set_allowance(&owner, &pid, &xlm, &7000);
+    assert_eq!(p.get_allowance(&pid, &xlm), 7000);
+    assert_eq!(p.get_allowance(&pid, &usdc), 10000);
+}
+
+#[test]
+fn check_allowance_success_and_exceeded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+    p.set_allowance(&owner, &pid, &asset, &1000);
+
+    // Within limit succeeds.
+    assert!(p.try_check_allowance(&pid, &asset, &800).is_ok());
+    // Exact limit succeeds.
+    assert!(p.try_check_allowance(&pid, &asset, &1000).is_ok());
+    // Over limit fails with the deterministic policy-denial code.
+    let err = p.try_check_allowance(&pid, &asset, &1001).unwrap_err();
+    assert_eq!(err, Ok(astroid_shared::errors::Error::PolicyDenied));
+    let err2 = p
+        .try_check_transfer(&pid, &asset, &Address::generate(&env), &1001)
+        .unwrap_err();
+    assert_eq!(err2, Ok(astroid_shared::errors::Error::PolicyDenied));
+}
+
+#[test]
+fn update_allowance_decrements_and_guards() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+    p.set_allowance(&owner, &pid, &asset, &1000);
+
+    p.update_allowance(&owner, &pid, &asset, &400);
+    assert_eq!(p.get_allowance(&pid, &asset), 600);
+    p.update_allowance(&owner, &pid, &asset, &600);
+    assert_eq!(p.get_allowance(&pid, &asset), 0);
+
+    // Further consume beyond zero fails cleanly.
+    let err = p
+        .try_update_allowance(&owner, &pid, &asset, &1)
+        .unwrap_err();
+    assert_eq!(err, Ok(astroid_shared::errors::Error::PolicyDenied));
+    assert_eq!(p.get_allowance(&pid, &asset), 0);
+}
+
+#[test]
+fn allowance_multi_asset_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let xlm = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+    p.set_allowance(&owner, &pid, &xlm, &1000);
+    p.set_allowance(&owner, &pid, &usdc, &5000);
+
+    // Consume XLM does not affect USDC.
+    p.update_allowance(&owner, &pid, &xlm, &800);
+    assert_eq!(p.get_allowance(&pid, &xlm), 200);
+    assert_eq!(p.get_allowance(&pid, &usdc), 5000);
+
+    // Check_transfer respects per-asset limits.
+    let recip = Address::generate(&env);
+    assert!(p.try_check_transfer(&pid, &xlm, &recip, &200).is_ok());
+    assert!(
+        p.try_check_transfer(&pid, &xlm, &recip, &201).unwrap_err()
+            == Ok(astroid_shared::errors::Error::PolicyDenied)
+    );
+    assert!(p.try_check_transfer(&pid, &usdc, &recip, &5000).is_ok());
+    assert!(
+        p.try_check_transfer(&pid, &usdc, &recip, &5001)
+            .unwrap_err()
+            == Ok(astroid_shared::errors::Error::PolicyDenied)
+    );
+}
+
+#[test]
+fn allowance_unlimited_when_not_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+    // No allowance set => check succeeds even for large amount (unless max_amount gate).
+    assert!(p.try_check_allowance(&pid, &asset, &1_000_000).is_ok());
+    // check_transfer also succeeds within max_amount, despite no allowance entry.
+    assert!(p
+        .try_check_transfer(&pid, &asset, &Address::generate(&env), &500_000)
+        .is_ok());
+}
+
+#[test]
+fn set_allowance_requires_owner_and_valid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+
+    let res = p.try_set_allowance(&stranger, &pid, &asset, &1000);
+    assert_eq!(res, Err(Ok(astroid_shared::errors::Error::Unauthorized)));
+
+    let res2 = p.try_set_allowance(&owner, &pid, &asset, &-5);
+    assert_eq!(res2, Err(Ok(astroid_shared::errors::Error::InvalidAmount)));
+
+    let res3 = p.try_update_allowance(&stranger, &pid, &asset, &100);
+    assert_eq!(res3, Err(Ok(astroid_shared::errors::Error::Unauthorized)));
+}
+
+#[test]
+fn check_transfer_without_allowance_still_enforces_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+    // max_amount is 1_000_000, so even with no allowance, max gate still applies.
+    assert!(p
+        .try_check_transfer(&pid, &asset, &Address::generate(&env), &1_000_001)
+        .is_err());
+}
+
+#[test]
+fn allowance_checked_math_no_overflow_panic() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
+    p.set_allowance(&owner, &pid, &asset, &500);
+    // Consuming exactly 500 then trying to consume more is a clean error, not a panic.
+    p.update_allowance(&owner, &pid, &asset, &500);
+    assert_eq!(p.get_allowance(&pid, &asset), 0);
+    let err = p
+        .try_update_allowance(&owner, &pid, &asset, &1)
+        .unwrap_err();
+    assert_eq!(err, Ok(astroid_shared::errors::Error::PolicyDenied));
+}
