@@ -38,7 +38,7 @@ impl SafeAdd for i128 {
 
 impl SafeSub for i128 {
     fn safe_sub(self, other: i128) -> Result<i128, Error> {
-        self.checked_sub(other).ok_or(Error::Underflow)
+        self.checked_sub(other).ok_or(Error::MathOverflow)
     }
 }
 
@@ -51,7 +51,7 @@ impl SafeMul for i128 {
 impl SafeDiv for i128 {
     fn safe_div(self, other: i128) -> Result<i128, Error> {
         if other == 0 {
-            return Err(Error::DivisionByZero);
+            return Err(Error::InvalidInput);
         }
         self.checked_div(other).ok_or(Error::MathOverflow)
     }
@@ -72,11 +72,5 @@ pub fn checked_mul(a: i128, b: i128) -> Result<i128, Error> {
 }
 
 pub fn checked_div(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_div(b).map_err(|e| {
-        if e == Error::DivisionByZero {
-            Error::InvalidInput
-        } else {
-            Error::Overflow
-        }
-    })
+    a.safe_div(b)
 }

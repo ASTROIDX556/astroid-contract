@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
@@ -92,7 +92,6 @@ pub struct Proposal {
     /// Links (opaque references owned by the backend / other contracts).
     pub wallet: String,
     pub policy: String,
-    pub tx_ref: String,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
@@ -119,21 +118,6 @@ impl Proposal {
     pub fn can_execute(&self, env: &Env) -> bool {
         self.is_active(env) && self.state == ProposalState::Approved
     }
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateProposalParams {
-    pub org: String,
-    pub wallet: String,
-    pub policy: String,
-    pub tx_ref: String,
-    pub approvers: Vec<Address>,
-    pub dependencies: Vec<u64>,
-    pub threshold: u32,
-    pub deposit: Vec<AssetAmount>,
-    pub expires_at: u64,
-    pub grace_period: u64,
 }
 
 #[contracttype]
@@ -178,17 +162,30 @@ impl ProposalContract {
     /// case of the same check. Because every edge strictly decreases the id,
     /// no sequence of edges can return to its starting proposal, so the graph
     /// is a DAG by construction and no traversal is needed.
-    pub fn create(env: Env, proposer: Address, params: CreateProposalParams) -> Result<u64, Error> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        approvers: Vec<Address>,
+        dependencies: Vec<u64>,
+        threshold: u32,
+        deposit: Vec<AssetAmount>,
+        expires_at: u64,
+        grace_period: u64,
+    ) -> Result<u64, Error> {
         proposer.require_auth();
-        require_non_empty(&params.org)?;
-        let n = params.approvers.len();
+        require_non_empty(&org)?;
+        let n = approvers.len();
         if n == 0 || n > MAX_APPROVERS {
             return Err(Error::InvalidInput);
         }
-        if params.threshold == 0 || params.threshold > n {
+        if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
         }
-        if let Some(dep) = params.deposit.first() {
+        if let Some(dep) = deposit.first() {
             if dep.amount <= 0 {
                 return Err(Error::InvalidAmount);
             }
@@ -198,11 +195,11 @@ impl ProposalContract {
                 &dep.amount,
             );
         }
-        if params.expires_at != 0 && params.expires_at <= env.ledger().timestamp() {
+        if expires_at != 0 && expires_at <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
         }
 
-        if params.dependencies.len() > MAX_DEPENDENCIES {
+        if dependencies.len() > MAX_DEPENDENCIES {
             return Err(Error::InvalidInput);
         }
 
@@ -217,7 +214,7 @@ impl ProposalContract {
         // Validate the declared prerequisites and collapse duplicates, so that
         // `execute` reads each prerequisite exactly once.
         let mut deps: Vec<u64> = Vec::new(&env);
-        for dep in params.dependencies.iter() {
+        for dep in dependencies.iter() {
             // Any edge that does not point strictly backwards would close a
             // cycle (or be a self-reference); see the acyclicity note above.
             if dep >= id {
@@ -233,19 +230,18 @@ impl ProposalContract {
 
         let proposal = Proposal {
             proposer: proposer.clone(),
-            org: params.org.clone(),
-            wallet: params.wallet.clone(),
-            policy: params.policy.clone(),
-            tx_ref: params.tx_ref.clone(),
-            approvers: params.approvers.clone(),
+            org,
+            wallet,
+            policy,
+            approvers,
             dependencies: deps,
-            threshold: params.threshold,
+            threshold,
             approvals: 0,
-            deposit: params.deposit.clone(),
+            deposit,
             state: ProposalState::Pending,
             created_at: env.ledger().timestamp(),
-            expires_at: params.expires_at,
-            grace_period: params.grace_period,
+            expires_at,
+            grace_period,
         };
         env.storage()
             .persistent()
@@ -518,19 +514,6 @@ impl ProposalContract {
             if !prerequisite.state.has_executed() {
                 return Err(Error::PrerequisiteNotMet);
             }
-        }
-        Ok(())
-    }
-
-    /// Surface [`Error::ProposalExpired`] when the deadline has passed so callers
-    /// fail safely. This deliberately does NOT persist the `Expired` state: on the
-    /// Soroban host, returning `Err` rolls back every storage write from the
-    /// invocation, so the terminal transition is recorded only through the
-    /// permissionless [`ProposalContract::expire`] entrypoint (which returns `Ok`).
-    #[allow(dead_code)]
-    fn ensure_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
-        if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
-            return Err(Error::ProposalExpired);
         }
         Ok(())
     }

@@ -2,8 +2,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::Address as _, testutils::Events, token, vec, Address, Env, IntoVal, String, Symbol,
-    Val, Vec,
+    testutils::{Address as _, Events, Ledger},
+    token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use astroid_shared::constants::MAX_BATCH_PAYMENTS;
@@ -147,6 +147,69 @@ fn prepare_holds_state() {
 }
 
 #[test]
+fn allowance_caps_withdrawal_and_accumulates() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    // Approve a 500 ceiling for admin -> recipient in this asset.
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &500, &0);
+
+    // First withdrawal within the ceiling succeeds and is deducted.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
+    let al = h.client.allowance(&h.admin, &recipient, &h.asset);
+    assert_eq!(al.spent, 400);
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // Second withdrawal exceeds the remaining 100 -> rejected at the allowance gate.
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // A different recipient is not under the allowance, so it is allowed.
+    let other = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &other, &100);
+    assert_eq!(token_balance(&h, &other), 100);
+}
+
+#[test]
+fn expired_allowance_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &id);
+    client.initialize(&String::from_str(&env, "vault"), &admin);
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000);
+    client.deposit(&admin, &asset, &1_000);
+
+    // Allowance already expired (expires_at in the past).
+    let recipient = Address::generate(&env);
+    client.set_allowance(&admin, &admin, &recipient, &asset, &500, &5_000);
+    let res = client.try_withdraw(&admin, &asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::AllowanceExpired)));
+}
+
+#[test]
+fn remove_allowance_clears_cap() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &0);
+    h.client
+        .remove_allowance(&h.admin, &h.admin, &recipient, &h.asset);
+    // With no allowance in place the full balance may be withdrawn.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
+    assert_eq!(token_balance(&h, &recipient), 1_000);
+}
+
+#[test]
 fn test_milestone_releases() {
     let env = Env::default();
     env.mock_all_auths();
@@ -207,185 +270,6 @@ fn standard_events_emitted() {
     h2.client.deposit(&h2.admin, &h2.asset, &1_000);
     h2.client.withdraw(&h2.admin, &h2.asset, &recipient, &100);
     assert_event(&h2.env, "TransferExecuted");
-}
-
-// ── Allowance tracking ───────────────────────────────────────────────
-
-#[test]
-fn allowance_set_and_get() {
-    let h = setup("vault", 0);
-    let agent = Address::generate(&h.env);
-    // Initially no allowance → 0
-    assert_eq!(h.client.get_allowance(&agent), 0);
-    h.client.set_allowance(&h.admin, &agent, &500);
-    assert_eq!(h.client.get_allowance(&agent), 500);
-    // Overwrite with higher value
-    h.client.set_allowance(&h.admin, &agent, &1_000);
-    assert_eq!(h.client.get_allowance(&agent), 1_000);
-    // Zero allowance blocks (explicit 0 means no further withdraws)
-    h.client.set_allowance(&h.admin, &agent, &0);
-    assert_eq!(h.client.get_allowance(&agent), 0);
-}
-
-#[test]
-fn allowance_successful_usage() {
-    let h = setup("vault", 1_000);
-    let agent = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.set_allowance(&h.admin, &agent, &600);
-
-    // Withdraw within allowance succeeds and atomically decrements.
-    h.client.withdraw(&h.admin, &h.asset, &agent, &400);
-    assert_eq!(h.client.get_allowance(&agent), 200);
-    assert_eq!(token_balance(&h, &agent), 400);
-    assert_eq!(token_balance(&h, &h.client.address), 600);
-    let holding = h.client.holding(&h.asset);
-    assert_eq!(holding.total_in, 600);
-    assert_eq!(holding.total_out, 400);
-}
-
-#[test]
-fn allowance_exact_limit_boundary() {
-    let h = setup("vault", 500);
-    let agent = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &500);
-    h.client.set_allowance(&h.admin, &agent, &500);
-
-    // Exact match is allowed; remaining becomes 0.
-    h.client.withdraw(&h.admin, &h.asset, &agent, &500);
-    assert_eq!(h.client.get_allowance(&agent), 0);
-    assert_eq!(token_balance(&h, &agent), 500);
-    assert_eq!(token_balance(&h, &h.client.address), 0);
-
-    // Any further withdraw, even 1 stroop, must fail with AllowanceExceeded.
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &agent, &1);
-    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
-    // State unchanged after rejection.
-    assert_eq!(h.client.get_allowance(&agent), 0);
-    assert_eq!(token_balance(&h, &h.client.address), 0);
-    assert_eq!(h.client.holding(&h.asset).total_in, 0);
-}
-
-#[test]
-fn allowance_over_limit_rejection() {
-    let h = setup("vault", 1_000);
-    let agent = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.set_allowance(&h.admin, &agent, &300);
-
-    // Attempt to withdraw more than allowance → deterministic error.
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &agent, &400);
-    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
-    // No tokens moved, allowance unchanged, internal ledger untouched.
-    assert_eq!(h.client.get_allowance(&agent), 300);
-    assert_eq!(token_balance(&h, &agent), 0);
-    assert_eq!(token_balance(&h, &h.client.address), 1_000);
-    assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
-    assert_eq!(h.client.holding(&h.asset).total_out, 0);
-}
-
-#[test]
-fn allowance_multiple_withdraws_decrement_atomically() {
-    let h = setup("vault", 1_000);
-    let agent = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.set_allowance(&h.admin, &agent, &1_000);
-
-    h.client.withdraw(&h.admin, &h.asset, &agent, &300);
-    assert_eq!(h.client.get_allowance(&agent), 700);
-    h.client.withdraw(&h.admin, &h.asset, &agent, &400);
-    assert_eq!(h.client.get_allowance(&agent), 300);
-    h.client.withdraw(&h.admin, &h.asset, &agent, &300);
-    assert_eq!(h.client.get_allowance(&agent), 0);
-    assert_eq!(token_balance(&h, &agent), 1_000);
-
-    // Exhausted → next withdraw fails.
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &agent, &1);
-    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
-    assert_eq!(token_balance(&h, &agent), 1_000);
-}
-
-#[test]
-fn allowance_zero_blocks_withdrawal() {
-    let h = setup("vault", 1_000);
-    let agent = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.set_allowance(&h.admin, &agent, &0);
-
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &agent, &10);
-    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
-    assert_eq!(h.client.get_allowance(&agent), 0);
-    assert_eq!(token_balance(&h, &agent), 0);
-}
-
-#[test]
-fn allowance_non_admin_cannot_set() {
-    let h = setup("vault", 0);
-    let agent = Address::generate(&h.env);
-    let intruder = Address::generate(&h.env);
-    let res = h.client.try_set_allowance(&intruder, &agent, &500);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    assert_eq!(h.client.get_allowance(&agent), 0);
-}
-
-#[test]
-fn allowance_negative_amount_rejected() {
-    let h = setup("vault", 0);
-    let agent = Address::generate(&h.env);
-    let res = h.client.try_set_allowance(&h.admin, &agent, &-10);
-    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
-    assert_eq!(h.client.get_allowance(&agent), 0);
-}
-
-#[test]
-fn allowance_per_beneficiary_isolation() {
-    let h = setup("vault", 1_000);
-    let alice = Address::generate(&h.env);
-    let bob = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.set_allowance(&h.admin, &alice, &400);
-    h.client.set_allowance(&h.admin, &bob, &700);
-
-    h.client.withdraw(&h.admin, &h.asset, &alice, &400);
-    assert_eq!(h.client.get_allowance(&alice), 0);
-    assert_eq!(h.client.get_allowance(&bob), 700);
-    // Bob still has full allowance independent of Alice's consumption.
-    assert_eq!(token_balance(&h, &alice), 400);
-    assert_eq!(token_balance(&h, &bob), 0);
-
-    // Alice exhausted → next Alice withdraw fails, Bob still succeeds.
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &alice, &1);
-    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
-    h.client.withdraw(&h.admin, &h.asset, &bob, &600);
-    assert_eq!(h.client.get_allowance(&bob), 100);
-    assert_eq!(token_balance(&h, &bob), 600);
-}
-
-#[test]
-fn allowance_unlimited_when_not_set() {
-    // Withdrawals to an address with no explicit allowance are unlimited
-    // (backward compatibility with pre-allowance treasuries).
-    let h = setup("vault", 1_000);
-    let recipient = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    // No set_allowance call → withdraw succeeds.
-    assert_eq!(h.client.get_allowance(&recipient), 0);
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
-    assert_eq!(token_balance(&h, &recipient), 1_000);
-}
-
-#[test]
-fn allowance_over_limit_does_not_consume_budget_or_funds() {
-    let h = setup("vault", 500);
-    let agent = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &500);
-    h.client.set_allowance(&h.admin, &agent, &100);
-    // Even though treasury has 500 funds, allowance breach aborts before ledger debit.
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &agent, &200);
-    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
-    assert_eq!(h.client.holding(&h.asset).total_in, 500);
-    assert_eq!(h.client.holding(&h.asset).total_out, 0);
-    assert_eq!(token_balance(&h, &h.client.address), 500);
 }
 
 /// Build one leg of a batch payout.

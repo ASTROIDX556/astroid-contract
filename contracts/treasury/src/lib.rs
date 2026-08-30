@@ -22,9 +22,9 @@
 //! invocation and no recipient is paid.
 //!
 //! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
-//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`,
-//! `holding`, `set_allowance`, `get_allowance` — with per-beneficiary withdrawal
-//! allowance tracking.
+//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`,
+//! `set_allowance`, `remove_allowance`, `allowance`, `init_milestone_disbursement`,
+//! `release_next_milestone`, `get`, `holding`.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -35,9 +35,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::{Payment, ResourceState};
-use astroid_shared::validation::{
-    require_non_empty, require_non_negative_amount, require_positive_amount,
-};
+use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
 };
@@ -81,6 +79,32 @@ pub struct Holding {
     pub budget_id: Option<String>,
 }
 
+/// Composite key identifying a withdrawal allowance scoped to a specific agent
+/// (the caller that may spend), recipient and asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowanceId {
+    pub agent: Address,
+    pub recipient: Address,
+    pub asset: Address,
+}
+
+/// Active withdrawal allowance restricting agent-driven expenditures against a
+/// specific recipient/asset to a pre-approved `limit` over a time window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Allowance {
+    pub agent: Address,
+    pub recipient: Address,
+    pub asset: Address,
+    /// Maximum cumulative amount that may be withdrawn under this allowance.
+    pub limit: i128,
+    /// Amount already consumed against the allowance.
+    pub spent: i128,
+    /// Unix timestamp after which the allowance can no longer be used (0 = never).
+    pub expires_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -90,7 +114,7 @@ enum DataKey {
     Frozen,
     Milestone(u64),
     MilestoneCount,
-    Allowance(Address),
+    Allowance(AllowanceId),
 }
 
 #[contract]
@@ -250,54 +274,91 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Set the withdrawal allowance for a beneficiary. Only the admin may call.
-    /// The allowance caps the total amount the beneficiary can receive via
-    /// `withdraw`. Uses persistent storage keyed by the beneficiary address and
-    /// checked math to prevent overflows. Setting to 0 blocks further withdrawals
-    /// to that beneficiary until raised.
+    /// Create or update a withdrawal allowance capping how much `agent` may send
+    /// to `recipient` in `asset`. `limit` is the cumulative ceiling; `expires_at`
+    /// is an optional unix expiry (0 = no expiry). Admin only.
     pub fn set_allowance(
         env: Env,
-        caller: Address,
-        beneficiary: Address,
-        amount: i128,
+        admin: Address,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+        limit: i128,
+        expires_at: u64,
     ) -> Result<(), Error> {
-        let t = Self::require_admin(&env, &caller)?;
-        require_non_negative_amount(amount)?;
-        let key = DataKey::Allowance(beneficiary.clone());
-        env.storage().persistent().set(&key, &amount);
-        env.storage().persistent().extend_ttl(
-            &key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("allowance")),
-            (beneficiary, amount),
-        );
-        events::publish(
-            &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("allowance"),
-            },
-        );
+        let _t = Self::require_admin(&env, &admin)?;
+        require_positive_amount(limit)?;
+        if agent == recipient {
+            return Err(Error::InvalidInput);
+        }
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        let allowance = Allowance {
+            agent: id.agent.clone(),
+            recipient: id.recipient.clone(),
+            asset: id.asset.clone(),
+            limit,
+            spent: 0,
+            expires_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(id), &allowance);
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allow")), ());
         Ok(())
     }
 
-    /// Get the remaining withdrawal allowance for a beneficiary. Returns 0 if no
-    /// allowance has been set for that address.
-    pub fn get_allowance(env: Env, beneficiary: Address) -> i128 {
+    /// Remove an active withdrawal allowance (admin only).
+    pub fn remove_allowance(
+        env: Env,
+        admin: Address,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+    ) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &admin)?;
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Allowance(id.clone()))
+        {
+            return Err(Error::AllowanceNotFound);
+        }
+        env.storage().persistent().remove(&DataKey::Allowance(id));
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allowrm")), ());
+        Ok(())
+    }
+
+    /// Read the current state of a withdrawal allowance.
+    pub fn allowance(
+        env: Env,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+    ) -> Result<Allowance, Error> {
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
         env.storage()
             .persistent()
-            .get(&DataKey::Allowance(beneficiary))
-            .unwrap_or(0)
+            .get(&DataKey::Allowance(id))
+            .ok_or(Error::AllowanceNotFound)
     }
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
     /// must clear policy and budget gates before the ledger is debited.
-    /// If an allowance has been set for the recipient, the amount is checked
-    /// against the remaining allowance and atomically decremented; exceeding the
-    /// allowance returns `AllowanceExceeded` or `InsufficientAllowance`.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -331,29 +392,32 @@ impl TreasuryContract {
                 .consume(&caller, budget_id, &amount);
         }
 
-        // 2b. Allowance enforcement — check and atomically decrement remaining
-        // allowance for the beneficiary. Uses persistent storage keyed by the
-        // recipient address and checked math. If no allowance has been set for
-        // the beneficiary, the check is skipped (unlimited). Otherwise the spend
-        // must satisfy amount <= remaining allowance, else AllowanceExceeded.
-        let allowance_key = DataKey::Allowance(to.clone());
-        if env.storage().persistent().has(&allowance_key) {
-            let current: i128 = env.storage().persistent().get(&allowance_key).unwrap_or(0);
-            if current < amount {
+        // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
+        //    pre-approved periodic ceilings per (agent, recipient, asset).
+        let allowance_id = AllowanceId {
+            agent: caller.clone(),
+            recipient: to.clone(),
+            asset: asset.clone(),
+        };
+        if let Some(mut al) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Allowance>(&DataKey::Allowance(allowance_id.clone()))
+        {
+            if al.expires_at != 0 && env.ledger().timestamp() >= al.expires_at {
+                return Err(Error::AllowanceExpired);
+            }
+            let remaining = checked_sub(al.limit, al.spent)?;
+            if amount > remaining {
                 return Err(Error::AllowanceExceeded);
             }
-            let new_allowance = checked_sub(current, amount)?;
+            al.spent = checked_add(al.spent, amount)?;
             env.storage()
                 .persistent()
-                .set(&allowance_key, &new_allowance);
-            env.storage().persistent().extend_ttl(
-                &allowance_key,
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+                .set(&DataKey::Allowance(allowance_id), &al);
         }
 
-        // 3. Debit the internal ledger, then move real tokens out of custody.
+        // 4. Debit the internal ledger, then move real tokens out of custody.
         if holding.total_in < amount {
             return Err(Error::InsufficientFunds);
         }
