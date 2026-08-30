@@ -69,6 +69,7 @@ enum DataKey {
 pub struct PolicyContract;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl PolicyContract {
     /// Initialize the policy contract, registering `admin` as the only address
     /// authorized to rotate policies and to operate the emergency pause switch.
