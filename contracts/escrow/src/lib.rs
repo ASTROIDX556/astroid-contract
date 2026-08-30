@@ -214,6 +214,7 @@ impl EscrowContract {
 
     /// Initialize an escrow with time-lock (unfunded version). Manual
     /// signature override is not available on this path (empty signer set).
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize_timelock(
         env: Env,
         sender: Address,

@@ -95,12 +95,7 @@ fn no_signers(h: &Harness) -> Vec<BytesN<32>> {
     Vec::new(&h.env)
 }
 
-fn create(
-    h: &Harness,
-    assets: &Vec<AssetAmount>,
-    deadline: u64,
-    grace_period: u64,
-) -> u64 {
+fn create(h: &Harness, assets: &Vec<AssetAmount>, deadline: u64, grace_period: u64) -> u64 {
     h.client.create(
         &h.sender,
         &h.recipient,
