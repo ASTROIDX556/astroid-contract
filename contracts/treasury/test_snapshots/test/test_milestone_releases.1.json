@@ -718,6 +718,12 @@
                             },
                             {
                               "key": {
+                                "symbol": "multisig"
+                              },
+                              "val": "void"
+                            },
+                            {
+                              "key": {
                                 "symbol": "org"
                               },
                               "val": {
