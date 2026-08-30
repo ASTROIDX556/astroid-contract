@@ -337,7 +337,7 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "Signers"
+                              "symbol": "SignerWeights"
                             }
                           ]
                         },
