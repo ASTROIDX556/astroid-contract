@@ -40,6 +40,7 @@
 
 use astroid_interfaces::RegistryInterface;
 use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
+use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
@@ -238,9 +239,7 @@ impl RegistryContract {
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
         let key = DataKey::Module(org.clone(), kind);
-        if !env.storage().persistent().has(&key) {
-            return Err(Error::NotFound);
-        }
+        ensure!(env.storage().persistent().has(&key), Error::NotFound);
         env.storage().persistent().remove(&key);
         env.events().publish(
             (
@@ -342,9 +341,7 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
-        if version == 0 {
-            return Err(Error::InvalidInput);
-        }
+        ensure!(version != 0, Error::InvalidInput);
         let vkey = DataKey::Version(kind, version);
         env.storage().persistent().set(&vkey, &address);
         Self::bump(&env, &vkey);
@@ -433,9 +430,10 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        if owner != caller && !Self::is_admin(&env, &caller) {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(
+            owner == caller || Self::is_admin(&env, &caller),
+            Error::Unauthorized
+        );
         env.storage().instance().set(&DataKey::Frozen, &true);
         astroid_shared::events::publish(
             &env,
@@ -458,9 +456,10 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        if owner != caller && !Self::is_admin(&env, &caller) {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(
+            owner == caller || Self::is_admin(&env, &caller),
+            Error::Unauthorized
+        );
         env.storage().instance().set(&DataKey::Frozen, &false);
         astroid_shared::events::publish(
             &env,
@@ -521,14 +520,13 @@ impl RegistryContract {
     // --- internal helpers ---
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
-        if env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::Frozen)
-            .unwrap_or(false)
-        {
-            return Err(Error::RegistryFrozen);
-        }
+        ensure!(
+            !env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Frozen)
+                .unwrap_or(false),
+            Error::RegistryFrozen
+        );
         Ok(())
     }
 
@@ -546,9 +544,7 @@ impl RegistryContract {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
-        if &admin != caller {
-            return Err(Error::Unauthorized);
-        }
+        ensure!(&admin == caller, Error::Unauthorized);
         Ok(())
     }
 
