@@ -381,8 +381,14 @@ struct BatchHarness {
 }
 
 /// Register the multisig plus a stateful helper contract and initialize with
-/// `n` signers and the given threshold.
+/// `n` signers of weight 1 and the given threshold.
 fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
+    let weights: std::vec::Vec<u32> = (0..n).map(|_| 1).collect();
+    setup_batch_weighted(&weights, threshold)
+}
+
+/// As [`setup_batch`], but with an explicit voting weight per signer.
+fn setup_batch_weighted(weights: &[u32], threshold: u32) -> BatchHarness {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiSigContract);
@@ -393,12 +399,9 @@ fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
 
     let mut signers = std::vec::Vec::new();
     let mut sv = Vec::new(&env);
-    for _ in 0..n {
+    for w in weights {
         let a = Address::generate(&env);
-        sv.push_back(SignerWeight {
-            address: a.clone(),
-            weight: 1,
-        });
+        sv.push_back(sw(&a, *w));
         signers.push(a);
     }
     client.initialize(&sv, &threshold);
@@ -650,189 +653,101 @@ fn batch_blocked_by_emergency_lock() {
     assert_eq!(res, Err(Ok(Error::EmergencyLock)));
 }
 
-// ── Threshold update tests ──────────────────────────────────────────
+#[test]
+fn batch_execution_uses_signer_weights() {
+    // A single heavy signer carries the batch on its own.
+    let h = setup_batch_weighted(&[5, 1, 1], 5);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    h.client.execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[]),
+    );
+    assert_eq!(h.helper_client.get(&1), 100);
 
-fn propose_thresh(h: &Harness, proposer: &Address, new_threshold: u32) -> u64 {
-    h.client
-        .propose_threshold_update(proposer, &new_threshold, &0)
+    // The two light signers together fall short of the same threshold.
+    let res = h.client.try_execute_batch(
+        &h.signers[1],
+        &2,
+        &calls,
+        &approvers(&h.env, &h.signers, &[2]),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
 }
 
-fn exec_thresh(h: &Harness, caller: &Address, proposal_id: u64) {
-    h.client.execute_threshold_update(caller, &proposal_id)
+// --- standalone threshold verification ---
+
+#[test]
+fn verify_threshold_accumulates_weight_of_distinct_signers() {
+    let h = setup(&[3, 2, 1], 5);
+    let weight = h.client.verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
+    assert_eq!(weight, 5);
 }
 
 #[test]
-fn threshold_update_increase_with_valid_quorum() {
-    let h = setup(&[2, 2, 1], 3);
-    let id = propose_thresh(&h, &h.signers[0], 5);
-    // Proposer weight 2; need weight 3+ to reach threshold.
-    h.client.approve(&h.signers[1], &id);
-    // Proposer 2 + approver 2 = 4 >= threshold 3.
-    exec_thresh(&h, &h.signers[2], id);
-    assert_eq!(h.client.get_threshold(), 5);
+fn verify_threshold_below_threshold_is_refused() {
+    let h = setup(&[3, 2, 1], 5);
+    let res = h.client.try_verify_threshold(
+        &h.signers[1],
+        &approvers(&h.env, &h.signers, &[2]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
 }
 
 #[test]
-fn threshold_update_decrease_with_valid_quorum() {
-    let h = setup(&[2, 2, 1], 4);
-    assert_eq!(h.client.get_threshold(), 4);
-    let id = propose_thresh(&h, &h.signers[0], 2);
-    h.client.approve(&h.signers[1], &id);
-    exec_thresh(&h, &h.signers[0], id);
-    assert_eq!(h.client.get_threshold(), 2);
+fn verify_threshold_counts_a_repeated_signatory_once() {
+    let h = setup(&[3, 2, 1], 5);
+    // s0 listed as its own signatory must not stack its weight to 6.
+    let res = h.client.try_verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[0]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
 }
 
 #[test]
-fn threshold_update_zero_rejected() {
-    let h = setup(&[1, 1, 1], 2);
-    let res = h.client.try_propose_threshold_update(&h.signers[0], &0, &0);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
-}
-
-#[test]
-fn threshold_update_above_total_weight_rejected() {
-    let h = setup(&[1, 1, 1], 2);
-    // Total weight = 3; threshold 4 > total.
-    let res = h.client.try_propose_threshold_update(&h.signers[0], &4, &0);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
-}
-
-#[test]
-fn threshold_update_unauthorized_proposal_rejected() {
-    let h = setup(&[1, 1, 1], 2);
+fn verify_threshold_rejects_unregistered_signatories() {
+    let h = setup(&[3, 2, 1], 5);
     let stranger = Address::generate(&h.env);
-    let res = h.client.try_propose_threshold_update(&stranger, &3, &0);
+    let signatories = vec![&h.env, stranger];
+    let res = h
+        .client
+        .try_verify_threshold(&h.signers[0], &signatories, &payload(&h.env));
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_verify_threshold(
+        &stranger,
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
     assert_eq!(res, Err(Ok(Error::NotASigner)));
 }
 
 #[test]
-fn threshold_update_insufficient_approval_rejected() {
-    let h = setup(&[2, 2, 1], 3);
-    let id = propose_thresh(&h, &h.signers[0], 4);
-    // Only proposer weight 2 < threshold 3.
-    let res = h.client.try_execute_threshold_update(&h.signers[2], &id);
-    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
-}
-
-#[test]
-fn threshold_update_exact_boundary_succeeds() {
-    let h = setup(&[1, 1, 1], 2);
-    // Threshold equals total weight (3) — boundary.
-    let id = propose_thresh(&h, &h.signers[0], 3);
-    h.client.approve(&h.signers[1], &id);
-    exec_thresh(&h, &h.signers[2], id);
-    assert_eq!(h.client.get_threshold(), 3);
-}
-
-#[test]
-fn threshold_update_failed_leaves_threshold_unchanged() {
-    let h = setup(&[2, 2, 1], 3);
-    let id = propose_thresh(&h, &h.signers[0], 5);
-    // Only proposer weight 2 < threshold 3 — cannot execute.
-    let res = h.client.try_execute_threshold_update(&h.signers[1], &id);
-    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
-    assert_eq!(h.client.get_threshold(), 3);
-}
-
-#[test]
-fn threshold_update_event_emitted() {
-    let h = setup(&[2, 2, 1], 3);
-    let id = propose_thresh(&h, &h.signers[0], 5);
-    h.client.approve(&h.signers[1], &id);
-    exec_thresh(&h, &h.signers[2], id);
-
-    let thresh_topic: Val = symbol_short!("threshold").into_val(&h.env);
-    let updated_topic: Val = symbol_short!("updated").into_val(&h.env);
-    let found = h
-        .env
-        .events()
-        .all()
-        .iter()
-        .any(|(_contract_id, topics, _data)| {
-            topics.contains(thresh_topic) && topics.contains(updated_topic)
-        });
-    assert!(found, "ThresholdUpdated event not emitted");
-}
-
-#[test]
-fn threshold_update_signer_auth_remains_correct_after() {
-    let h = setup(&[2, 2, 1], 3);
-    let id = propose_thresh(&h, &h.signers[0], 1);
-    h.client.approve(&h.signers[1], &id);
-    exec_thresh(&h, &h.signers[2], id);
-    assert_eq!(h.client.get_threshold(), 1);
-
-    // Signer set unchanged — can still propose and execute.
-    let id2 = h.client.propose(
-        &h.signers[2],
-        &symbol_short!("payment"),
-        &payload(&h.env),
-        &0,
-    );
-    h.client.approve(&h.signers[0], &id2);
-    h.client.execute(&h.signers[1], &id2);
-    assert!(h.client.get_proposal(&id2).executed);
-}
-
-#[test]
-fn threshold_update_repeated_updates() {
-    let h = setup(&[3, 2, 1], 4);
-    // First update: 4 -> 5
-    let id1 = propose_thresh(&h, &h.signers[0], 5);
-    h.client.approve(&h.signers[1], &id1);
-    exec_thresh(&h, &h.signers[0], id1);
-    assert_eq!(h.client.get_threshold(), 5);
-
-    // Second update: 5 -> 3
-    let id2 = propose_thresh(&h, &h.signers[0], 3);
-    h.client.approve(&h.signers[1], &id2);
-    exec_thresh(&h, &h.signers[0], id2);
-    assert_eq!(h.client.get_threshold(), 3);
-}
-
-#[test]
-fn threshold_update_emergency_lock_blocks_proposal() {
-    let h = setup(&[1, 1, 1], 2);
+fn verify_threshold_is_blocked_by_the_emergency_lock() {
+    let h = setup(&[3, 2, 1], 5);
     h.client.set_emergency_lock(&h.signers[0], &true);
-    let res = h.client.try_propose_threshold_update(&h.signers[0], &3, &0);
+    let res = h.client.try_verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
     assert_eq!(res, Err(Ok(Error::EmergencyLock)));
 }
 
 #[test]
-fn threshold_update_exec_already_executed_rejected() {
-    let h = setup(&[2, 2, 1], 3);
-    let id = propose_thresh(&h, &h.signers[0], 5);
-    h.client.approve(&h.signers[1], &id);
-    exec_thresh(&h, &h.signers[2], id);
-    // Try to execute again.
-    let res = h.client.try_execute_threshold_update(&h.signers[2], &id);
-    assert_eq!(res, Err(Ok(Error::InvalidProposalState)));
-}
-
-#[test]
-fn threshold_update_non_signer_cannot_execute() {
-    let h = setup(&[2, 2, 1], 3);
-    let id = propose_thresh(&h, &h.signers[0], 5);
-    h.client.approve(&h.signers[1], &id);
-    let stranger = Address::generate(&h.env);
-    let res = h.client.try_execute_threshold_update(&stranger, &id);
-    assert_eq!(res, Err(Ok(Error::NotASigner)));
-}
-
-#[test]
-fn threshold_update_with_timelock() {
-    let h = setup(&[2, 2, 1], 3);
-    h.env.ledger().set_timestamp(1_000);
-    let unlock = 5_000u64;
-    let id = h
-        .client
-        .propose_threshold_update(&h.signers[0], &5, &unlock);
-    h.client.approve(&h.signers[1], &id);
-    // Time lock not reached.
-    let res = h.client.try_execute_threshold_update(&h.signers[2], &id);
-    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
-    // Advance past lock.
-    h.env.ledger().set_timestamp(6_000);
-    exec_thresh(&h, &h.signers[2], id);
-    assert_eq!(h.client.get_threshold(), 5);
+fn weight_views_report_the_configured_weights() {
+    let h = setup(&[3, 2, 1], 5);
+    assert_eq!(h.client.get_signer_weight(&h.signers[0]), 3);
+    assert_eq!(h.client.get_signer_weight(&h.signers[2]), 1);
+    assert_eq!(h.client.get_signer_weight(&Address::generate(&h.env)), 0);
+    assert_eq!(h.client.get_total_weight(), 6);
 }
