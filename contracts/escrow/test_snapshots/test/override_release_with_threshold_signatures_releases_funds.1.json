@@ -553,6 +553,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "refund_window"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "released_amount"
                       },
                       "val": {
@@ -2964,6 +2972,14 @@
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {
