@@ -63,7 +63,6 @@ use astroid_interfaces::{BudgetClient, PolicyClient};
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
-use astroid_shared::math::{checked_add, checked_mul, checked_sub};
 use astroid_shared::math::{SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
@@ -93,59 +92,6 @@ enum DataKey {
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
-    /// Minimum collateral reserve ratio in basis points: (id, asset) -> u32.
-    MinReserve(u64, Address),
-}
-
-/// A single sub-call to be executed as part of a batch. `contract_addr` is the
-/// target contract, `fn_name` is the entry-point symbol, and `args` are the
-/// serialized arguments. The batch executor invokes each sub-call sequentially;
-/// if any fails the entire transaction is atomically reverted by the Soroban
-/// runtime.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractCall {
-    pub contract_addr: Address,
-    pub fn_name: Symbol,
-    pub args: soroban_sdk::Vec<soroban_sdk::Val>,
-}
-
-/// One policy- and budget-gated action of a validated batch. Carries the raw
-/// [`ContractCall`] to execute plus the metadata the wallet needs to validate
-/// the action before any value moves: the policy envelope and asset/recipient
-/// the spend is checked against, and the budget envelope it is consumed from.
-///
-/// An empty `policy_id` skips the policy gate for that action; an empty
-/// `budget_id` skips budget consumption — mirrors how the treasury wires each
-/// holding to a specific envelope.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatchAction {
-    /// The external sub-call to execute.
-    pub call: ContractCall,
-    /// Policy envelope id validated against this action; empty = skip.
-    pub policy_id: String,
-    /// Budget envelope id consumed by this action; empty = skip.
-    pub budget_id: String,
-    /// Asset moved by this action, used by the policy check.
-    pub asset: Address,
-    /// Recipient of this action's value, used by the policy check.
-    pub recipient: Address,
-    /// Value moved by this action, checked against policy and budget.
-    pub amount: i128,
-}
-
-/// Aggregated outcome of a validated batch execution.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatchReceipt {
-    /// Number of sub-calls executed.
-    pub executed: u32,
-    /// Cumulative value across the batch (checked-sum of all action amounts).
-    pub total_amount: i128,
-    /// Remaining allocation of the last budget envelope consumed; `0` when the
-    /// batch touched no budget.
-    pub budget_remaining: i128,
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -155,9 +101,6 @@ pub struct WalletData {
     pub owner: Address,
     pub state: ResourceState,
 }
-
-/// Maximum enforceable collateral reserve ratio, in basis points (10000 = 100%).
-pub const MAX_RESERVE_RATIO_BPS: u32 = 10_000;
 
 #[contract]
 pub struct WalletContract;
@@ -301,7 +244,6 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
-        Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -328,7 +270,6 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
-        Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -403,184 +344,6 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Execute a batch of sub-calls atomically. If any sub-call returns an
-    /// error the Soroban runtime rolls back all state changes made during the
-    /// entire batch, guaranteeing atomicity. The `caller` is the executing
-    /// agent ([`Role::Agent`] is sufficient, matching `transfer`), and the
-    /// contract-wide circuit breaker must be reset.
-    pub fn batch_execute(
-        env: Env,
-        caller: Address,
-        wallet_id: u64,
-        calls: soroban_sdk::Vec<ContractCall>,
-    ) -> Result<(), Error> {
-        Self::when_not_paused(&env)?;
-        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
-        Self::require_active(&wallet)?;
-
-        if calls.is_empty() {
-            return Err(Error::InvalidInput);
-        }
-        if calls.len() > constants::MAX_BATCH_CALLS {
-            return Err(Error::InvalidInput);
-        }
-
-        let n = calls.len();
-        for call in calls.into_iter() {
-            Self::execute_call(&env, &call)?;
-        }
-
-        events::wallet_batch_executed(&env, wallet_id, n);
-        Ok(())
-    }
-
-    /// Execute a batch of [`BatchAction`]s atomically, validating every action
-    /// against the contract's policy and budget gates before any sub-call
-    /// fires. Each action opts into the gates via `policy_id` / `budget_id`: a
-    /// non-empty id requires the corresponding contract to be wired up
-    /// (`set_policy` / `set_budget`) or the batch is refused, while an empty id
-    /// skips that gate for the action.
-    ///
-    /// Phase 1 verifies every action and aggregates its value with checked math
-    /// in a single pass (one budget consumption per envelope — no speculative
-    /// pre-flights), then Phase 2 executes the sub-calls sequentially. Any
-    /// failure — a policy denial, a budget overrun, a cumulative overflow, or a
-    /// failing sub-call — reverts the entire transaction, so validation and
-    /// execution are atomic. On success an aggregated [`BatchReceipt`] is
-    /// returned.
-    pub fn batch_execute_validated(
-        env: Env,
-        caller: Address,
-        wallet_id: u64,
-        actions: soroban_sdk::Vec<BatchAction>,
-    ) -> Result<BatchReceipt, Error> {
-        Self::when_not_paused(&env)?;
-        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
-        Self::require_active(&wallet)?;
-
-        if actions.is_empty() {
-            return Err(Error::InvalidInput);
-        }
-        if actions.len() > constants::MAX_BATCH_CALLS {
-            return Err(Error::InvalidInput);
-        }
-
-        let policy: Option<Address> = env.storage().instance().get(&DataKey::Policy);
-        let budget: Option<Address> = env.storage().instance().get(&DataKey::Budget);
-
-        // Phase 1 — verify every action and aggregate its value with checked
-        // math so a cumulative overflow is caught before any value moves.
-        let mut total_amount: i128 = 0;
-        let mut budget_remaining: i128 = 0;
-        for action in actions.iter() {
-            require_positive_amount(action.amount)?;
-            total_amount = checked_add(total_amount, action.amount)?;
-
-            if !action.policy_id.is_empty() {
-                let policy_addr = policy.as_ref().ok_or(Error::InvalidInput)?;
-                PolicyClient::new(&env, policy_addr).check_transfer(
-                    &action.policy_id,
-                    &action.asset,
-                    &action.recipient,
-                    &action.amount,
-                );
-            }
-
-            if !action.budget_id.is_empty() {
-                let budget_addr = budget.as_ref().ok_or(Error::InvalidInput)?;
-                budget_remaining = BudgetClient::new(&env, budget_addr).consume(
-                    &caller,
-                    &action.budget_id,
-                    &action.amount,
-                );
-            }
-        }
-
-        // Phase 2 — execute every action sequentially; the runtime rolls the
-        // whole batch back if any sub-call fails.
-        let mut executed: u32 = 0;
-        for action in actions.into_iter() {
-            Self::execute_call(&env, &action.call)?;
-            executed += 1;
-        }
-
-        events::wallet_batch_validated(&env, wallet_id, executed, total_amount, budget_remaining);
-        Ok(BatchReceipt {
-            executed,
-            total_amount,
-            budget_remaining,
-        })
-    }
-
-    /// Wire the policy contract consulted when validating batch actions
-    /// (contract admin only).
-    pub fn set_policy(env: Env, caller: Address, policy: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Policy, &policy);
-        Ok(())
-    }
-
-    /// Wire the budget contract batch actions consume from (contract admin
-    /// only).
-    pub fn set_budget(env: Env, caller: Address, budget: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Budget, &budget);
-        Ok(())
-    }
-
-    /// Invoke a single batch call so a callee failure surfaces as its own
-    /// contract error, reverting the whole batch atomically; system-level
-    /// failures are reported as [`Error::BatchCallFailed`].
-    fn execute_call(env: &Env, call: &ContractCall) -> Result<(), Error> {
-        match env.try_invoke_contract::<Val, Error>(
-            &call.contract_addr,
-            &call.fn_name,
-            call.args.clone(),
-        ) {
-            Ok(_) => Ok(()),
-            // A raw `Val` always decodes, so this arm is unreachable in
-            // practice; kept for exhaustiveness.
-            Err(Ok(e)) => Err(e),
-            // System-level failure (panic / abort / unknown error code).
-            Err(Err(_)) => Err(Error::BatchCallFailed),
-        }
-    }
-
-    /// Set the minimum collateral reserve ratio for a wallet/asset pair (owner
-    /// only). `ratio_bps` is in basis points (0..=10000); 0 disables the check.
-    /// Once set, every outbound transfer/withdrawal must leave at least
-    /// `ratio_bps/10000` of the current balance behind, so organizations can
-    /// enforce a mandatory backing ratio before high-risk agent transactions.
-    pub fn set_reserve_ratio(
-        env: Env,
-        caller: Address,
-        wallet_id: u64,
-        asset: Address,
-        ratio_bps: u32,
-    ) -> Result<(), Error> {
-        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
-        if ratio_bps > MAX_RESERVE_RATIO_BPS {
-            return Err(Error::InvalidInput);
-        }
-        let key = DataKey::MinReserve(wallet_id, asset.clone());
-        if ratio_bps == 0 {
-            env.storage().persistent().remove(&key);
-        } else {
-            env.storage().persistent().set(&key, &ratio_bps);
-            env.storage().persistent().extend_ttl(
-                &key,
-                constants::PERSISTENT_LIFETIME_THRESHOLD,
-                constants::PERSISTENT_BUMP_AMOUNT,
-            );
-        }
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("resv_set")),
-            (wallet_id, asset, ratio_bps),
-        );
-        Ok(())
-    }
-
-    /// Archive a wallet (owner only). Terminal state; no further transactions.
     /// Archive a wallet ([`Role::Admin`]). Terminal state; no further
     /// transactions.
     pub fn archive(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
@@ -676,15 +439,6 @@ impl WalletContract {
         env.storage()
             .persistent()
             .get(&DataKey::Balance(wallet_id, asset))
-            .unwrap_or(0)
-    }
-
-    /// Read the configured minimum reserve ratio for a wallet/asset pair in
-    /// basis points (0 when no reserve requirement is set).
-    pub fn reserve_ratio(env: Env, wallet_id: u64, asset: Address) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MinReserve(wallet_id, asset))
             .unwrap_or(0)
     }
 
@@ -813,36 +567,6 @@ impl WalletContract {
             constants::PERSISTENT_LIFETIME_THRESHOLD,
             constants::PERSISTENT_BUMP_AMOUNT,
         );
-        Ok(())
-    }
-
-    /// Pre-execution reserve hook: verify that a planned outbound movement keeps
-    /// the wallet's remaining balance at or above the configured minimum reserve
-    /// ratio. Uses cross-multiplication (`projected * 10000 >= current * bps`)
-    /// so no division is ever performed — division-by-zero is impossible even
-    /// when the current balance is zero. Emits a precise event on failure.
-    fn require_reserve_ok(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
-        let key = DataKey::MinReserve(id, asset.clone());
-        let ratio_bps: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        if ratio_bps == 0 {
-            return Ok(());
-        }
-        let current: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(id, asset.clone()))
-            .unwrap_or(0);
-        if current < amount {
-            return Err(Error::InsufficientFunds);
-        }
-        let projected = checked_sub(current, amount)?;
-        if checked_mul(projected, 10_000)? < checked_mul(current, ratio_bps as i128)? {
-            env.events().publish(
-                (symbol_short!("wallet"), symbol_short!("resv_fail")),
-                (id, asset.clone(), amount, ratio_bps),
-            );
-            return Err(Error::ReserveViolation);
-        }
         Ok(())
     }
 
