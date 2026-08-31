@@ -1669,3 +1669,134 @@ fn composite_realistic_not_blacklisted_and_max_amount() {
         Err(Ok(Error::PolicyRecipientRestricted))
     );
 }
+
+// --- asset deny list ---
+
+#[test]
+fn blacklisted_asset_is_denied() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // The transfer passes every scalar gate before the asset is listed.
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    assert!(p.is_asset_blacklisted(&pid, &asset));
+    let r = p.try_check_transfer(&pid, &asset, &recip, &1);
+    assert_eq!(r, Err(Ok(Error::PolicyDenied)));
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn blacklist_removal_restores_the_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    p.remove_asset_blacklist(&owner, &pid, &asset);
+    assert!(!p.is_asset_blacklisted(&pid, &asset));
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+}
+
+#[test]
+fn blacklist_beats_the_asset_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Explicitly allow the asset, then deny it: the deny list wins.
+    p.set_asset_whitelist_enabled(&owner, &pid, &true);
+    p.add_asset_to_whitelist(&owner, &pid, &asset);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    let r = p.try_check_transfer(&pid, &asset, &recip, &1);
+    assert_eq!(r, Err(Ok(Error::PolicyDenied)));
+}
+
+#[test]
+fn blacklist_is_scoped_to_its_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let other = String::from_str(&env, "other");
+    p.register_policy(
+        &owner,
+        &other,
+        &BytesN::from_array(&env, &[7; 32]),
+        &1_000_000,
+        &None,
+        &None,
+        &0,
+    );
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_asset_blacklist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    // The sibling policy is untouched by the other policy's deny list.
+    assert!(!p.is_asset_blacklisted(&other, &asset));
+    assert!(p.try_check_transfer(&other, &asset, &recip, &1).is_ok());
+}
+
+#[test]
+fn blacklist_management_rejects_bad_input() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+
+    // Removing an asset that was never listed.
+    assert_eq!(
+        p.try_remove_asset_blacklist(&owner, &pid, &asset),
+        Err(Ok(Error::NotFound))
+    );
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    // Listing it twice.
+    assert_eq!(
+        p.try_add_asset_blacklist(&owner, &pid, &asset),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // Unknown policy.
+    assert_eq!(
+        p.try_add_asset_blacklist(&owner, &String::from_str(&env, "nope"), &asset),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn only_the_owner_can_manage_the_blacklist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+
+    assert_eq!(
+        p.try_add_asset_blacklist(&stranger, &pid, &asset),
+        Err(Ok(Error::Unauthorized))
+    );
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    assert_eq!(
+        p.try_remove_asset_blacklist(&stranger, &pid, &asset),
+        Err(Ok(Error::Unauthorized))
+    );
+}

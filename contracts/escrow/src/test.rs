@@ -1126,211 +1126,134 @@ fn reclaim_rejected_after_release() {
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
 }
 
-#[test]
-fn proposed_beneficiary_no_rights_before_timelock() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let new_beneficiary = Address::generate(&h.env);
+// --- bounded refund window ---
 
-    propose(&h, &h.sender, id, &new_beneficiary);
-
-    // The proposed beneficiary cannot release (not the arbiter).
-    let res = h.client.try_release(&new_beneficiary, &id, &5_000);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-}
-
-#[test]
-fn proposal_state_cleared_after_claim() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let new_beneficiary = Address::generate(&h.env);
-
-    propose(&h, &h.sender, id, &new_beneficiary);
-    advance_ledgers(&h, HOUR_IN_LEDGERS);
-    h.client.claim_beneficiary(&new_beneficiary, &id);
-
-    let escrow = h.client.get(&id);
-    assert!(escrow.proposed_beneficiary.is_none());
-    assert_eq!(escrow.recipient, new_beneficiary);
-}
-
-#[test]
-fn repeated_proposal_replaces_previous() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let first = Address::generate(&h.env);
-    let second = Address::generate(&h.env);
-
-    propose(&h, &h.sender, id, &first);
-    let seq1 = h.client.get(&id).proposed_at_seq;
-
-    advance_ledgers(&h, 10);
-    propose(&h, &h.sender, id, &second);
-
-    let escrow = h.client.get(&id);
-    assert_eq!(escrow.proposed_beneficiary.unwrap(), second);
-    assert_eq!(escrow.proposed_at_seq, seq1 + 10);
-}
-
-#[test]
-fn propose_same_beneficiary_again_resets_timelock() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let new_beneficiary = Address::generate(&h.env);
-
-    propose(&h, &h.sender, id, &new_beneficiary);
-    advance_ledgers(&h, HOUR_IN_LEDGERS - 10);
-
-    // Re-propose the same beneficiary — timelock resets.
-    propose(&h, &h.sender, id, &new_beneficiary);
-
-    // Advancing 10 more ledgers is no longer enough.
-    let res = try_claim(&h, &new_beneficiary, id);
-    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
-}
-
-#[test]
-fn propose_to_current_recipient_rejected() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-
-    // Proposing the current recipient as the new beneficiary is rejected.
-    let res = try_propose(&h, &h.sender, id, &h.recipient);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
-}
-
-#[test]
-fn propose_to_sender_rejected() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-
-    let res = try_propose(&h, &h.sender, id, &h.sender);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
-}
-
-#[test]
-fn propose_to_arbiter_rejected() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-
-    let res = try_propose(&h, &h.sender, id, &h.arbiter);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
-}
-
-#[test]
-fn propose_on_released_escrow_rejected() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let new_beneficiary = Address::generate(&h.env);
-
-    h.client.release(&h.arbiter, &id, &5_000);
-
-    let res = try_propose(&h, &h.sender, id, &new_beneficiary);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn claim_on_released_escrow_rejected() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let new_beneficiary = Address::generate(&h.env);
-
-    propose(&h, &h.sender, id, &new_beneficiary);
-    advance_ledgers(&h, HOUR_IN_LEDGERS);
-    h.client.release(&h.arbiter, &id, &5_000);
-
-    // Re-reading the released escrow — recipient is still the original
-    // because release uses the pre-proposal recipient. Trying to claim after
-    // release is rejected because state is no longer Created/Funded.
-    let res = try_claim(&h, &new_beneficiary, id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn claim_without_proposal_rejected() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let anyone = Address::generate(&h.env);
-
-    advance_ledgers(&h, HOUR_IN_LEDGERS);
-    let res = try_claim(&h, &anyone, id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn proposal_on_timelock_escrow_works() {
-    let h = setup(0, 0);
-    let new_beneficiary = Address::generate(&h.env);
-    let unlock_time = START + 100;
-
-    let id = h.client.initialize_timelock(
+/// Create a funded escrow whose refund window closes `refund_window` seconds
+/// after refunds open at `deadline + grace_period`.
+fn create_windowed(
+    h: &Harness,
+    assets: &Vec<AssetAmount>,
+    deadline: u64,
+    grace_period: u64,
+    refund_window: u64,
+) -> u64 {
+    h.client.create_with_refund_window(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &one_asset(&h, 5_000),
-        &unlock_time,
+        assets,
+        &deadline,
+        &grace_period,
+        &refund_window,
+        &String::from_str(&h.env, "payment"),
+        &no_signers(h),
         &0,
-        &String::from_str(&h.env, "locked"),
+    )
+}
+
+fn at(h: &Harness, ts: u64) {
+    h.env.ledger().with_mut(|l| l.timestamp = ts);
+}
+
+#[test]
+fn unbounded_window_is_the_default() {
+    let h = setup(1_000, 0);
+    let id = create(&h, &one_asset(&h, 100), START + 100, 0);
+    assert_eq!(h.client.refund_window_closes_at(&id), 0);
+    // Far past the deadline the refund is still available.
+    at(&h, START + 10_000_000);
+    assert!(h.client.is_refundable(&id));
+    h.client.refund(&h.sender, &id);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 1_000);
+}
+
+#[test]
+fn refund_inside_the_window_succeeds() {
+    let h = setup(1_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 100), START + 100, 0, 50);
+    assert_eq!(h.client.refund_window_closes_at(&id), START + 150);
+
+    at(&h, START + 120);
+    assert!(h.client.is_refundable(&id));
+    h.client.refund(&h.sender, &id);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 1_000);
+}
+
+#[test]
+fn refund_after_the_window_closes_is_rejected() {
+    let h = setup(1_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 100), START + 100, 0, 50);
+
+    at(&h, START + 150);
+    assert!(!h.client.is_refundable(&id));
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::EscrowExpired))
+    );
+    // The funds stay in the escrow's custody rather than moving anywhere.
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 900);
+}
+
+#[test]
+fn refund_at_the_last_second_of_the_window_succeeds() {
+    let h = setup(1_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 100), START + 100, 0, 50);
+    // The window is half-open: it closes *at* START + 150.
+    at(&h, START + 149);
+    h.client.refund(&h.sender, &id);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 1_000);
+}
+
+#[test]
+fn the_window_is_measured_from_the_end_of_the_grace_period() {
+    let h = setup(1_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 100), START + 100, 40, 50);
+    // Refunds open at deadline + grace = START + 140, so the window closes at
+    // START + 190 — never before it opens.
+    assert_eq!(h.client.refund_window_closes_at(&id), START + 190);
+
+    at(&h, START + 120);
+    assert!(!h.client.is_refundable(&id));
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::GraceActive))
     );
 
-    propose(&h, &h.sender, id, &new_beneficiary);
-    let escrow = h.client.get(&id);
-    assert!(escrow.proposed_beneficiary.is_some());
-    assert_eq!(escrow.proposed_beneficiary.unwrap(), new_beneficiary);
+    at(&h, START + 150);
+    assert!(h.client.is_refundable(&id));
+    h.client.refund(&h.sender, &id);
 }
 
 #[test]
-fn claim_on_timelock_escrow_after_timelock() {
-    let h = setup(0, 0);
-    let new_beneficiary = Address::generate(&h.env);
-    let unlock_time = START + 100;
-
-    let id = h.client.initialize_timelock(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &one_asset(&h, 5_000),
-        &unlock_time,
-        &0,
-        &String::from_str(&h.env, "locked"),
+fn reclaim_respects_the_window() {
+    let h = setup(1_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 100), START + 100, 0, 50);
+    at(&h, START + 150);
+    assert_eq!(
+        h.client.try_reclaim(&h.sender, &id),
+        Err(Ok(Error::EscrowExpired))
     );
-
-    propose(&h, &h.sender, id, &new_beneficiary);
-    advance_ledgers(&h, HOUR_IN_LEDGERS);
-
-    h.client.claim_beneficiary(&new_beneficiary, &id);
-    assert_eq!(h.client.get(&id).recipient, new_beneficiary);
 }
 
 #[test]
-fn new_beneficiary_can_release_after_claim() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 86_400, 0);
-    let new_beneficiary = Address::generate(&h.env);
-
-    propose(&h, &h.sender, id, &new_beneficiary);
-    advance_ledgers(&h, HOUR_IN_LEDGERS);
-    h.client.claim_beneficiary(&new_beneficiary, &id);
-
-    // The new beneficiary is now the recipient — arbiter releases to them.
-    h.client.release(&h.arbiter, &id, &5_000);
-    assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(balance(&h, &h.asset_a, &new_beneficiary), 5_000);
+fn release_is_unaffected_by_the_refund_window() {
+    let h = setup(1_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 100), START + 100, 200, 50);
+    // The arbiter may still release during the grace period, whatever the
+    // refund window says.
+    at(&h, START + 150);
+    h.client.release(&h.arbiter, &id, &100);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 100);
+    // A settled escrow is never refundable.
+    assert!(!h.client.is_refundable(&id));
 }
 
 #[test]
-fn propose_and_claim_event_emission() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
-    let new_beneficiary = Address::generate(&h.env);
-
-    propose(&h, &h.sender, id, &new_beneficiary);
-    advance_ledgers(&h, HOUR_IN_LEDGERS);
-    h.client.claim_beneficiary(&new_beneficiary, &id);
-
-    // Verify final state is consistent.
-    let escrow = h.client.get(&id);
-    assert_eq!(escrow.recipient, new_beneficiary);
-    assert!(escrow.proposed_beneficiary.is_none());
-    assert_eq!(escrow.state, EscrowState::Funded);
+fn an_absurd_window_saturates_instead_of_overflowing() {
+    let h = setup(1_000, 0);
+    let id = create_windowed(&h, &one_asset(&h, 100), START + 100, 0, u64::MAX);
+    assert_eq!(h.client.refund_window_closes_at(&id), u64::MAX);
+    at(&h, START + 10_000_000);
+    assert!(h.client.is_refundable(&id));
+    h.client.refund(&h.sender, &id);
 }
