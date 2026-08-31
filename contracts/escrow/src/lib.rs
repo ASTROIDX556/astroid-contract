@@ -15,8 +15,7 @@
 //! ## Settlement paths
 //!
 //! ```text
-//! Funded ──(arbiter, before deadline)───────────▶ Released ─▶ recipient ─▶ Closed
-//! Funded ──(arbiter, within deadline+grace)─────▶ Released ─▶ recipient ─▶ Closed
+//! Funded ──(arbiter, before deadline+grace)─────▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(signature override, before deadline)▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(sender/arbiter cancel, before deadline)──▶ Refunded ─▶ sender ─▶ Closed
 //! Funded ──(after deadline+grace, refund)───────▶ Refunded ─▶ sender   ─▶ Closed
@@ -26,11 +25,8 @@
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
-//! grace window has elapsed); funds stay in custody until `refund` / `reclaim` /
-//! `cancel` return them to the sender, so no escrow can be `Closed` with money
-//! still locked. Once the expiration deadline has passed the arbiter can no
-//! longer release (`Error::EscrowExpired`), so unfulfilled escrows are always
-//! reclaimable by the depositor without a multi-party signature.
+//! deadline passes); funds stay in custody until `refund` returns them to the
+//! sender, so no escrow can be `Closed` with money still locked.
 //!
 //! ## Signature-based release override
 //!
@@ -870,40 +866,24 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Clawback: let the depositor reclaim the locked funds once the escrow has
-    /// expired and the funds remain unclaimed. Only the original `sender` may
-    /// cancel, only after the deadline (plus grace) has passed, and only while
-    /// the escrow still holds the funds (`Funded`, `Expired`, or an unfunded
-    /// timelock `Created`). Returns every remaining locked token exclusively to
-    /// the depositor and marks the escrow `Cancelled` so no other settlement
-    /// path can double-spend it.
+    /// Close a settled escrow (terminal).
+    /// Cancel an escrow before its fulfillment `deadline` and return any held
+    /// funds to the sender. Either the `sender` or the `arbiter` may cancel, but
+    /// only while the escrow is still `Funded`/`Created` and before the deadline
+    /// has been reached — this is the pre-fulfillment dispute exit.
     pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
-        if escrow.sender != caller {
+        if escrow.sender != caller && escrow.arbiter != caller {
             return Err(Error::Unauthorized);
         }
-        // Cancellation is only permitted after the expiration window — clawing
-        // funds back before the deadline would break the arbiter's release path.
-        if env.ledger().timestamp() < escrow.deadline {
-            return Err(Error::EscrowNotExpired);
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Created) {
+            return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
-            // During the grace window the counterparty may still fulfill.
-            return Err(Error::GraceActive);
+        // Cancellation is only permitted before the fulfillment deadline.
+        if env.ledger().timestamp() >= escrow.deadline {
+            return Err(Error::InvalidState);
         }
-        // Funds must still be in custody (unclaimed). Released / Refunded /
-        // Closed / Cancelled escrows have already settled.
-        if !matches!(
-            escrow.state,
-            EscrowState::Funded | EscrowState::Expired | EscrowState::Created
-        ) {
-            return Err(Error::EscrowAlreadySettled);
-        }
-
-        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
-        escrow.state = EscrowState::Cancelled;
-        store_escrow(&env, id, &escrow);
 
         // Return the remaining locked assets exclusively to the depositor.
         if remaining > 0 {

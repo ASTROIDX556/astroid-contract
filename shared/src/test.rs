@@ -54,7 +54,9 @@ fn mul_underflow() {
 fn mul_large_values() {
     // Both large positive — still fits.
     assert_eq!(checked_mul(1_000_000, 1_000_000), Ok(1_000_000_000_000));
-    // Large negative * large positive — still within i128 range.
+    // True overflow: max * 2 wraps past the upper bound.
+    assert_eq!(checked_mul(i128::MAX, 2), Err(Error::Overflow));
+    // Large negative * large positive — fits in i128 (order 10^24).
     assert_eq!(
         checked_mul(-1_000_000_000_000i128, 1_000_000_000_000i128),
         Ok(-1_000_000_000_000_000_000_000_000i128)
@@ -185,7 +187,8 @@ fn abs_extremes() {
 
 #[test]
 fn math_additional_edge_cases() {
-    // Both overflow and underflow wrap, which the helpers report as Overflow.
+    // Underflow only when the result drops below the minimum value. All wraps
+    // are reported as Overflow by the checked helpers.
     assert_eq!(checked_sub(0, 1), Ok(-1));
     assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Overflow));
     assert_eq!(checked_add(i128::MIN, -1), Err(Error::Overflow));
