@@ -60,8 +60,13 @@ pub struct Escrow {
     pub assets: Vec<AssetAmount>,
     pub state: EscrowState,
     pub deadline: u64,
-    /// Seconds after `deadline` during which a refund may be claimed.
-    /// `0` means the refund window never closes.
+    /// Extra time after `deadline` during which the arbiter may still release
+    /// and before the sender may reclaim. 0 means no grace beyond the deadline.
+    pub grace_period: u64,
+    /// How long the sender may reclaim the funds once refunds open at
+    /// `deadline + grace_period`. `0` leaves the window open forever; a bounded
+    /// window lets settlement logic treat an un-refunded, timed-out escrow as
+    /// final.
     pub refund_window: u64,
     pub funded_amount: i128,
     pub memo: String,
@@ -77,6 +82,7 @@ pub struct Escrow {
 pub enum DataKey {
     Count,
     Escrow(u64),
+    Milestones(u64),
 }
 
 pub fn get_count(env: &Env) -> u64 {

@@ -304,7 +304,6 @@ impl RegistryContract {
             .ok_or(Error::NotFound)
     }
 
-    /// Remove a module registration. Admin or org owner.
     /// Remove a module registration. Same gate as `register_module`: admin, org
     /// owner, or a delegated role that reaches this [`ModuleKind`].
     pub fn remove_module(
@@ -704,7 +703,7 @@ impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
-        let address: Address = env
+        let val = env
             .storage()
             .persistent()
             .get(&key)
@@ -719,7 +718,7 @@ impl RegistryInterface for RegistryContract {
             return Err(Error::ModuleDeprecated);
         }
         Self::bump(&env, &key);
-        Ok(address)
+        Ok(val)
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {

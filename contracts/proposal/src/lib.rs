@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
@@ -81,19 +81,6 @@ impl ProposalState {
     }
 }
 
-/// What a proposal is about: the organization it belongs to plus the opaque
-/// references (owned by the backend and other contracts) it points at. These
-/// four always travel together and are stored verbatim, so they are passed as
-/// one record to keep `create` within Soroban's 10-parameter limit.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProposalTarget {
-    pub org: String,
-    pub wallet: String,
-    pub policy: String,
-    pub tx_ref: String,
-}
-
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
 /// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
 /// the ids of proposals that must have executed before this one may execute.
@@ -105,7 +92,6 @@ pub struct Proposal {
     /// Links (opaque references owned by the backend / other contracts).
     pub wallet: String,
     pub policy: String,
-    pub tx_ref: String,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
@@ -180,7 +166,9 @@ impl ProposalContract {
     pub fn create(
         env: Env,
         proposer: Address,
-        target: ProposalTarget,
+        org: String,
+        wallet: String,
+        policy: String,
         approvers: Vec<Address>,
         dependencies: Vec<u64>,
         threshold: u32,
@@ -189,12 +177,6 @@ impl ProposalContract {
         grace_period: u64,
     ) -> Result<u64, Error> {
         proposer.require_auth();
-        let ProposalTarget {
-            org,
-            wallet,
-            policy,
-            tx_ref,
-        } = target;
         require_non_empty(&org)?;
         let n = approvers.len();
         if n == 0 || n > MAX_APPROVERS {
@@ -251,7 +233,6 @@ impl ProposalContract {
             org,
             wallet,
             policy,
-            tx_ref,
             approvers,
             dependencies: deps,
             threshold,
