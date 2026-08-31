@@ -27,9 +27,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -43,38 +40,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 50
-                      }
-                    }
-                  ]
+                  "u64": 50
                 }
               ]
             }
@@ -106,9 +84,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -122,38 +97,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 50
-                      }
-                    }
-                  ]
+                  "u64": 50
                 }
               ]
             }
@@ -341,14 +297,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx1"
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "wallet"
                       },
                       "val": {
@@ -505,14 +453,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx1"
                       }
                     },
                     {
@@ -778,9 +718,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -794,38 +731,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 50
-                      }
-                    }
-                  ]
+                  "u64": 50
                 }
               ]
             }
@@ -937,7 +855,7 @@
             ],
             "data": {
               "error": {
-                "contract": 45
+                "contract": 75
               }
             }
           }
@@ -958,7 +876,7 @@
               },
               {
                 "error": {
-                  "contract": 45
+                  "contract": 75
                 }
               }
             ],
@@ -983,7 +901,7 @@
               },
               {
                 "error": {
-                  "contract": 45
+                  "contract": 75
                 }
               }
             ],
@@ -1045,9 +963,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -1061,38 +976,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 50
-                      }
-                    }
-                  ]
+                  "u64": 50
                 }
               ]
             }

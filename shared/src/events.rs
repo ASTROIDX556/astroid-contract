@@ -83,6 +83,19 @@ pub enum ContractEvent {
         recipient: Address,
         assets: Vec<AssetAmount>,
     },
+    /// Gas usage telemetry for a single operation execution.
+    GasTelemetry {
+        operation: Symbol,
+        gas_used: u64,
+        storage_bytes: u64,
+    },
+    /// Cumulative resource usage summary for an entire transaction.
+    TransactionSummary {
+        total_gas: u64,
+        total_cpu: u64,
+        total_storage: u64,
+        operation_count: u32,
+    },
 }
 
 /// Publish a [`ContractEvent`] using the canonical schema.
@@ -174,6 +187,27 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (escrow_id, recipient, assets),
             );
         }
+        ContractEvent::GasTelemetry {
+            operation,
+            gas_used,
+            storage_bytes,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "GasTelemetry"),),
+                (operation, gas_used, storage_bytes),
+            );
+        }
+        ContractEvent::TransactionSummary {
+            total_gas,
+            total_cpu,
+            total_storage,
+            operation_count,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TransactionSummary"),),
+                (total_gas, total_cpu, total_storage, operation_count),
+            );
+        }
     }
 }
 
@@ -229,8 +263,28 @@ pub fn treasury_created(env: &Env, org: &String, admin: &Address) {
     env.events().publish(topics, (org.clone(), admin.clone()));
 }
 
+/// `AllowanceSet` — topic `("treasury", "allow_set")`.
+pub fn allowance_set(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_set"));
+    env.events()
+        .publish(topics, (agent.clone(), asset.clone(), amount));
+}
+
+/// `AllowanceConsumed` — topic `("treasury", "allow_use")`.
+pub fn allowance_consumed(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_use"));
+    env.events()
+        .publish(topics, (agent.clone(), asset.clone(), amount));
+}
+
 /// Construct a `Symbol` reason code from a static name (used as event payloads
 /// for policy/budget violations) so all call sites share one construction path.
 pub fn reason(env: &Env, name: &str) -> Symbol {
     Symbol::new(env, name)
+}
+
+/// `WalletBatchExecuted` — topic `("wallet", "batch")`.
+pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
+    let topics = (symbol_short!("wallet"), symbol_short!("batch"));
+    env.events().publish(topics, (wallet_id, call_count));
 }

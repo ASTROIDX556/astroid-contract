@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
@@ -81,16 +81,6 @@ impl ProposalState {
     }
 }
 
-/// Extra parameters bundled into [`ProposalContract::create`] to stay within
-/// soroban's 10-parameter limit.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProposalCreateParams {
-    pub dependencies: Vec<u64>,
-    pub deposit: Vec<AssetAmount>,
-    pub grace_period: u64,
-}
-
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
 /// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
 /// the ids of proposals that must have executed before this one may execute.
@@ -102,7 +92,6 @@ pub struct Proposal {
     /// Links (opaque references owned by the backend / other contracts).
     pub wallet: String,
     pub policy: String,
-    pub tx_ref: String,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
@@ -180,11 +169,12 @@ impl ProposalContract {
         org: String,
         wallet: String,
         policy: String,
-        tx_ref: String,
         approvers: Vec<Address>,
+        dependencies: Vec<u64>,
         threshold: u32,
+        deposit: Vec<AssetAmount>,
         expires_at: u64,
-        params: ProposalCreateParams,
+        grace_period: u64,
     ) -> Result<u64, Error> {
         proposer.require_auth();
         require_non_empty(&org)?;
@@ -195,7 +185,7 @@ impl ProposalContract {
         if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
         }
-        if let Some(dep) = params.deposit.first() {
+        if let Some(dep) = deposit.first() {
             if dep.amount <= 0 {
                 return Err(Error::InvalidAmount);
             }
@@ -209,7 +199,7 @@ impl ProposalContract {
             return Err(Error::InvalidInput);
         }
 
-        if params.dependencies.len() > MAX_DEPENDENCIES {
+        if dependencies.len() > MAX_DEPENDENCIES {
             return Err(Error::InvalidInput);
         }
 
@@ -224,7 +214,7 @@ impl ProposalContract {
         // Validate the declared prerequisites and collapse duplicates, so that
         // `execute` reads each prerequisite exactly once.
         let mut deps: Vec<u64> = Vec::new(&env);
-        for dep in params.dependencies.iter() {
+        for dep in dependencies.iter() {
             // Any edge that does not point strictly backwards would close a
             // cycle (or be a self-reference); see the acyclicity note above.
             if dep >= id {
@@ -243,16 +233,15 @@ impl ProposalContract {
             org,
             wallet,
             policy,
-            tx_ref,
             approvers,
             dependencies: deps,
             threshold,
             approvals: 0,
-            deposit: params.deposit,
+            deposit,
             state: ProposalState::Pending,
             created_at: env.ledger().timestamp(),
             expires_at,
-            grace_period: params.grace_period,
+            grace_period,
         };
         env.storage()
             .persistent()
@@ -525,19 +514,6 @@ impl ProposalContract {
             if !prerequisite.state.has_executed() {
                 return Err(Error::PrerequisiteNotMet);
             }
-        }
-        Ok(())
-    }
-
-    /// Surface [`Error::ProposalExpired`] when the deadline has passed so callers
-    /// fail safely. This deliberately does NOT persist the `Expired` state: on the
-    /// Soroban host, returning `Err` rolls back every storage write from the
-    /// invocation, so the terminal transition is recorded only through the
-    /// permissionless [`ProposalContract::expire`] entrypoint (which returns `Ok`).
-    #[allow(dead_code)]
-    fn ensure_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
-        if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
-            return Err(Error::ProposalExpired);
         }
         Ok(())
     }

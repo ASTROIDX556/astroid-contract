@@ -117,6 +117,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -170,6 +173,12 @@
                 },
                 {
                   "u64": 1
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 5000
+                  }
                 }
               ]
             }
@@ -406,6 +415,14 @@
                           "hi": 0,
                           "lo": 5000
                         }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     },
                     {
@@ -1584,6 +1601,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -1799,6 +1819,12 @@
                 },
                 {
                   "u64": 1
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 5000
+                  }
                 }
               ]
             }
@@ -2014,6 +2040,12 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 5000
+                  }
                 }
               ]
             }
@@ -2096,7 +2128,7 @@
             ],
             "data": {
               "error": {
-                "contract": 30
+                "contract": 53
               }
             }
           }
@@ -2117,7 +2149,7 @@
               },
               {
                 "error": {
-                  "contract": 30
+                  "contract": 53
                 }
               }
             ],
@@ -2142,7 +2174,7 @@
               },
               {
                 "error": {
-                  "contract": 30
+                  "contract": 53
                 }
               }
             ],

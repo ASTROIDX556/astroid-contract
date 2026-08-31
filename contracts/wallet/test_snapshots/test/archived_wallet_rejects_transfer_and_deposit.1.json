@@ -400,6 +400,30 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Guardian"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Paused"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "WalletCount"
                             }
                           ]
@@ -1650,7 +1674,7 @@
             ],
             "data": {
               "error": {
-                "contract": 28
+                "contract": 51
               }
             }
           }
@@ -1671,7 +1695,7 @@
               },
               {
                 "error": {
-                  "contract": 28
+                  "contract": 51
                 }
               }
             ],
@@ -1696,7 +1720,7 @@
               },
               {
                 "error": {
-                  "contract": 28
+                  "contract": 51
                 }
               }
             ],
@@ -1885,7 +1909,7 @@
             ],
             "data": {
               "error": {
-                "contract": 28
+                "contract": 51
               }
             }
           }
@@ -1906,7 +1930,7 @@
               },
               {
                 "error": {
-                  "contract": 28
+                  "contract": 51
                 }
               }
             ],
@@ -1931,7 +1955,7 @@
               },
               {
                 "error": {
-                  "contract": 28
+                  "contract": 51
                 }
               }
             ],

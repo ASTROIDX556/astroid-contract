@@ -27,9 +27,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -43,38 +40,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 5000
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    }
-                  ]
+                  "u64": 0
                 }
               ]
             }
@@ -313,14 +291,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "wallet"
                       },
                       "val": {
@@ -549,9 +519,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -565,38 +532,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 5000
                 },
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    }
-                  ]
+                  "u64": 0
                 }
               ]
             }
@@ -797,7 +745,7 @@
             ],
             "data": {
               "error": {
-                "contract": 32
+                "contract": 62
               }
             }
           }
@@ -818,7 +766,7 @@
               },
               {
                 "error": {
-                  "contract": 32
+                  "contract": 62
                 }
               }
             ],
@@ -843,7 +791,7 @@
               },
               {
                 "error": {
-                  "contract": 32
+                  "contract": 62
                 }
               }
             ],
