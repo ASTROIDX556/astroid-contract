@@ -241,10 +241,7 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &budget);
         Self::bump(&env, &budget_id);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("allocated")),
-            (budget_id, owner, limit),
-        );
+        events::budget_allocated(&env, &budget_id, &owner, limit);
         Ok(())
     }
 
@@ -293,10 +290,7 @@ impl BudgetContract {
         }
         budget.window_start = env.ledger().timestamp();
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("recurring")),
-            (budget_id, period, period_seconds, rollover_cap),
-        );
+        events::budget_recurring(&env, &budget_id, period, period_seconds, rollover_cap);
         Ok(())
     }
 
@@ -340,10 +334,7 @@ impl BudgetContract {
         }
         budget.limit = new_limit;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("setlimit")),
-            (budget_id, new_limit),
-        );
+        events::budget_setlimit(&env, &budget_id, new_limit);
         Ok(())
     }
     /// Freeze a budget (owner-gated). Frozen budgets reject consumption.
@@ -354,10 +345,7 @@ impl BudgetContract {
         }
         budget.state = ResourceState::Frozen;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("frozen")),
-            budget_id,
-        );
+        events::budget_frozen(&env, &budget_id);
         Ok(())
     }
     /// Unfreeze a budget back to active (owner-gated).
@@ -368,10 +356,7 @@ impl BudgetContract {
         }
         budget.state = ResourceState::Active;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("unfrozen")),
-            budget_id,
-        );
+        events::budget_unfrozen(&env, &budget_id);
         Ok(())
     }
     /// Archive a budget (owner-gated, terminal). Rejects further consumption.
@@ -379,10 +364,7 @@ impl BudgetContract {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         budget.state = ResourceState::Archived;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("archived")),
-            budget_id,
-        );
+        events::budget_archived(&env, &budget_id);
         Ok(())
     }
     /// Move unused allocation from one budget to another. Both must share the
@@ -415,10 +397,7 @@ impl BudgetContract {
         to.limit = checked_add(to.limit, amount)?;
         Self::store(&env, &from_id, &from);
         Self::store(&env, &to_id, &to);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("realloc")),
-            (from_id, to_id, amount),
-        );
+        events::budget_realloc(&env, &from_id, &to_id, amount);
         Ok(())
     }
 
@@ -447,10 +426,7 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("set_ast")),
-            (budget_id, token, limit),
-        );
+        events::budget_set_asset(&env, &budget_id, &token, limit);
         Ok(())
     }
     /// Check and record spend for a specific token.
@@ -493,10 +469,7 @@ impl BudgetContract {
         asset_budget.spent = new_spent;
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("ast_spend")),
-            (budget_id, token, amount),
-        );
+        events::budget_asset_spend(&env, &budget_id, &token, amount);
         Ok(())
     }
     // --- views ---
@@ -603,10 +576,7 @@ impl BudgetContract {
         let now = env.ledger().timestamp();
         if budget.expires_at != 0 && now >= budget.expires_at {
             if publish {
-                env.events().publish(
-                    (symbol_short!("budget"), symbol_short!("expired")),
-                    budget_id.clone(),
-                );
+                events::budget_expired(&env, &budget_id);
             }
             return Err(Error::BudgetExpired);
         }
@@ -664,10 +634,7 @@ impl BudgetContract {
             } else {
                 checked_sub(capacity, spent)?
             };
-            env.events().publish(
-                (symbol_short!("budget"), action.clone()),
-                (budget_id.clone(), amount),
-            );
+            events::budget_action(&env, &budget_id, action.clone(), amount);
             events::publish(
                 env,
                 ContractEvent::BudgetUpdated {
@@ -727,10 +694,7 @@ impl BudgetContract {
     }
 
     fn emit_asset_reset(env: &Env, budget_id: &String, token: &Address, limit: i128) {
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("ast_reset")),
-            (budget_id.clone(), token.clone(), limit),
-        );
+        events::budget_asset_reset(env, budget_id, token, limit);
         events::publish(
             env,
             ContractEvent::BudgetUpdated {
@@ -795,10 +759,7 @@ impl BudgetInterface for BudgetContract {
                 budget.spent = new_spent;
                 Self::store(&env, &budget_id, &budget);
                 let remaining = capacity - new_spent; // may be negative
-                env.events().publish(
-                    (symbol_short!("budget"), symbol_short!("consumed")),
-                    (budget_id, amount, remaining),
-                );
+                events::budget_consumed(&env, &budget_id, amount, remaining);
                 return Ok(remaining);
             }
             let remaining = checked_sub(ceiling, budget.spent)?;
@@ -808,10 +769,7 @@ impl BudgetInterface for BudgetContract {
         budget.spent = new_spent;
         Self::store(&env, &budget_id, &budget);
         let remaining = checked_sub(ceiling, budget.spent)?;
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("consumed")),
-            (budget_id, amount, remaining),
-        );
+        events::budget_consumed(&env, &budget_id, amount, remaining);
         Ok(remaining)
     }
     /// Read remaining allocation, accounting for a pending period transition.
