@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{ProposalContract, ProposalContractClient, ProposalState, ProposalTarget};
+use crate::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -43,16 +43,6 @@ fn approver_vec(h: &Harness) -> Vec<Address> {
     v
 }
 
-/// The routing record every test proposal points at.
-fn target(h: &Harness, org: &str, wallet: &str, policy: &str, tx_ref: &str) -> ProposalTarget {
-    ProposalTarget {
-        org: String::from_str(&h.env, org),
-        wallet: String::from_str(&h.env, wallet),
-        policy: String::from_str(&h.env, policy),
-        tx_ref: String::from_str(&h.env, tx_ref),
-    }
-}
-
 /// Create an independent proposal (no prerequisites).
 fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
     create_with_deps(h, threshold, expires_at, &[])
@@ -62,7 +52,9 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
 fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> u64 {
     h.client.create(
         &h.proposer,
-        &target(h, "acme", "wallet-1", "policy-1", "tx-ref-1"),
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
         &approver_vec(h),
         &dep_vec(h, deps),
         &threshold,
@@ -77,12 +69,14 @@ fn try_create_with_deps(h: &Harness, deps: &[u64]) -> Result<u64, Error> {
     h.client
         .try_create(
             &h.proposer,
-            &target(h, "acme", "wallet-1", "policy-1", "tx-ref-1"),
+            &String::from_str(&h.env, "acme"),
+            &String::from_str(&h.env, "wallet-1"),
+            &String::from_str(&h.env, "policy-1"),
             &approver_vec(h),
             &dep_vec(h, deps),
             &2,
             &soroban_sdk::vec![&h.env],
-            &5_000,
+            &0,
             &0,
         )
         .map(|ok| ok.unwrap())
@@ -209,7 +203,9 @@ fn create_with_bad_threshold_fails() {
     // threshold 3 > 2 approvers
     let res = h.client.try_create(
         &h.proposer,
-        &target(&h, "acme", "wallet-1", "policy-1", "tx-ref-1"),
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &3,
@@ -225,7 +221,9 @@ fn create_with_past_expiry_fails() {
     let h = setup(2);
     let res = h.client.try_create(
         &h.proposer,
-        &target(&h, "acme", "wallet-1", "policy-1", "tx-ref-1"),
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &1,
@@ -454,7 +452,9 @@ fn test_cancellation_grace_window() {
     h.env.ledger().set_timestamp(100);
     let id = h.client.create(
         &h.proposer,
-        &target(&h, "org", "w1", "p1", "tx1"),
+        &String::from_str(&h.env, "org"),
+        &String::from_str(&h.env, "w1"),
+        &String::from_str(&h.env, "p1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &2,
@@ -473,7 +473,9 @@ fn test_cancellation_grace_window() {
     // Create a new one and cancel inside window
     let id2 = h.client.create(
         &h.proposer,
-        &target(&h, "org", "w1", "p1", "tx1"),
+        &String::from_str(&h.env, "org"),
+        &String::from_str(&h.env, "w1"),
+        &String::from_str(&h.env, "p1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &2,

@@ -32,28 +32,28 @@ pub trait SafeDiv {
 
 impl SafeAdd for i128 {
     fn safe_add(self, other: i128) -> Result<i128, Error> {
-        self.checked_add(other).ok_or(Error::MathOverflow)
+        self.checked_add(other).ok_or(Error::Overflow)
     }
 }
 
 impl SafeSub for i128 {
     fn safe_sub(self, other: i128) -> Result<i128, Error> {
-        self.checked_sub(other).ok_or(Error::Underflow)
+        self.checked_sub(other).ok_or(Error::Overflow)
     }
 }
 
 impl SafeMul for i128 {
     fn safe_mul(self, other: i128) -> Result<i128, Error> {
-        self.checked_mul(other).ok_or(Error::MathOverflow)
+        self.checked_mul(other).ok_or(Error::Overflow)
     }
 }
 
 impl SafeDiv for i128 {
     fn safe_div(self, other: i128) -> Result<i128, Error> {
         if other == 0 {
-            return Err(Error::DivisionByZero);
+            return Err(Error::InvalidInput);
         }
-        self.checked_div(other).ok_or(Error::MathOverflow)
+        self.checked_div(other).ok_or(Error::Overflow)
     }
 }
 
@@ -72,11 +72,25 @@ pub fn checked_mul(a: i128, b: i128) -> Result<i128, Error> {
 }
 
 pub fn checked_div(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_div(b).map_err(|e| {
-        if e == Error::DivisionByZero {
-            Error::InvalidInput
-        } else {
-            Error::Overflow
-        }
-    })
+    a.safe_div(b)
+}
+
+/// Checked remainder. Returns [`Error::InvalidInput`] on divide-by-zero.
+pub fn checked_rem(a: i128, b: i128) -> Result<i128, Error> {
+    if b == 0 {
+        return Err(Error::InvalidInput);
+    }
+    a.checked_rem(b).ok_or(Error::Overflow)
+}
+
+/// Checked negation. Returns [`Error::Overflow`] when the result cannot be
+/// represented (only `i128::MIN`).
+pub fn checked_neg(a: i128) -> Result<i128, Error> {
+    a.checked_neg().ok_or(Error::Overflow)
+}
+
+/// Checked absolute value. Returns [`Error::Overflow`] when the result
+/// cannot be represented (only `i128::MIN`).
+pub fn checked_abs(a: i128) -> Result<i128, Error> {
+    a.checked_abs().ok_or(Error::Overflow)
 }
