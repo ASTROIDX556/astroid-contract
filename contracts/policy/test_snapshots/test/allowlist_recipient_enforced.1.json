@@ -30,12 +30,6 @@
                   }
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
-                },
-                {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 "void",
@@ -231,17 +225,6 @@
                     {
                       "key": {
                         "symbol": "max_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 0
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "max_fee"
                       },
                       "val": {
                         "i128": {
@@ -458,12 +441,6 @@
                 },
                 {
                   "bytes": "0707070707070707070707070707070707070707070707070707070707070707"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
                 },
                 {
                   "i128": {

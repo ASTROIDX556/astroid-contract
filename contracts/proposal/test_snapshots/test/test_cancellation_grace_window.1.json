@@ -27,9 +27,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -43,7 +40,13 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
@@ -81,9 +84,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -97,7 +97,13 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
@@ -219,6 +225,22 @@
                     },
                     {
                       "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {
@@ -271,14 +293,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx1"
                       }
                     },
                     {
@@ -371,6 +385,22 @@
                     },
                     {
                       "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {
@@ -423,14 +453,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx1"
                       }
                     },
                     {
@@ -696,9 +718,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -712,7 +731,13 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
@@ -830,7 +855,7 @@
             ],
             "data": {
               "error": {
-                "contract": 74
+                "contract": 75
               }
             }
           }
@@ -851,7 +876,7 @@
               },
               {
                 "error": {
-                  "contract": 74
+                  "contract": 75
                 }
               }
             ],
@@ -876,7 +901,7 @@
               },
               {
                 "error": {
-                  "contract": 74
+                  "contract": 75
                 }
               }
             ],
@@ -938,9 +963,6 @@
                   "string": "p1"
                 },
                 {
-                  "string": "tx1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -954,7 +976,13 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 0
