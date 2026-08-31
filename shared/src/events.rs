@@ -42,6 +42,9 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// The contract was paused (`paused = true`) or unpaused (`paused = false`)
+    /// via the system-wide emergency circuit breaker.
+    ContractPaused { paused: bool },
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
@@ -118,6 +121,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
+        }
+        ContractEvent::ContractPaused { paused } => {
+            env.events()
+                .publish((Symbol::new(env, "ContractPaused"),), paused);
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
