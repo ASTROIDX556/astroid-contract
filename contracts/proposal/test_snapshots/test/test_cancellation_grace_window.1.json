@@ -18,16 +18,40 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "org"
-                },
-                {
-                  "string": "w1"
-                },
-                {
-                  "string": "p1"
-                },
-                {
-                  "string": "tx1"
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "string": "org"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy"
+                      },
+                      "val": {
+                        "string": "p1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tx_ref"
+                      },
+                      "val": {
+                        "string": "tx1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "wallet"
+                      },
+                      "val": {
+                        "string": "w1"
+                      }
+                    }
+                  ]
                 },
                 {
                   "vec": [
@@ -41,6 +65,9 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u32": 2
@@ -75,16 +102,40 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "org"
-                },
-                {
-                  "string": "w1"
-                },
-                {
-                  "string": "p1"
-                },
-                {
-                  "string": "tx1"
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "string": "org"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy"
+                      },
+                      "val": {
+                        "string": "p1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tx_ref"
+                      },
+                      "val": {
+                        "string": "tx1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "wallet"
+                      },
+                      "val": {
+                        "string": "w1"
+                      }
+                    }
+                  ]
                 },
                 {
                   "vec": [
@@ -98,6 +149,9 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u32": 2
@@ -217,10 +271,59 @@
                     },
                     {
                       "key": {
+                        "symbol": "context"
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "org"
+                            },
+                            "val": {
+                              "string": "org"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "policy"
+                            },
+                            "val": {
+                              "string": "p1"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "tx_ref"
+                            },
+                            "val": {
+                              "string": "tx1"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "wallet"
+                            },
+                            "val": {
+                              "string": "w1"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "created_at"
                       },
                       "val": {
                         "u64": 100
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
                       }
                     },
                     {
@@ -249,22 +352,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "org"
-                      },
-                      "val": {
-                        "string": "org"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "policy"
-                      },
-                      "val": {
-                        "string": "p1"
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "proposer"
                       },
                       "val": {
@@ -285,22 +372,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "wallet"
-                      },
-                      "val": {
-                        "string": "w1"
                       }
                     }
                   ]
@@ -377,10 +448,59 @@
                     },
                     {
                       "key": {
+                        "symbol": "context"
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "org"
+                            },
+                            "val": {
+                              "string": "org"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "policy"
+                            },
+                            "val": {
+                              "string": "p1"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "tx_ref"
+                            },
+                            "val": {
+                              "string": "tx1"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "wallet"
+                            },
+                            "val": {
+                              "string": "w1"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "created_at"
                       },
                       "val": {
                         "u64": 151
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
                       }
                     },
                     {
@@ -409,22 +529,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "org"
-                      },
-                      "val": {
-                        "string": "org"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "policy"
-                      },
-                      "val": {
-                        "string": "p1"
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "proposer"
                       },
                       "val": {
@@ -445,22 +549,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "wallet"
-                      },
-                      "val": {
-                        "string": "w1"
                       }
                     }
                   ]
@@ -709,16 +797,40 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "org"
-                },
-                {
-                  "string": "w1"
-                },
-                {
-                  "string": "p1"
-                },
-                {
-                  "string": "tx1"
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "string": "org"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy"
+                      },
+                      "val": {
+                        "string": "p1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tx_ref"
+                      },
+                      "val": {
+                        "string": "tx1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "wallet"
+                      },
+                      "val": {
+                        "string": "w1"
+                      }
+                    }
+                  ]
                 },
                 {
                   "vec": [
@@ -732,6 +844,9 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u32": 2
@@ -855,7 +970,7 @@
             ],
             "data": {
               "error": {
-                "contract": 45
+                "contract": 43
               }
             }
           }
@@ -876,7 +991,7 @@
               },
               {
                 "error": {
-                  "contract": 45
+                  "contract": 43
                 }
               }
             ],
@@ -901,7 +1016,7 @@
               },
               {
                 "error": {
-                  "contract": 45
+                  "contract": 43
                 }
               }
             ],
@@ -954,16 +1069,40 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "org"
-                },
-                {
-                  "string": "w1"
-                },
-                {
-                  "string": "p1"
-                },
-                {
-                  "string": "tx1"
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "string": "org"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy"
+                      },
+                      "val": {
+                        "string": "p1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tx_ref"
+                      },
+                      "val": {
+                        "string": "tx1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "wallet"
+                      },
+                      "val": {
+                        "string": "w1"
+                      }
+                    }
+                  ]
                 },
                 {
                   "vec": [
@@ -977,6 +1116,9 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u32": 2

@@ -81,6 +81,17 @@ impl ProposalState {
     }
 }
 
+/// Off-chain context bundled with every proposal so the backend can
+/// reconstruct why money moved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalContext {
+    pub org: String,
+    pub wallet: String,
+    pub policy: String,
+    pub tx_ref: String,
+}
+
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
 /// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
 /// the ids of proposals that must have executed before this one may execute.
@@ -88,11 +99,7 @@ impl ProposalState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposal {
     pub proposer: Address,
-    pub org: String,
-    /// Links (opaque references owned by the backend / other contracts).
-    pub wallet: String,
-    pub policy: String,
-    pub tx_ref: String,
+    pub context: ProposalContext,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
@@ -167,10 +174,7 @@ impl ProposalContract {
     pub fn create(
         env: Env,
         proposer: Address,
-        org: String,
-        wallet: String,
-        policy: String,
-        tx_ref: String,
+        context: ProposalContext,
         approvers: Vec<Address>,
         dependencies: Vec<u64>,
         threshold: u32,
@@ -179,7 +183,7 @@ impl ProposalContract {
         grace_period: u64,
     ) -> Result<u64, Error> {
         proposer.require_auth();
-        require_non_empty(&org)?;
+        require_non_empty(&context.org)?;
         let n = approvers.len();
         if n == 0 || n > MAX_APPROVERS {
             return Err(Error::InvalidInput);
@@ -232,10 +236,7 @@ impl ProposalContract {
 
         let proposal = Proposal {
             proposer: proposer.clone(),
-            org,
-            wallet,
-            policy,
-            tx_ref,
+            context,
             approvers,
             dependencies: deps,
             threshold,
@@ -517,18 +518,6 @@ impl ProposalContract {
             if !prerequisite.state.has_executed() {
                 return Err(Error::PrerequisiteNotMet);
             }
-        }
-        Ok(())
-    }
-
-    /// Surface [`Error::ProposalExpired`] when the deadline has passed so callers
-    /// fail safely. This deliberately does NOT persist the `Expired` state: on the
-    /// Soroban host, returning `Err` rolls back every storage write from the
-    /// invocation, so the terminal transition is recorded only through the
-    /// permissionless [`ProposalContract::expire`] entrypoint (which returns `Ok`).
-    fn ensure_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
-        if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
-            return Err(Error::ProposalExpired);
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{ProposalContract, ProposalContractClient, ProposalState};
+use crate::{ProposalContext, ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -52,10 +52,12 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
 fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> u64 {
     h.client.create(
         &h.proposer,
-        &String::from_str(&h.env, "acme"),
-        &String::from_str(&h.env, "wallet-1"),
-        &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
+        &ProposalContext {
+            org: String::from_str(&h.env, "acme"),
+            wallet: String::from_str(&h.env, "wallet-1"),
+            policy: String::from_str(&h.env, "policy-1"),
+            tx_ref: String::from_str(&h.env, "tx-ref-1"),
+        },
         &approver_vec(h),
         &dep_vec(h, deps),
         &threshold,
@@ -70,14 +72,18 @@ fn try_create_with_deps(h: &Harness, deps: &[u64]) -> Result<u64, Error> {
     h.client
         .try_create(
             &h.proposer,
-            &String::from_str(&h.env, "acme"),
-            &String::from_str(&h.env, "wallet-1"),
-            &String::from_str(&h.env, "policy-1"),
-            &String::from_str(&h.env, "tx-ref-1"),
+            &ProposalContext {
+                org: String::from_str(&h.env, "acme"),
+                wallet: String::from_str(&h.env, "wallet-1"),
+                policy: String::from_str(&h.env, "policy-1"),
+                tx_ref: String::from_str(&h.env, "tx-ref-1"),
+            },
             &approver_vec(h),
             &dep_vec(h, deps),
             &2,
-            &5_000,
+            &soroban_sdk::vec![&h.env],
+            &0,
+            &0,
         )
         .map(|ok| ok.unwrap())
         .map_err(|err| err.unwrap())
@@ -203,10 +209,12 @@ fn create_with_bad_threshold_fails() {
     // threshold 3 > 2 approvers
     let res = h.client.try_create(
         &h.proposer,
-        &String::from_str(&h.env, "acme"),
-        &String::from_str(&h.env, "wallet-1"),
-        &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
+        &ProposalContext {
+            org: String::from_str(&h.env, "acme"),
+            wallet: String::from_str(&h.env, "wallet-1"),
+            policy: String::from_str(&h.env, "policy-1"),
+            tx_ref: String::from_str(&h.env, "tx-ref-1"),
+        },
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &3,
@@ -222,10 +230,12 @@ fn create_with_past_expiry_fails() {
     let h = setup(2);
     let res = h.client.try_create(
         &h.proposer,
-        &String::from_str(&h.env, "acme"),
-        &String::from_str(&h.env, "wallet-1"),
-        &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
+        &ProposalContext {
+            org: String::from_str(&h.env, "acme"),
+            wallet: String::from_str(&h.env, "wallet-1"),
+            policy: String::from_str(&h.env, "policy-1"),
+            tx_ref: String::from_str(&h.env, "tx-ref-1"),
+        },
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &1,
@@ -446,17 +456,22 @@ fn fail_requires_approval_and_the_proposer() {
 
     h.client.fail(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Failed);
+}
+
 #[test]
 fn test_cancellation_grace_window() {
     let h = setup(3);
     h.env.ledger().set_timestamp(100);
     let id = h.client.create(
         &h.proposer,
-        &String::from_str(&h.env, "org"),
-        &String::from_str(&h.env, "w1"),
-        &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
+        &ProposalContext {
+            org: String::from_str(&h.env, "org"),
+            wallet: String::from_str(&h.env, "w1"),
+            policy: String::from_str(&h.env, "p1"),
+            tx_ref: String::from_str(&h.env, "tx1"),
+        },
         &approver_vec(&h),
+        &soroban_sdk::vec![&h.env],
         &2,
         &soroban_sdk::vec![&h.env],
         &0,
@@ -473,11 +488,14 @@ fn test_cancellation_grace_window() {
     // Create a new one and cancel inside window
     let id2 = h.client.create(
         &h.proposer,
-        &String::from_str(&h.env, "org"),
-        &String::from_str(&h.env, "w1"),
-        &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
+        &ProposalContext {
+            org: String::from_str(&h.env, "org"),
+            wallet: String::from_str(&h.env, "w1"),
+            policy: String::from_str(&h.env, "p1"),
+            tx_ref: String::from_str(&h.env, "tx1"),
+        },
         &approver_vec(&h),
+        &soroban_sdk::vec![&h.env],
         &2,
         &soroban_sdk::vec![&h.env],
         &0,

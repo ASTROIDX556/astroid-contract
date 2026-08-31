@@ -27,63 +27,49 @@ pub enum Error {
 
     // --- Policy (20-29) ---
     PolicyDenied = 11,
-    PolicyHashMismatch = 12,
-    EmergencyLock = 13,
-    PolicyRecipientRestricted = 14,
-    PolicyMerchantBlocked = 15,
-    PolicyCategoryRestricted = 16,
+    EmergencyLock = 12,
+    PolicyRecipientRestricted = 13,
+    PolicyMerchantBlocked = 14,
+    PolicyCategoryRestricted = 15,
     /// The asset is not in the organization's whitelist.
-    AssetNotWhitelisted = 17,
-    FeeLimitExceeded = 18,
+    AssetNotWhitelisted = 16,
     /// A conditional policy rule denied the transaction.
-    RuleDenied = 19,
+    RuleDenied = 17,
 
     // --- Registry (30-39) ---
-    RegistryFrozen = 20,
-    ModuleDeprecated = 21,
+    RegistryFrozen = 18,
+    ModuleDeprecated = 19,
 
     // --- Budget (40-49) ---
-    BudgetExceeded = 22,
-    BudgetFrozen = 23,
-    BudgetArchived = 24,
-    AssetNotAuthorized = 25,
-    BudgetExpired = 26,
+    BudgetExceeded = 20,
+    BudgetFrozen = 21,
+    BudgetArchived = 22,
+    AssetNotAuthorized = 23,
+    BudgetExpired = 24,
 
     // --- Wallet (50-59) ---
-    WalletFrozen = 27,
-    WalletArchived = 28,
-    WalletPaused = 29,
-    InvalidState = 30,
+    WalletFrozen = 25,
+    WalletArchived = 26,
+    WalletPaused = 27,
+    InvalidState = 28,
 
     // --- Multisig / approvals (60-69) ---
-    ThresholdNotMet = 31,
-    AlreadySigned = 32,
-    NotASigner = 33,
-    InvalidThreshold = 34,
-    TimeLocked = 35,
-    TooManySigners = 36,
+    ThresholdNotMet = 29,
+    AlreadySigned = 30,
+    NotASigner = 31,
+    InvalidThreshold = 32,
+    TimeLocked = 33,
+    TooManySigners = 34,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
-    BatchCallFailed = 37,
+    BatchCallFailed = 35,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
-    InvalidNonce = 38,
+    InvalidNonce = 36,
     /// A signer with zero (or otherwise invalid) voting weight was supplied.
-    InvalidSignerWeight = 39,
+    InvalidSignerWeight = 37,
     /// Accumulated approval weight is below the configured threshold.
-    InsufficientWeight = 40,
+    InsufficientWeight = 38,
 
     // --- Proposal (70-79) ---
-    ProposalExpired = 70,
-    InvalidProposalState = 71,
-    ProposalNotApproved = 72,
-    NotAnApprover = 73,
-    /// A prerequisite proposal has not executed, so the dependent proposal may
-    /// not execute yet.
-    PrerequisiteNotMet = 74,
-    /// A declared dependency would close a cycle in the dependency graph.
-    CircularDependencyDetected = 75,
-    CancellationWindowClosed = 74,
-    MathOverflow = 75,
-    DivisionByZero = 76,
     ProposalExpired = 39,
     InvalidProposalState = 40,
     ProposalNotApproved = 41,
@@ -91,6 +77,11 @@ pub enum Error {
     CancellationWindowClosed = 43,
     MathOverflow = 44,
     DivisionByZero = 45,
+    /// A prerequisite proposal has not executed, so the dependent proposal may
+    /// not execute yet.
+    PrerequisiteNotMet = 46,
+    /// A declared dependency would close a cycle in the dependency graph.
+    CircularDependencyDetected = 47,
 
     // --- Escrow (80-89) ---
     EscrowExpired = 48,
