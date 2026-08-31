@@ -35,6 +35,137 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
 
+/// Maximum recursion depth for composite rule evaluation to prevent stack
+/// overflows and excessive gas consumption on-chain.
+const MAX_RULE_DEPTH: u32 = 10;
+
+/// A transaction payload submitted for policy evaluation.
+///
+/// This struct carries the essential fields of a proposed transfer so the
+/// composite rule engine can assess it against the full policy tree.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionPayload {
+    /// The Stellar asset contract address being transferred.
+    pub asset: Address,
+    /// The intended recipient of the transfer.
+    pub recipient: Address,
+    /// The amount being transferred (in base units).
+    pub amount: i128,
+}
+
+/// The operation performed by a rule node.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RuleOp {
+    /// Leaf: transfer amount must be at most `value_i128`.
+    MaxAmount = 0,
+    /// Leaf: recipient must equal `value_address`.
+    AllowedRecipient = 1,
+    /// Leaf: asset must equal `value_address`.
+    AllowedAsset = 2,
+    /// Leaf: recipient must be on the on-chain blacklist.
+    RecipientBlacklisted = 3,
+    /// Leaf: recipient must be on the merchant blacklist.
+    MerchantBlacklisted = 4,
+    /// Branch: **all** children must evaluate to `true`.
+    And = 5,
+    /// Branch: **at least one** child must evaluate to `true`.
+    Or = 6,
+    /// Branch: negates the single child rule.
+    Not = 7,
+}
+
+/// A single node in a flattened composite rule tree.
+///
+/// Branch nodes (`And`, `Or`, `Not`) reference their children by index range
+/// into the enclosing [`RuleTree`] vector. Leaf nodes use
+/// `children_start == children_end == 0`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleNode {
+    /// The operation this node performs.
+    pub op: RuleOp,
+    /// Payload for leaf nodes that carry an amount threshold.
+    pub value_i128: i128,
+    /// Payload for leaf nodes that carry an address.
+    pub value_address: Address,
+    /// Index of the first child in the tree vector (`0` = no children).
+    pub children_start: u32,
+    /// One past the last child index (`0` = no children).
+    pub children_end: u32,
+}
+
+/// A flattened composite policy rule tree.
+///
+/// The root node is always at index **0**.  Children of a branch node at index
+/// `i` occupy the contiguous range `[children_start, children_end)` in the
+/// same vector.
+///
+/// **Gas safety:** Evaluation is depth-limited to [`MAX_RULE_DEPTH`].
+pub type RuleTree = soroban_sdk::Vec<RuleNode>;
+
+/// Evaluate a node in a [`RuleTree`] against `payload`.
+///
+/// `depth` is decremented on every recursive call; returns
+/// `Err(Error::InvalidInput)` when exhausted (stack/gas protection).
+fn evaluate_node(
+    env: &Env,
+    tree: &RuleTree,
+    node_idx: u32,
+    payload: &TransactionPayload,
+    depth: u32,
+) -> Result<bool, Error> {
+    if depth == 0 {
+        return Err(Error::InvalidInput);
+    }
+    let remaining = depth - 1;
+    let node = tree.get(node_idx).ok_or(Error::InvalidInput)?;
+    match node.op {
+        RuleOp::MaxAmount => Ok(payload.amount <= node.value_i128),
+        RuleOp::AllowedRecipient => Ok(payload.recipient == node.value_address),
+        RuleOp::AllowedAsset => Ok(payload.asset == node.value_address),
+        RuleOp::RecipientBlacklisted => Ok(env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(payload.recipient.clone()))),
+        RuleOp::MerchantBlacklisted => Ok(env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(payload.recipient.clone()))),
+        RuleOp::And => {
+            if node.children_start == node.children_end {
+                return Err(Error::InvalidInput);
+            }
+            for i in node.children_start..node.children_end {
+                if !evaluate_node(env, tree, i, payload, remaining)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        RuleOp::Or => {
+            if node.children_start == node.children_end {
+                return Err(Error::InvalidInput);
+            }
+            for i in node.children_start..node.children_end {
+                if evaluate_node(env, tree, i, payload, remaining)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        RuleOp::Not => {
+            if node.children_start + 1 != node.children_end {
+                return Err(Error::InvalidInput);
+            }
+            let result = evaluate_node(env, tree, node.children_start, payload, remaining)?;
+            Ok(!result)
+        }
+    }
+}
+
 /// On-chain representation of a registered policy.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +201,8 @@ enum DataKey {
     AssetWhitelistEnabled(String),
     /// Per-(policy, asset) multi-token spending allowance.
     Allowance(String, Address),
+    /// Composite rule tree for a policy (set via `set_composite_rule`).
+    CompositeRule(String),
 }
 
 /// A per-asset spending allowance attached to a policy.
@@ -637,6 +770,94 @@ impl PolicyContract {
         Ok(())
     }
 
+    // --- composite rules ---
+
+    /// Register or replace the composite rule tree for a policy.
+    ///
+    /// The rule tree is evaluated during `check_transfer` **after** all the
+    /// standard scalar gates (blocklist, max amount, recipient, asset, etc.)
+    /// have passed. If the rule tree evaluates to `false`, the transfer is
+    /// denied with [`Error::PolicyDenied`].
+    ///
+    /// `owner` only. The tree must contain at least one node with the root at
+    /// index 0.
+    pub fn set_composite_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        rule_tree: RuleTree,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        if rule_tree.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        let key = DataKey::CompositeRule(policy_id.clone());
+        env.storage().persistent().set(&key, &rule_tree);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_set")),
+            policy_id,
+        );
+        Ok(())
+    }
+
+    /// Remove the composite rule tree for a policy (owner only).
+    pub fn clear_composite_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::CompositeRule(policy_id.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_clr")),
+            policy_id,
+        );
+        Ok(())
+    }
+
+    /// Read the composite rule tree for a policy, if one is set.
+    pub fn get_composite_rule(env: Env, policy_id: String) -> Result<RuleTree, Error> {
+        let key = DataKey::CompositeRule(policy_id.clone());
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)
+    }
+
+    /// Evaluate a composite rule tree against a transaction payload.
+    ///
+    /// Returns `Ok(true)` when the rule permits the transaction, or
+    /// `Err(Error::PolicyDenied)` when it denies it. If no composite rule
+    /// is registered for the policy the function returns `Ok(true)` (permissive
+    /// default — standard scalar gates still apply).
+    pub fn evaluate_composite_rule(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<bool, Error> {
+        let key = DataKey::CompositeRule(policy_id.clone());
+        let tree: RuleTree = match env.storage().persistent().get(&key) {
+            Some(t) => t,
+            None => return Ok(true),
+        };
+        if tree.is_empty() {
+            return Ok(true);
+        }
+        evaluate_node(&env, &tree, 0, &payload, MAX_RULE_DEPTH)
+    }
+
     // --- views ---
 
     pub fn get(env: Env, policy_id: String) -> Result<Policy, Error> {
@@ -717,6 +938,17 @@ impl PolicyInterface for PolicyContract {
         // Multi-token allowance gate: reject a spend that would breach the
         // per-(policy, asset) allowance. An unset allowance is unrestricted.
         Self::check_allowance(env.clone(), policy_id.clone(), asset.clone(), amount)?;
+        // --- Composite rule evaluation ---
+        let payload = TransactionPayload {
+            asset: asset.clone(),
+            recipient: recipient.clone(),
+            amount,
+        };
+        let rule_result = Self::evaluate_composite_rule(env.clone(), policy_id.clone(), payload)?;
+        if !rule_result {
+            events_policy_violation(&env, &policy_id, "rule_denied");
+            return Err(Error::PolicyDenied);
+        }
         Ok(())
     }
 }
