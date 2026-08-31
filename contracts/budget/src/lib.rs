@@ -123,7 +123,6 @@ enum DataKey {
 pub struct BudgetContract;
 #[contractimpl]
 impl BudgetContract {
-
     // --- registry-gated upgrades ---
 
     /// Record (or rotate) who may upgrade this contract and which registry

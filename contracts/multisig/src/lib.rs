@@ -186,7 +186,6 @@ pub struct MultiSigContract;
 
 #[contractimpl]
 impl MultiSigContract {
-
     // --- registry-gated upgrades ---
 
     /// Record (or rotate) who may upgrade this contract and which registry

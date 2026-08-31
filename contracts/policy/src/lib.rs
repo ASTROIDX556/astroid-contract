@@ -231,7 +231,6 @@ pub struct PolicyContract;
 #[contractimpl]
 #[allow(clippy::too_many_arguments)]
 impl PolicyContract {
-
     // --- registry-gated upgrades ---
 
     /// Record (or rotate) who may upgrade this contract and which registry

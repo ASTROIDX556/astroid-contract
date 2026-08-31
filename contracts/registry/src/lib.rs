@@ -123,7 +123,6 @@ pub struct RegistryContract;
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl RegistryContract {
-
     // --- registry-gated upgrades ---
 
     /// Record (or rotate) who may upgrade this contract and which registry

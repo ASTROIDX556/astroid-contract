@@ -123,7 +123,6 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
-
     // --- registry-gated upgrades ---
 
     /// Record (or rotate) who may upgrade this contract and which registry
