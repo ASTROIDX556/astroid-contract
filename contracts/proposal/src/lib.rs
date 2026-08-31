@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose

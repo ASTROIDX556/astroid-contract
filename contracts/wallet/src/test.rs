@@ -23,6 +23,7 @@ fn assert_event(env: &Env, variant: &str) {
 struct Harness {
     env: Env,
     client: WalletContractClient<'static>,
+    admin: Address,
     token: Address,
 }
 
@@ -41,7 +42,12 @@ fn setup() -> Harness {
         .register_stellar_asset_contract_v2(token_admin.clone())
         .address();
 
-    Harness { env, client, token }
+    Harness {
+        env,
+        client,
+        admin,
+        token,
+    }
 }
 
 fn mint(h: &Harness, to: &Address, amount: i128) {
@@ -249,6 +255,159 @@ fn funded_wallet(h: &Harness, amount: i128) -> (Address, u64) {
     mint(h, &owner, amount);
     h.client.deposit(&id, &owner, &h.token, &amount);
     (owner, id)
+}
+
+#[test]
+fn breaker_starts_reset_and_guardian_defaults_to_admin() {
+    let h = setup();
+    assert!(!h.client.is_paused());
+    assert_eq!(h.client.get_guardian(), h.admin);
+}
+
+#[test]
+fn paused_wallet_contract_blocks_all_outgoing_value() {
+    let h = setup();
+    let (owner, id) = funded_wallet(&h, 1_000);
+    let recipient = Address::generate(&h.env);
+
+    h.client.emergency_pause(&h.admin);
+    assert!(h.client.is_paused());
+
+    assert_eq!(
+        h.client
+            .try_transfer(&owner, &id, &recipient, &h.token, &100),
+        Err(Ok(Error::WalletPaused))
+    );
+    assert_eq!(
+        h.client.try_withdraw(&owner, &id, &h.token, &100),
+        Err(Ok(Error::WalletPaused))
+    );
+    // No value moved on any rejected path.
+    assert_eq!(h.client.balance(&id, &h.token), 1_000);
+    assert_eq!(token_balance(&h, &recipient), 0);
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+}
+
+#[test]
+fn paused_wallet_contract_blocks_new_wallets() {
+    let h = setup();
+    h.client.emergency_pause(&h.admin);
+    let owner = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_create_wallet(&owner),
+        Err(Ok(Error::WalletPaused))
+    );
+}
+
+#[test]
+fn inspection_and_recovery_stay_available_while_paused() {
+    let h = setup();
+    let (owner, id) = funded_wallet(&h, 1_000);
+    h.client.emergency_pause(&h.admin);
+
+    // Read-only inspection is unaffected.
+    assert_eq!(h.client.balance(&id, &h.token), 1_000);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Active);
+    assert!(h.client.is_paused());
+
+    // Funding a wallet is inbound, so it stays open.
+    mint(&h, &owner, 500);
+    h.client.deposit(&id, &owner, &h.token, &500);
+    assert_eq!(h.client.balance(&id, &h.token), 1_500);
+
+    // Per-wallet quarantine still works, so an operator can act on a specific
+    // compromised wallet while the breaker holds the line globally.
+    h.client.freeze(&h.admin, &id);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Frozen);
+    h.client.unfreeze(&h.admin, &id);
+    h.client.pause(&owner, &id);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Paused);
+}
+
+#[test]
+fn normal_operation_resumes_after_unpause() {
+    let h = setup();
+    let (owner, id) = funded_wallet(&h, 1_000);
+    let recipient = Address::generate(&h.env);
+
+    h.client.emergency_pause(&h.admin);
+    h.client.emergency_unpause(&h.admin);
+    assert!(!h.client.is_paused());
+
+    h.client.transfer(&owner, &id, &recipient, &h.token, &400);
+    assert_eq!(token_balance(&h, &recipient), 400);
+    assert_eq!(h.client.balance(&id, &h.token), 600);
+}
+
+#[test]
+fn designated_guardian_can_trip_but_not_reset_the_breaker() {
+    let h = setup();
+    let guardian = Address::generate(&h.env);
+    h.client.set_guardian(&h.admin, &guardian);
+    assert_eq!(h.client.get_guardian(), guardian);
+
+    // Containment is fast: one guardian key is enough.
+    h.client.emergency_pause(&guardian);
+    assert!(h.client.is_paused());
+
+    // Releasing funds back into motion is not.
+    assert_eq!(
+        h.client.try_emergency_unpause(&guardian),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(h.client.is_paused());
+
+    h.client.emergency_unpause(&h.admin);
+    assert!(!h.client.is_paused());
+}
+
+#[test]
+fn strangers_cannot_touch_the_breaker() {
+    let h = setup();
+    let stranger = Address::generate(&h.env);
+    let owner = Address::generate(&h.env);
+    // Owning a wallet grants no emergency authority.
+    h.client.create_wallet(&owner);
+
+    assert_eq!(
+        h.client.try_emergency_pause(&stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_emergency_pause(&owner),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(!h.client.is_paused());
+
+    h.client.emergency_pause(&h.admin);
+    assert_eq!(
+        h.client.try_emergency_unpause(&stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(h.client.is_paused());
+}
+
+#[test]
+fn only_the_admin_designates_the_guardian() {
+    let h = setup();
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_set_guardian(&stranger, &stranger);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(h.client.get_guardian(), h.admin);
+}
+
+#[test]
+fn redundant_breaker_transitions_are_rejected() {
+    let h = setup();
+    assert_eq!(
+        h.client.try_emergency_unpause(&h.admin),
+        Err(Ok(Error::InvalidState))
+    );
+    h.client.emergency_pause(&h.admin);
+    assert_eq!(
+        h.client.try_emergency_pause(&h.admin),
+        Err(Ok(Error::InvalidState))
+    );
 }
 
 #[test]
@@ -475,6 +634,15 @@ fn role_checks_report_unknown_wallets_as_not_found() {
             .try_grant_role(&account, &999, &account, &Role::Agent),
         Err(Ok(Error::NotFound))
     );
+}
+
+#[test]
+fn breaker_events_are_emitted() {
+    let h = setup();
+    h.client.emergency_pause(&h.admin);
+    assert_event(&h.env, "WalletPaused");
+    h.client.emergency_unpause(&h.admin);
+    assert_event(&h.env, "WalletUnpaused");
 }
 
 #[test]

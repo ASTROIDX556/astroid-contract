@@ -66,6 +66,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ChangeCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "EmergencyLock"
                             }
                           ]
@@ -181,6 +193,18 @@
                         },
                         "val": {
                           "u32": 2
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TimelockDelay"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 86400
                         }
                       }
                     ]
@@ -570,7 +594,7 @@
             ],
             "data": {
               "error": {
-                "contract": 12
+                "contract": 21
               }
             }
           }
@@ -591,7 +615,7 @@
               },
               {
                 "error": {
-                  "contract": 12
+                  "contract": 21
                 }
               }
             ],
@@ -616,7 +640,7 @@
               },
               {
                 "error": {
-                  "contract": 12
+                  "contract": 21
                 }
               }
             ],

@@ -304,7 +304,6 @@ impl RegistryContract {
             .ok_or(Error::NotFound)
     }
 
-    /// Remove a module registration. Admin or org owner.
     /// Remove a module registration. Same gate as `register_module`: admin, org
     /// owner, or a delegated role that reaches this [`ModuleKind`].
     pub fn remove_module(
@@ -319,7 +318,8 @@ impl RegistryContract {
         let key = DataKey::Module(org.clone(), kind);
         ensure!(env.storage().persistent().has(&key), Error::NotFound);
         env.storage().persistent().remove(&key);
-        // Also remove the deprecation flag so lookups report NotFound, not
+        // Drop the deprecation flag together with the record so a later
+        // re-registration starts clean and lookups report NotFound, not
         // ModuleDeprecated, for a removed module.
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         if env.storage().persistent().has(&dkey) {
@@ -387,8 +387,6 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        // Note: deprecation flags for individual modules are not cleaned up here
-        // since revoke_role operates at the role level, not the module level.
         env.events().publish(
             (symbol_short!("role"), symbol_short!("revoked")),
             (org, account),
@@ -705,7 +703,7 @@ impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
-        let val: Address = env
+        let val = env
             .storage()
             .persistent()
             .get(&key)
