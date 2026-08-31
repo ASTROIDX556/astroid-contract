@@ -20,54 +20,52 @@ pub enum Error {
     AlreadyInitialized = 6,
 
     // --- Value / arithmetic (10-19) ---
-    InsufficientFunds = 7,
-    Overflow = 8,
-    Underflow = 9,
-    InvalidAmount = 10,
+    InsufficientFunds = 10,
+    Overflow = 11,
+    Underflow = 12,
+    InvalidAmount = 13,
 
     // --- Policy (20-29) ---
-    PolicyDenied = 11,
-    PolicyHashMismatch = 12,
-    EmergencyLock = 13,
-    PolicyRecipientRestricted = 14,
-    PolicyMerchantBlocked = 15,
-    PolicyCategoryRestricted = 16,
+    PolicyDenied = 20,
+    EmergencyLock = 21,
+    PolicyRecipientRestricted = 22,
+    PolicyMerchantBlocked = 23,
+    PolicyCategoryRestricted = 24,
     /// The asset is not in the organization's whitelist.
-    AssetNotWhitelisted = 17,
-    FeeLimitExceeded = 18,
+    AssetNotWhitelisted = 25,
 
     // --- Registry (30-39) ---
-    RegistryFrozen = 19,
-    ModuleDeprecated = 20,
+    RegistryFrozen = 30,
+    ModuleDeprecated = 31,
 
     // --- Budget (40-49) ---
-    BudgetExceeded = 21,
-    BudgetFrozen = 22,
-    BudgetArchived = 23,
-    AssetNotAuthorized = 24,
-    BudgetExpired = 25,
+    BudgetExceeded = 40,
+    BudgetFrozen = 41,
+    BudgetArchived = 42,
+    AssetNotAuthorized = 43,
+    BudgetExpired = 44,
 
     // --- Wallet (50-59) ---
-    WalletFrozen = 26,
-    WalletArchived = 27,
-    WalletPaused = 28,
-    InvalidState = 29,
+    WalletFrozen = 50,
+    WalletArchived = 51,
+    WalletPaused = 52,
+    InvalidState = 53,
 
     // --- Multisig / approvals (60-69) ---
-    ThresholdNotMet = 30,
-    AlreadySigned = 31,
-    NotASigner = 32,
-    InvalidThreshold = 33,
-    TimeLocked = 34,
-    TooManySigners = 35,
+    ThresholdNotMet = 61,
+    AlreadySigned = 62,
+    NotASigner = 63,
+    InvalidThreshold = 64,
+    TimeLocked = 65,
+    TooManySigners = 66,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
-    BatchCallFailed = 36,
+    BatchCallFailed = 67,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
-    InvalidNonce = 37,
+    InvalidNonce = 68,
     /// A signer with zero (or otherwise invalid) voting weight was supplied.
-    InvalidSignerWeight = 38,
+    InvalidSignerWeight = 69,
     /// Accumulated approval weight is below the configured threshold.
-    InsufficientWeight = 39,
+    InsufficientWeight = 90,
 
     // --- Proposal (70-79) ---
     ProposalExpired = 70,
@@ -79,20 +77,13 @@ pub enum Error {
     PrerequisiteNotMet = 74,
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 75,
-    CancellationWindowClosed = 74,
-    MathOverflow = 75,
-    DivisionByZero = 76,
-    ProposalExpired = 39,
-    InvalidProposalState = 40,
-    ProposalNotApproved = 41,
-    NotAnApprover = 42,
-    CancellationWindowClosed = 43,
-    MathOverflow = 44,
-    DivisionByZero = 45,
+    CancellationWindowClosed = 76,
+    MathOverflow = 77,
+    DivisionByZero = 78,
 
     // --- Escrow (80-89) ---
-    EscrowExpired = 47,
-    TimeLockActive = 48,
+    EscrowExpired = 80,
+    TimeLockActive = 81,
 
     // --- Interface versioning (95-99) ---
     /// The remote contract's interface version is older than the minimum

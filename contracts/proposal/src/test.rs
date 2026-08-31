@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{ProposalContract, ProposalContractClient, ProposalState};
+use crate::{ProposalContext, ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -43,6 +43,30 @@ fn approver_vec(h: &Harness) -> Vec<Address> {
     v
 }
 
+fn dep_vec(h: &Harness, deps: &[u64]) -> Vec<u64> {
+    let mut v = Vec::new(&h.env);
+    for d in deps {
+        v.push_back(*d);
+    }
+    v
+}
+
+fn make_ctx(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> ProposalContext {
+    ProposalContext {
+        proposer: h.proposer.clone(),
+        org: String::from_str(&h.env, "acme"),
+        wallet: String::from_str(&h.env, "wallet-1"),
+        policy: String::from_str(&h.env, "policy-1"),
+        tx_ref: String::from_str(&h.env, "tx-ref-1"),
+        approvers: approver_vec(h),
+        dependencies: dep_vec(h, deps),
+        threshold,
+        deposit: soroban_sdk::vec![&h.env],
+        expires_at,
+        grace_period: 0,
+    }
+}
+
 /// Create an independent proposal (no prerequisites).
 fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
     create_with_deps(h, threshold, expires_at, &[])
@@ -50,45 +74,15 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
 
 /// Create a proposal that depends on `deps`.
 fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> u64 {
-    h.client.create(
-        &h.proposer,
-        &String::from_str(&h.env, "acme"),
-        &String::from_str(&h.env, "wallet-1"),
-        &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
-        &approver_vec(h),
-        &dep_vec(h, deps),
-        &threshold,
-        &soroban_sdk::vec![&h.env],
-        &expires_at,
-        &0,
-    )
+    h.client.create(&make_ctx(h, threshold, expires_at, deps))
 }
 
 /// `create_with_deps` in its fallible form, for the rejection paths.
 fn try_create_with_deps(h: &Harness, deps: &[u64]) -> Result<u64, Error> {
     h.client
-        .try_create(
-            &h.proposer,
-            &String::from_str(&h.env, "acme"),
-            &String::from_str(&h.env, "wallet-1"),
-            &String::from_str(&h.env, "policy-1"),
-            &String::from_str(&h.env, "tx-ref-1"),
-            &approver_vec(h),
-            &dep_vec(h, deps),
-            &2,
-            &5_000,
-        )
+        .try_create(&make_ctx(h, 2, 5_000, deps))
         .map(|ok| ok.unwrap())
         .map_err(|err| err.unwrap())
-}
-
-fn dep_vec(h: &Harness, deps: &[u64]) -> Vec<u64> {
-    let mut v = Vec::new(&h.env);
-    for d in deps {
-        v.push_back(*d);
-    }
-    v
 }
 
 /// Drive a proposal all the way to `Executed`.
@@ -201,38 +195,14 @@ fn explicit_expire_transition() {
 fn create_with_bad_threshold_fails() {
     let h = setup(2);
     // threshold 3 > 2 approvers
-    let res = h.client.try_create(
-        &h.proposer,
-        &String::from_str(&h.env, "acme"),
-        &String::from_str(&h.env, "wallet-1"),
-        &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
-        &approver_vec(&h),
-        &dep_vec(&h, &[]),
-        &3,
-        &soroban_sdk::vec![&h.env],
-        &5_000,
-        &0,
-    );
+    let res = h.client.try_create(&make_ctx(&h, 3, 5_000, &[]));
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
 
 #[test]
 fn create_with_past_expiry_fails() {
     let h = setup(2);
-    let res = h.client.try_create(
-        &h.proposer,
-        &String::from_str(&h.env, "acme"),
-        &String::from_str(&h.env, "wallet-1"),
-        &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
-        &approver_vec(&h),
-        &dep_vec(&h, &[]),
-        &1,
-        &soroban_sdk::vec![&h.env],
-        &500, // in the past (now = 1000)
-        &0,
-    );
+    let res = h.client.try_create(&make_ctx(&h, 1, 500, &[]));
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
 }
 
@@ -446,22 +416,15 @@ fn fail_requires_approval_and_the_proposer() {
 
     h.client.fail(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Failed);
+}
+
 #[test]
 fn test_cancellation_grace_window() {
     let h = setup(3);
     h.env.ledger().set_timestamp(100);
-    let id = h.client.create(
-        &h.proposer,
-        &String::from_str(&h.env, "org"),
-        &String::from_str(&h.env, "w1"),
-        &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
-        &approver_vec(&h),
-        &2,
-        &soroban_sdk::vec![&h.env],
-        &0,
-        &50, // 50 seconds grace period
-    );
+    let mut ctx = make_ctx(&h, 2, 0, &[]);
+    ctx.grace_period = 50;
+    let id = h.client.create(&ctx);
 
     // Fast forward 51 seconds
     h.env.ledger().set_timestamp(151);
@@ -471,18 +434,10 @@ fn test_cancellation_grace_window() {
     assert_eq!(res, Err(Ok(Error::CancellationWindowClosed)));
 
     // Create a new one and cancel inside window
-    let id2 = h.client.create(
-        &h.proposer,
-        &String::from_str(&h.env, "org"),
-        &String::from_str(&h.env, "w1"),
-        &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
-        &approver_vec(&h),
-        &2,
-        &soroban_sdk::vec![&h.env],
-        &0,
-        &50,
-    );
+    h.env.ledger().set_timestamp(151);
+    let mut ctx2 = make_ctx(&h, 2, 0, &[]);
+    ctx2.grace_period = 50;
+    let id2 = h.client.create(&ctx2);
 
     h.env.ledger().set_timestamp(160);
     h.client.cancel(&h.proposer, &id2); // works since 160 < 151 + 50 (created at 151)

@@ -129,6 +129,24 @@ enum DataKey {
     Approval(u64, Address),
 }
 
+/// Parameters for creating a proposal. Bundled into a struct to stay within
+/// Soroban's 10-parameter contract-function limit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalContext {
+    pub proposer: Address,
+    pub org: String,
+    pub wallet: String,
+    pub policy: String,
+    pub tx_ref: String,
+    pub approvers: Vec<Address>,
+    pub dependencies: Vec<u64>,
+    pub threshold: u32,
+    pub deposit: Vec<AssetAmount>,
+    pub expires_at: u64,
+    pub grace_period: u64,
+}
+
 #[contract]
 pub struct ProposalContract;
 
@@ -163,21 +181,20 @@ impl ProposalContract {
     /// case of the same check. Because every edge strictly decreases the id,
     /// no sequence of edges can return to its starting proposal, so the graph
     /// is a DAG by construction and no traversal is needed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create(
-        env: Env,
-        proposer: Address,
-        org: String,
-        wallet: String,
-        policy: String,
-        tx_ref: String,
-        approvers: Vec<Address>,
-        dependencies: Vec<u64>,
-        threshold: u32,
-        deposit: Vec<AssetAmount>,
-        expires_at: u64,
-        grace_period: u64,
-    ) -> Result<u64, Error> {
+    pub fn create(env: Env, ctx: ProposalContext) -> Result<u64, Error> {
+        let ProposalContext {
+            proposer,
+            org,
+            wallet,
+            policy,
+            tx_ref,
+            approvers,
+            dependencies,
+            threshold,
+            deposit,
+            expires_at,
+            grace_period,
+        } = ctx;
         proposer.require_auth();
         require_non_empty(&org)?;
         let n = approvers.len();
@@ -517,18 +534,6 @@ impl ProposalContract {
             if !prerequisite.state.has_executed() {
                 return Err(Error::PrerequisiteNotMet);
             }
-        }
-        Ok(())
-    }
-
-    /// Surface [`Error::ProposalExpired`] when the deadline has passed so callers
-    /// fail safely. This deliberately does NOT persist the `Expired` state: on the
-    /// Soroban host, returning `Err` rolls back every storage write from the
-    /// invocation, so the terminal transition is recorded only through the
-    /// permissionless [`ProposalContract::expire`] entrypoint (which returns `Ok`).
-    fn ensure_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
-        if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
-            return Err(Error::ProposalExpired);
         }
         Ok(())
     }
