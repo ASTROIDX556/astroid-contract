@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`. Execution is
 //! additionally gated on a **cryptographically verified quorum**: [`execute`]
@@ -63,7 +63,6 @@ pub struct Proposal {
     /// Links (opaque references owned by the backend / other contracts).
     pub wallet: String,
     pub policy: String,
-    pub tx_ref: String,
     pub approvers: Vec<Address>,
     pub threshold: u32,
     pub approvals: u32,
@@ -123,7 +122,6 @@ impl ProposalContract {
         org: String,
         wallet: String,
         policy: String,
-        tx_ref: String,
         approvers: Vec<Address>,
         threshold: u32,
         deposit: Vec<AssetAmount>,
@@ -166,7 +164,6 @@ impl ProposalContract {
             org,
             wallet,
             policy,
-            tx_ref,
             approvers,
             threshold,
             approvals: 0,
@@ -440,6 +437,24 @@ impl ProposalContract {
             .persistent()
             .set(&DataKey::Proposal(id), proposal);
         Self::bump(env, id);
+    }
+
+    /// Require that every prerequisite proposal has executed.
+    ///
+    /// Dependencies are deduplicated at creation time and each entry is one
+    /// storage read, so a check costs exactly as many reads as the proposal has
+    /// distinct prerequisites — and short-circuits on the first unmet one. A
+    /// prerequisite that has been cancelled, rejected, expired or explicitly
+    /// marked `Failed` can never become executed, but it is reported the same
+    /// way: the dependent proposal simply cannot run.
+    fn ensure_dependencies_met(env: &Env, proposal: &Proposal) -> Result<(), Error> {
+        for dep in proposal.dependencies.iter() {
+            let prerequisite = Self::load(env, dep)?;
+            if !prerequisite.state.has_executed() {
+                return Err(Error::PrerequisiteNotMet);
+            }
+        }
+        Ok(())
     }
 
     fn bump(env: &Env, id: u64) {

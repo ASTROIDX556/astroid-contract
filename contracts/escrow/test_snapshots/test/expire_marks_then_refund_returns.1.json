@@ -117,6 +117,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -402,6 +405,25 @@
                       },
                       "val": {
                         "u64": 1100
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "funded_amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 5000
+                        }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     },
                     {
@@ -1493,6 +1515,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -1957,6 +1982,25 @@
                   },
                   "val": {
                     "u64": 1100
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "funded_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {
@@ -2443,6 +2487,25 @@
                   },
                   "val": {
                     "u64": 1100
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "funded_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {

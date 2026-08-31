@@ -704,6 +704,7 @@ impl RegistryInterface for RegistryContract {
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
         let address: Address = env
+        let val = env
             .storage()
             .persistent()
             .get(&key)
