@@ -50,6 +50,7 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    UnauthorizedDispatch = 54,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
