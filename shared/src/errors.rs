@@ -24,17 +24,16 @@ pub enum Error {
     Overflow = 11,
     InvalidAmount = 12,
 
-    // --- Policy (20-27) ---
+    // --- Policy (20-23, 25) ---
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
     PolicyMerchantBlocked = 23,
-    PolicyCategoryRestricted = 24,
     AssetNotWhitelisted = 25,
     /// A proposed spend would breach a per-asset spending allowance.
     PolicyAllowanceExceeded = 26,
 
-    // --- Registry (30-39) ---
+    // --- Registry (30-31) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
 
@@ -56,7 +55,6 @@ pub enum Error {
     AlreadySigned = 62,
     NotASigner = 63,
     InvalidThreshold = 64,
-    TooManySigners = 66,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
     BatchCallFailed = 67,
     /// Batch nonce is not strictly greater than the last used nonce (replay).
@@ -71,7 +69,7 @@ pub enum Error {
     /// weights or the threshold.
     UnauthorizedModification = 92,
 
-    // --- Proposal (71-79) ---
+    // --- Proposal (71-75, 78-79) ---
     ProposalExpired = 71,
     InvalidProposalState = 72,
     ProposalNotApproved = 73,
@@ -87,6 +85,8 @@ pub enum Error {
     EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
+    EscrowNotExpired = 85,
+    EscrowAlreadySettled = 86,
 
     // --- Treasury allowances (83-84) ---
     AllowanceExceeded = 83,

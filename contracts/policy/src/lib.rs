@@ -402,6 +402,54 @@ impl PolicyContract {
         Ok(())
     }
 
+    /// Add an address to the recipient whitelist (owner only).
+    pub fn add_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(address.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &policy_id);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wl_add")),
+            (policy_id, address),
+        );
+        Ok(())
+    }
+
+    /// Remove an address from the recipient whitelist (owner only).
+    pub fn remove_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        address: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(address.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wl_rem")),
+            (policy_id, address),
+        );
+        Ok(())
+    }
+
     /// Remove a spending category from the category blacklist (owner only).
     pub fn remove_category_blacklist(
         env: Env,
@@ -477,7 +525,7 @@ impl PolicyContract {
     }
 
     /// Check if a spending category is restricted. Returns Ok(()) if the category
-    /// is allowed, or PolicyCategoryRestricted if it's blacklisted.
+    /// is allowed, or PolicyDenied if it's blacklisted.
     pub fn check_category(env: Env, policy_id: String, category: String) -> Result<(), Error> {
         // Empty category is always allowed
         if category.is_empty() {
@@ -490,7 +538,7 @@ impl PolicyContract {
             .has(&DataKey::CategoryBlacklist(category.clone()))
         {
             events_policy_violation(&env, &policy_id, "category_restricted");
-            return Err(Error::PolicyCategoryRestricted);
+            return Err(Error::PolicyDenied);
         }
         Ok(())
     }
