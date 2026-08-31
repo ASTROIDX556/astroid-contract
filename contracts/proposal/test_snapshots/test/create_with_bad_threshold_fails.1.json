@@ -164,9 +164,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -177,10 +174,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 3
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u64": 5000
+                },
+                {
+                  "u64": 0
                 }
               ]
             }
@@ -279,9 +285,6 @@
                       "string": "policy-1"
                     },
                     {
-                      "string": "tx-ref-1"
-                    },
-                    {
                       "vec": [
                         {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -292,10 +295,19 @@
                       ]
                     },
                     {
+                      "vec": []
+                    },
+                    {
                       "u32": 3
                     },
                     {
+                      "vec": []
+                    },
+                    {
                       "u64": 5000
+                    },
+                    {
+                      "u64": 0
                     }
                   ]
                 }
