@@ -15,106 +15,44 @@
               "function_name": "create",
               "args": [
                 {
-                  "map": [
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "string": "org"
+                },
+                {
+                  "string": "w1"
+                },
+                {
+                  "string": "p1"
+                },
+                {
+                  "vec": [
                     {
-                      "key": {
-                        "symbol": "approvers"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                          },
-                          {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                          },
-                          {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                          }
-                        ]
-                      }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     },
                     {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                     },
                     {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "expires_at"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 50
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "org"
-                      },
-                      "val": {
-                        "string": "acme"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "policy"
-                      },
-                      "val": {
-                        "string": "policy-1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "proposer"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "threshold"
-                      },
-                      "val": {
-                        "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "wallet"
-                      },
-                      "val": {
-                        "string": "wallet-1"
-                      }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
+                },
+                {
+                  "u32": 2
+                },
+                {
+                  "vec": []
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "u64": 50
                 }
               ]
             }
@@ -134,106 +72,44 @@
               "function_name": "create",
               "args": [
                 {
-                  "map": [
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "string": "org"
+                },
+                {
+                  "string": "w1"
+                },
+                {
+                  "string": "p1"
+                },
+                {
+                  "vec": [
                     {
-                      "key": {
-                        "symbol": "approvers"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                          },
-                          {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                          },
-                          {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                          }
-                        ]
-                      }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     },
                     {
-                      "key": {
-                        "symbol": "dependencies"
-                      },
-                      "val": {
-                        "vec": []
-                      }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                     },
                     {
-                      "key": {
-                        "symbol": "deposit"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "expires_at"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "grace_period"
-                      },
-                      "val": {
-                        "u64": 50
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "org"
-                      },
-                      "val": {
-                        "string": "acme"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "policy"
-                      },
-                      "val": {
-                        "string": "policy-1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "proposer"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "threshold"
-                      },
-                      "val": {
-                        "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "wallet"
-                      },
-                      "val": {
-                        "string": "wallet-1"
-                      }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
+                },
+                {
+                  "u32": 2
+                },
+                {
+                  "vec": []
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "u64": 50
                 }
               ]
             }
@@ -384,7 +260,7 @@
                         "symbol": "org"
                       },
                       "val": {
-                        "string": "acme"
+                        "string": "org"
                       }
                     },
                     {
@@ -392,7 +268,7 @@
                         "symbol": "policy"
                       },
                       "val": {
-                        "string": "policy-1"
+                        "string": "p1"
                       }
                     },
                     {
@@ -421,18 +297,10 @@
                     },
                     {
                       "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "wallet"
                       },
                       "val": {
-                        "string": "wallet-1"
+                        "string": "w1"
                       }
                     }
                   ]
@@ -552,7 +420,7 @@
                         "symbol": "org"
                       },
                       "val": {
-                        "string": "acme"
+                        "string": "org"
                       }
                     },
                     {
@@ -560,7 +428,7 @@
                         "symbol": "policy"
                       },
                       "val": {
-                        "string": "policy-1"
+                        "string": "p1"
                       }
                     },
                     {
@@ -589,18 +457,10 @@
                     },
                     {
                       "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "wallet"
                       },
                       "val": {
-                        "string": "wallet-1"
+                        "string": "w1"
                       }
                     }
                   ]
@@ -844,104 +704,46 @@
               }
             ],
             "data": {
-              "map": [
+              "vec": [
                 {
-                  "key": {
-                    "symbol": "approvers"
-                  },
-                  "val": {
-                    "vec": [
-                      {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                      },
-                      {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                      },
-                      {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                      }
-                    ]
-                  }
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "key": {
-                    "symbol": "dependencies"
-                  },
-                  "val": {
-                    "vec": []
-                  }
+                  "string": "org"
                 },
                 {
-                  "key": {
-                    "symbol": "deposit"
-                  },
-                  "val": {
-                    "vec": []
-                  }
+                  "string": "w1"
                 },
                 {
-                  "key": {
-                    "symbol": "expires_at"
-                  },
-                  "val": {
-                    "u64": 0
-                  }
+                  "string": "p1"
                 },
                 {
-                  "key": {
-                    "symbol": "grace_period"
-                  },
-                  "val": {
-                    "u64": 50
-                  }
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  ]
                 },
                 {
-                  "key": {
-                    "symbol": "org"
-                  },
-                  "val": {
-                    "string": "acme"
-                  }
+                  "vec": []
                 },
                 {
-                  "key": {
-                    "symbol": "policy"
-                  },
-                  "val": {
-                    "string": "policy-1"
-                  }
+                  "u32": 2
                 },
                 {
-                  "key": {
-                    "symbol": "proposer"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                  }
+                  "vec": []
                 },
                 {
-                  "key": {
-                    "symbol": "threshold"
-                  },
-                  "val": {
-                    "u32": 2
-                  }
+                  "u64": 0
                 },
                 {
-                  "key": {
-                    "symbol": "tx_ref"
-                  },
-                  "val": {
-                    "string": "tx-ref-1"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "wallet"
-                  },
-                  "val": {
-                    "string": "wallet-1"
-                  }
+                  "u64": 50
                 }
               ]
             }
@@ -1053,7 +855,7 @@
             ],
             "data": {
               "error": {
-                "contract": 76
+                "contract": 75
               }
             }
           }
@@ -1074,7 +876,7 @@
               },
               {
                 "error": {
-                  "contract": 76
+                  "contract": 75
                 }
               }
             ],
@@ -1099,7 +901,7 @@
               },
               {
                 "error": {
-                  "contract": 76
+                  "contract": 75
                 }
               }
             ],
@@ -1147,104 +949,46 @@
               }
             ],
             "data": {
-              "map": [
+              "vec": [
                 {
-                  "key": {
-                    "symbol": "approvers"
-                  },
-                  "val": {
-                    "vec": [
-                      {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                      },
-                      {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                      },
-                      {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                      }
-                    ]
-                  }
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "key": {
-                    "symbol": "dependencies"
-                  },
-                  "val": {
-                    "vec": []
-                  }
+                  "string": "org"
                 },
                 {
-                  "key": {
-                    "symbol": "deposit"
-                  },
-                  "val": {
-                    "vec": []
-                  }
+                  "string": "w1"
                 },
                 {
-                  "key": {
-                    "symbol": "expires_at"
-                  },
-                  "val": {
-                    "u64": 0
-                  }
+                  "string": "p1"
                 },
                 {
-                  "key": {
-                    "symbol": "grace_period"
-                  },
-                  "val": {
-                    "u64": 50
-                  }
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  ]
                 },
                 {
-                  "key": {
-                    "symbol": "org"
-                  },
-                  "val": {
-                    "string": "acme"
-                  }
+                  "vec": []
                 },
                 {
-                  "key": {
-                    "symbol": "policy"
-                  },
-                  "val": {
-                    "string": "policy-1"
-                  }
+                  "u32": 2
                 },
                 {
-                  "key": {
-                    "symbol": "proposer"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                  }
+                  "vec": []
                 },
                 {
-                  "key": {
-                    "symbol": "threshold"
-                  },
-                  "val": {
-                    "u32": 2
-                  }
+                  "u64": 0
                 },
                 {
-                  "key": {
-                    "symbol": "tx_ref"
-                  },
-                  "val": {
-                    "string": "tx-ref-1"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "wallet"
-                  },
-                  "val": {
-                    "string": "wallet-1"
-                  }
+                  "u64": 50
                 }
               ]
             }

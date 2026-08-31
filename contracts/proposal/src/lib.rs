@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
@@ -92,7 +92,6 @@ pub struct Proposal {
     /// Links (opaque references owned by the backend / other contracts).
     pub wallet: String,
     pub policy: String,
-    pub tx_ref: String,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
@@ -129,24 +128,6 @@ enum DataKey {
     Approval(u64, Address),
 }
 
-/// Parameters for creating a proposal. Bundled into a struct to stay within
-/// Soroban's 10-parameter contract-function limit.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProposalContext {
-    pub proposer: Address,
-    pub org: String,
-    pub wallet: String,
-    pub policy: String,
-    pub tx_ref: String,
-    pub approvers: Vec<Address>,
-    pub dependencies: Vec<u64>,
-    pub threshold: u32,
-    pub deposit: Vec<AssetAmount>,
-    pub expires_at: u64,
-    pub grace_period: u64,
-}
-
 #[contract]
 pub struct ProposalContract;
 
@@ -181,20 +162,20 @@ impl ProposalContract {
     /// case of the same check. Because every edge strictly decreases the id,
     /// no sequence of edges can return to its starting proposal, so the graph
     /// is a DAG by construction and no traversal is needed.
-    pub fn create(env: Env, ctx: ProposalContext) -> Result<u64, Error> {
-        let ProposalContext {
-            proposer,
-            org,
-            wallet,
-            policy,
-            tx_ref,
-            approvers,
-            dependencies,
-            threshold,
-            deposit,
-            expires_at,
-            grace_period,
-        } = ctx;
+    #[allow(clippy::too_many_arguments)]
+    pub fn create(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        approvers: Vec<Address>,
+        dependencies: Vec<u64>,
+        threshold: u32,
+        deposit: Vec<AssetAmount>,
+        expires_at: u64,
+        grace_period: u64,
+    ) -> Result<u64, Error> {
         proposer.require_auth();
         require_non_empty(&org)?;
         let n = approvers.len();
@@ -252,7 +233,6 @@ impl ProposalContract {
             org,
             wallet,
             policy,
-            tx_ref,
             approvers,
             dependencies: deps,
             threshold,
