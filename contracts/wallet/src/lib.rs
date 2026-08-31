@@ -439,6 +439,37 @@ impl WalletContract {
         Ok(())
     }
 
+    /// Dispatch a wallet operation from an authorized caller.
+    ///
+    /// The `caller` must be one of:
+    /// - the wallet's **owner** (verified against on-chain wallet state), or
+    /// - a **registered module** for this wallet's organization, confirmed via
+    ///   the on-chain registry contract.
+    ///
+    /// This is the primary entrypoint for organizational modules (multisig,
+    /// treasury, policy, etc.) to execute wallet operations on behalf of the
+    /// organization. Direct owner calls to `transfer` / `freeze` etc. remain
+    /// available for backwards compatibility.
+    ///
+    /// # Errors
+    /// - [`Error::UnauthorizedDispatch`] if the caller is neither the owner nor
+    ///   a registered module.
+    /// - Propagates any error from the underlying wallet operation.
+    pub fn dispatch(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        action: WalletAction,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Authorize: caller must be the wallet owner, the wallet admin, or a
+        // registered module for this wallet's organization.
+        Self::require_registered_caller(&env, &caller, wallet_id)?;
+
+        Self::execute_dispatch(&env, wallet_id, &action)
+    }
+
     // --- views ---
 
     /// Read the role `account` effectively holds on a wallet, or `None` if it
