@@ -805,11 +805,7 @@ impl PolicyContract {
     }
 
     /// Remove the composite rule tree for a policy (owner only).
-    pub fn clear_composite_rule(
-        env: Env,
-        caller: Address,
-        policy_id: String,
-    ) -> Result<(), Error> {
+    pub fn clear_composite_rule(env: Env, caller: Address, policy_id: String) -> Result<(), Error> {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
@@ -830,10 +826,7 @@ impl PolicyContract {
     /// Read the composite rule tree for a policy, if one is set.
     pub fn get_composite_rule(env: Env, policy_id: String) -> Result<RuleTree, Error> {
         let key = DataKey::CompositeRule(policy_id.clone());
-        env.storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotFound)
+        env.storage().persistent().get(&key).ok_or(Error::NotFound)
     }
 
     /// Evaluate a composite rule tree against a transaction payload.

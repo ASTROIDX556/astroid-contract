@@ -1063,7 +1063,11 @@ fn composite_or_first_passes() {
         children_end: 3,
     });
     tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
-    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, Address::generate(&env), &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        Address::generate(&env),
+        &env,
+    ));
     p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
 
     // Amount is within limit so first branch passes
@@ -1117,7 +1121,11 @@ fn composite_or_all_fail() {
         children_end: 3,
     });
     tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
-    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, Address::generate(&env), &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        Address::generate(&env),
+        &env,
+    ));
     p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
 
     // Amount exceeds limit AND recipient is wrong
@@ -1411,7 +1419,11 @@ fn composite_get_rule_roundtrip() {
         children_end: 3,
     });
     tree.push_back(leaf_amount(RuleOp::MaxAmount, 500, &env));
-    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, Address::generate(&env), &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        Address::generate(&env),
+        &env,
+    ));
 
     p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
 
@@ -1450,11 +1462,7 @@ fn composite_set_rule_unauthorized_fails() {
     let p = composite_setup(&env, &owner);
 
     let tree = single_amount_tree(RuleOp::MaxAmount, 100, &env);
-    let result = p.try_set_composite_rule(
-        &unauthorized,
-        &String::from_str(&env, "cr"),
-        &tree,
-    );
+    let result = p.try_set_composite_rule(&unauthorized, &String::from_str(&env, "cr"), &tree);
     assert!(result.is_err());
 }
 
