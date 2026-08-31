@@ -117,6 +117,9 @@
                   "u64": 2000
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "override"
                 },
                 {
@@ -392,6 +395,14 @@
                           "hi": 0,
                           "lo": 5000
                         }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     },
                     {
@@ -1457,6 +1468,9 @@
                   "u64": 2000
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "override"
                 },
                 {
@@ -1748,7 +1762,7 @@
             ],
             "data": {
               "error": {
-                "contract": 31
+                "contract": 62
               }
             }
           }
@@ -1769,7 +1783,7 @@
               },
               {
                 "error": {
-                  "contract": 31
+                  "contract": 62
                 }
               }
             ],
@@ -1794,7 +1808,7 @@
               },
               {
                 "error": {
-                  "contract": 31
+                  "contract": 62
                 }
               }
             ],

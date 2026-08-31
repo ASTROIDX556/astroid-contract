@@ -2,7 +2,7 @@
 extern crate std;
 
 use crate::{BatchCall, MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_shared::constants::MAX_BATCH_CALLS;
+use astroid_shared::constants::{MAX_BATCH_CALLS, MIN_TIMELOCK_DELAY};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
 use soroban_sdk::{
@@ -77,6 +77,11 @@ fn setup(weights: &[u32], threshold: u32) -> Harness {
     }
 }
 
+fn advance(h: &Harness, seconds: u64) {
+    let now = h.env.ledger().timestamp();
+    h.env.ledger().set_timestamp(now + seconds);
+}
+
 fn payload(env: &Env) -> Bytes {
     Bytes::from_array(env, &[1, 2, 3, 4])
 }
@@ -114,7 +119,7 @@ fn zero_weight_rejected_on_init() {
     sv.push_back(sw(&Address::generate(&env), 0));
     sv.push_back(sw(&Address::generate(&env), 1));
     let res = client.try_initialize(&sv, &1);
-    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
+    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
 }
 
 #[test]
@@ -226,7 +231,7 @@ fn time_lock_blocks_early_execution() {
     h.client.approve(&h.signers[1], &id);
     // Threshold met (4), but time lock not reached.
     let res = h.client.try_execute(&h.signers[0], &id);
-    assert_eq!(res, Err(Ok(Error::TimeLocked)));
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
 
     // Advance past the lock.
     h.env.ledger().set_timestamp(6_000);
@@ -295,7 +300,11 @@ fn update_signer_weight_and_reach_threshold() {
     // Weights 1, 1 with threshold 2.
     let h = setup(&[1, 1], 2);
     // Bump signer[0] to weight 5; must keep total >= threshold (ok).
-    h.client.set_signer_weight(&h.signers[1], &h.signers[0], &5);
+    let id = h
+        .client
+        .propose_weight_change(&h.signers[1], &h.signers[0], &5);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &id);
     let stored = h.client.get_signers();
     assert!(stored
         .iter()
@@ -323,7 +332,7 @@ fn cannot_drop_total_weight_below_threshold() {
     // Lowering signer[0] weight to 1 would drop total to 2 < 3 -> rejected.
     let res = h
         .client
-        .try_set_signer_weight(&h.signers[1], &h.signers[0], &1);
+        .try_propose_weight_change(&h.signers[1], &h.signers[0], &1);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
 
@@ -334,8 +343,10 @@ fn set_threshold_bounds_enforced() {
     // Threshold larger than total weight is rejected.
     let res = h.client.try_set_threshold(&h.signers[0], &4);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
-    // Valid update works.
+    // Valid update works (deferred via set_threshold + finalize_threshold).
     h.client.set_threshold(&h.signers[0], &3);
+    h.env.ledger().set_sequence_number(17_280); // advance past THRESHOLD_CHANGE_DELAY_LEDGERS
+    h.client.finalize_threshold(&h.signers[0]);
     assert_eq!(h.client.get_threshold(), 3);
 }
 
@@ -353,8 +364,9 @@ fn non_signer_cannot_change_config() {
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
-        h.client.try_set_signer_weight(&stranger, &h.signers[0], &5),
-        Err(Ok(Error::NotASigner))
+        h.client
+            .try_propose_weight_change(&stranger, &h.signers[0], &5),
+        Err(Ok(Error::UnauthorizedModification))
     );
 }
 
@@ -818,7 +830,7 @@ fn threshold_update_with_timelock() {
     h.client.approve(&h.signers[1], &id);
     // Time lock not reached.
     let res = h.client.try_execute_threshold_update(&h.signers[2], &id);
-    assert_eq!(res, Err(Ok(Error::TimeLocked)));
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
     // Advance past lock.
     h.env.ledger().set_timestamp(6_000);
     exec_thresh(&h, &h.signers[2], id);

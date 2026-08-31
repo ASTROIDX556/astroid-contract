@@ -27,9 +27,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -41,6 +38,9 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u32": 2
@@ -169,6 +169,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "deposit"
                       },
                       "val": {
@@ -229,14 +237,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
                       }
                     },
                     {
@@ -469,9 +469,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -483,6 +480,9 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     }
                   ]
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u32": 2
@@ -739,7 +739,7 @@
             ],
             "data": {
               "error": {
-                "contract": 42
+                "contract": 72
               }
             }
           }
@@ -760,7 +760,7 @@
               },
               {
                 "error": {
-                  "contract": 42
+                  "contract": 72
                 }
               }
             ],
@@ -785,7 +785,7 @@
               },
               {
                 "error": {
-                  "contract": 42
+                  "contract": 72
                 }
               }
             ],

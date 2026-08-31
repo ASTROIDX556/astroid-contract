@@ -46,6 +46,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ChangeCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "EmergencyLock"
                             }
                           ]
@@ -161,6 +173,18 @@
                         },
                         "val": {
                           "u32": 2
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TimelockDelay"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 86400
                         }
                       }
                     ]
@@ -365,7 +389,7 @@
             ],
             "data": {
               "error": {
-                "contract": 33
+                "contract": 63
               }
             }
           }
@@ -386,7 +410,7 @@
               },
               {
                 "error": {
-                  "contract": 33
+                  "contract": 63
                 }
               }
             ],
@@ -411,7 +435,7 @@
               },
               {
                 "error": {
-                  "contract": 33
+                  "contract": 63
                 }
               }
             ],
@@ -493,7 +517,7 @@
             ],
             "data": {
               "error": {
-                "contract": 33
+                "contract": 63
               }
             }
           }
@@ -514,7 +538,7 @@
               },
               {
                 "error": {
-                  "contract": 33
+                  "contract": 63
                 }
               }
             ],
@@ -539,7 +563,7 @@
               },
               {
                 "error": {
-                  "contract": 33
+                  "contract": 63
                 }
               }
             ],
@@ -583,7 +607,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "set_signer_weight"
+                "symbol": "propose_weight_change"
               }
             ],
             "data": {
@@ -616,12 +640,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "set_signer_weight"
+                "symbol": "propose_weight_change"
               }
             ],
             "data": {
               "error": {
-                "contract": 33
+                "contract": 92
               }
             }
           }
@@ -642,7 +666,7 @@
               },
               {
                 "error": {
-                  "contract": 33
+                  "contract": 92
                 }
               }
             ],
@@ -667,7 +691,7 @@
               },
               {
                 "error": {
-                  "contract": 33
+                  "contract": 92
                 }
               }
             ],
@@ -677,7 +701,7 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "set_signer_weight"
+                  "symbol": "propose_weight_change"
                 },
                 {
                   "vec": [

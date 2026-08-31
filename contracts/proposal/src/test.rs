@@ -55,7 +55,6 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
         &String::from_str(&h.env, "acme"),
         &String::from_str(&h.env, "wallet-1"),
         &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(h),
         &dep_vec(h, deps),
         &threshold,
@@ -73,11 +72,12 @@ fn try_create_with_deps(h: &Harness, deps: &[u64]) -> Result<u64, Error> {
             &String::from_str(&h.env, "acme"),
             &String::from_str(&h.env, "wallet-1"),
             &String::from_str(&h.env, "policy-1"),
-            &String::from_str(&h.env, "tx-ref-1"),
             &approver_vec(h),
             &dep_vec(h, deps),
             &2,
-            &5_000,
+            &soroban_sdk::vec![&h.env],
+            &0,
+            &0,
         )
         .map(|ok| ok.unwrap())
         .map_err(|err| err.unwrap())
@@ -206,7 +206,6 @@ fn create_with_bad_threshold_fails() {
         &String::from_str(&h.env, "acme"),
         &String::from_str(&h.env, "wallet-1"),
         &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &3,
@@ -225,7 +224,6 @@ fn create_with_past_expiry_fails() {
         &String::from_str(&h.env, "acme"),
         &String::from_str(&h.env, "wallet-1"),
         &String::from_str(&h.env, "policy-1"),
-        &String::from_str(&h.env, "tx-ref-1"),
         &approver_vec(&h),
         &dep_vec(&h, &[]),
         &1,
@@ -446,6 +444,8 @@ fn fail_requires_approval_and_the_proposer() {
 
     h.client.fail(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Failed);
+}
+
 #[test]
 fn test_cancellation_grace_window() {
     let h = setup(3);
@@ -455,8 +455,8 @@ fn test_cancellation_grace_window() {
         &String::from_str(&h.env, "org"),
         &String::from_str(&h.env, "w1"),
         &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
         &approver_vec(&h),
+        &dep_vec(&h, &[]),
         &2,
         &soroban_sdk::vec![&h.env],
         &0,
@@ -476,8 +476,8 @@ fn test_cancellation_grace_window() {
         &String::from_str(&h.env, "org"),
         &String::from_str(&h.env, "w1"),
         &String::from_str(&h.env, "p1"),
-        &String::from_str(&h.env, "tx1"),
         &approver_vec(&h),
+        &dep_vec(&h, &[]),
         &2,
         &soroban_sdk::vec![&h.env],
         &0,
