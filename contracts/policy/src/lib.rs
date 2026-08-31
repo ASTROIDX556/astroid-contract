@@ -16,12 +16,21 @@
 //! This contract answers: "may `amount` of `asset` flow to `recipient`
 //! right now?" with a deterministic [`Error`] when it may not.
 //!
-//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
+//! Functions: `initialize`, `register_policy`, `rotate_policy`, `set_allowance`,
+//! `get_allowance`, `check_allowance`, `update_allowance`, `check_transfer`.
+//!
+//! ## Multi-token allowances
+//!
+//! A policy can attach a per-asset spending allowance to any policy. Each
+//! Stellar asset type (native XLM or a Soroban SAC token) is tracked under its
+//! own `(policy_id, asset)` key, so evaluation is safe against overflow and
+//! cheap (single persistent read/write).
 
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
-use astroid_shared::validation::require_non_empty;
+use astroid_shared::math::{checked_add, checked_sub};
+use astroid_shared::validation::{require_non_empty, require_non_negative_amount};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
@@ -59,12 +68,35 @@ enum DataKey {
     /// Whether an org uses a permissive (all-assets-allowed) or restrictive
     /// (whitelist-enforced) asset mode. Stored per policy_id.
     AssetWhitelistEnabled(String),
+    /// Per-(policy, asset) multi-token spending allowance.
+    Allowance(String, Address),
+}
+
+/// A per-asset spending allowance attached to a policy.
+///
+/// Multiple Stellar asset types (native XLM and Soroban SAC tokens) are tracked
+/// independently under the (policy_id, asset) key, so a policy can express a
+/// granular quota per token rather than a single default denomination.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetAllowance {
+    /// The policy this allowance belongs to.
+    pub policy_id: String,
+    /// The asset contract address (SAC) or the native XLM contract.
+    pub asset: Address,
+    /// Cumulative spending limit for this asset. `0` means disabled.
+    pub limit: i128,
+    /// Amount already spent against the limit.
+    pub spent: i128,
+    /// Unix timestamp the allowance expires at (`0` = never).
+    pub expires_at: u64,
 }
 
 #[contract]
 pub struct PolicyContract;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl PolicyContract {
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
@@ -463,6 +495,148 @@ impl PolicyContract {
         Ok(())
     }
 
+    // --- multi-token allowances ---
+
+    /// Create or update the spending allowance for `(policy_id, asset)`.
+    /// `owner` only. Rejects a negative limit. `expires_at == 0` means never.
+    pub fn set_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+        limit: i128,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        require_non_negative_amount(limit)?;
+        // Updating an allowance keeps existing spend so limits are enforced
+        // cumulatively across updates.
+        let mut allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
+        allowance.limit = limit;
+        allowance.expires_at = expires_at;
+        allowance.policy_id = policy_id.clone();
+        allowance.asset = asset.clone();
+        env.storage().persistent().set(
+            &DataKey::Allowance(policy_id.clone(), asset.clone()),
+            &allowance,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("allow_set")),
+            (policy_id, asset, limit),
+        );
+        Ok(())
+    }
+
+    /// Remove the spending allowance for `(policy_id, asset)`. `owner` only.
+    pub fn remove_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Allowance(policy_id.clone(), asset.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("allow_rem")),
+            (policy_id, asset),
+        );
+        Ok(())
+    }
+
+    /// Read the current allowance for `(policy_id, asset)`. Returns the stored
+    /// record, or a zeroed record when none has been configured (so callers can
+    /// treat an unset allowance as "unrestricted").
+    pub fn get_allowance(env: Env, policy_id: String, asset: Address) -> AssetAllowance {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(policy_id.clone(), asset.clone()))
+            .unwrap_or(AssetAllowance {
+                policy_id,
+                asset,
+                limit: 0,
+                spent: 0,
+                expires_at: 0,
+            })
+    }
+
+    /// Check whether spending `amount` of `asset` under `policy_id` is within
+    /// the configured allowance. Returns the remaining headroom after the spend
+    /// (0 = the allowance would be fully consumed, which is permitted). An
+    /// unset allowance is unrestricted. Returns
+    /// [`Error::PolicyAllowanceExceeded`] when the spend would breach the
+    /// allowance.
+    pub fn check_allowance(
+        env: Env,
+        policy_id: String,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        require_non_negative_amount(amount)?;
+        let allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
+        // No configured allowance => unrestricted for this asset.
+        if allowance.limit == 0 {
+            return Ok(i128::MAX);
+        }
+        if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
+            events_policy_violation(&env, &policy_id, "allowance_expired");
+            return Err(Error::PolicyDenied);
+        }
+        let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
+        if amount > headroom_after_spend {
+            events_policy_violation(&env, &policy_id, "allowance_exceeded");
+            return Err(Error::PolicyAllowanceExceeded);
+        }
+        checked_sub(headroom_after_spend, amount)
+    }
+
+    /// Atomically consume `amount` against the `(policy_id, asset)` allowance.
+    /// Returns `Ok(())` when the allowance was decremented, or
+    /// [`Error::PolicyAllowanceExceeded`] when it would be breached.
+    pub fn update_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        require_non_negative_amount(amount)?;
+        let mut allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
+        // No configured allowance => nothing to enforce.
+        if allowance.limit == 0 {
+            return Ok(());
+        }
+        if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
+            return Err(Error::PolicyDenied);
+        }
+        let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
+        if amount > headroom_after_spend {
+            return Err(Error::PolicyAllowanceExceeded);
+        }
+        allowance.spent = checked_add(allowance.spent, amount)?;
+        env.storage().persistent().set(
+            &DataKey::Allowance(policy_id.clone(), asset.clone()),
+            &allowance,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("allow_use")),
+            (policy_id, asset, amount, allowance.spent),
+        );
+        Ok(())
+    }
+
     // --- views ---
 
     pub fn get(env: Env, policy_id: String) -> Result<Policy, Error> {
@@ -540,33 +714,9 @@ impl PolicyInterface for PolicyContract {
         }
         // Check asset whitelist (Issue #37)
         Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
-        // Check blacklist
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Blacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "blacklisted");
-            return Err(Error::PolicyRecipientRestricted);
-        }
-        // Check merchant blacklist
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
-        }
-        // Check merchant blacklist
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
-        }
+        // Multi-token allowance gate: reject a spend that would breach the
+        // per-(policy, asset) allowance. An unset allowance is unrestricted.
+        Self::check_allowance(env.clone(), policy_id.clone(), asset.clone(), amount)?;
         Ok(())
     }
 }

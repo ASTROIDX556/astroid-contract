@@ -60,6 +60,10 @@ enum DataKey {
     Org(String),
     /// Module address: (org slug, kind) -> contract address.
     Module(String, ModuleKind),
+    /// Module deprecation flag: (org slug, kind) -> bool. When set, the routing
+    /// surface (`lookup`) rejects new interactions with [`Error::ModuleDeprecated`]
+    /// while the raw address stays readable for legacy migrations.
+    ModuleDeprecated(String, ModuleKind),
     /// Delegated role: (org slug, account) -> RegistryRole.
     OrgRole(String, Address),
     /// Version table: (kind, version) -> contract address (global upgrade map).
@@ -207,6 +211,12 @@ impl RegistryContract {
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
+        // A (re)registration points at a fresh implementation, so any prior
+        // deprecation flag must not carry over and block the new address.
+        let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+        if env.storage().persistent().has(&dkey) {
+            env.storage().persistent().remove(&dkey);
+        }
         astroid_shared::events::publish(
             &env,
             ContractEvent::RegistryModuleUpdated {
@@ -227,6 +237,73 @@ impl RegistryContract {
         Ok(())
     }
 
+    /// Mark a registered module as deprecated. Admin-gated. Once flagged,
+    /// [`Self::lookup`] rejects new interactions with [`Error::ModuleDeprecated`]
+    /// while the raw address remains readable through [`Self::get_module_address`]
+    /// so legacy migrations can still reach the old implementation.
+    pub fn deprecate_module(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        let mkey = DataKey::Module(org.clone(), kind);
+        if !env.storage().persistent().has(&mkey) {
+            return Err(Error::NotFound);
+        }
+        let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+        env.storage().persistent().set(&dkey, &true);
+        Self::bump(&env, &dkey);
+        env.events().publish(
+            (symbol_short!("module"), symbol_short!("deprecate")),
+            (org, kind),
+        );
+        Ok(())
+    }
+
+    /// Clear a module's deprecation flag, restoring normal routing. Admin-gated.
+    pub fn reactivate_module(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        let mkey = DataKey::Module(org.clone(), kind);
+        if !env.storage().persistent().has(&mkey) {
+            return Err(Error::NotFound);
+        }
+        let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+        env.storage().persistent().set(&dkey, &false);
+        Self::bump(&env, &dkey);
+        env.events().publish(
+            (symbol_short!("module"), symbol_short!("restore")),
+            (org, kind),
+        );
+        Ok(())
+    }
+
+    /// Read a module's deprecation status (false when never flagged).
+    pub fn is_module_deprecated(env: Env, org: String, kind: ModuleKind) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ModuleDeprecated(org, kind))
+            .unwrap_or(false)
+    }
+
+    /// Read a registered module address bypassing the deprecation guard.
+    /// Intended for legacy migrations and admin tooling that must still reach a
+    /// deprecated implementation.
+    pub fn get_module_address(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Module(org, kind))
+            .ok_or(Error::NotFound)
+    }
+
     /// Remove a module registration. Same gate as `register_module`: admin, org
     /// owner, or a delegated role that reaches this [`ModuleKind`].
     pub fn remove_module(
@@ -241,6 +318,13 @@ impl RegistryContract {
         let key = DataKey::Module(org.clone(), kind);
         ensure!(env.storage().persistent().has(&key), Error::NotFound);
         env.storage().persistent().remove(&key);
+        // Drop the deprecation flag together with the record so a later
+        // re-registration starts clean and lookups report NotFound, not
+        // ModuleDeprecated, for a removed module.
+        let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+        if env.storage().persistent().has(&dkey) {
+            env.storage().persistent().remove(&dkey);
+        }
         env.events().publish(
             (
                 symbol_short!("module"),
@@ -618,12 +702,21 @@ impl RegistryContract {
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
-        let key = DataKey::Module(org, kind);
+        let key = DataKey::Module(org.clone(), kind);
         let val = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(Error::NotFound)?;
+        // Routing guard: reject new interactions targeting deprecated modules.
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ModuleDeprecated(org, kind))
+            .unwrap_or(false)
+        {
+            return Err(Error::ModuleDeprecated);
+        }
         Self::bump(&env, &key);
         Ok(val)
     }

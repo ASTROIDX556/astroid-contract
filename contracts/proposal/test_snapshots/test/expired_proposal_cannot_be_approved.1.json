@@ -27,9 +27,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -43,22 +40,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 5000
                 },
-<<<<<<< HEAD
-                "void",
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
-=======
                 {
                   "u64": 0
->>>>>>> origin/main
                 }
               ]
             }
@@ -147,9 +141,6 @@
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deadline"
-=======
                         "symbol": "created_at"
                       },
                       "val": {
@@ -158,8 +149,23 @@
                     },
                     {
                       "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
->>>>>>> origin/main
                       },
                       "val": {
                         "u64": 5000
@@ -167,33 +173,14 @@
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deposit_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 0
-                        }
-=======
                         "symbol": "grace_period"
                       },
                       "val": {
                         "u64": 0
->>>>>>> origin/main
                       }
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deposit_asset"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-=======
->>>>>>> origin/main
                         "symbol": "org"
                       },
                       "val": {
@@ -230,14 +217,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
                       }
                     },
                     {
@@ -437,9 +416,6 @@
                   "string": "policy-1"
                 },
                 {
-                  "string": "tx-ref-1"
-                },
-                {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -453,22 +429,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 5000
                 },
-<<<<<<< HEAD
-                "void",
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
-=======
                 {
                   "u64": 0
->>>>>>> origin/main
                 }
               ]
             }
@@ -580,7 +553,7 @@
             ],
             "data": {
               "error": {
-                "contract": 70
+                "contract": 71
               }
             }
           }
@@ -601,7 +574,7 @@
               },
               {
                 "error": {
-                  "contract": 70
+                  "contract": 71
                 }
               }
             ],
@@ -626,7 +599,7 @@
               },
               {
                 "error": {
-                  "contract": 70
+                  "contract": 71
                 }
               }
             ],
@@ -719,7 +692,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "claim_expired_refund"
+                "symbol": "expire"
               }
             ],
             "data": {
@@ -742,7 +715,7 @@
                 "symbol": "proposal"
               },
               {
-                "symbol": "refunded"
+                "symbol": "expired"
               }
             ],
             "data": {
@@ -765,7 +738,7 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "claim_expired_refund"
+                "symbol": "expire"
               }
             ],
             "data": "void"
