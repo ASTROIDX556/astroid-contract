@@ -5,7 +5,7 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, Val,
 };
 
-use crate::{PolicyContract, PolicyContractClient, PolicyRule, RuleMatch, RuleTarget};
+use crate::{PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -1581,4 +1581,1031 @@ fn allowance_remove_restores_unlimited() {
     assert!(p
         .try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &200)
         .is_ok());
+}
+
+// --- Composite rule tests ---
+
+fn composite_setup<'a>(env: &'a Env, owner: &Address) -> PolicyContractClient<'a> {
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(env, &id);
+    client.initialize();
+    client.register_policy(
+        owner,
+        &String::from_str(env, "cr"),
+        &BytesN::from_array(env, &[99; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    client
+}
+
+/// Build a leaf RuleNode (no children).
+fn leaf(op: RuleOp, env: &Env) -> RuleNode {
+    RuleNode {
+        op,
+        value_i128: 0,
+        value_address: Address::generate(env),
+        children_start: 0,
+        children_end: 0,
+    }
+}
+
+/// Build a leaf RuleNode with an i128 value.
+fn leaf_amount(op: RuleOp, amount: i128, env: &Env) -> RuleNode {
+    RuleNode {
+        op,
+        value_i128: amount,
+        value_address: Address::generate(env),
+        children_start: 0,
+        children_end: 0,
+    }
+}
+
+/// Build a leaf RuleNode with an address value.
+fn leaf_addr(op: RuleOp, addr: Address, _env: &Env) -> RuleNode {
+    RuleNode {
+        op,
+        value_i128: 0,
+        value_address: addr,
+        children_start: 0,
+        children_end: 0,
+    }
+}
+
+/// Build a RuleTree with a single leaf node carrying an amount.
+fn single_amount_tree(op: RuleOp, amount: i128, env: &Env) -> RuleTree {
+    let mut tree = soroban_sdk::Vec::new(env);
+    tree.push_back(leaf_amount(op, amount, env));
+    tree
+}
+
+/// Build a RuleTree with a single leaf node carrying an address.
+fn single_addr_tree(op: RuleOp, addr: Address, env: &Env) -> RuleTree {
+    let mut tree = soroban_sdk::Vec::new(env);
+    tree.push_back(leaf_addr(op, addr, env));
+    tree
+}
+
+// --- Leaf rule: MaxAmount ---
+
+#[test]
+fn composite_max_amount_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 500, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &500)
+        .is_ok());
+}
+
+#[test]
+fn composite_max_amount_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 500, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &501),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+// --- Leaf rule: AllowedRecipient ---
+
+#[test]
+fn composite_allowed_recipient_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    let tree = single_addr_tree(RuleOp::AllowedRecipient, allowed.clone(), &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &allowed, &100)
+        .is_ok());
+}
+
+#[test]
+fn composite_allowed_recipient_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    let tree = single_addr_tree(RuleOp::AllowedRecipient, allowed, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &blocked, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+// --- Leaf rule: AllowedAsset ---
+
+#[test]
+fn composite_allowed_asset_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let recip = Address::generate(&env);
+
+    let tree = single_addr_tree(RuleOp::AllowedAsset, asset.clone(), &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100)
+        .is_ok());
+}
+
+#[test]
+fn composite_allowed_asset_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let allowed_asset = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let recip = Address::generate(&env);
+
+    let tree = single_addr_tree(RuleOp::AllowedAsset, allowed_asset, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &other_asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+// --- AND combinator ---
+// Tree layout for AND(a, b):
+//   [0] RuleNode { op: And, children_start: 1, children_end: 2 }
+//   [1] RuleNode { op: a }
+//   [2] RuleNode { op: b }
+
+#[test]
+fn composite_and_all_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 1000, &env));
+    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, recip.clone(), &env));
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &500)
+        .is_ok());
+}
+
+#[test]
+fn composite_and_one_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let blocked = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 1000, &env));
+    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, allowed, &env));
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Amount is fine but recipient is wrong
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &blocked, &500),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn composite_and_empty_children_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // AND node with children_start == children_end (empty)
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 1,
+    });
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+// --- OR combinator ---
+// Tree layout for OR(a, b):
+//   [0] RuleNode { op: Or, children_start: 1, children_end: 2 }
+//   [1] a
+//   [2] b
+
+#[test]
+fn composite_or_first_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        Address::generate(&env),
+        &env,
+    ));
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Amount is within limit so first branch passes
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &50)
+        .is_ok());
+}
+
+#[test]
+fn composite_or_second_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
+    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, allowed.clone(), &env));
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Amount exceeds limit but recipient matches
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &allowed, &500)
+        .is_ok());
+}
+
+#[test]
+fn composite_or_all_fail() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        Address::generate(&env),
+        &env,
+    ));
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Amount exceeds limit AND recipient is wrong
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &blocked, &500),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn composite_or_empty_children_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 1,
+    });
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+// --- NOT combinator ---
+// Tree layout for NOT(MaxAmount(100)):
+//   [0] RuleNode { op: Not, children_start: 1, children_end: 2 }
+//   [1] RuleNode { op: MaxAmount, value_i128: 100 }
+
+#[test]
+fn composite_not_inverts_pass_to_deny() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Not,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 2,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Amount 50 <= 100, inner rule passes => Not inverts => deny
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &50),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn composite_not_inverts_deny_to_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Not,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 2,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Amount 150 > 100, inner rule fails => Not inverts => pass
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &150)
+        .is_ok());
+}
+
+// --- Nested combinations ---
+// Tree layout for OR( AND(MaxAmount(500), AllowedRecipient(allowed)), AllowedAsset(asset) ):
+//   [0] RuleNode { op: Or, children_start: 1, children_end: 3 }
+//   [1] RuleNode { op: And, children_start: 3, children_end: 5 }
+//   [2] RuleNode { op: AllowedAsset, value_address: asset }
+//   [3] RuleNode { op: MaxAmount, value_i128: 500 }
+//   [4] RuleNode { op: AllowedRecipient, value_address: allowed }
+
+#[test]
+fn composite_nested_and_or() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let allowed = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    // [0] Root: OR with children 1..3
+    tree.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    // [1] AND with children 3..5
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 3,
+        children_end: 5,
+    });
+    // [2] AllowedAsset(asset)
+    tree.push_back(leaf_addr(RuleOp::AllowedAsset, asset.clone(), &env));
+    // [3] MaxAmount(500)
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 500, &env));
+    // [4] AllowedRecipient(allowed)
+    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, allowed.clone(), &env));
+
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Case 1: Wrong recipient but correct asset — OR passes via second branch
+    let wrong_recip = Address::generate(&env);
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &wrong_recip, &1_000)
+        .is_ok());
+
+    // Case 2: Correct recipient and amount within limit — AND branch passes
+    // (regardless of asset), so OR passes too.
+    let other_asset = Address::generate(&env);
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &other_asset, &allowed, &300)
+        .is_ok());
+
+    // Case 3: Wrong recipient AND wrong asset — neither OR branch passes => deny
+    assert_eq!(
+        p.try_check_transfer(
+            &String::from_str(&env, "cr"),
+            &other_asset,
+            &wrong_recip,
+            &1_000
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn composite_deeply_nested_not_of_and() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Rule: Not(And(MaxAmount(200), AllowedRecipient(recip)))
+    // Denies when BOTH conditions hold; allows when either fails.
+    let mut tree = soroban_sdk::Vec::new(&env);
+    // [0] NOT with child at index 1
+    tree.push_back(RuleNode {
+        op: RuleOp::Not,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 2,
+    });
+    // [1] AND with children 2..4
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 2,
+        children_end: 4,
+    });
+    // [2] MaxAmount(200)
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 200, &env));
+    // [3] AllowedRecipient(recip)
+    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, recip.clone(), &env));
+
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Both hold: amount 100 <= 200 AND recipient matches => And passes => Not denies
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Amount exceeds: And fails => Not passes
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &300)
+        .is_ok());
+}
+
+// --- Recursion depth limit ---
+// Build a chain of 15 nested Not nodes (exceeds MAX_RULE_DEPTH = 10)
+// Layout: [0] Not -> [1] Not -> [2] Not -> ... -> [15] MaxAmount(i128::MAX)
+
+#[test]
+fn composite_depth_exceeded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    for i in 0..15u32 {
+        tree.push_back(RuleNode {
+            op: RuleOp::Not,
+            value_i128: 0,
+            value_address: Address::generate(&env),
+            children_start: i + 1,
+            children_end: i + 2,
+        });
+    }
+    // [15] MaxAmount leaf
+    tree.push_back(RuleNode {
+        op: RuleOp::MaxAmount,
+        value_i128: i128::MAX,
+        value_address: Address::generate(&env),
+        children_start: 0,
+        children_end: 0,
+    });
+
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+// --- Clear / management ---
+
+#[test]
+fn composite_clear_rule_restores_permissive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Denied by composite rule
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Clear the rule
+    p.clear_composite_rule(&owner, &String::from_str(&env, "cr"));
+
+    // Now passes (no composite rule => permissive)
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100)
+        .is_ok());
+}
+
+#[test]
+fn composite_get_rule_roundtrip() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+
+    // Build a two-node OR tree
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 500, &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        Address::generate(&env),
+        &env,
+    ));
+
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    let retrieved = p.get_composite_rule(&String::from_str(&env, "cr"));
+    assert_eq!(retrieved.len(), tree.len());
+}
+
+#[test]
+fn composite_get_nonexistent_rule_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+
+    let result = p.try_get_composite_rule(&String::from_str(&env, "cr"));
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn composite_clear_nonexistent_rule_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+
+    let result = p.try_clear_composite_rule(&owner, &String::from_str(&env, "cr"));
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_set_rule_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 100, &env);
+    let result = p.try_set_composite_rule(&unauthorized, &String::from_str(&env, "cr"), &tree);
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_set_empty_tree_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+
+    let tree = soroban_sdk::Vec::new(&env);
+    let result = p.try_set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+    assert!(result.is_err());
+}
+
+// --- Rule evaluation event emitted ---
+
+#[test]
+fn composite_rule_denied_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    let _ = p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100);
+    assert_event(&env, "PolicyViolation");
+}
+
+// --- Evaluate composite rule view function ---
+
+#[test]
+fn composite_evaluate_view_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 500, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip.clone(),
+        amount: 200,
+    };
+    assert_eq!(
+        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &payload),
+        Ok(Ok(true))
+    );
+}
+
+#[test]
+fn composite_evaluate_view_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 100, &env);
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip.clone(),
+        amount: 200,
+    };
+    assert_eq!(
+        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &payload),
+        Ok(Ok(false))
+    );
+}
+
+#[test]
+fn composite_evaluate_no_rule_permissive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // No rule set => permissive (true)
+    let payload = TransactionPayload {
+        asset,
+        recipient: recip,
+        amount: 999_999,
+    };
+    assert_eq!(
+        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &payload),
+        Ok(Ok(true))
+    );
+}
+
+// --- Realistic scenario: max amount OR specific vendor whitelist ---
+
+#[test]
+fn composite_realistic_max_amount_or_vendor_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let vendor_a = Address::generate(&env);
+    let vendor_b = Address::generate(&env);
+    let random = Address::generate(&env);
+
+    // Rule: OR(MaxAmount(100), AllowedRecipient(vendor_a))
+    // i.e. small transfers allowed to anyone, or large transfers only to vendor_a
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 100, &env));
+    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, vendor_a.clone(), &env));
+
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Small transfer to random: passes (MaxAmount branch)
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &random, &50)
+        .is_ok());
+
+    // Large transfer to vendor_a: passes (AllowedRecipient branch)
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &vendor_a, &500)
+        .is_ok());
+
+    // Large transfer to vendor_b: denied (neither branch)
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &vendor_b, &500),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Large transfer to random: denied
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &random, &500),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+// --- Realistic scenario: NOT recipient blacklisted AND max amount ---
+// Tree layout for AND(NOT(RecipientBlacklisted), MaxAmount(1000)):
+//   [0] AND { children_start: 1, children_end: 3 }
+//   [1] NOT { children_start: 3, children_end: 4 }
+//   [2] MaxAmount(1000)
+//   [3] RecipientBlacklisted
+
+#[test]
+fn composite_realistic_not_blacklisted_and_max_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let safe = Address::generate(&env);
+    let bad = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    // [0] AND with children 1..3
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    // [1] NOT with child at index 3
+    tree.push_back(RuleNode {
+        op: RuleOp::Not,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 3,
+        children_end: 4,
+    });
+    // [2] MaxAmount(1000)
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 1000, &env));
+    // [3] RecipientBlacklisted
+    tree.push_back(leaf(RuleOp::RecipientBlacklisted, &env));
+
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // Safe recipient, amount OK: passes
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &safe, &500)
+        .is_ok());
+
+    // Blacklisted recipient: denied by blocklist check (before composite rules)
+    p.add_to_blocklist(&owner, &String::from_str(&env, "cr"), &bad);
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &bad, &500),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+}
+
+// --- asset deny list ---
+
+#[test]
+fn blacklisted_asset_is_denied() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // The transfer passes every scalar gate before the asset is listed.
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    assert!(p.is_asset_blacklisted(&pid, &asset));
+    let r = p.try_check_transfer(&pid, &asset, &recip, &1);
+    assert_eq!(r, Err(Ok(Error::PolicyDenied)));
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn blacklist_removal_restores_the_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    p.remove_asset_blacklist(&owner, &pid, &asset);
+    assert!(!p.is_asset_blacklisted(&pid, &asset));
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+}
+
+#[test]
+fn blacklist_beats_the_asset_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Explicitly allow the asset, then deny it: the deny list wins.
+    p.set_asset_whitelist_enabled(&owner, &pid, &true);
+    p.add_asset_to_whitelist(&owner, &pid, &asset);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    let r = p.try_check_transfer(&pid, &asset, &recip, &1);
+    assert_eq!(r, Err(Ok(Error::PolicyDenied)));
+}
+
+#[test]
+fn blacklist_is_scoped_to_its_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let other = String::from_str(&env, "other");
+    p.register_policy(
+        &owner,
+        &other,
+        &BytesN::from_array(&env, &[7; 32]),
+        &1_000_000,
+        &None,
+        &None,
+        &0,
+    );
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_asset_blacklist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    // The sibling policy is untouched by the other policy's deny list.
+    assert!(!p.is_asset_blacklisted(&other, &asset));
+    assert!(p.try_check_transfer(&other, &asset, &recip, &1).is_ok());
+}
+
+#[test]
+fn blacklist_management_rejects_bad_input() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+
+    // Removing an asset that was never listed.
+    assert_eq!(
+        p.try_remove_asset_blacklist(&owner, &pid, &asset),
+        Err(Ok(Error::NotFound))
+    );
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    // Listing it twice.
+    assert_eq!(
+        p.try_add_asset_blacklist(&owner, &pid, &asset),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // Unknown policy.
+    assert_eq!(
+        p.try_add_asset_blacklist(&owner, &String::from_str(&env, "nope"), &asset),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn only_the_owner_can_manage_the_blacklist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+
+    assert_eq!(
+        p.try_add_asset_blacklist(&stranger, &pid, &asset),
+        Err(Ok(Error::Unauthorized))
+    );
+    p.add_asset_blacklist(&owner, &pid, &asset);
+    assert_eq!(
+        p.try_remove_asset_blacklist(&stranger, &pid, &asset),
+        Err(Ok(Error::Unauthorized))
+    );
 }
