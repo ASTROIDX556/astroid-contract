@@ -1046,8 +1046,12 @@ fn batch_execution_uses_signer_weights() {
     // A single heavy signer carries the batch on its own.
     let h = setup_batch_weighted(&[5, 1, 1], 5);
     let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
-    h.client
-        .execute_batch(&h.signers[0], &1, &calls, &approvers(&h.env, &h.signers, &[]));
+    h.client.execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[]),
+    );
     assert_eq!(h.helper_client.get(&1), 100);
 
     // The two light signers together fall short of the same threshold.
@@ -1065,9 +1069,11 @@ fn batch_execution_uses_signer_weights() {
 #[test]
 fn verify_threshold_accumulates_weight_of_distinct_signers() {
     let h = setup(&[3, 2, 1], 5);
-    let weight = h
-        .client
-        .verify_threshold(&h.signers[0], &approvers(&h.env, &h.signers, &[1]), &payload(&h.env));
+    let weight = h.client.verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
     assert_eq!(weight, 5);
 }
 
