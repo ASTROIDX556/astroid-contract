@@ -941,6 +941,7 @@ fn scalar_gates_still_enforced_with_rules() {
 }
 
 // === Tests from upstream ===
+#[test]
 fn merchant_blacklist_blocks_transfers() {
     let env = Env::default();
     env.mock_all_auths();
