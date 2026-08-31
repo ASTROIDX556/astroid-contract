@@ -35,10 +35,6 @@
 //! assets are refused deterministically with [`Error::AssetNotAuthorized`] on
 //! both inflows and outflows.
 //!
-//! Functions: `initialize`, `set_policy`, `set_budget`, `add_approved_asset`,
-//! `remove_approved_asset`, `freeze`, `unfreeze`, `deposit`, `withdraw`,
-//! `allocate_budget`, `get`, `holding`, `is_approved_asset`,
-//! `approved_asset_count`.
 //! [`TreasuryContract::batch_transfer`] applies the same gate chain to a whole
 //! vector of payouts in a single, atomic invocation: the cumulative amount is
 //! accumulated with checked math and validated against the treasury balance
@@ -46,10 +42,12 @@
 //! the fee of one transaction. If any leg fails, the host reverts the entire
 //! invocation and no recipient is paid.
 //!
-//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
-//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`,
-//! `set_allowance`, `remove_allowance`, `allowance`, `init_milestone_disbursement`,
-//! `release_next_milestone`, `get`, `holding`.
+//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`,
+//! `add_approved_asset`, `remove_approved_asset`, `freeze`, `unfreeze`,
+//! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `set_allowance`,
+//! `remove_allowance`, `allowance`, `init_milestone_disbursement`,
+//! `release_next_milestone`, `get`, `holding`, `is_approved_asset`,
+//! `approved_asset_count`.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -62,8 +60,7 @@ use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::{Payment, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol,
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
 
 /// Stored treasury record.
@@ -255,8 +252,6 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Freeze the treasury; all outflows are rejected while frozen.
-    pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
     /// Wire the multisig contract authorized for emergency freeze/unfreeze.
     pub fn set_multisig(env: Env, caller: Address, multisig: Address) -> Result<(), Error> {
         let mut t = Self::require_admin(&env, &caller)?;
@@ -326,12 +321,6 @@ impl TreasuryContract {
         // Inbound routing is validated too: an unapproved token contract is
         // never invoked, not even to pull funds in.
         Self::require_approved_asset(&env, &asset)?;
-        // Pull tokens into the contract's own custody.
-        token::TokenClient::new(&env, &asset).transfer(
-            &from,
-            &env.current_contract_address(),
-            &amount,
-        );
         Self::lock(&env)?;
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, amount)?;
@@ -842,6 +831,9 @@ impl TreasuryContract {
                 org: t.org.clone(),
                 action,
             },
+        );
+    }
+
     fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
         let t = Self::load(env);
         match &t.multisig {

@@ -30,7 +30,6 @@ struct Harness<'a> {
     admin: Address,
     multisig: Address,
     asset: Address,
-    second_asset: Address,
 }
 
 /// Register a treasury plus a test SAC token, approve that token for routing,
@@ -51,11 +50,6 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
 
-    let token_admin2 = Address::generate(&env);
-    let second_asset = env
-        .register_stellar_asset_contract_v2(token_admin2)
-        .address();
-
     if funded > 0 {
         token::StellarAssetClient::new(&env, &asset).mint(&admin, &funded);
     }
@@ -67,7 +61,6 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         admin,
         multisig,
         asset,
-        second_asset,
     }
 }
 
@@ -195,6 +188,7 @@ fn expired_allowance_rejected() {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
     token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000);
+    client.add_approved_asset(&admin, &asset);
     client.deposit(&admin, &asset, &1_000);
 
     // Allowance already expired (expires_at in the past).
@@ -233,6 +227,7 @@ fn test_milestone_releases() {
         .address();
     let token_admin = token::StellarAssetClient::new(&env, &token);
     let token_client = token::TokenClient::new(&env, &token);
+    client.add_approved_asset(&admin, &token);
 
     let to = Address::generate(&env);
 
@@ -444,6 +439,8 @@ fn whitelist_changes_emit_events() {
     assert_event(&h.env, "TreasuryConfigUpdated");
     h.client.remove_approved_asset(&h.admin, &other);
     assert_event(&h.env, "TreasuryConfigUpdated");
+}
+
 /// Build one leg of a batch payout.
 fn payment(recipient: &Address, amount: i128) -> Payment {
     Payment {
