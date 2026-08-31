@@ -22,18 +22,10 @@
 //! invocation and no recipient is paid.
 //!
 //! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
-//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `get`,
-//! `holding`.
-//!
-//! ## Upgradeability
-//!
-//! Code upgrades are gated twice: the caller must be this contract's recorded
-//! upgrade admin, and the new Wasm hash must be approved for
-//! [`ModuleKind::Treasury`] in the registry's version map. See
-//! [`astroid_interfaces::upgrade`]; anything else is refused with
-//! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
+//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`,
+//! `set_allowance`, `remove_allowance`, `allowance`, `init_milestone_disbursement`,
+//! `release_next_milestone`, `get`, `holding`.
 
-use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, PERSISTENT_BUMP_AMOUNT,
@@ -42,10 +34,10 @@ use astroid_shared::constants::{
 use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
-use astroid_shared::types::{ModuleKind, Payment, ResourceState};
+use astroid_shared::types::{Payment, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, String, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
 };
 
 /// Stored treasury record.
@@ -87,15 +79,43 @@ pub struct Holding {
     pub budget_id: Option<String>,
 }
 
+/// Composite key identifying a withdrawal allowance scoped to a specific agent
+/// (the caller that may spend), recipient and asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowanceId {
+    pub agent: Address,
+    pub recipient: Address,
+    pub asset: Address,
+}
+
+/// Active withdrawal allowance restricting agent-driven expenditures against a
+/// specific recipient/asset to a pre-approved `limit` over a time window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Allowance {
+    pub agent: Address,
+    pub recipient: Address,
+    pub asset: Address,
+    /// Maximum cumulative amount that may be withdrawn under this allowance.
+    pub limit: i128,
+    /// Amount already consumed against the allowance.
+    pub spent: i128,
+    /// Unix timestamp after which the allowance can no longer be used (0 = never).
+    pub expires_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Treasury,
     Holding(Address),
+    ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
     Milestone(u64),
     MilestoneCount,
+    Allowance(AllowanceId),
 }
 
 #[contract]
@@ -103,6 +123,45 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
+
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Treasury`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Treasury,
+            wasm_hash,
+        )
+    }
     /// Create a treasury for `org`, gated on the admin's signature.
     pub fn initialize(env: Env, org: String, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Treasury) {
@@ -124,6 +183,7 @@ impl TreasuryContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         events::treasury_created(&env, &org, &admin);
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -141,6 +201,7 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("policy")), ());
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -158,6 +219,7 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("budget")), ());
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -175,6 +237,7 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("multisig")), ());
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -190,6 +253,7 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("frozen")), ());
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -213,6 +277,7 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("unfrozen")), ());
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -224,19 +289,22 @@ impl TreasuryContract {
         from.require_auth();
         let t = Self::load(&env);
         Self::require_active(&t)?;
+        Self::lock(&env)?;
+        let mut h = Self::load_holding(&env, &asset);
+        h.total_in = checked_add(h.total_in, amount)?;
+        Self::store_holding(&env, &asset, &h);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("deposited")),
+            (asset.clone(), amount),
+        );
         // Pull tokens into the contract's own custody.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
             &env.current_contract_address(),
             &amount,
         );
-        let mut h = Self::load_holding(&env, &asset);
-        h.total_in = checked_add(h.total_in, amount)?;
-        Self::store_holding(&env, &asset, &h);
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("deposited")),
-            (asset, amount),
-        );
+        Self::unlock(&env);
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -252,7 +320,93 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.budget_id = Some(budget_id);
         Self::store_holding(&env, &asset, &h);
+        Self::unlock(&env);
         Ok(())
+    }
+
+    /// Create or update a withdrawal allowance capping how much `agent` may send
+    /// to `recipient` in `asset`. `limit` is the cumulative ceiling; `expires_at`
+    /// is an optional unix expiry (0 = no expiry). Admin only.
+    pub fn set_allowance(
+        env: Env,
+        admin: Address,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+        limit: i128,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &admin)?;
+        require_positive_amount(limit)?;
+        if agent == recipient {
+            return Err(Error::InvalidInput);
+        }
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        let allowance = Allowance {
+            agent: id.agent.clone(),
+            recipient: id.recipient.clone(),
+            asset: id.asset.clone(),
+            limit,
+            spent: 0,
+            expires_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(id), &allowance);
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allow")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Remove an active withdrawal allowance (admin only).
+    pub fn remove_allowance(
+        env: Env,
+        admin: Address,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+    ) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &admin)?;
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Allowance(id.clone()))
+        {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&DataKey::Allowance(id));
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allowrm")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Read the current state of a withdrawal allowance.
+    pub fn allowance(
+        env: Env,
+        agent: Address,
+        recipient: Address,
+        asset: Address,
+    ) -> Result<Allowance, Error> {
+        let id = AllowanceId {
+            agent,
+            recipient,
+            asset,
+        };
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(id))
+            .ok_or(Error::NotFound)
     }
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
@@ -290,13 +444,44 @@ impl TreasuryContract {
                 .consume(&caller, budget_id, &amount);
         }
 
-        // 3. Debit the internal ledger, then move real tokens out of custody.
+        // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
+        //    pre-approved periodic ceilings per (agent, recipient, asset).
+        Self::lock(&env)?;
+
+        let allowance_id = AllowanceId {
+            agent: caller.clone(),
+            recipient: to.clone(),
+            asset: asset.clone(),
+        };
+        if let Some(mut al) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Allowance>(&DataKey::Allowance(allowance_id.clone()))
+        {
+            if al.expires_at != 0 && env.ledger().timestamp() >= al.expires_at {
+                Self::unlock(&env);
+                return Err(Error::AllowanceExpired);
+            }
+            let remaining = checked_sub(al.limit, al.spent)?;
+            if amount > remaining {
+                Self::unlock(&env);
+                return Err(Error::AllowanceExceeded);
+            }
+            al.spent = checked_add(al.spent, amount)?;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Allowance(allowance_id), &al);
+        }
+
+        // 4. Debit the internal ledger, then move real tokens out of custody.
         if holding.total_in < amount {
+            Self::unlock(&env);
             return Err(Error::InsufficientFunds);
         }
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
             &to,
@@ -312,6 +497,7 @@ impl TreasuryContract {
                 amount,
             },
         );
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -376,6 +562,7 @@ impl TreasuryContract {
         }
 
         // 5. Debit the internal ledger once, then move real tokens per recipient.
+        Self::lock(&env)?;
         holding.total_in = checked_sub(holding.total_in, total)?;
         holding.total_out = checked_add(holding.total_out, total)?;
         Self::store_holding(&env, &asset, &holding);
@@ -401,47 +588,10 @@ impl TreasuryContract {
             (symbol_short!("treasury"), symbol_short!("batchpay")),
             (asset, payments.len(), total),
         );
+
+        Self::unlock(&env);
+        Self::unlock(&env);
         Ok(())
-    }
-
-    // --- upgradeability (registry-authorized) ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. The first call bootstraps the authority and is
-    /// meant to run in the same transaction as `initialize`; afterwards only
-    /// the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: Env,
-        caller: Address,
-        admin: Address,
-        registry: Address,
-    ) -> Result<(), Error> {
-        upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(env: Env) -> Result<UpgradeAuthority, Error> {
-        upgrade::get_authority(&env)
-    }
-
-    /// Validate an upgrade without performing it: the caller must be the
-    /// upgrade admin and `new_wasm_hash` must be an approved implementation of
-    /// [`ModuleKind::Treasury`] in the registry's version map. Returns the
-    /// approved version, or [`Error::UnauthorizedUpgrade`].
-    pub fn check_upgrade(
-        env: Env,
-        caller: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<u32, Error> {
-        upgrade::check(&env, &caller, ModuleKind::Treasury, &new_wasm_hash)
-    }
-
-    /// Replace this contract's code with `new_wasm_hash` after the registry has
-    /// authorized it. An unauthorized caller or an unregistered hash aborts
-    /// before any code is swapped, so the contract keeps running its current
-    /// implementation.
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<u32, Error> {
-        upgrade::perform(&env, &caller, ModuleKind::Treasury, new_wasm_hash)
     }
 
     // --- views ---
@@ -547,6 +697,7 @@ impl TreasuryContract {
             (symbol_short!("milestone"), symbol_short!("disbursed")),
             (milestone_id, d.disbursed, amount),
         );
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -603,6 +754,7 @@ impl TreasuryContract {
         if frozen {
             return Err(Error::InvalidState);
         }
+        Self::unlock(env);
         Ok(())
     }
 
@@ -619,6 +771,28 @@ impl TreasuryContract {
             ResourceState::Active => Ok(()),
             _ => Err(Error::InvalidState),
         }
+    }
+
+    fn lock(env: &Env) -> Result<(), Error> {
+        let is_locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentrancyLock)
+            .unwrap_or(false);
+        if is_locked {
+            return Err(Error::InvalidState);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
+        Self::unlock(env);
+        Ok(())
+    }
+
+    fn unlock(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &false);
     }
 
     fn load_holding(env: &Env, asset: &Address) -> Holding {

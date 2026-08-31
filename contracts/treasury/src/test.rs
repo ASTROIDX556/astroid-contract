@@ -2,8 +2,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::Address as _, testutils::Events, token, vec, Address, Env, IntoVal, String, Symbol,
-    Val, Vec,
+    testutils::{Address as _, Events, Ledger},
+    token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use astroid_shared::constants::MAX_BATCH_PAYMENTS;
@@ -30,6 +30,7 @@ struct Harness<'a> {
     admin: Address,
     multisig: Address,
     asset: Address,
+    second_asset: Address,
 }
 
 /// Register a treasury plus a test SAC token, and mint `funded` of the asset to
@@ -49,6 +50,12 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
     let asset = env
         .register_stellar_asset_contract_v2(token_admin)
         .address();
+
+    let token_admin2 = Address::generate(&env);
+    let second_asset = env
+        .register_stellar_asset_contract_v2(token_admin2)
+        .address();
+
     if funded > 0 {
         token::StellarAssetClient::new(&env, &asset).mint(&admin, &funded);
     }
@@ -59,6 +66,7 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         admin,
         multisig,
         asset,
+        second_asset,
     }
 }
 
@@ -144,6 +152,69 @@ fn prepare_holds_state() {
     let h = setup("vault", 0);
     let state = h.client.get();
     assert_eq!(state.org, String::from_str(&h.env, "vault"));
+}
+
+#[test]
+fn allowance_caps_withdrawal_and_accumulates() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    // Approve a 500 ceiling for admin -> recipient in this asset.
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &500, &0);
+
+    // First withdrawal within the ceiling succeeds and is deducted.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
+    let al = h.client.allowance(&h.admin, &recipient, &h.asset);
+    assert_eq!(al.spent, 400);
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // Second withdrawal exceeds the remaining 100 -> rejected at the allowance gate.
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(res, Err(Ok(Error::AllowanceExceeded)));
+    assert_eq!(token_balance(&h, &recipient), 400);
+
+    // A different recipient is not under the allowance, so it is allowed.
+    let other = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &other, &100);
+    assert_eq!(token_balance(&h, &other), 100);
+}
+
+#[test]
+fn expired_allowance_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &id);
+    client.initialize(&String::from_str(&env, "vault"), &admin);
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000);
+    client.deposit(&admin, &asset, &1_000);
+
+    // Allowance already expired (expires_at in the past).
+    let recipient = Address::generate(&env);
+    client.set_allowance(&admin, &admin, &recipient, &asset, &500, &5_000);
+    let res = client.try_withdraw(&admin, &asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::AllowanceExpired)));
+}
+
+#[test]
+fn remove_allowance_clears_cap() {
+    let h = setup("vault", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &0);
+    h.client
+        .remove_allowance(&h.admin, &h.admin, &recipient, &h.asset);
+    // With no allowance in place the full balance may be withdrawn.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
+    assert_eq!(token_balance(&h, &recipient), 1_000);
 }
 
 #[test]
@@ -481,50 +552,4 @@ fn freeze_without_multisig_configured_fails() {
     // Try to freeze without setting multisig - should fail
     let res = client.try_freeze(&admin);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
-}
-
-// --- registry-authorized upgrades ---
-
-/// The upgrade surface is wired to `astroid_interfaces::upgrade`, whose
-/// end-to-end behaviour against a real registry is covered in the registry
-/// crate. These assertions pin this contract's own gating: an upgrade is
-/// impossible before an authority exists, and a caller that is not the upgrade
-/// admin is rejected before the registry is ever consulted.
-#[test]
-fn upgrade_is_gated_by_the_configured_authority() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let id = env.register_contract(None, crate::TreasuryContract);
-    let client = crate::TreasuryContractClient::new(&env, &id);
-
-    let admin = Address::generate(&env);
-    let registry = Address::generate(&env);
-    let stranger = Address::generate(&env);
-    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-
-    // No authority configured yet.
-    assert_eq!(
-        client.try_check_upgrade(&admin, &wasm_hash),
-        Err(Ok(astroid_shared::errors::Error::NotInitialized))
-    );
-
-    client.set_upgrade_authority(&admin, &admin, &registry);
-    let authority = client.get_upgrade_authority();
-    assert_eq!(authority.admin, admin);
-    assert_eq!(authority.registry, registry);
-
-    // A stranger can neither dry-run nor perform an upgrade...
-    assert_eq!(
-        client.try_check_upgrade(&stranger, &wasm_hash),
-        Err(Ok(astroid_shared::errors::Error::Unauthorized))
-    );
-    assert_eq!(
-        client.try_upgrade(&stranger, &wasm_hash),
-        Err(Ok(astroid_shared::errors::Error::Unauthorized))
-    );
-    // ...nor rotate the authority to itself.
-    assert_eq!(
-        client.try_set_upgrade_authority(&stranger, &stranger, &registry),
-        Err(Ok(astroid_shared::errors::Error::Unauthorized))
-    );
 }

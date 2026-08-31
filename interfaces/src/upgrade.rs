@@ -9,26 +9,36 @@
 //! upgrade through it:
 //!
 //! ```text
-//! caller ──auth──▶ member contract ──registry.is_upgrade_approved(kind, hash)──▶ registry
-//!                        │                                    approved version │
-//!                        └──── update_current_contract_wasm(hash) ◀────────────┘
+//! caller ──auth──▶ member contract ──registry.is_wasm_approved(kind, hash)──▶ registry
+//!                        │                                       approved? │
+//!                        └──── update_current_contract_wasm(hash) ◀─────────┘
 //! ```
 //!
 //! Both gates must pass: the caller must be the contract's recorded upgrade
-//! admin, and the new Wasm hash must be registered for that [`ModuleKind`] in
-//! the registry's version map. Anything else fails with
-//! [`Error::UnauthorizedUpgrade`] and the contract keeps running its current
-//! code.
+//! admin, and the new Wasm hash must be approved for that [`ModuleKind`] in the
+//! registry. Anything else fails with [`Error::Unauthorized`] and the contract
+//! keeps running its current code.
 //!
-//! The helpers live here rather than in `astroid-shared` because they need the
-//! generated [`RegistryClient`], and here rather than in each contract because
-//! every member contract must enforce the identical rule.
+//! The helpers live here rather than in `astroid-shared` because they need a
+//! generated cross-contract client, and here rather than in each contract
+//! because every member contract must enforce the identical rule.
 
-use crate::RegistryClient;
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{contractclient, contracttype, symbol_short, Address, BytesN, Env};
+
+/// The slice of the registry an upgrading contract needs: whether a Wasm hash is
+/// approved for a module kind.
+///
+/// Declared here as its own client rather than folded into `RegistryInterface`
+/// so the registry keeps exposing `is_wasm_approved` as a plain entrypoint and
+/// nothing else has to change to be callable.
+#[contractclient(name = "UpgradeRegistryClient")]
+pub trait UpgradeRegistryInterface {
+    /// Whether `wasm_hash` is an approved implementation for `kind`.
+    fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool;
+}
 
 /// Instance-storage key for the upgrade authority. Namespaced under its own
 /// type so it can never collide with a contract's own `DataKey`.
@@ -44,7 +54,7 @@ enum UpgradeKey {
 pub struct UpgradeAuthority {
     /// The only address allowed to request an upgrade.
     pub admin: Address,
-    /// Registry contract consulted for the approved version map.
+    /// Registry contract consulted for the approved implementations.
     pub registry: Address,
 }
 
@@ -89,8 +99,7 @@ pub fn get_authority(env: &Env) -> Result<UpgradeAuthority, Error> {
 }
 
 /// Authorize an upgrade without performing it: authenticate `caller` as the
-/// upgrade admin and resolve `wasm_hash` in the registry's version map for
-/// `kind`. Returns the version the hash is registered under.
+/// upgrade admin and confirm `wasm_hash` is approved for `kind` in the registry.
 ///
 /// Exposed on its own so an upgrade can be validated (by a keeper, a dry run or
 /// a test) without swapping any code.
@@ -99,44 +108,45 @@ pub fn check(
     caller: &Address,
     kind: ModuleKind,
     wasm_hash: &BytesN<32>,
-) -> Result<u32, Error> {
+) -> Result<(), Error> {
     caller.require_auth();
     let authority = get_authority(env)?;
     if &authority.admin != caller {
         return Err(Error::Unauthorized);
     }
-    let registry = RegistryClient::new(env, &authority.registry);
-    match registry.try_is_upgrade_approved(&kind, wasm_hash) {
-        Ok(Ok(version)) => Ok(version),
-        // The registry returned something that is not a version.
-        Ok(Err(_)) => Err(Error::UnauthorizedUpgrade),
-        // The registry rejected the hash (or is frozen) — surface its reason.
-        Err(Ok(e)) => Err(e),
-        // System-level failure: fail closed rather than upgrade.
-        Err(Err(_)) => Err(Error::UnauthorizedUpgrade),
+    let registry = UpgradeRegistryClient::new(env, &authority.registry);
+    match registry.try_is_wasm_approved(&kind, wasm_hash) {
+        Ok(Ok(true)) => Ok(()),
+        // The registry answered, and the answer is no.
+        Ok(Ok(false)) => Err(Error::Unauthorized),
+        // The registry returned something that is not a bool, rejected the
+        // call (e.g. it is frozen), or failed at the host level. `is_wasm_approved`
+        // is infallible on the registry side, so any of these means we could not
+        // establish approval — fail closed rather than upgrade.
+        Ok(Err(_)) | Err(_) => Err(Error::Unauthorized),
     }
 }
 
 /// Authorize and then perform the upgrade: on success the contract's code is
-/// replaced with `wasm_hash` and the approved version is returned.
+/// replaced with `wasm_hash`.
 ///
-/// [`check`] runs first, so an unauthorized caller or an unregistered hash
-/// aborts before `update_current_contract_wasm` is ever reached. The new code
-/// takes effect after the current invocation completes.
+/// [`check`] runs first, so an unauthorized caller or an unapproved hash aborts
+/// before `update_current_contract_wasm` is ever reached. The new code takes
+/// effect after the current invocation completes.
 pub fn perform(
     env: &Env,
     caller: &Address,
     kind: ModuleKind,
     wasm_hash: BytesN<32>,
-) -> Result<u32, Error> {
-    let version = check(env, caller, kind, &wasm_hash)?;
+) -> Result<(), Error> {
+    check(env, caller, kind, &wasm_hash)?;
     env.deployer()
         .update_current_contract_wasm(wasm_hash.clone());
     env.events().publish(
         (symbol_short!("upgrade"), symbol_short!("applied")),
-        (kind, version, wasm_hash),
+        (kind, wasm_hash),
     );
-    Ok(version)
+    Ok(())
 }
 
 fn stored(env: &Env) -> Option<UpgradeAuthority> {

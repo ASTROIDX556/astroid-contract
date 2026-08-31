@@ -408,6 +408,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "memo"
                       },
                       "val": {
@@ -1792,7 +1800,7 @@
             ],
             "data": {
               "error": {
-                "contract": 47
+                "contract": 81
               }
             }
           }
@@ -1813,7 +1821,7 @@
               },
               {
                 "error": {
-                  "contract": 47
+                  "contract": 81
                 }
               }
             ],
@@ -1838,7 +1846,7 @@
               },
               {
                 "error": {
-                  "contract": 47
+                  "contract": 81
                 }
               }
             ],
@@ -2268,6 +2276,14 @@
                       "hi": 0,
                       "lo": 5000
                     }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {

@@ -12,8 +12,8 @@
 //!            / Expired
 //! ```
 //!
-//! A proposal links off-chain context — `wallet`, `policy`, `org` and a `tx_ref`
-//! transaction reference — so the backend can reconstruct why money moved. The
+//! A proposal links off-chain context — `wallet`, `policy` and `org` — so the
+//! backend can reconstruct why money moved. The
 //! contract records an explicit approver allow-list and an approval threshold;
 //! reaching the threshold moves the proposal to `Approved`, after which it may
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
@@ -38,27 +38,18 @@
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
 //! `fail`, `close`.
-//!
-//! ## Upgradeability
-//!
-//! Code upgrades are gated twice: the caller must be this contract's recorded
-//! upgrade admin, and the new Wasm hash must be approved for
-//! [`ModuleKind::Proposal`] in the registry's version map. See
-//! [`astroid_interfaces::upgrade`]; anything else is refused with
-//! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
 
-use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
-use astroid_shared::types::{AssetAmount, ModuleKind};
+use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, BytesN, Env,
-    String, Vec,
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
+    Vec,
 };
 
 /// Proposal lifecycle state.
@@ -90,19 +81,6 @@ impl ProposalState {
     }
 }
 
-/// What a proposal is about: the organization it belongs to plus the opaque
-/// references (owned by the backend and other contracts) it points at. These
-/// four always travel together and are stored verbatim, so they are passed as
-/// one record to keep `create` within Soroban's 10-parameter limit.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProposalTarget {
-    pub org: String,
-    pub wallet: String,
-    pub policy: String,
-    pub tx_ref: String,
-}
-
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
 /// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
 /// the ids of proposals that must have executed before this one may execute.
@@ -114,7 +92,6 @@ pub struct Proposal {
     /// Links (opaque references owned by the backend / other contracts).
     pub wallet: String,
     pub policy: String,
-    pub tx_ref: String,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
@@ -156,6 +133,45 @@ pub struct ProposalContract;
 
 #[contractimpl]
 impl ProposalContract {
+
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Proposal`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Proposal,
+            wasm_hash,
+        )
+    }
     /// Initialize the id counter. Idempotent-guarded.
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::ProposalCount) {
@@ -189,7 +205,9 @@ impl ProposalContract {
     pub fn create(
         env: Env,
         proposer: Address,
-        target: ProposalTarget,
+        org: String,
+        wallet: String,
+        policy: String,
         approvers: Vec<Address>,
         dependencies: Vec<u64>,
         threshold: u32,
@@ -198,12 +216,6 @@ impl ProposalContract {
         grace_period: u64,
     ) -> Result<u64, Error> {
         proposer.require_auth();
-        let ProposalTarget {
-            org,
-            wallet,
-            policy,
-            tx_ref,
-        } = target;
         require_non_empty(&org)?;
         let n = approvers.len();
         if n == 0 || n > MAX_APPROVERS {
@@ -260,7 +272,6 @@ impl ProposalContract {
             org,
             wallet,
             policy,
-            tx_ref,
             approvers,
             dependencies: deps,
             threshold,
@@ -488,46 +499,6 @@ impl ProposalContract {
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("closed")), id);
         Ok(())
-    }
-
-    // --- upgradeability (registry-authorized) ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. The first call bootstraps the authority and is
-    /// meant to run in the same transaction as `initialize`; afterwards only
-    /// the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: Env,
-        caller: Address,
-        admin: Address,
-        registry: Address,
-    ) -> Result<(), Error> {
-        upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(env: Env) -> Result<UpgradeAuthority, Error> {
-        upgrade::get_authority(&env)
-    }
-
-    /// Validate an upgrade without performing it: the caller must be the
-    /// upgrade admin and `new_wasm_hash` must be an approved implementation of
-    /// [`ModuleKind::Proposal`] in the registry's version map. Returns the
-    /// approved version, or [`Error::UnauthorizedUpgrade`].
-    pub fn check_upgrade(
-        env: Env,
-        caller: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<u32, Error> {
-        upgrade::check(&env, &caller, ModuleKind::Proposal, &new_wasm_hash)
-    }
-
-    /// Replace this contract's code with `new_wasm_hash` after the registry has
-    /// authorized it. An unauthorized caller or an unregistered hash aborts
-    /// before any code is swapped, so the contract keeps running its current
-    /// implementation.
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<u32, Error> {
-        upgrade::perform(&env, &caller, ModuleKind::Proposal, new_wasm_hash)
     }
 
     // --- views ---

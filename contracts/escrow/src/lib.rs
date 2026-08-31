@@ -13,10 +13,11 @@
 //! only leave through one of three settlement paths:
 //!
 //! ```text
-//! Funded ──(arbiter, before deadline)──────────▶ Released ─▶ recipient ─▶ Closed
+//! Funded ──(arbiter, before deadline+grace)─────▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(signature override, before deadline)▶ Released ─▶ recipient ─▶ Closed
-//! Funded ──(after deadline)────────────────────▶ Refunded ─▶ sender    ─▶ Closed
-//!    └────(after deadline, marker)─────────────▶ Expired ──(refund)──▶ Refunded
+//! Funded ──(cancel, before deadline)────────────▶ Refunded ─▶ sender    ─▶ Closed
+//! Funded ──(after deadline+grace, no release)───▶ reclaim  ─▶ sender    ─▶ Closed
+//!    └────(after deadline+grace, marker)────────▶ Expired ──(refund)──▶ Refunded
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
@@ -40,6 +41,15 @@
 //! greater one, which makes a captured signature unusable a second time
 //! (replay protection).
 //!
+//! ## Milestone-based progressive release
+//!
+//! An escrow may optionally be funded via [`EscrowContract::deposit_with_milestones`]
+//! with a list of basis-point-weighted milestones. Instead of a single arbiter
+//! release, the arbiter approves each milestone individually via
+//! [`EscrowContract::release_milestone`], disbursing funds proportionally. The
+//! final milestone pays the dust-free remainder so the full amount is disbursed.
+//! Plain `release` is blocked on milestone escrows to enforce phased settlement.
+//!
 //! ## Time-lock release schedules
 //!
 //! Escrows support configurable time-locks and gradual release schedules:
@@ -49,14 +59,6 @@
 //! - Partial and multiple gradual withdrawals by the beneficiary.
 //! - Deterministic `Error::TimeLockActive` when withdrawing before maturity or cliff.
 
-//! ## Upgradeability
-//!
-//! Code upgrades are gated twice: the caller must be this contract's recorded
-//! upgrade admin, and the new Wasm hash must be approved for
-//! [`ModuleKind::Escrow`] in the registry's version map. See
-//! [`astroid_interfaces::upgrade`]; anything else is refused with
-//! [`Error::UnauthorizedUpgrade`] and the current code keeps running.
-
 pub mod storage;
 
 pub use storage::{
@@ -64,19 +66,19 @@ pub use storage::{
     EscrowState, ReleaseSchedule, ReleaseType,
 };
 
-use astroid_interfaces::upgrade::{self, UpgradeAuthority};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events::{self, ContractEvent};
 use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
-use astroid_shared::types::{AssetAmount, ModuleKind};
+use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, String,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes, BytesN, Env,
+    String, Vec,
 };
 
 /// Calculate vested amount according to a ReleaseSchedule at a given ledger timestamp.
@@ -153,11 +155,79 @@ pub struct OverrideSignature {
     pub signature: BytesN<64>,
 }
 
+/// A single milestone within a milestone-based escrow. `release_bps` is the
+/// proportion of the total escrow amount (in basis points, 10_000 = 100%) that
+/// is disbursed to the recipient when this milestone is approved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub index: u32,
+    pub description: String,
+    pub release_bps: u32,
+    pub released: bool,
+}
+
+/// Input describing a milestone when the escrow is created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSpec {
+    pub description: String,
+    pub release_bps: u32,
+}
+
+/// Aggregate milestone state for an escrow: the ordered milestones and the total
+/// amount disbursed so far (used to compute the final, dust-free payout).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSet {
+    pub milestones: Vec<Milestone>,
+    pub released_amount: i128,
+}
+
 #[contract]
 pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
+
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Escrow`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Escrow,
+            wasm_hash,
+        )
+    }
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
             return Err(Error::AlreadyInitialized);
@@ -177,6 +247,10 @@ impl EscrowContract {
     /// `release_signers`/`release_threshold` optionally configure the manual
     /// signature-override mechanism (see module docs); pass an empty
     /// `release_signers` and a `0` threshold to disable it for this escrow.
+    /// `grace_period` extends the settlement window past the deadline: the
+    /// arbiter may still release during the grace, but the sender may only
+    /// reclaim the funds once the grace has fully elapsed without fulfillment.
+    /// Either party (sender or arbiter) may cancel before the deadline.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         env: Env,
@@ -185,6 +259,7 @@ impl EscrowContract {
         arbiter: Address,
         assets: Vec<AssetAmount>,
         deadline: u64,
+        grace_period: u64,
         memo: String,
         release_signers: Vec<BytesN<32>>,
         release_threshold: u32,
@@ -218,6 +293,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline,
+            grace_period,
             funded_amount,
             memo,
             schedule: ReleaseSchedule::none(),
@@ -282,6 +358,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline: unlock_time,
+            grace_period: 0,
             funded_amount,
             memo,
             schedule,
@@ -357,6 +434,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline: effective_deadline,
+            grace_period: 0,
             funded_amount,
             memo,
             schedule: schedule.clone(),
@@ -388,6 +466,7 @@ impl EscrowContract {
 
     /// Initialize an escrow with time-lock (unfunded version). Manual
     /// signature override is not available on this path (empty signer set).
+    /// `grace_period` extends the settlement window past `unlock_time`.
     #[allow(clippy::too_many_arguments)]
     pub fn initialize_timelock(
         env: Env,
@@ -396,6 +475,7 @@ impl EscrowContract {
         arbiter: Address,
         assets: Vec<AssetAmount>,
         unlock_time: u64,
+        grace_period: u64,
         memo: String,
     ) -> Result<u64, Error> {
         sender.require_auth();
@@ -424,6 +504,7 @@ impl EscrowContract {
             assets: assets.clone(),
             state: EscrowState::Created,
             deadline: unlock_time,
+            grace_period,
             funded_amount: 0,
             memo,
             schedule,
@@ -541,7 +622,7 @@ impl EscrowContract {
             ) {
                 calculate_claimable_amount(&escrow, now)?
             } else {
-                if now < escrow.deadline {
+                if now < escrow.deadline + escrow.grace_period {
                     return Err(Error::TimeLockActive);
                 }
                 checked_sub(escrow.funded_amount, escrow.released_amount)?
@@ -581,7 +662,7 @@ impl EscrowContract {
             );
             Ok(claimable)
         } else if matches!(escrow.state, EscrowState::Created) {
-            if now < escrow.deadline {
+            if now < escrow.deadline + escrow.grace_period {
                 return Err(Error::TimeLockActive);
             }
             escrow.state = EscrowState::Released;
@@ -608,7 +689,13 @@ impl EscrowContract {
 
     /// Release the escrowed assets to the recipient. Only the arbiter may call,
     /// and only before the deadline — afterward the sender reclaims via `refund`.
-    pub fn release(env: Env, arbiter: Address, id: u64) -> Result<(), Error> {
+    ///
+    /// `release_amount` is the amount to release this call. Partial releases are
+    /// supported: the cumulative `released_amount` is tracked on the escrow and
+    /// must not exceed `funded_amount`. A full release transitions the escrow to
+    /// `Released`; a partial release keeps the escrow in `Funded` so that more
+    /// can be released later or the remaining balance can be revoked.
+    pub fn release(env: Env, arbiter: Address, id: u64, release_amount: i128) -> Result<(), Error> {
         arbiter.require_auth();
         let mut escrow = load_escrow(&env, id)?;
         if escrow.arbiter != arbiter {
@@ -617,8 +704,22 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() >= escrow.deadline {
+        if env.storage().persistent().has(&DataKey::Milestones(id)) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() >= escrow.deadline + escrow.grace_period {
+            // Past the grace window the arbiter can no longer release. We do NOT
+            // persist an `Expired` transition here: returning `Err` rolls back every
+            // storage write, so the marker is set through the permissionless `expire`
+            // entrypoint and the funds are reclaimed via `refund` / `reclaim`.
             return Err(Error::EscrowExpired);
+        }
+        let remaining = escrow
+            .funded_amount
+            .checked_sub(escrow.released_amount)
+            .ok_or(Error::Overflow)?;
+        if release_amount > remaining {
+            return Err(Error::InvalidAmount);
         }
 
         escrow.released_amount = escrow.funded_amount;
@@ -639,7 +740,7 @@ impl EscrowContract {
         );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("released")),
-            (id, arbiter),
+            (id, arbiter, release_amount),
         );
         Ok(())
     }
@@ -730,7 +831,9 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline {
+        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+            // The grace window is still open — the arbiter may still release, so the
+            // escrow cannot be marked expired yet.
             return Err(Error::InvalidState);
         }
         escrow.state = EscrowState::Expired;
@@ -748,7 +851,13 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
         if env.ledger().timestamp() < escrow.deadline {
+            // Before the fulfillment deadline the escrow is still live.
             return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+            // During the grace window the counterparty may still fulfill, so funds
+            // may not yet be reclaimed via refund. Use `reclaim` after grace expiry.
+            return Err(Error::GraceActive);
         }
 
         let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
@@ -788,7 +897,7 @@ impl EscrowContract {
         ) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline {
+        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
             return Err(Error::TimeLockActive);
         }
 
@@ -817,6 +926,71 @@ impl EscrowContract {
     }
 
     /// Close a settled escrow (terminal).
+    /// Cancel an escrow before its fulfillment `deadline` and return any held
+    /// funds to the sender. Either the `sender` or the `arbiter` may cancel, but
+    /// only while the escrow is still `Funded`/`Created` and before the deadline
+    /// has been reached — this is the pre-fulfillment dispute exit.
+    pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.sender != caller && escrow.arbiter != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
+        // Cancellation is only permitted before the fulfillment deadline.
+        if env.ledger().timestamp() >= escrow.deadline {
+            return Err(Error::InvalidState);
+        }
+
+        Self::transfer_all(&env, &escrow, &escrow.sender);
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
+        }
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("cancelled")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Reclaim the escrowed funds to the sender after the grace period has fully
+    /// elapsed without counterparty fulfillment. Only the `sender` may reclaim,
+    /// and only once `now >= deadline + grace_period`. This is the post-dispute
+    /// safe-settlement path that guarantees funds cannot be stranded or
+    /// double-spent while a dispute is unresolved.
+    pub fn reclaim(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        // Only the sender may reclaim post-grace.
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+        // The grace window must have fully elapsed without fulfillment.
+        let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
+        if env.ledger().timestamp() < grace_end {
+            return Err(Error::GraceActive);
+        }
+
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+        Self::transfer_all(&env, &escrow, &escrow.sender);
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
+        }
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("reclaimed")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -831,44 +1005,199 @@ impl EscrowContract {
         Ok(())
     }
 
-    // --- upgradeability (registry-authorized) ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. The first call bootstraps the authority and is
-    /// meant to run in the same transaction as `initialize`; afterwards only
-    /// the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
+    /// Fund an escrow with a milestone-based progressive release schedule.
+    /// `milestones` is an ordered list of basis-point-weighted milestones whose
+    /// weights must sum to exactly 10_000 (100%). The arbiter approves each
+    /// milestone individually via [`EscrowContract::release_milestone`]; plain
+    /// `release` is blocked on milestone escrows to enforce phased settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deposit_with_milestones(
         env: Env,
-        caller: Address,
-        admin: Address,
-        registry: Address,
-    ) -> Result<(), Error> {
-        upgrade::set_authority(&env, &caller, &admin, &registry)
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        asset: Address,
+        amount: i128,
+        deadline: u64,
+        memo: String,
+        milestones: Vec<MilestoneSpec>,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        require_positive_amount(amount)?;
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        if deadline <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
+        if milestones.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+
+        let mut total_bps: u32 = 0;
+        for spec in milestones.iter() {
+            total_bps = total_bps
+                .checked_add(spec.release_bps)
+                .ok_or(Error::Overflow)?;
+        }
+        if total_bps != 10_000 {
+            return Err(Error::InvalidInput);
+        }
+
+        let id = increment_count(&env)?;
+
+        token::TokenClient::new(&env, &asset).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let mut items: Vec<Milestone> = Vec::new(&env);
+        for (i, spec) in milestones.iter().enumerate() {
+            items.push_back(Milestone {
+                index: i as u32,
+                description: spec.description.clone(),
+                release_bps: spec.release_bps,
+                released: false,
+            });
+        }
+        let set = MilestoneSet {
+            milestones: items,
+            released_amount: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Milestones(id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let asset_amounts = vec![
+            &env,
+            AssetAmount {
+                asset: asset.clone(),
+                amount,
+            },
+        ];
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            assets: asset_amounts,
+            state: EscrowState::Funded,
+            deadline,
+            grace_period: 0,
+            funded_amount: amount,
+            memo,
+            schedule: ReleaseSchedule::none(),
+            released_amount: 0,
+            override_signers: Vec::new(&env),
+            override_threshold: 0,
+            override_nonce: 0,
+        };
+        store_escrow(&env, id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("milestone")),
+            (id, sender, recipient, asset, amount),
+        );
+        Ok(id)
     }
 
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(env: Env) -> Result<UpgradeAuthority, Error> {
-        upgrade::get_authority(&env)
+    /// Approve and release a single milestone's proportional payout. Only the
+    /// arbiter may approve; a milestone may be released at most once. The final
+    /// milestone pays the dust-free remainder so the full amount is disbursed.
+    pub fn release_milestone(env: Env, caller: Address, id: u64, index: u32) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.arbiter != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Released) {
+            return Err(Error::InvalidState);
+        }
+
+        let mut set: MilestoneSet = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)?;
+
+        let mut found_idx: usize = 0;
+        let mut target: Option<Milestone> = None;
+        for (i, m) in set.milestones.iter().enumerate() {
+            if m.index == index {
+                found_idx = i;
+                target = Some(m.clone());
+            }
+        }
+        let milestone = target.ok_or(Error::InvalidInput)?;
+        if milestone.released {
+            return Err(Error::InvalidState);
+        }
+
+        let total_amount = Self::total_amount(&escrow.assets);
+        let mut unreleased: u32 = 0;
+        for m in set.milestones.iter() {
+            if !m.released {
+                unreleased = unreleased.saturating_add(1);
+            }
+        }
+        let gross = checked_div(
+            checked_mul(total_amount, milestone.release_bps as i128)?,
+            10_000,
+        )?;
+        let remaining = checked_sub(total_amount, set.released_amount)?;
+        let payout = if unreleased == 1 { remaining } else { gross };
+
+        let primary_asset = &escrow.assets.get_unchecked(0).asset;
+        token::TokenClient::new(&env, primary_asset).transfer(
+            &env.current_contract_address(),
+            &escrow.recipient,
+            &payout,
+        );
+        events::transfer_executed(
+            &env,
+            &escrow.sender,
+            &escrow.recipient,
+            primary_asset,
+            payout,
+        );
+
+        set.released_amount = checked_add(set.released_amount, payout)?;
+        let updated = Milestone {
+            index: milestone.index,
+            description: milestone.description,
+            release_bps: milestone.release_bps,
+            released: true,
+        };
+        set.milestones.set(found_idx as u32, updated);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+
+        let all_released = set.milestones.iter().all(|m| m.released);
+        if all_released {
+            escrow.state = EscrowState::Released;
+            store_escrow(&env, id, &escrow);
+        }
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ms_rel")),
+            (id, caller, index, payout),
+        );
+        Ok(())
     }
 
-    /// Validate an upgrade without performing it: the caller must be the
-    /// upgrade admin and `new_wasm_hash` must be an approved implementation of
-    /// [`ModuleKind::Escrow`] in the registry's version map. Returns the
-    /// approved version, or [`Error::UnauthorizedUpgrade`].
-    pub fn check_upgrade(
-        env: Env,
-        caller: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<u32, Error> {
-        upgrade::check(&env, &caller, ModuleKind::Escrow, &new_wasm_hash)
-    }
-
-    /// Replace this contract's code with `new_wasm_hash` after the registry has
-    /// authorized it. An unauthorized caller or an unregistered hash aborts
-    /// before any code is swapped, so the contract keeps running its current
-    /// implementation.
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<u32, Error> {
-        upgrade::perform(&env, &caller, ModuleKind::Escrow, new_wasm_hash)
+    /// Read the milestone state for an escrow.
+    pub fn milestones(env: Env, id: u64) -> Result<MilestoneSet, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)
     }
 
     // --- views ---
@@ -905,6 +1234,16 @@ impl EscrowContract {
                 &a.amount,
             );
         }
+    }
+
+    /// Sum the amounts across every listed asset (single-asset milestone
+    /// escrows simply return that asset's amount).
+    fn total_amount(assets: &Vec<AssetAmount>) -> i128 {
+        let mut total: i128 = 0;
+        for a in assets.iter() {
+            total += a.amount;
+        }
+        total
     }
 
     /// Validate a multi-asset list: non-empty, within the size cap, every
