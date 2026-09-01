@@ -12,6 +12,7 @@ use astroid_shared::types::AssetAmount;
 use crate::{EscrowContract, EscrowContractClient, EscrowState, ReleaseSignature};
 
 const START: u64 = 1_000;
+const GRACE: u64 = 1_000;
 
 struct Harness<'a> {
     env: Env,
@@ -94,6 +95,7 @@ fn create(
         &h.arbiter,
         assets,
         &deadline,
+        &grace_period,
         &String::from_str(&h.env, "payment"),
         release_signers,
         &release_threshold,
@@ -144,7 +146,7 @@ fn full_cycle_create_release_multi_asset() {
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(h.client.get(&id).assets.len(), 2);
 
-    h.client.release(&h.arbiter, &id);
+    h.client.release(&h.arbiter, &id, &10_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
     assert_eq!(balance(&h, &h.asset, &h.recipient), 6_000);
     assert_eq!(balance(&h, &h.asset2, &h.recipient), 4_000);
@@ -162,7 +164,7 @@ fn non_arbiter_cannot_release() {
     let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
     let intruder = Address::generate(&h.env);
 
-    let res = h.client.try_release(&intruder, &id);
+    let res = h.client.try_release(&intruder, &id, &5_000);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
     assert_eq!(balance(&h, &h.asset, &h.client.address), 5_000);
     assert_eq!(balance(&h, &h.asset, &h.recipient), 0);
@@ -175,8 +177,8 @@ fn release_after_deadline_is_refused() {
     let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    let res = h.client.try_release(&h.arbiter, &id);
-    assert_eq!(res, Err(Ok(Error::EscrowExpired)));
+    let res = h.client.try_release(&h.arbiter, &id, &5_000);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset, &h.client.address), 5_000);
 }
@@ -267,6 +269,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &assets_of(&h, &[1_000]),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &signers,
         &0,
@@ -280,6 +283,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &assets_of(&h, &[1_000]),
         &(START - 500),
+        &0,
         &String::from_str(&h.env, "x"),
         &signers,
         &0,
@@ -293,6 +297,7 @@ fn create_rejects_bad_input() {
         &h.arbiter,
         &assets_of(&h, &[0]),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
         &signers,
         &0,

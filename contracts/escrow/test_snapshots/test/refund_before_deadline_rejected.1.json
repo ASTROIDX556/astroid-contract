@@ -142,6 +142,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -407,6 +410,30 @@
                       },
                       "val": {
                         "string": "payment"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_nonce"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_signers"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_threshold"
+                      },
+                      "val": {
+                        "u32": 0
                       }
                     },
                     {
@@ -1590,6 +1617,9 @@
                 },
                 {
                   "u64": 1100
+                },
+                {
+                  "u64": 0
                 },
                 {
                   "string": "payment"

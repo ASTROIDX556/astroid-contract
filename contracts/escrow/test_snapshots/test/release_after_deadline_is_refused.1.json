@@ -142,6 +142,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -408,6 +411,30 @@
                       },
                       "val": {
                         "string": "payment"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_nonce"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_signers"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_threshold"
+                      },
+                      "val": {
+                        "u32": 0
                       }
                     },
                     {
@@ -1593,6 +1620,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -1808,6 +1838,12 @@
                 },
                 {
                   "u64": 1
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 5000
+                  }
                 }
               ]
             }
@@ -1833,7 +1869,7 @@
             ],
             "data": {
               "error": {
-                "contract": 82
+                "contract": 53
               }
             }
           }
@@ -1854,7 +1890,7 @@
               },
               {
                 "error": {
-                  "contract": 82
+                  "contract": 53
                 }
               }
             ],
@@ -1879,7 +1915,7 @@
               },
               {
                 "error": {
-                  "contract": 82
+                  "contract": 53
                 }
               }
             ],
@@ -1898,6 +1934,12 @@
                     },
                     {
                       "u64": 1
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 5000
+                      }
                     }
                   ]
                 }
@@ -2005,6 +2047,30 @@
                   },
                   "val": {
                     "string": "payment"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "override_nonce"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "override_signers"
+                  },
+                  "val": {
+                    "vec": []
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "override_threshold"
+                  },
+                  "val": {
+                    "u32": 0
                   }
                 },
                 {

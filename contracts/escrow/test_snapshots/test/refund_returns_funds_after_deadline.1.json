@@ -99,8 +99,8 @@
         {
           "function": {
             "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "create",
+              "contract_address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG",
+              "function_name": "mint",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
@@ -163,6 +163,9 @@
                 },
                 {
                   "u64": 1100
+                },
+                {
+                  "u64": 0
                 },
                 {
                   "string": "payment"
@@ -501,6 +504,30 @@
                       },
                       "val": {
                         "string": "payment"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_nonce"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_signers"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "override_threshold"
+                      },
+                      "val": {
+                        "u32": 0
                       }
                     },
                     {
@@ -1815,6 +1842,9 @@
                   "u64": 1100
                 },
                 {
+                  "u64": 0
+                },
+                {
                   "string": "payment"
                 },
                 {
@@ -2558,6 +2588,30 @@
                   },
                   "val": {
                     "string": "payment"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "override_nonce"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "override_signers"
+                  },
+                  "val": {
+                    "vec": []
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "override_threshold"
+                  },
+                  "val": {
+                    "u32": 0
                   }
                 },
                 {

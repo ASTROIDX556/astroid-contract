@@ -41,7 +41,8 @@ off-chain dispute-resolution quorum.
 
 `Created → Funded → (Released | Refunded | Expired) → Closed`
 
-- `create` funds immediately (atomic in a single call).
+- `create` funds immediately (atomic in a single call), pulling every listed
+  `(asset, amount)` pair into custody.
 - `release` requires the arbiter and a live deadline.
 - `release_with_signatures` requires a threshold of override signatures and
   works regardless of the deadline.
