@@ -58,6 +58,10 @@ pub enum Error {
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
+    VelocityExceeded = 45,
+
+    // --- Treasury (91-99) ---
+    PayoutScheduleViolated = 91,
 
     // --- Wallet (50-59) ---
     // --- Wallet (50-53) ---

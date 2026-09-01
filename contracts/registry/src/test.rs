@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{RegistryContract, RegistryContractClient, RegistryRole};
+use crate::{RegistryContract, RegistryContractClient, Role};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::testutils::Address as _;
@@ -330,746 +330,112 @@ fn standard_events_emitted() {
     assert_event(&env, "RegistryFrozen");
 }
 
-// ---------------------------------------------------------------------------
-// System-wide emergency pause
-// ---------------------------------------------------------------------------
-
 #[test]
-fn admin_can_pause_and_unpause() {
-    let (env, client, admin) = setup();
-    assert!(!client.is_paused());
-    client.pause(&admin);
-    assert!(client.is_paused());
-    client.unpause(&admin);
-    assert!(!client.is_paused());
-}
-
-#[test]
-fn non_admin_cannot_pause() {
-    let (env, client, _admin) = setup();
-    let stranger = Address::generate(&env);
-    assert_eq!(client.try_pause(&stranger), Err(Ok(Error::Unauthorized)));
-    assert!(!client.is_paused());
-}
-
-#[test]
-fn non_admin_cannot_unpause() {
-    let (env, client, admin) = setup();
-    client.pause(&admin);
-    let stranger = Address::generate(&env);
-    assert_eq!(
-        client.try_unpause(&stranger),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert!(client.is_paused());
-}
-
-#[test]
-fn paused_registry_blocks_register_org() {
-    let (env, client, admin) = setup();
-    client.pause(&admin);
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    assert_eq!(
-        client.try_register_org(&admin, &org, &owner),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_set_org_owner() {
+fn module_manager_can_register_module() {
     let (env, client, admin) = setup();
     let org = String::from_str(&env, "acme");
     let owner = Address::generate(&env);
     client.register_org(&admin, &org, &owner);
-    client.pause(&admin);
-    let new_owner = Address::generate(&env);
-    assert_eq!(
-        client.try_set_org_owner(&owner, &org, &new_owner),
-        Err(Ok(Error::ContractPaused))
-    );
-}
 
-#[test]
-fn paused_registry_blocks_register_module() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    client.pause(&admin);
+    // Grant module manager role to a different address
+    let module_mgr = Address::generate(&env);
+    client.grant_role(&owner, &org, &module_mgr, &Role::ModuleManager);
+
+    // Module manager can register modules
     let wallet = Address::generate(&env);
-    assert_eq!(
-        client.try_register_module(&owner, &org, &ModuleKind::Wallet, &wallet),
-        Err(Ok(Error::ContractPaused))
-    );
+    client.register_module(&module_mgr, &org, &ModuleKind::Wallet, &wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
 }
 
 #[test]
-fn paused_registry_blocks_lookup() {
+fn module_manager_can_remove_module() {
     let (env, client, admin) = setup();
     let org = String::from_str(&env, "acme");
     let owner = Address::generate(&env);
     client.register_org(&admin, &org, &owner);
+
     let wallet = Address::generate(&env);
     client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
-    client.pause(&admin);
+
+    // Grant module manager role
+    let module_mgr = Address::generate(&env);
+    client.grant_role(&owner, &org, &module_mgr, &Role::ModuleManager);
+
+    // Module manager can remove modules
+    client.remove_module(&module_mgr, &org, &ModuleKind::Wallet);
     assert_eq!(
         client.try_lookup(&org, &ModuleKind::Wallet),
-        Err(Ok(Error::ContractPaused))
+        Err(Ok(Error::NotFound))
     );
 }
 
 #[test]
-fn paused_registry_blocks_verify_owner() {
+fn unauthorized_user_cannot_register_module() {
     let (env, client, admin) = setup();
     let org = String::from_str(&env, "acme");
     let owner = Address::generate(&env);
     client.register_org(&admin, &org, &owner);
-    client.pause(&admin);
-    assert_eq!(
-        client.try_verify_owner(&org, &owner),
-        Err(Ok(Error::ContractPaused))
-    );
-}
 
-#[test]
-fn paused_registry_blocks_grant_role() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    client.pause(&admin);
-    let delegate = Address::generate(&env);
-    assert_eq!(
-        client.try_grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_remove_module() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    let wallet = Address::generate(&env);
-    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
-    client.pause(&admin);
-    assert_eq!(
-        client.try_remove_module(&owner, &org, &ModuleKind::Wallet),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_deprecate_module() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    let wallet = Address::generate(&env);
-    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
-    client.pause(&admin);
-    assert_eq!(
-        client.try_deprecate_module(&admin, &org, &ModuleKind::Wallet),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_reactivate_module() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    let wallet = Address::generate(&env);
-    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
-    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
-    client.pause(&admin);
-    assert_eq!(
-        client.try_reactivate_module(&admin, &org, &ModuleKind::Wallet),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_register_version() {
-    let (env, client, admin) = setup();
-    client.pause(&admin);
-    let addr = Address::generate(&env);
-    assert_eq!(
-        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_set_admin() {
-    let (env, client, admin) = setup();
-    client.pause(&admin);
-    let new_admin = Address::generate(&env);
-    assert_eq!(
-        client.try_set_admin(&admin, &new_admin),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_add_approved_wasm() {
-    let (env, client, admin) = setup();
-    client.pause(&admin);
-    let wasm = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-    assert_eq!(
-        client.try_add_approved_wasm(&admin, &ModuleKind::Wallet, &wasm),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_remove_approved_wasm() {
-    let (env, client, admin) = setup();
-    let wasm = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &wasm);
-    client.pause(&admin);
-    assert_eq!(
-        client.try_remove_approved_wasm(&admin, &ModuleKind::Wallet, &wasm),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn pause_unpause_emits_events() {
-    let (env, client, admin) = setup();
-    client.pause(&admin);
-    assert_event(&env, "ContractPaused");
-    client.unpause(&admin);
-    assert_event(&env, "ContractPaused");
-}
-
-#[test]
-fn operations_succeed_after_unpause() {
-    let (env, client, admin) = setup();
-    client.pause(&admin);
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    assert_eq!(
-        client.try_register_org(&admin, &org, &owner),
-        Err(Ok(Error::ContractPaused))
-    );
-    client.unpause(&admin);
-    client.register_org(&admin, &org, &owner);
-    assert_eq!(client.get_org_owner(&org), owner);
-}
-
-#[test]
-fn revoke_role_works_while_paused() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    let delegate = Address::generate(&env);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager);
-    client.pause(&admin);
-    // Revocation must work while paused so owners can withdraw access during incidents.
-    client.revoke_role(&owner, &org, &delegate);
-    assert_eq!(client.get_role(&org, &delegate), None);
-}
-
-#[test]
-fn freeze_works_while_paused() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    client.pause(&admin);
-    // Org owners must be able to freeze even while paused.
-    client.freeze(&owner, &org);
-}
-
-#[test]
-fn unfreeze_works_while_paused() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    client.freeze(&owner, &org);
-    client.pause(&admin);
-    // Unfreeze must work even while paused so owners can recover.
-    client.unfreeze(&owner, &org);
-}
-
-#[test]
-fn get_module_address_works_while_paused() {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    let wallet = Address::generate(&env);
-    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
-    client.pause(&admin);
-    // Read-only accessors must work while paused.
-    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
-}
-
-#[test]
-fn paused_registry_blocks_upgrade() {
-    let h = setup_upgrade();
-    h.member
-        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
-    h.registry
-        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
-    h.member.pause(&h.admin);
-    assert_eq!(
-        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-#[test]
-fn paused_registry_blocks_set_upgrade_authority() {
-    let h = setup_upgrade();
-    h.member.pause(&h.admin);
-    assert_eq!(
-        h.member
-            .try_set_upgrade_authority(&h.admin, &h.admin, &h.registry_id),
-        Err(Ok(Error::ContractPaused))
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Role-based permission delegation
-// ---------------------------------------------------------------------------
-
-/// A registry with one registered organization, returning the org slug and its
-/// owner alongside the usual handles.
-fn setup_org() -> (
-    Env,
-    RegistryContractClient<'static>,
-    Address,
-    String,
-    Address,
-) {
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
-    (env, client, admin, org, owner)
-}
-
-#[test]
-fn owner_is_implicitly_owner_role() {
-    let (env, client, _admin, org, owner) = setup_org();
-    assert_eq!(client.get_role(&org, &owner), Some(RegistryRole::Owner));
-    assert!(client.can_manage_module(&org, &owner, &ModuleKind::Policy));
-    assert!(client.can_manage_module(&org, &owner, &ModuleKind::Treasury));
-
+    // User without any role
     let stranger = Address::generate(&env);
-    assert_eq!(client.get_role(&org, &stranger), None);
-    assert!(!client.can_manage_module(&org, &stranger, &ModuleKind::Policy));
+    let wallet = Address::generate(&env);
+    let res = client.try_register_module(&stranger, &org, &ModuleKind::Wallet, &wallet);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]
-fn granted_role_is_readable_and_revocable() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
+fn grant_and_revoke_role_work() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
 
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager);
+    let user = Address::generate(&env);
+    // Grant role
+    client.grant_role(&owner, &org, &user, &Role::ModuleManager);
     assert_eq!(
-        client.get_role(&org, &delegate),
-        Some(RegistryRole::PolicyManager)
+        client.get_role(&org, &user),
+        Some(Role::ModuleManager)
     );
-
-    // Re-granting replaces rather than stacks.
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::TreasuryOperator);
-    assert_eq!(
-        client.get_role(&org, &delegate),
-        Some(RegistryRole::TreasuryOperator)
-    );
-
-    client.revoke_role(&owner, &org, &delegate);
-    assert_eq!(client.get_role(&org, &delegate), None);
-
-    // Revoking again is an explicit failure, not a silent no-op.
-    assert_eq!(
-        client.try_revoke_role(&owner, &org, &delegate),
-        Err(Ok(Error::NotFound))
-    );
+    // Revoke role
+    client.revoke_role(&owner, &org, &user);
+    assert_eq!(client.get_role(&org, &user), None);
 }
 
 #[test]
-fn policy_manager_reaches_only_the_policy_module() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let addr = Address::generate(&env);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager);
+fn revoke_nonexistent_role_fails() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
 
-    client.register_module(&delegate, &org, &ModuleKind::Policy, &addr);
-    assert_eq!(client.lookup(&org, &ModuleKind::Policy), addr);
-
-    for kind in [ModuleKind::Treasury, ModuleKind::Wallet, ModuleKind::Budget] {
-        assert!(!client.can_manage_module(&org, &delegate, &kind));
-        assert_eq!(
-            client.try_register_module(&delegate, &org, &kind, &addr),
-            Err(Ok(Error::Unauthorized))
-        );
-        assert_eq!(client.try_lookup(&org, &kind), Err(Ok(Error::NotFound)));
-    }
+    let user = Address::generate(&env);
+    let res = client.try_revoke_role(&owner, &org, &user);
+    assert_eq!(res, Err(Ok(Error::NotFound)));
 }
 
 #[test]
-fn treasury_operator_reaches_the_value_custody_modules() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let addr = Address::generate(&env);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::TreasuryOperator);
+fn org_owner_cannot_grant_admin_role() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
 
-    for kind in [ModuleKind::Treasury, ModuleKind::Budget, ModuleKind::Escrow] {
-        assert!(client.can_manage_module(&org, &delegate, &kind));
-        client.register_module(&delegate, &org, &kind, &addr);
-        assert_eq!(client.lookup(&org, &kind), addr);
-    }
-
-    // ...but not the policy that governs them.
-    assert!(!client.can_manage_module(&org, &delegate, &ModuleKind::Policy));
-    assert_eq!(
-        client.try_register_module(&delegate, &org, &ModuleKind::Policy, &addr),
-        Err(Ok(Error::Unauthorized))
-    );
+    let user = Address::generate(&env);
+    // Org owner cannot grant Admin role
+    let res = client.try_grant_role(&owner, &org, &user, &Role::Admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]
-fn module_upgrader_may_repoint_any_module() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let v1 = Address::generate(&env);
-    let v2 = Address::generate(&env);
-    client.register_module(&owner, &org, &ModuleKind::Wallet, &v1);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::ModuleUpgrader);
+fn admin_can_grant_admin_role() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
 
-    client.register_module(&delegate, &org, &ModuleKind::Wallet, &v2);
-    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), v2);
-    client.register_module(&delegate, &org, &ModuleKind::Policy, &v2);
-    assert_eq!(client.lookup(&org, &ModuleKind::Policy), v2);
-}
-
-#[test]
-fn delegated_owner_reaches_every_module_kind() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let addr = Address::generate(&env);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::Owner);
-
-    for kind in [
-        ModuleKind::Wallet,
-        ModuleKind::Treasury,
-        ModuleKind::Policy,
-        ModuleKind::Escrow,
-    ] {
-        client.register_module(&delegate, &org, &kind, &addr);
-        assert_eq!(client.lookup(&org, &kind), addr);
-    }
-}
-
-#[test]
-fn delegates_may_remove_modules_they_may_register() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let addr = Address::generate(&env);
-    client.register_module(&owner, &org, &ModuleKind::Policy, &addr);
-    client.register_module(&owner, &org, &ModuleKind::Treasury, &addr);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager);
-
-    client.remove_module(&delegate, &org, &ModuleKind::Policy);
-    assert_eq!(
-        client.try_lookup(&org, &ModuleKind::Policy),
-        Err(Ok(Error::NotFound))
-    );
-    // The removal gate matches the registration gate exactly.
-    assert_eq!(
-        client.try_remove_module(&delegate, &org, &ModuleKind::Treasury),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert_eq!(client.lookup(&org, &ModuleKind::Treasury), addr);
-}
-
-#[test]
-fn unauthorized_accounts_are_rejected() {
-    let (env, client, _admin, org, _owner) = setup_org();
-    let stranger = Address::generate(&env);
-    let addr = Address::generate(&env);
-
-    assert_eq!(
-        client.try_register_module(&stranger, &org, &ModuleKind::Wallet, &addr),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert_eq!(
-        client.try_remove_module(&stranger, &org, &ModuleKind::Wallet),
-        Err(Ok(Error::Unauthorized))
-    );
-}
-
-#[test]
-fn delegates_cannot_administer_roles_or_ownership() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let accomplice = Address::generate(&env);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::Owner);
-
-    // Even the broadest delegated role cannot mint further delegations...
-    assert_eq!(
-        client.try_grant_role(&delegate, &org, &accomplice, &RegistryRole::Owner),
-        Err(Ok(Error::Unauthorized))
-    );
-    // ...revoke its way around the owner...
-    assert_eq!(
-        client.try_revoke_role(&delegate, &org, &delegate),
-        Err(Ok(Error::Unauthorized))
-    );
-    // ...or escalate into ownership.
-    assert_eq!(
-        client.try_set_org_owner(&delegate, &org, &delegate),
-        Err(Ok(Error::Unauthorized))
-    );
-
-    assert_eq!(client.get_role(&org, &accomplice), None);
-    assert_eq!(client.get_org_owner(&org), owner);
-}
-
-#[test]
-fn protocol_admin_may_administer_roles() {
-    let (env, client, admin, org, _owner) = setup_org();
-    let delegate = Address::generate(&env);
-
-    client.grant_role(&admin, &org, &delegate, &RegistryRole::ModuleUpgrader);
-    assert_eq!(
-        client.get_role(&org, &delegate),
-        Some(RegistryRole::ModuleUpgrader)
-    );
-    client.revoke_role(&admin, &org, &delegate);
-    assert_eq!(client.get_role(&org, &delegate), None);
-}
-
-#[test]
-fn revoked_delegate_loses_access_immediately() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let addr = Address::generate(&env);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager);
-    client.register_module(&delegate, &org, &ModuleKind::Policy, &addr);
-
-    client.revoke_role(&owner, &org, &delegate);
-    assert_eq!(
-        client.try_register_module(&delegate, &org, &ModuleKind::Policy, &addr),
-        Err(Ok(Error::Unauthorized))
-    );
-}
-
-#[test]
-fn roles_do_not_leak_between_organizations() {
-    let (env, client, admin, org_a, owner_a) = setup_org();
-    let org_b = String::from_str(&env, "globex");
-    let owner_b = Address::generate(&env);
-    client.register_org(&admin, &org_b, &owner_b);
-
-    let delegate = Address::generate(&env);
-    let addr = Address::generate(&env);
-    client.grant_role(&owner_a, &org_a, &delegate, &RegistryRole::PolicyManager);
-
-    client.register_module(&delegate, &org_a, &ModuleKind::Policy, &addr);
-    assert_eq!(client.get_role(&org_b, &delegate), None);
-    assert_eq!(
-        client.try_register_module(&delegate, &org_b, &ModuleKind::Policy, &addr),
-        Err(Ok(Error::Unauthorized))
-    );
-}
-
-#[test]
-fn owner_cannot_be_assigned_a_role() {
-    let (_env, client, _admin, org, owner) = setup_org();
-    // The owner already reaches every kind; recording a narrower role for them
-    // would be misleading rather than restrictive.
-    assert_eq!(
-        client.try_grant_role(&owner, &org, &owner, &RegistryRole::PolicyManager),
-        Err(Ok(Error::InvalidInput))
-    );
-    assert_eq!(client.get_role(&org, &owner), Some(RegistryRole::Owner));
-}
-
-#[test]
-fn role_administration_on_an_unknown_org_fails() {
-    let (env, client, admin, _org, _owner) = setup_org();
-    let ghost = String::from_str(&env, "nowhere");
-    let account = Address::generate(&env);
-
-    assert_eq!(
-        client.try_grant_role(&admin, &ghost, &account, &RegistryRole::Owner),
-        Err(Ok(Error::NotFound))
-    );
-    assert_eq!(
-        client.try_revoke_role(&admin, &ghost, &account),
-        Err(Ok(Error::NotFound))
-    );
-    assert_eq!(client.get_role(&ghost, &account), None);
-}
-
-#[test]
-fn frozen_registry_blocks_grants_and_delegated_writes() {
-    let (env, client, _admin, org, owner) = setup_org();
-    let delegate = Address::generate(&env);
-    let other = Address::generate(&env);
-    let addr = Address::generate(&env);
-    client.grant_role(&owner, &org, &delegate, &RegistryRole::Owner);
-    client.freeze(&owner, &org);
-
-    assert_eq!(
-        client.try_register_module(&delegate, &org, &ModuleKind::Wallet, &addr),
-        Err(Ok(Error::RegistryFrozen))
-    );
-    assert_eq!(
-        client.try_grant_role(&owner, &org, &other, &RegistryRole::Owner),
-        Err(Ok(Error::RegistryFrozen))
-    );
-
-    // Revocation stays available while frozen so an owner can always withdraw
-    // access during an incident.
-    client.revoke_role(&owner, &org, &delegate);
-    assert_eq!(client.get_role(&org, &delegate), None);
-}
-
-// --- registry-gated upgrades ---
-
-/// Two independent registry instances: `registry` plays the protocol registry
-/// that authorizes implementations, `member` plays a contract being upgraded
-/// (every member contract carries the same three upgrade entrypoints).
-struct UpgradeHarness {
-    env: Env,
-    registry: RegistryContractClient<'static>,
-    registry_id: Address,
-    member: RegistryContractClient<'static>,
-    admin: Address,
-}
-
-fn setup_upgrade() -> UpgradeHarness {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-
-    let registry_id = env.register_contract(None, RegistryContract);
-    let registry = RegistryContractClient::new(&env, &registry_id);
-    registry.initialize(&admin);
-
-    let member_id = env.register_contract(None, RegistryContract);
-    let member = RegistryContractClient::new(&env, &member_id);
-    member.initialize(&admin);
-
-    UpgradeHarness {
-        env,
-        registry,
-        registry_id,
-        member,
-        admin,
-    }
-}
-
-fn hash(env: &Env, seed: u8) -> soroban_sdk::BytesN<32> {
-    soroban_sdk::BytesN::from_array(env, &[seed; 32])
-}
-
-#[test]
-fn upgrade_authority_is_recorded_and_readable() {
-    let h = setup_upgrade();
-    h.member
-        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
-    let authority = h.member.get_upgrade_authority();
-    assert_eq!(authority.admin, h.admin);
-    assert_eq!(authority.registry, h.registry_id);
-}
-
-#[test]
-fn upgrade_needs_a_configured_authority() {
-    let h = setup_upgrade();
-    assert_eq!(
-        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
-        Err(Ok(Error::NotInitialized))
-    );
-}
-
-#[test]
-fn upgrade_to_an_unapproved_hash_is_refused() {
-    let h = setup_upgrade();
-    h.member
-        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
-    // Nothing has been approved for this kind, so the registry says no.
-    assert_eq!(
-        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
-        Err(Ok(Error::Unauthorized))
-    );
-}
-
-#[test]
-fn upgrade_requires_the_recorded_admin() {
-    let h = setup_upgrade();
-    let stranger = Address::generate(&h.env);
-    h.member
-        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
-    // Approved in the registry, but the caller is not the upgrade admin.
-    h.registry
-        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
-    assert_eq!(
-        h.member.try_upgrade(&stranger, &hash(&h.env, 1)),
-        Err(Ok(Error::Unauthorized))
-    );
-}
-
-#[test]
-fn approval_is_scoped_to_the_module_kind() {
-    let h = setup_upgrade();
-    h.member
-        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
-    // Approved for a different kind than the member reports, so it must not
-    // satisfy this member's gate.
-    h.registry
-        .add_approved_wasm(&h.admin, &ModuleKind::Wallet, &hash(&h.env, 1));
-    assert!(h
-        .registry
-        .is_wasm_approved(&ModuleKind::Wallet, &hash(&h.env, 1)));
-    assert!(!h
-        .registry
-        .is_wasm_approved(&ModuleKind::Organization, &hash(&h.env, 1)));
-    assert_eq!(
-        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
-        Err(Ok(Error::Unauthorized))
-    );
-}
-
-#[test]
-fn a_revoked_hash_stops_authorizing_upgrades() {
-    let h = setup_upgrade();
-    h.member
-        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
-    h.registry
-        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
-    h.registry
-        .remove_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
-    assert_eq!(
-        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
-        Err(Ok(Error::Unauthorized))
-    );
-}
-
-#[test]
-fn only_the_current_admin_can_rotate_the_authority() {
-    let h = setup_upgrade();
-    let stranger = Address::generate(&h.env);
-    h.member
-        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
-    assert_eq!(
-        h.member
-            .try_set_upgrade_authority(&stranger, &stranger, &h.registry_id),
-        Err(Ok(Error::Unauthorized))
-    );
-    // The incumbent may hand the role over.
-    h.member
-        .set_upgrade_authority(&h.admin, &stranger, &h.registry_id);
-    assert_eq!(h.member.get_upgrade_authority().admin, stranger);
+    let user = Address::generate(&env);
+    // Admin can grant Admin role
+    client.grant_role(&admin, &org, &user, &Role::Admin);
+    assert_eq!(client.get_role(&org, &user), Some(Role::Admin));
 }

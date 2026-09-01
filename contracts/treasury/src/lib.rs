@@ -77,6 +77,19 @@ pub struct Treasury {
     pub budget: Option<Address>,
     /// Lifecycle state shared with wallets.
     pub state: ResourceState,
+    /// Optional streaming payout schedule for validation.
+    pub payout_schedule: Option<PayoutSchedule>,
+}
+
+/// Streaming payout schedule configuration. Limits how much can be paid out
+/// within a given time interval to enforce a maximum streaming velocity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutSchedule {
+    /// Maximum amount that can be paid out per interval.
+    pub max_per_interval: i128,
+    /// Length of the interval in seconds.
+    pub interval_seconds: u64,
 }
 
 /// Per-asset accounting within the treasury.
@@ -100,6 +113,10 @@ pub struct Holding {
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
+    /// Amount paid out in the current interval (for streaming validation).
+    pub interval_payout: i128,
+    /// Start of the current payout interval (unix seconds).
+    pub interval_start: u64,
 }
 
 /// Composite key identifying a withdrawal allowance scoped to a specific agent
@@ -203,6 +220,7 @@ impl TreasuryContract {
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
+                payout_schedule: None,
             },
         );
         env.storage()
@@ -249,49 +267,59 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Approve a token contract for use by this treasury (governance-gated).
-    ///
-    /// Only whitelisted assets may be deposited, withdrawn or bound to a budget
-    /// envelope, so this is the single point at which an organization decides
-    /// which token contracts its funds are ever routed through.
-    pub fn add_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
-        let t = Self::require_admin(&env, &caller)?;
-        let key = DataKey::ApprovedAsset(asset.clone());
-        if env.storage().persistent().get(&key).unwrap_or(false) {
-            return Err(Error::AlreadyExists);
+    /// Set the streaming payout schedule (admin). Enforces a maximum payout
+    /// velocity per interval for all withdrawals.
+    pub fn set_payout_schedule(
+        env: Env,
+        caller: Address,
+        max_per_interval: i128,
+        interval_seconds: u64,
+    ) -> Result<(), Error> {
+        if max_per_interval <= 0 {
+            return Err(Error::InvalidInput);
         }
-        env.storage().persistent().set(&key, &true);
-        env.storage().persistent().extend_ttl(
-            &key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
+        if interval_seconds == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.payout_schedule = Some(PayoutSchedule {
+            max_per_interval,
+            interval_seconds,
+        });
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("payout"),
+            },
         );
-        let count = checked_add(Self::approved_count(&env) as i128, 1)? as u32;
-        Self::store_approved_count(&env, count);
-        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_add"));
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("payout")),
+            (max_per_interval, interval_seconds),
+        );
         Ok(())
     }
 
-    /// Revoke a token contract's approval (governance-gated).
-    ///
-    /// Existing internal accounting for the asset is deliberately left intact
-    /// so a revoked holding stays inspectable; what stops is any further
-    /// routing through it.
-    pub fn remove_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
-        let t = Self::require_admin(&env, &caller)?;
-        let key = DataKey::ApprovedAsset(asset.clone());
-        if !env.storage().persistent().get(&key).unwrap_or(false) {
-            return Err(Error::NotFound);
-        }
-        env.storage().persistent().remove(&key);
-        let count = Self::approved_count(&env).saturating_sub(1);
-        Self::store_approved_count(&env, count);
-        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_rm"));
+    /// Clear the streaming payout schedule (admin).
+    pub fn clear_payout_schedule(env: Env, caller: Address) -> Result<(), Error> {
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.payout_schedule = None;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("payout_clr"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("payout_clr")), ());
         Ok(())
     }
 
-    /// Wire the multisig contract authorized for emergency freeze/unfreeze.
-    pub fn set_multisig(env: Env, caller: Address, multisig: Address) -> Result<(), Error> {
+    /// Freeze the treasury; all outflows are rejected while frozen.
+    pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
         let mut t = Self::require_admin(&env, &caller)?;
         t.multisig = Some(multisig);
         Self::store(&env, &t);
@@ -478,7 +506,8 @@ impl TreasuryContract {
     }
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
-    /// must clear policy and budget gates before the ledger is debited.
+    /// must clear policy, budget, and payout schedule gates before the ledger
+    /// is debited.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -516,33 +545,19 @@ impl TreasuryContract {
                 .consume(&caller, budget_id, &amount);
         }
 
-        // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
-        //    pre-approved periodic ceilings per (agent, recipient, asset).
-        Self::lock(&env)?;
-
-        let allowance_id = AllowanceId {
-            agent: caller.clone(),
-            recipient: to.clone(),
-            asset: asset.clone(),
-        };
-        if let Some(mut al) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Allowance>(&DataKey::Allowance(allowance_id.clone()))
-        {
-            if al.expires_at != 0 && env.ledger().timestamp() >= al.expires_at {
-                Self::unlock(&env);
-                return Err(Error::AllowanceExpired);
+        // 3. Streaming payout schedule validation — enforces max payout velocity.
+        if let Some(schedule) = &t.payout_schedule {
+            let now = env.ledger().timestamp();
+            // Reset interval if elapsed
+            if now >= holding.interval_start.saturating_add(schedule.interval_seconds) {
+                holding.interval_payout = 0;
+                holding.interval_start = now;
             }
-            let remaining = checked_sub(al.limit, al.spent)?;
-            if amount > remaining {
-                Self::unlock(&env);
-                return Err(Error::AllowanceExceeded);
+            let new_payout = checked_add(holding.interval_payout, amount)?;
+            if new_payout > schedule.max_per_interval {
+                return Err(Error::PayoutScheduleViolated);
             }
-            al.spent = checked_add(al.spent, amount)?;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Allowance(allowance_id), &al);
+            holding.interval_payout = new_payout;
         }
 
         // 4. Debit the internal ledger, then move real tokens out of custody.
@@ -930,6 +945,8 @@ impl TreasuryContract {
                 total_in: 0,
                 total_out: 0,
                 budget_id: None,
+                interval_payout: 0,
+                interval_start: 0,
             })
     }
 

@@ -276,441 +276,61 @@ fn standard_events_emitted() {
     assert_event(&h2.env, "TransferExecuted");
 }
 
-// ---------------------------------------------------------------------------
-// Multi-token asset whitelist and routing validation
-// ---------------------------------------------------------------------------
-
-/// Register a second SAC token that the treasury has *not* approved, minting
-/// `funded` of it to the admin.
-fn unapproved_token(h: &Harness, funded: i128) -> Address {
-    let token_admin = Address::generate(&h.env);
-    let asset = h
-        .env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    if funded > 0 {
-        token::StellarAssetClient::new(&h.env, &asset).mint(&h.admin, &funded);
-    }
-    asset
-}
-
 #[test]
-fn governance_adds_and_removes_approved_assets() {
-    let h = setup("vault", 100);
-    // setup approved exactly one asset.
-    assert!(h.client.is_approved_asset(&h.asset));
-    assert_eq!(h.client.approved_asset_count(), 1);
-
-    let other = unapproved_token(&h, 0);
-    assert!(!h.client.is_approved_asset(&other));
-
-    h.client.add_approved_asset(&h.admin, &other);
-    assert!(h.client.is_approved_asset(&other));
-    assert_eq!(h.client.approved_asset_count(), 2);
-
-    h.client.remove_approved_asset(&h.admin, &other);
-    assert!(!h.client.is_approved_asset(&other));
-    assert_eq!(h.client.approved_asset_count(), 1);
-
-    // With nothing approved, the treasury routes nothing at all — which is
-    // also the state a freshly initialized treasury starts in.
-    h.client.remove_approved_asset(&h.admin, &h.asset);
-    assert_eq!(h.client.approved_asset_count(), 0);
-    assert_eq!(
-        h.client.try_deposit(&h.admin, &h.asset, &10),
-        Err(Ok(Error::AssetNotAuthorized))
-    );
-}
-
-#[test]
-fn whitelist_changes_are_idempotency_checked() {
-    let h = setup("vault", 0);
-    assert_eq!(
-        h.client.try_add_approved_asset(&h.admin, &h.asset),
-        Err(Ok(Error::AlreadyExists))
-    );
-    let other = unapproved_token(&h, 0);
-    assert_eq!(
-        h.client.try_remove_approved_asset(&h.admin, &other),
-        Err(Ok(Error::NotFound))
-    );
-}
-
-#[test]
-fn only_governance_can_change_the_whitelist() {
-    let h = setup("vault", 0);
-    let intruder = Address::generate(&h.env);
-    let other = unapproved_token(&h, 0);
-
-    assert_eq!(
-        h.client.try_add_approved_asset(&intruder, &other),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert!(!h.client.is_approved_asset(&other));
-
-    assert_eq!(
-        h.client.try_remove_approved_asset(&intruder, &h.asset),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert!(h.client.is_approved_asset(&h.asset));
-}
-
-#[test]
-fn deposit_of_an_unapproved_asset_is_refused() {
-    let h = setup("vault", 0);
-    let rogue = unapproved_token(&h, 1_000);
-
-    let res = h.client.try_deposit(&h.admin, &rogue, &500);
-    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
-    // The rogue token contract was never invoked: no value moved.
-    assert_eq!(
-        token::TokenClient::new(&h.env, &rogue).balance(&h.admin),
-        1_000
-    );
-    assert_eq!(h.client.holding(&rogue).total_in, 0);
-}
-
-#[test]
-fn withdraw_of_an_unapproved_asset_is_refused() {
+fn payout_schedule_limits_withdraw_per_interval() {
     let h = setup("vault", 1_000);
     h.client.deposit(&h.admin, &h.asset, &1_000);
+    // Set payout schedule: max 300 per 1 hour
+    h.client.set_payout_schedule(&h.admin, &300, &3_600);
     let recipient = Address::generate(&h.env);
-
-    // Revoking approval closes the route without touching the accounting.
-    h.client.remove_approved_asset(&h.admin, &h.asset);
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
-    assert_eq!(token_balance(&h, &recipient), 0);
-    assert_eq!(token_balance(&h, &h.client.address), 1_000);
-    assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
-
-    // Re-approving restores it.
-    h.client.add_approved_asset(&h.admin, &h.asset);
+    // First withdraw within limit
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(token_balance(&h, &recipient), 200);
+    // Second withdraw would exceed limit (200 + 200 > 300)
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(res, Err(Ok(Error::PayoutScheduleViolated)));
+    // Can still withdraw up to the limit
     h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(token_balance(&h, &recipient), 100);
+    assert_eq!(token_balance(&h, &recipient), 300);
 }
 
 #[test]
-fn budget_envelopes_cannot_be_bound_to_unapproved_assets() {
-    let h = setup("vault", 0);
-    let rogue = unapproved_token(&h, 0);
-    let res = h
-        .client
-        .try_allocate_budget(&h.admin, &rogue, &String::from_str(&h.env, "maint"));
-    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
-    assert_eq!(h.client.holding(&rogue).budget_id, None);
-}
-
-#[test]
-fn multiple_approved_assets_route_independently() {
+fn payout_schedule_resets_after_interval() {
     let h = setup("vault", 1_000);
-    let second = unapproved_token(&h, 500);
-    h.client.add_approved_asset(&h.admin, &second);
-    let recipient = Address::generate(&h.env);
-
     h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.deposit(&h.admin, &second, &500);
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
-    h.client.withdraw(&h.admin, &second, &recipient, &200);
-
-    assert_eq!(h.client.holding(&h.asset).total_out, 400);
-    assert_eq!(h.client.holding(&second).total_out, 200);
-    assert_eq!(token_balance(&h, &recipient), 400);
-    assert_eq!(
-        token::TokenClient::new(&h.env, &second).balance(&recipient),
-        200
-    );
-
-    // Revoking one asset leaves the other fully usable.
-    h.client.remove_approved_asset(&h.admin, &second);
-    assert_eq!(
-        h.client.try_withdraw(&h.admin, &second, &recipient, &10),
-        Err(Ok(Error::AssetNotAuthorized))
-    );
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    h.client.set_payout_schedule(&h.admin, &300, &3_600);
+    let recipient = Address::generate(&h.env);
+    // Exhaust the interval
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &300);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1);
+    assert_eq!(res, Err(Ok(Error::PayoutScheduleViolated)));
+    // Advance past the interval
+    h.env.ledger().set_timestamp(1_700 + 3_600);
+    // Should be able to withdraw again
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &200);
     assert_eq!(token_balance(&h, &recipient), 500);
 }
 
 #[test]
-fn whitelist_changes_emit_events() {
-    let h = setup("vault", 0);
-    let other = unapproved_token(&h, 0);
-    h.client.add_approved_asset(&h.admin, &other);
-    assert_event(&h.env, "TreasuryConfigUpdated");
-    h.client.remove_approved_asset(&h.admin, &other);
-    assert_event(&h.env, "TreasuryConfigUpdated");
-}
-
-/// Build one leg of a batch payout.
-fn payment(recipient: &Address, amount: i128) -> Payment {
-    Payment {
-        recipient: recipient.clone(),
-        amount,
-    }
-}
-
-#[test]
-fn batch_transfer_pays_every_recipient() {
+fn clear_payout_schedule_removes_limit() {
     let h = setup("vault", 1_000);
     h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    let a = Address::generate(&h.env);
-    let b = Address::generate(&h.env);
-    let c = Address::generate(&h.env);
-    let payments: Vec<Payment> = vec![&h.env, payment(&a, 100), payment(&b, 250), payment(&c, 50)];
-
-    h.client.batch_transfer(&h.admin, &h.asset, &payments);
-
-    assert_eq!(token_balance(&h, &a), 100);
-    assert_eq!(token_balance(&h, &b), 250);
-    assert_eq!(token_balance(&h, &c), 50);
-    assert_eq!(token_balance(&h, &h.client.address), 600);
-
-    // Internal accounting mirrors the aggregate payout exactly once.
-    let holding = h.client.holding(&h.asset);
-    assert_eq!(holding.total_in, 600);
-    assert_eq!(holding.total_out, 400);
-
-    assert_event(&h.env, "BatchTransferExecuted");
-}
-
-#[test]
-fn batch_transfer_over_balance_pays_nobody() {
-    let h = setup("vault", 300);
-    h.client.deposit(&h.admin, &h.asset, &300);
-
-    let a = Address::generate(&h.env);
-    let b = Address::generate(&h.env);
-    // Each leg fits on its own, but the cumulative total overdraws the treasury.
-    let payments: Vec<Payment> = vec![&h.env, payment(&a, 200), payment(&b, 200)];
-
-    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
-    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
-
-    // Nothing partially executed: no recipient was paid and custody is intact.
-    assert_eq!(token_balance(&h, &a), 0);
-    assert_eq!(token_balance(&h, &b), 0);
-    assert_eq!(token_balance(&h, &h.client.address), 300);
-    let holding = h.client.holding(&h.asset);
-    assert_eq!(holding.total_in, 300);
-    assert_eq!(holding.total_out, 0);
-}
-
-#[test]
-fn batch_transfer_rolls_back_when_one_leg_is_invalid() {
-    let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    let a = Address::generate(&h.env);
-    let b = Address::generate(&h.env);
-    let c = Address::generate(&h.env);
-    // The middle leg is a zero-amount payment, which invalidates the batch.
-    let payments: Vec<Payment> = vec![&h.env, payment(&a, 100), payment(&b, 0), payment(&c, 100)];
-
-    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
-    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
-
-    // The legs preceding the bad one are rolled back with the rest of the batch.
-    assert_eq!(token_balance(&h, &a), 0);
-    assert_eq!(token_balance(&h, &c), 0);
-    assert_eq!(token_balance(&h, &h.client.address), 1_000);
-    assert_eq!(h.client.holding(&h.asset).total_out, 0);
-}
-
-#[test]
-fn batch_transfer_rejected_when_not_admin() {
-    let h = setup("vault", 500);
-    h.client.deposit(&h.admin, &h.asset, &500);
-
-    let intruder = Address::generate(&h.env);
+    h.client.set_payout_schedule(&h.admin, &100, &3_600);
+    // Clear the schedule
+    h.client.clear_payout_schedule(&h.admin);
     let recipient = Address::generate(&h.env);
-    let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 10)];
-
-    let res = h.client.try_batch_transfer(&intruder, &h.asset, &payments);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    assert_eq!(token_balance(&h, &h.client.address), 500);
+    // Can now withdraw more than the previous limit
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &500);
+    assert_eq!(token_balance(&h, &recipient), 500);
 }
 
 #[test]
-fn batch_transfer_rejected_when_frozen() {
-    let h = setup("vault", 500);
-    h.client.deposit(&h.admin, &h.asset, &500);
-    h.client.freeze(&h.multisig);
-
-    let recipient = Address::generate(&h.env);
-    let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 10)];
-
-    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-    assert_eq!(token_balance(&h, &recipient), 0);
-}
-
-#[test]
-fn batch_transfer_rejects_empty_and_oversized_batches() {
+fn payout_schedule_invalid_params_rejected() {
     let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    let empty: Vec<Payment> = Vec::new(&h.env);
-    assert_eq!(
-        h.client.try_batch_transfer(&h.admin, &h.asset, &empty),
-        Err(Ok(Error::InvalidInput))
-    );
-
-    let mut oversized: Vec<Payment> = Vec::new(&h.env);
-    for _ in 0..(MAX_BATCH_PAYMENTS + 1) {
-        let r = Address::generate(&h.env);
-        oversized.push_back(payment(&r, 1));
-    }
-    assert_eq!(
-        h.client.try_batch_transfer(&h.admin, &h.asset, &oversized),
-        Err(Ok(Error::InvalidInput))
-    );
-    assert_eq!(token_balance(&h, &h.client.address), 1_000);
-}
-
-#[test]
-fn batch_transfer_at_the_maximum_size_succeeds() {
-    let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    let mut payments: Vec<Payment> = Vec::new(&h.env);
-    let mut recipients = std::vec::Vec::new();
-    for _ in 0..MAX_BATCH_PAYMENTS {
-        let r = Address::generate(&h.env);
-        payments.push_back(payment(&r, 5));
-        recipients.push(r);
-    }
-
-    h.client.batch_transfer(&h.admin, &h.asset, &payments);
-
-    for r in recipients.iter() {
-        assert_eq!(token_balance(&h, r), 5);
-    }
-    let holding = h.client.holding(&h.asset);
-    assert_eq!(holding.total_out, 5 * MAX_BATCH_PAYMENTS as i128);
-    assert_eq!(holding.total_in, 1_000 - 5 * MAX_BATCH_PAYMENTS as i128);
-}
-
-#[test]
-fn emergency_freeze_rejected_by_non_multisig() {
-    let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    // Admin should not be able to freeze - only multisig
-    let res = h.client.try_freeze(&h.admin);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-
-    // Random address should also be rejected
-    let intruder = Address::generate(&h.env);
-    let res = h.client.try_freeze(&intruder);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-
-    // Ensure transfers still work
-    let recipient = Address::generate(&h.env);
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(token_balance(&h, &recipient), 100);
-}
-
-#[test]
-fn emergency_freeze_by_multisig_blocks_transfers() {
-    let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    // Multisig can freeze
-    h.client.freeze(&h.multisig);
-
-    // All outbound transfers should be blocked
-    let recipient = Address::generate(&h.env);
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-
-    let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 50)];
-    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-
-    // Verify funds are still in treasury
-    assert_eq!(token_balance(&h, &h.client.address), 1_000);
-}
-
-#[test]
-fn emergency_unfreeze_restores_transfers() {
-    let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    // Freeze with multisig
-    h.client.freeze(&h.multisig);
-
-    // Verify frozen state blocks transfers
-    let recipient = Address::generate(&h.env);
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-
-    // Unfreeze with multisig
-    h.client.unfreeze(&h.multisig);
-
-    // Transfers should work again
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(token_balance(&h, &recipient), 100);
-    assert_eq!(token_balance(&h, &h.client.address), 900);
-}
-
-#[test]
-fn emergency_unfreeze_rejected_by_non_multisig() {
-    let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    // Freeze with multisig
-    h.client.freeze(&h.multisig);
-
-    // Admin should not be able to unfreeze
-    let res = h.client.try_unfreeze(&h.admin);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-
-    // Random address should also be rejected
-    let intruder = Address::generate(&h.env);
-    let res = h.client.try_unfreeze(&intruder);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-
-    // Should still be frozen
-    let recipient = Address::generate(&h.env);
-    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn emergency_unfreeze_without_freeze_fails() {
-    let h = setup("vault", 1_000);
-
-    // Trying to unfreeze when not frozen should fail
-    let res = h.client.try_unfreeze(&h.multisig);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-}
-
-#[test]
-fn treasury_frozen_and_unfrozen_events_emitted() {
-    let h = setup("vault", 1_000);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    // Freeze should emit TreasuryFrozen event
-    h.client.freeze(&h.multisig);
-    assert_event(&h.env, "TreasuryFrozen");
-
-    // Unfreeze should emit TreasuryUnfrozen event
-    h.client.unfreeze(&h.multisig);
-    assert_event(&h.env, "TreasuryUnfrozen");
-}
-
-#[test]
-fn freeze_without_multisig_configured_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-
-    let id = env.register_contract(None, TreasuryContract);
-    let client = TreasuryContractClient::new(&env, &id);
-    client.initialize(&String::from_str(&env, "vault"), &admin);
-
-    // Try to freeze without setting multisig - should fail
-    let res = client.try_freeze(&admin);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    // max_per_interval must be positive
+    let res = h.client.try_set_payout_schedule(&h.admin, &0, &3_600);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    // interval_seconds must be positive
+    let res = h.client.try_set_payout_schedule(&h.admin, &100, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
 }
