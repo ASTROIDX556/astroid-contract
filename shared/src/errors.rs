@@ -31,12 +31,17 @@ pub enum Error {
     PolicyRecipientRestricted = 22,
     PolicyMerchantBlocked = 23,
     PolicyCategoryRestricted = 24,
+    /// The asset is not in the organization's whitelist.
     AssetNotWhitelisted = 25,
-    PolicyPaused = 26,
+    AssetNotWhitelisted = 25,
+    /// A proposed spend would breach a per-asset spending allowance.
+    PolicyAllowanceExceeded = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
+    /// System-wide emergency pause: all critical registry operations are halted.
+    ContractPaused = 32,
 
     // --- Budget (40-49) ---
     BudgetExceeded = 40,
@@ -44,6 +49,10 @@ pub enum Error {
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
+    VelocityExceeded = 45,
+
+    // --- Treasury (91-99) ---
+    PayoutScheduleViolated = 91,
 
     // --- Wallet (50-59) ---
     WalletFrozen = 50,

@@ -54,10 +54,10 @@ fn mul_underflow() {
 fn mul_large_values() {
     // Both large positive — still fits.
     assert_eq!(checked_mul(1_000_000, 1_000_000), Ok(1_000_000_000_000));
-    // Large negative * large positive — overflow.
+    // Large negative * large positive — well within i128 range.
     assert_eq!(
         checked_mul(-1_000_000_000_000i128, 1_000_000_000_000i128),
-        Err(Error::Overflow)
+        Ok(-1_000_000_000_000_000_000_000_000i128)
     );
 }
 
@@ -185,11 +185,10 @@ fn abs_extremes() {
 
 #[test]
 fn math_additional_edge_cases() {
-    // Underflow only when the result drops below the minimum value. Per the
-    // helper contracts, `checked_add`/`checked_mul` report any wrap as Overflow
-    // while `checked_sub` reports wraps as Underflow.
+    // Per the helper contracts, any wrap (including subtraction below the
+    // minimum value) reports as Overflow.
     assert_eq!(checked_sub(0, 1), Ok(-1));
-    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Underflow));
+    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Overflow));
     assert_eq!(checked_add(i128::MIN, -1), Err(Error::Overflow));
     // Multiplication overflow on the extreme negative bound.
     assert_eq!(checked_mul(i128::MIN, -1), Err(Error::Overflow));
@@ -258,14 +257,6 @@ fn time_validation() {
 fn constants_are_sane() {
     const _: () = {
         assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
-    };
-    const _: () = {
-        assert!(MAX_SIGNERS >= 1);
-    };
-    const _: () = {
-        assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
-    };
-    const _: () = {
         assert!(MAX_SIGNERS >= 1);
     };
 }

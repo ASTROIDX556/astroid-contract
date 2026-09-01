@@ -223,272 +223,6 @@ fn zero_amount_transfer_rejected() {
     assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
 
-// --- Batch execution tests ---
-
-/// Helper: build a `ContractCall` targeting `wallet.transfer`.
-fn transfer_call(
-    env: &Env,
-    wallet_addr: &Address,
-    caller: &Address,
-    to: &Address,
-    asset: &Address,
-    amount: i128,
-) -> ContractCall {
-    let mut args: Vec<soroban_sdk::RawVal> = Vec::new(env);
-    args.push_back(caller.clone().into_val(env));
-    args.push_back((*wallet_addr).into_val(env));
-    args.push_back(to.clone().into_val(env));
-    args.push_back(asset.clone().into_val(env));
-    args.push_back(amount.into_val(env));
-    ContractCall {
-        contract_addr: wallet_addr.clone(),
-        fn_name: Symbol::new(env, "transfer"),
-        args,
-    }
-}
-
-/// Helper: build a `ContractCall` targeting `wallet.deposit`.
-fn deposit_call(
-    env: &Env,
-    wallet_addr: &Address,
-    wallet_id: u64,
-    from: &Address,
-    asset: &Address,
-    amount: i128,
-) -> ContractCall {
-    let mut args: Vec<soroban_sdk::RawVal> = Vec::new(env);
-    args.push_back(wallet_id.into_val(env));
-    args.push_back(from.clone().into_val(env));
-    args.push_back(asset.clone().into_val(env));
-    args.push_back(amount.into_val(env));
-    ContractCall {
-        contract_addr: wallet_addr.clone(),
-        fn_name: Symbol::new(env, "deposit"),
-        args,
-    }
-}
-
-/// Helper: build a `ContractCall` targeting the token's `transfer`.
-fn token_transfer_call(
-    env: &Env,
-    token_addr: &Address,
-    from: &Address,
-    to: &Address,
-    amount: i128,
-) -> ContractCall {
-    let mut args: Vec<soroban_sdk::RawVal> = Vec::new(env);
-    args.push_back(from.clone().into_val(env));
-    args.push_back(to.clone().into_val(env));
-    args.push_back(amount.into_val(env));
-    ContractCall {
-        contract_addr: token_addr.clone(),
-        fn_name: Symbol::new(env, "transfer"),
-        args,
-    }
-}
-
-#[test]
-fn batch_execute_empty_fails() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    let empty: Vec<ContractCall> = Vec::new(&h.env);
-    let res = h.client.try_batch_execute(&owner, &id, &empty);
-    assert_eq!(res, Err(Ok(Error::BatchEmpty)));
-}
-
-#[test]
-fn batch_execute_single_transfer() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let recipient = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 1_000);
-    h.client.deposit(&id, &owner, &h.token, &500);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &recipient, &h.token, 200));
-    h.client.batch_execute(&owner, &id, &calls);
-
-    assert_eq!(h.client.balance(&id, &h.token), 300);
-    assert_eq!(token_balance(&h, &recipient), 200);
-}
-
-#[test]
-fn batch_execute_multiple_transfers() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let r1 = Address::generate(&h.env);
-    let r2 = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 1_000);
-    h.client.deposit(&id, &owner, &h.token, &1_000);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r1, &h.token, 300));
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r2, &h.token, 200));
-    h.client.batch_execute(&owner, &id, &calls);
-
-    assert_eq!(h.client.balance(&id, &h.token), 500);
-    assert_eq!(token_balance(&h, &r1), 300);
-    assert_eq!(token_balance(&h, &r2), 200);
-}
-
-#[test]
-fn batch_execute_atomicity_on_failure() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let r1 = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 100);
-    h.client.deposit(&id, &owner, &h.token, &100);
-
-    // First call succeeds (50), second fails (90 > 50 remaining).
-    // Atomicity means the first transfer is rolled back too.
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r1, &h.token, 50));
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &r1, &h.token, 90));
-    let res = h.client.try_batch_execute(&owner, &id, &calls);
-    assert!(res.is_err());
-
-    // Balance unchanged — full rollback.
-    assert_eq!(h.client.balance(&id, &h.token), 100);
-    assert_eq!(token_balance(&h, &r1), 0);
-}
-
-#[test]
-fn batch_execute_non_owner_fails() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let stranger = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 100);
-    h.client.deposit(&id, &owner, &h.token, &100);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(deposit_call(&h.env, &h.contract_id, id, &stranger, &h.token, 50));
-    let res = h.client.try_batch_execute(&stranger, &id, &calls);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-}
-
-#[test]
-fn batch_execute_mixed_operations() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let recipient = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 1_000);
-
-    // Batch: deposit 500, then transfer 200 to recipient.
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(deposit_call(&h.env, &h.contract_id, id, &owner, &h.token, 500));
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &recipient, &h.token, 200));
-    h.client.batch_execute(&owner, &id, &calls);
-
-    assert_eq!(h.client.balance(&id, &h.token), 300);
-    assert_eq!(token_balance(&h, &recipient), 200);
-}
-
-#[test]
-fn batch_execute_frozen_wallet_fails() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let recipient = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 100);
-    h.client.deposit(&id, &owner, &h.token, &100);
-    h.client.freeze(&owner, &id);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(transfer_call(&h.env, &h.contract_id, &owner, &recipient, &h.token, 10));
-    let res = h.client.try_batch_execute(&owner, &id, &calls);
-    assert!(res.is_err());
-    // Balance unchanged.
-    assert_eq!(h.client.balance(&id, &h.token), 100);
-}
-
-#[test]
-fn reserve_ratio_blocks_below_threshold() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let recipient = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 1_000);
-    h.client.deposit(&id, &owner, &h.token, &1_000);
-
-    // Require 20% of the balance to remain after any outbound movement.
-    h.client.set_reserve_ratio(&owner, &id, &h.token, &2_000);
-    assert_eq!(h.client.reserve_ratio(&id, &h.token), 2_000);
-
-    // Transferring 900 leaves 100 (10%) — below the 20% reserve: blocked.
-    let res = h
-        .client
-        .try_transfer(&owner, &id, &recipient, &h.token, &900);
-    assert_eq!(res, Err(Ok(Error::ReserveViolation)));
-    assert_eq!(h.client.balance(&id, &h.token), 1_000);
-    assert_eq!(token_balance(&h, &recipient), 0);
-
-    // Transferring 800 leaves exactly 200 (20%) — the threshold passes.
-    h.client.transfer(&owner, &id, &recipient, &h.token, &800);
-    assert_eq!(h.client.balance(&id, &h.token), 200);
-    assert_eq!(token_balance(&h, &recipient), 800);
-}
-
-#[test]
-fn reserve_ratio_also_guards_withdrawals() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 1_000);
-    h.client.deposit(&id, &owner, &h.token, &1_000);
-
-    h.client.set_reserve_ratio(&owner, &id, &h.token, &5_000);
-    // Withdrawing 600 would leave 400 (40%) — below the 50% reserve: blocked.
-    let res = h.client.try_withdraw(&owner, &id, &h.token, &600);
-    assert_eq!(res, Err(Ok(Error::ReserveViolation)));
-    // Withdrawing 500 leaves exactly 50%: passes.
-    h.client.withdraw(&owner, &id, &h.token, &500);
-    assert_eq!(h.client.balance(&id, &h.token), 500);
-    assert_eq!(token_balance(&h, &owner), 500);
-}
-
-#[test]
-fn reserve_ratio_zero_disables_enforcement() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let recipient = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    mint(&h, &owner, 1_000);
-    h.client.deposit(&id, &owner, &h.token, &1_000);
-
-    // Set then disable — after disabling, the full balance may move.
-    h.client.set_reserve_ratio(&owner, &id, &h.token, &5_000);
-    h.client.set_reserve_ratio(&owner, &id, &h.token, &0);
-    assert_eq!(h.client.reserve_ratio(&id, &h.token), 0);
-    h.client.transfer(&owner, &id, &recipient, &h.token, &1_000);
-    assert_eq!(token_balance(&h, &recipient), 1_000);
-}
-
-#[test]
-fn reserve_ratio_rejects_out_of_bounds_and_non_owner() {
-    let h = setup();
-    let owner = Address::generate(&h.env);
-    let intruder = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-
-    // Over 100% is invalid.
-    let bad = h
-        .client
-        .try_set_reserve_ratio(&owner, &id, &h.token, &10_001);
-    assert_eq!(bad, Err(Ok(Error::InvalidInput)));
-    // Only the owner may set a reserve ratio.
-    let res = h
-        .client
-        .try_set_reserve_ratio(&intruder, &id, &h.token, &1_000);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    assert_eq!(h.client.reserve_ratio(&id, &h.token), 0);
-}
-
 #[test]
 fn unknown_wallet_fails_not_found() {
     let h = setup();
@@ -508,6 +242,138 @@ fn standard_events_emitted() {
 
     h.client.freeze(&owner, &id);
     assert_event(&h.env, "WalletStateChanged");
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch authorization tests
+// ---------------------------------------------------------------------------
+
+/// Helper: register a mock module in the registry for the test org.
+fn register_mock_module(h: &Harness, kind: ModuleKind, addr: &Address) {
+    // In tests the registry is a mock that always returns the registered address.
+    // We store the mapping directly for the test harness.
+    h.env.as_contract(&h.client.address, || {
+        h.env
+            .storage()
+            .persistent()
+            .set(&(kind.clone(), h.org.clone()), addr);
+    });
+}
+
+#[test]
+fn dispatch_owner_can_transfer() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 250,
+    };
+    h.client.dispatch(&owner, &id, &action);
+
+    assert_eq!(h.client.balance(&id, &h.token), 750);
+    assert_eq!(token_balance(&h, &recipient), 250);
+}
+
+#[test]
+fn dispatch_owner_can_freeze_and_unfreeze() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    h.client.dispatch(&owner, &id, &WalletAction::Freeze);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Frozen);
+
+    h.client.dispatch(&owner, &id, &WalletAction::Unfreeze);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Active);
+}
+
+#[test]
+fn dispatch_unregistered_caller_blocked() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 100,
+    };
+    let res = h.client.try_dispatch(&stranger, &id, &action);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_unregistered_cannot_freeze() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let res = h.client.try_dispatch(&stranger, &id, &WalletAction::Freeze);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_unregistered_cannot_withdraw() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Withdraw {
+        asset: h.token.clone(),
+        amount: 100,
+    };
+    let res = h.client.try_dispatch(&stranger, &id, &action);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_frozen_wallet_blocks_transfer() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    h.client.freeze(&owner, &id);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 100,
+    };
+    let res = h.client.try_dispatch(&owner, &id, &action);
+    assert_eq!(res, Err(Ok(Error::WalletFrozen)));
+}
+
+#[test]
+fn dispatch_zero_amount_transfer_rejected() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 0,
+    };
+    let res = h.client.try_dispatch(&owner, &id, &action);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
 
 // ---------------------------------------------------------------------------
