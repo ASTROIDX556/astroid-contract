@@ -324,6 +324,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "LastBatchNonce"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "ProposalCount"
                             }
                           ]
