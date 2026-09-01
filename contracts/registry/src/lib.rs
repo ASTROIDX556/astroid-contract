@@ -45,9 +45,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -72,6 +70,9 @@ enum DataKey {
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+    /// System-wide emergency pause (instance). When true, all critical registry
+    /// operations are halted until the admin unpauses.
+    Paused,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
 }
@@ -123,6 +124,46 @@ pub struct RegistryContract;
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl RegistryContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        Self::check_paused(&env)?;
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Organization`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        Self::check_paused(&env)?;
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Organization,
+            wasm_hash,
+        )
+    }
     /// Initialize the registry with its administrator. Callable once.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -132,8 +173,7 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("init")), admin);
+        astroid_shared::events::registry_initialized(&env, &admin);
         Ok(())
     }
 
@@ -144,6 +184,7 @@ impl RegistryContract {
         org: String,
         owner: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         require_non_empty(&org)?;
         Self::require_admin(&env, &caller)?;
@@ -153,10 +194,7 @@ impl RegistryContract {
         }
         env.storage().persistent().set(&key, &owner);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("register"), org.clone()),
-            owner,
-        );
+        astroid_shared::events::registry_org_registered(&env, &org, &owner);
         Ok(())
     }
 
@@ -168,6 +206,7 @@ impl RegistryContract {
         org: String,
         new_owner: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         let key = DataKey::Org(org.clone());
@@ -188,10 +227,7 @@ impl RegistryContract {
                 new_owner: new_owner.clone(),
             },
         );
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("owner"), org.clone()),
-            new_owner,
-        );
+        astroid_shared::events::registry_org_owner(&env, &org, &new_owner);
         Ok(())
     }
 
@@ -205,6 +241,7 @@ impl RegistryContract {
         kind: ModuleKind,
         address: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
@@ -225,15 +262,7 @@ impl RegistryContract {
                 address: address.clone(),
             },
         );
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("register"),
-                org.clone(),
-                kind,
-            ),
-            address,
-        );
+        astroid_shared::events::registry_module_registered(&env, &org, kind, &address);
         Ok(())
     }
 
@@ -247,6 +276,7 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         let mkey = DataKey::Module(org.clone(), kind);
@@ -256,10 +286,7 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &true);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("deprecate")),
-            (org, kind),
-        );
+        astroid_shared::events::registry_module_deprecated(&env, &org, kind);
         Ok(())
     }
 
@@ -270,6 +297,7 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         let mkey = DataKey::Module(org.clone(), kind);
@@ -279,10 +307,7 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &false);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("restore")),
-            (org, kind),
-        );
+        astroid_shared::events::registry_module_restored(&env, &org, kind);
         Ok(())
     }
 
@@ -312,6 +337,7 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
@@ -325,15 +351,7 @@ impl RegistryContract {
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
         }
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("remove"),
-                org.clone(),
-                kind,
-            ),
-            (),
-        );
+        astroid_shared::events::registry_module_removed(&env, &org, kind);
         Ok(())
     }
 
@@ -352,6 +370,7 @@ impl RegistryContract {
         account: Address,
         role: RegistryRole,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         let owner = Self::require_root_owner(&env, &caller, &org)?;
@@ -361,10 +380,7 @@ impl RegistryContract {
         let key = DataKey::OrgRole(org.clone(), account.clone());
         env.storage().persistent().set(&key, &role);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (org, account, role),
-        );
+        astroid_shared::events::registry_role_granted(&env, &org, &account, role);
         Ok(())
     }
 
@@ -387,10 +403,7 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (org, account),
-        );
+        astroid_shared::events::registry_role_revoked(&env, &org, &account);
         Ok(())
     }
 
@@ -424,6 +437,7 @@ impl RegistryContract {
         version: u32,
         address: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
         let vkey = DataKey::Version(kind, version);
@@ -436,15 +450,7 @@ impl RegistryContract {
             env.storage().persistent().set(&lkey, &version);
             Self::bump(&env, &lkey);
         }
-        env.events().publish(
-            (
-                symbol_short!("version"),
-                symbol_short!("register"),
-                kind,
-                version,
-            ),
-            address,
-        );
+        astroid_shared::events::registry_version_registered(&env, kind, version, &address);
         Ok(())
     }
 
@@ -494,15 +500,13 @@ impl RegistryContract {
 
     /// Rotate the admin. Only the current admin may do this.
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events().publish(
-            (symbol_short!("registry"), symbol_short!("setadmin")),
-            new_admin,
-        );
+        astroid_shared::events::registry_set_admin(&env, &new_admin);
         Ok(())
     }
 
@@ -526,8 +530,7 @@ impl RegistryContract {
                 frozen: true,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
+        astroid_shared::events::registry_frozen(&env, &org);
         Ok(())
     }
 
@@ -552,9 +555,40 @@ impl RegistryContract {
                 frozen: false,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
+        astroid_shared::events::registry_unfrozen(&env, &org);
         Ok(())
+    }
+
+    /// Emergency pause — system-wide circuit breaker. Only the protocol admin
+    /// may pause. When paused, all critical registry operations (module
+    /// registration, org management, grants, upgrades) are halted. Read-only
+    /// accessors and unpause remain available.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        astroid_shared::events::publish(&env, ContractEvent::ContractPaused { paused: true });
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("paused")), ());
+        Ok(())
+    }
+
+    /// Unpause — only the protocol admin may resume operations. Works even
+    /// when paused (the admin must always be able to restore service).
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        astroid_shared::events::publish(&env, ContractEvent::ContractPaused { paused: false });
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("unpaused")), ());
+        Ok(())
+    }
+
+    /// Read whether the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Record an approved WASM hash for a specific module kind.
@@ -564,14 +598,12 @@ impl RegistryContract {
         kind: ModuleKind,
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         env.storage().persistent().set(&key, &true);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("approved")),
-            (kind, wasm_hash),
-        );
+        astroid_shared::events::registry_wasm_approved(&env, kind, &wasm_hash);
         Ok(())
     }
 
@@ -582,16 +614,14 @@ impl RegistryContract {
         kind: ModuleKind,
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("removed")),
-            (kind, wasm_hash),
-        );
+        astroid_shared::events::registry_wasm_removed(&env, kind, &wasm_hash);
         Ok(())
     }
 
@@ -610,6 +640,17 @@ impl RegistryContract {
                 .get::<_, bool>(&DataKey::Frozen)
                 .unwrap_or(false),
             Error::RegistryFrozen
+        );
+        Ok(())
+    }
+
+    fn check_paused(env: &Env) -> Result<(), Error> {
+        ensure!(
+            !env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Paused)
+                .unwrap_or(false),
+            Error::ContractPaused
         );
         Ok(())
     }
@@ -701,6 +742,7 @@ impl RegistryContract {
 #[contractimpl]
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
         let address: Address = env
@@ -723,6 +765,7 @@ impl RegistryInterface for RegistryContract {
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         let key = DataKey::Org(org);
         let recorded: Address = env
