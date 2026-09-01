@@ -28,14 +28,18 @@ pub enum Error {
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
-    PolicyMerchantBlocked = 23,
-    PolicyCategoryRestricted = 24,
-    AssetNotWhitelisted = 25,
-    PolicyPaused = 26,
+    /// The asset is not in the organization's whitelist.
+    AssetNotWhitelisted = 24,
+    /// A proposed spend would breach a per-asset spending allowance.
+    PolicyAllowanceExceeded = 25,
+    /// A conditional policy rule denied the transaction.
+    RuleDenied = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
+    /// System-wide emergency pause: all critical registry operations are halted.
+    ContractPaused = 32,
 
     // --- Budget (40-44) ---
     BudgetExceeded = 40,
@@ -49,13 +53,13 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    UnauthorizedDispatch = 54,
 
-    // --- Multisig / approvals (61-69) ---
+    // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
     NotASigner = 63,
     InvalidThreshold = 64,
-    TimeLocked = 65,
     TooManySigners = 66,
     /// A sub-call within a batch failed; the entire batch reverted atomically.
     BatchCallFailed = 67,
@@ -70,9 +74,6 @@ pub enum Error {
     /// A caller without governance rights attempted to modify signers,
     /// weights or the threshold.
     UnauthorizedModification = 92,
-    InvalidNonce = 67,
-    BatchCallFailed = 68,
-    InsufficientWeight = 69,
 
     // --- Proposal (71-79) ---
     ProposalExpired = 71,
@@ -80,8 +81,6 @@ pub enum Error {
     ProposalNotApproved = 73,
     NotAnApprover = 74,
     CancellationWindowClosed = 75,
-    MathOverflow = 76,
-    DivisionByZero = 77,
     /// A prerequisite proposal has not executed, so the dependent proposal may
     /// not execute yet.
     PrerequisiteNotMet = 78,
@@ -91,8 +90,9 @@ pub enum Error {
     // --- Escrow (80-81) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
+    GraceActive = 82,
 
-    // --- Treasury allowances (83-85) ---
+    // --- Treasury allowances (83-84) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
     AllowanceNotFound = 85,

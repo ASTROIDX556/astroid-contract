@@ -9,6 +9,8 @@ pub const SECONDS_PER_MONTH: u64 = 2_592_000;
 
 /// Approximate number of ledgers closed per day on Stellar (~5s per ledger).
 pub const DAY_IN_LEDGERS: u32 = 17_280;
+/// Approximate number of ledgers closed per hour on Stellar.
+pub const HOUR_IN_LEDGERS: u32 = 720;
 
 /// Instance storage TTL bump (7 days) and the threshold at which we bump.
 pub const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
@@ -38,18 +40,10 @@ pub const GOVERNANCE_GRACE_PERIOD: u64 = SECONDS_PER_WEEK;
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
 
-/// Upper bound on how many prerequisite proposals one proposal may depend on.
-/// Every prerequisite is read once when the dependent proposal executes, so
-/// this caps the storage reads a single execution can incur.
-pub const MAX_DEPENDENCIES: u32 = 8;
-
-/// Upper bound on how many discrete calls a single batch may contain (gas safety).
-pub const MAX_BATCH_CALLS: u32 = 16;
-
-/// Upper bound on how many recipients a single batch payment may pay out to.
-/// Batches are executed atomically, so this caps the worst-case cost of one
-/// invocation (and therefore the cost of the revert when a leg fails).
-pub const MAX_BATCH_PAYMENTS: u32 = 32;
-
-/// Upper bound on how many distinct assets a single escrow agreement may hold.
+/// Upper bound on how many distinct assets a single escrow may hold (gas
+/// safety — every asset in the list is iterated on create/release/refund).
 pub const MAX_ESCROW_ASSETS: u32 = 10;
+
+/// Upper bound on how many override-release public keys an escrow may
+/// configure for its signature-based manual release path.
+pub const MAX_RELEASE_SIGNERS: u32 = 10;

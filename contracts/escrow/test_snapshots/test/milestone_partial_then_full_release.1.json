@@ -488,6 +488,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "grace_period"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "memo"
                       },
                       "val": {
@@ -524,6 +532,14 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "refund_window"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     },
                     {
@@ -2148,6 +2164,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -2184,6 +2208,14 @@
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {
@@ -2838,6 +2870,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -2874,6 +2914,14 @@
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {
@@ -3386,6 +3434,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -3422,6 +3478,14 @@
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {
@@ -3657,6 +3721,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "grace_period"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "memo"
                   },
                   "val": {
@@ -3693,6 +3765,14 @@
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {

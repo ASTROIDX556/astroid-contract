@@ -245,11 +245,138 @@ fn standard_events_emitted() {
 }
 
 // ---------------------------------------------------------------------------
-// Emergency pause switch / circuit breaker
+// Dispatch authorization tests
 // ---------------------------------------------------------------------------
 
-/// Create a wallet holding `amount` of the harness token.
-fn funded_wallet(h: &Harness, amount: i128) -> (u64, Address) {
+/// Helper: register a mock module in the registry for the test org.
+fn register_mock_module(h: &Harness, kind: ModuleKind, addr: &Address) {
+    // In tests the registry is a mock that always returns the registered address.
+    // We store the mapping directly for the test harness.
+    h.env.as_contract(&h.client.address, || {
+        h.env
+            .storage()
+            .persistent()
+            .set(&(kind.clone(), h.org.clone()), addr);
+    });
+}
+
+#[test]
+fn dispatch_owner_can_transfer() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 250,
+    };
+    h.client.dispatch(&owner, &id, &action);
+
+    assert_eq!(h.client.balance(&id, &h.token), 750);
+    assert_eq!(token_balance(&h, &recipient), 250);
+}
+
+#[test]
+fn dispatch_owner_can_freeze_and_unfreeze() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    h.client.dispatch(&owner, &id, &WalletAction::Freeze);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Frozen);
+
+    h.client.dispatch(&owner, &id, &WalletAction::Unfreeze);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Active);
+}
+
+#[test]
+fn dispatch_unregistered_caller_blocked() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 100,
+    };
+    let res = h.client.try_dispatch(&stranger, &id, &action);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_unregistered_cannot_freeze() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let res = h.client.try_dispatch(&stranger, &id, &WalletAction::Freeze);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_unregistered_cannot_withdraw() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Withdraw {
+        asset: h.token.clone(),
+        amount: 100,
+    };
+    let res = h.client.try_dispatch(&stranger, &id, &action);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_frozen_wallet_blocks_transfer() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    h.client.freeze(&owner, &id);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 100,
+    };
+    let res = h.client.try_dispatch(&owner, &id, &action);
+    assert_eq!(res, Err(Ok(Error::WalletFrozen)));
+}
+
+#[test]
+fn dispatch_zero_amount_transfer_rejected() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let action = WalletAction::Transfer {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 0,
+    };
+    let res = h.client.try_dispatch(&owner, &id, &action);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+// ---------------------------------------------------------------------------
 // Role-based access control
 // ---------------------------------------------------------------------------
 
@@ -259,7 +386,7 @@ fn funded_wallet(h: &Harness, amount: i128) -> (Address, u64) {
     let id = h.client.create_wallet(&owner);
     mint(h, &owner, amount);
     h.client.deposit(&id, &owner, &h.token, &amount);
-    (id, owner)
+    (owner, id)
 }
 
 #[test]
@@ -272,7 +399,7 @@ fn breaker_starts_reset_and_guardian_defaults_to_admin() {
 #[test]
 fn paused_wallet_contract_blocks_all_outgoing_value() {
     let h = setup();
-    let (id, owner) = funded_wallet(&h, 1_000);
+    let (owner, id) = funded_wallet(&h, 1_000);
     let recipient = Address::generate(&h.env);
 
     h.client.emergency_pause(&h.admin);
@@ -307,7 +434,7 @@ fn paused_wallet_contract_blocks_new_wallets() {
 #[test]
 fn inspection_and_recovery_stay_available_while_paused() {
     let h = setup();
-    let (id, owner) = funded_wallet(&h, 1_000);
+    let (owner, id) = funded_wallet(&h, 1_000);
     h.client.emergency_pause(&h.admin);
 
     // Read-only inspection is unaffected.
@@ -332,7 +459,7 @@ fn inspection_and_recovery_stay_available_while_paused() {
 #[test]
 fn normal_operation_resumes_after_unpause() {
     let h = setup();
-    let (id, owner) = funded_wallet(&h, 1_000);
+    let (owner, id) = funded_wallet(&h, 1_000);
     let recipient = Address::generate(&h.env);
 
     h.client.emergency_pause(&h.admin);
@@ -412,7 +539,7 @@ fn redundant_breaker_transitions_are_rejected() {
     assert_eq!(
         h.client.try_emergency_pause(&h.admin),
         Err(Ok(Error::InvalidState))
-    (owner, id)
+    );
 }
 
 #[test]
@@ -648,6 +775,9 @@ fn breaker_events_are_emitted() {
     assert_event(&h.env, "WalletPaused");
     h.client.emergency_unpause(&h.admin);
     assert_event(&h.env, "WalletUnpaused");
+}
+
+#[test]
 fn granting_on_an_archived_wallet_is_refused() {
     let h = setup();
     let owner = Address::generate(&h.env);

@@ -101,6 +101,44 @@ pub struct WalletContract;
 
 #[contractimpl]
 impl WalletContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Wallet`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Wallet,
+            wasm_hash,
+        )
+    }
     /// Initialize the contract with an emergency admin (may freeze wallets).
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -122,10 +160,7 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Guardian, &guardian);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("guardian")),
-            guardian,
-        );
+        events::wallet_guardian(&env, &guardian);
         Ok(())
     }
 
@@ -215,10 +250,7 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("deposit")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_deposit(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -236,7 +268,6 @@ impl WalletContract {
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
@@ -263,7 +294,6 @@ impl WalletContract {
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
@@ -272,10 +302,7 @@ impl WalletContract {
             &wallet.owner,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("withdraw")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_withdraw(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -376,10 +403,7 @@ impl WalletContract {
             return Err(Error::InvalidInput);
         }
         access::set_role(&env, wallet_id, &account, role);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (wallet_id, account, role),
-        );
+        events::wallet_role_granted(&env, wallet_id, &account, role);
         Ok(())
     }
 
@@ -396,11 +420,39 @@ impl WalletContract {
     ) -> Result<(), Error> {
         Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         access::clear_role(&env, wallet_id, &account)?;
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (wallet_id, account),
-        );
+        events::wallet_role_revoked(&env, wallet_id, &account);
         Ok(())
+    }
+
+    /// Dispatch a wallet operation from an authorized caller.
+    ///
+    /// The `caller` must be one of:
+    /// - the wallet's **owner** (verified against on-chain wallet state), or
+    /// - a **registered module** for this wallet's organization, confirmed via
+    ///   the on-chain registry contract.
+    ///
+    /// This is the primary entrypoint for organizational modules (multisig,
+    /// treasury, policy, etc.) to execute wallet operations on behalf of the
+    /// organization. Direct owner calls to `transfer` / `freeze` etc. remain
+    /// available for backwards compatibility.
+    ///
+    /// # Errors
+    /// - [`Error::UnauthorizedDispatch`] if the caller is neither the owner nor
+    ///   a registered module.
+    /// - Propagates any error from the underlying wallet operation.
+    pub fn dispatch(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        action: WalletAction,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Authorize: caller must be the wallet owner, the wallet admin, or a
+        // registered module for this wallet's organization.
+        Self::require_registered_caller(&env, &caller, wallet_id)?;
+
+        Self::execute_dispatch(&env, wallet_id, &action)
     }
 
     // --- views ---

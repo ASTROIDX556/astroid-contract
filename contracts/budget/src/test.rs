@@ -416,7 +416,7 @@ fn assert_event(env: &Env, variant: &str) {
         .events()
         .all()
         .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
@@ -714,6 +714,8 @@ fn unknown_asset_budget_is_rejected() {
     let token = Address::generate(&h.env);
     let res = h.client.try_asset_remaining(&id(&h.env, "eng"), &token);
     assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
+}
+
 #[test]
 fn test_rollover_prevention() {
     let env = Env::default();
