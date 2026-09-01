@@ -75,6 +75,10 @@ pub struct Escrow {
     pub override_signers: Vec<BytesN<32>>,
     pub override_threshold: u32,
     pub override_nonce: u64,
+    /// Pending beneficiary replacement address (None = no proposal active).
+    pub proposed_beneficiary: Option<Address>,
+    /// Ledger sequence at which the beneficiary proposal was created.
+    pub proposed_at_seq: u32,
 }
 
 #[contracttype]

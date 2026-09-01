@@ -43,9 +43,7 @@ pub enum Error {
     AssetNotWhitelisted = 25,
     AssetNotWhitelisted = 25,
     /// A proposed spend would breach a per-asset spending allowance.
-    PolicyAllowanceExceeded = 25,
-    /// A conditional policy rule denied the transaction.
-    RuleDenied = 26,
+    PolicyAllowanceExceeded = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -113,7 +111,7 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-81) ---
+    // --- Escrow (80-82) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
@@ -121,5 +119,4 @@ pub enum Error {
     // --- Treasury allowances (83-84) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
-    AllowanceNotFound = 85,
 }

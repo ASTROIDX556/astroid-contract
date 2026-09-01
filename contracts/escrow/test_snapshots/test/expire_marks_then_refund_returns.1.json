@@ -466,6 +466,20 @@
                     },
                     {
                       "key": {
+                        "symbol": "proposed_at_seq"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "proposed_beneficiary"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
                         "symbol": "recipient"
                       },
                       "val": {
@@ -2216,6 +2230,20 @@
                 },
                 {
                   "key": {
+                    "symbol": "proposed_at_seq"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_beneficiary"
+                  },
+                  "val": "void"
+                },
+                {
+                  "key": {
                     "symbol": "recipient"
                   },
                   "val": {
@@ -2723,6 +2751,20 @@
                   "val": {
                     "u32": 0
                   }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_at_seq"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_beneficiary"
+                  },
+                  "val": "void"
                 },
                 {
                   "key": {

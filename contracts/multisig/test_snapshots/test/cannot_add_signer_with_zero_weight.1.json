@@ -349,7 +349,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "add_signer"
+                "symbol": "propose_signer_addition"
               }
             ],
             "data": {
@@ -382,7 +382,7 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "add_signer"
+                "symbol": "propose_signer_addition"
               }
             ],
             "data": {
@@ -443,7 +443,7 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "add_signer"
+                  "symbol": "propose_signer_addition"
                 },
                 {
                   "vec": [

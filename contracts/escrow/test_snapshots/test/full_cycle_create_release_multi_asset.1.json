@@ -534,7 +534,7 @@
                     },
                     {
                       "key": {
-                        "symbol": "recipient"
+                        "symbol": "override_nonce"
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -550,11 +550,25 @@
                     },
                     {
                       "key": {
-                        "symbol": "release_threshold"
+                        "symbol": "override_threshold"
                       },
                       "val": {
                         "u32": 0
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "proposed_at_seq"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "proposed_beneficiary"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -2889,7 +2903,7 @@
                 },
                 {
                   "key": {
-                    "symbol": "recipient"
+                    "symbol": "override_nonce"
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -2905,11 +2919,25 @@
                 },
                 {
                   "key": {
-                    "symbol": "release_threshold"
+                    "symbol": "override_threshold"
                   },
                   "val": {
                     "u32": 0
                   }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_at_seq"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_beneficiary"
+                  },
+                  "val": "void"
                 },
                 {
                   "key": {
@@ -3464,7 +3492,7 @@
                 },
                 {
                   "key": {
-                    "symbol": "recipient"
+                    "symbol": "override_nonce"
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -3480,11 +3508,25 @@
                 },
                 {
                   "key": {
-                    "symbol": "release_threshold"
+                    "symbol": "override_threshold"
                   },
                   "val": {
                     "u32": 0
                   }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_at_seq"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_beneficiary"
+                  },
+                  "val": "void"
                 },
                 {
                   "key": {
@@ -3955,7 +3997,7 @@
                 },
                 {
                   "key": {
-                    "symbol": "recipient"
+                    "symbol": "override_nonce"
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -3971,11 +4013,25 @@
                 },
                 {
                   "key": {
-                    "symbol": "release_threshold"
+                    "symbol": "override_threshold"
                   },
                   "val": {
                     "u32": 0
                   }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_at_seq"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "proposed_beneficiary"
+                  },
+                  "val": "void"
                 },
                 {
                   "key": {

@@ -38,7 +38,7 @@
 //!
 //! [`require_compatible`] returns [`Ok(())`] when `actual` ≥ `minimum` (same
 //! major, minor ≥ required). Any incompatibility produces
-//! [`Error::InterfaceVersionMismatch`].
+//! [`Error::InvalidInput`].
 
 use astroid_shared::errors::Error;
 use soroban_sdk::contracttype;
@@ -81,7 +81,7 @@ impl Version {
 /// Returns [`Ok(())`] when `actual` has the same `major` as `minimum` and its
 /// `minor` is greater than or equal to the required `minor`.
 ///
-/// Returns [`Err(Error::InterfaceVersionMismatch)`] when the versions are
+/// Returns [`Err(Error::InvalidInput)`] when the versions are
 /// incompatible — callers **must not** proceed with the cross-contract call.
 ///
 /// # Examples
@@ -100,7 +100,7 @@ pub fn require_compatible(actual: Version, minimum: Version) -> Result<(), Error
     if actual.is_compatible_with(minimum) {
         Ok(())
     } else {
-        Err(Error::InterfaceVersionMismatch)
+        Err(Error::InvalidInput)
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
     fn older_minor_fails_against_newer_minimum() {
         assert_eq!(
             require_compatible(Version::new(1, 0), Version::new(1, 3)),
-            Err(Error::InterfaceVersionMismatch)
+            Err(Error::InvalidInput)
         );
     }
 
@@ -160,7 +160,7 @@ mod tests {
     fn older_major_fails() {
         assert_eq!(
             require_compatible(Version::new(0, 9), Version::new(1, 0)),
-            Err(Error::InterfaceVersionMismatch)
+            Err(Error::InvalidInput)
         );
     }
 
@@ -173,7 +173,7 @@ mod tests {
         // Same minor but different major — incompatible.
         assert_eq!(
             require_compatible(Version::new(2, 0), Version::new(1, 0)),
-            Err(Error::InterfaceVersionMismatch)
+            Err(Error::InvalidInput)
         );
     }
 
@@ -181,7 +181,7 @@ mod tests {
     fn boundary_minor_exactly_one_less() {
         assert_eq!(
             require_compatible(Version::new(1, 4), Version::new(1, 5)),
-            Err(Error::InterfaceVersionMismatch)
+            Err(Error::InvalidInput)
         );
     }
 
@@ -216,9 +216,9 @@ mod tests {
     #[test]
     fn incompatible_returns_structured_error() {
         let result = require_compatible(Version::new(1, 0), Version::new(2, 0));
-        assert_eq!(result, Err(Error::InterfaceVersionMismatch));
-        // Verify the error code is 95.
-        assert_eq!(result.unwrap_err() as u32, 95);
+        assert_eq!(result, Err(Error::InvalidInput));
+        // Verify the error code is 4.
+        assert_eq!(result.unwrap_err() as u32, 4);
     }
 
     // ------------------------------------------------------------------

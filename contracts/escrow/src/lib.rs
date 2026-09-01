@@ -70,8 +70,8 @@ pub use storage::{
 };
 
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_RELEASE_SIGNERS,
-    MIN_THRESHOLD, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    HOUR_IN_LEDGERS, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS,
+    MAX_SIGNERS, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
@@ -136,17 +136,14 @@ pub fn calculate_vested_amount(
 /// escrow + nonce (see [`EscrowContract::release_with_signatures`]).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReleaseSignature {
-    pub signer: BytesN<32>,
-    pub signature: BytesN<64>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OverrideSignature {
     pub public_key: BytesN<32>,
     pub signature: BytesN<64>,
 }
+
+/// Mandatory number of ledger sequences that must elapse between a beneficiary
+/// proposal and when it may be claimed. ~1 hour on Stellar.
+pub const BENEFICIARY_TIMELEDGER_DELTA: u32 = HOUR_IN_LEDGERS;
 
 /// A single milestone within a milestone-based escrow. `release_bps` is the
 /// proportion of the total escrow amount (in basis points, 10_000 = 100%) that
@@ -267,6 +264,8 @@ impl EscrowContract {
             deadline,
             funded_amount,
             memo,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
             schedule: ReleaseSchedule::none(),
             released_amount: 0,
             override_signers: release_signers,
@@ -336,6 +335,8 @@ impl EscrowContract {
             override_signers: Vec::new(&env),
             override_threshold: 0,
             override_nonce: 0,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
         };
         store_escrow(&env, id, &escrow);
 
@@ -411,6 +412,8 @@ impl EscrowContract {
             override_signers: Vec::new(&env),
             override_threshold: 0,
             override_nonce: 0,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
         };
         store_escrow(&env, id, &escrow);
 
@@ -473,6 +476,8 @@ impl EscrowContract {
             deadline: unlock_time,
             funded_amount: 0,
             memo,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
             schedule,
             released_amount: 0,
             override_signers: Vec::new(&env),
@@ -884,7 +889,157 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Close a settled escrow (terminal).
+    /// Propose a new beneficiary for this escrow. Only the sender or arbiter may
+    /// call. A mandatory ledger-sequence timelock must elapse before the proposal
+    /// can be claimed via [`claim_beneficiary`]. Submitting a new proposal while
+    /// one already exists replaces it (resets the timelock).
+    pub fn propose_beneficiary(
+        env: Env,
+        caller: Address,
+        id: u64,
+        new_beneficiary: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if caller != escrow.sender && caller != escrow.arbiter {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Created | EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        if new_beneficiary == escrow.recipient {
+            return Err(Error::InvalidInput);
+        }
+        if new_beneficiary == escrow.sender {
+            return Err(Error::InvalidInput);
+        }
+        if new_beneficiary == escrow.arbiter {
+            return Err(Error::InvalidInput);
+        }
+        // Reject the zero address as a beneficiary.
+        if is_zero_address(&env, &new_beneficiary) {
+            return Err(Error::InvalidInput);
+        }
+
+        let current_seq = env.ledger().sequence();
+        escrow.proposed_beneficiary = Some(new_beneficiary.clone());
+        escrow.proposed_at_seq = current_seq;
+        store_escrow(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("bene_prp")),
+            (id, caller, new_beneficiary, current_seq),
+        );
+        Ok(())
+    }
+
+    /// Cancel an escrow before its fulfillment `deadline` and return any held
+    /// funds to the sender. Either the `sender` or the `arbiter` may cancel, but
+    /// only while the escrow is still `Funded`/`Created` and before the deadline
+    /// has been reached — this is the pre-fulfillment dispute exit.
+    pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.sender != caller && escrow.arbiter != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
+        // Cancellation is only permitted before the fulfillment deadline.
+        if env.ledger().timestamp() >= escrow.deadline {
+            return Err(Error::InvalidState);
+        }
+
+        Self::transfer_all(&env, &escrow, &escrow.sender);
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
+        }
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("cancelled")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Claim a previously proposed beneficiary change. Callable only by the
+    /// proposed beneficiary and only after [`BENEFICIARY_TIMELEDGER_DELTA`]
+    /// ledgers have elapsed since the proposal was created. On success the
+    /// escrow's `recipient` is updated and the proposal is cleared.
+    pub fn claim_beneficiary(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Created | EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        let proposed = escrow
+            .proposed_beneficiary
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
+        if *proposed != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let current_seq = env.ledger().sequence();
+        let required_seq = escrow
+            .proposed_at_seq
+            .checked_add(BENEFICIARY_TIMELEDGER_DELTA)
+            .ok_or(Error::Overflow)?;
+        if current_seq < required_seq {
+            return Err(Error::TimeLockActive);
+        }
+
+        escrow.recipient = proposed.clone();
+        escrow.proposed_beneficiary = None;
+        escrow.proposed_at_seq = 0;
+        store_escrow(&env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("bene_clm")),
+            (id, caller, escrow.recipient),
+        );
+        Ok(())
+    }
+
+    /// Reclaim the escrowed funds to the sender after the grace period has fully
+    /// elapsed without counterparty fulfillment. Only the `sender` may reclaim,
+    /// and only once `now >= deadline + grace_period`. This is the post-dispute
+    /// safe-settlement path that guarantees funds cannot be stranded or
+    /// double-spent while a dispute is unresolved.
+    pub fn reclaim(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        // Only the sender may reclaim post-grace.
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+        // The grace window must have fully elapsed without fulfillment.
+        let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
+        if env.ledger().timestamp() < grace_end {
+            return Err(Error::GraceActive);
+        }
+        Self::require_refund_window_open(&env, &escrow)?;
+
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+        Self::transfer_all(&env, &escrow, &escrow.sender);
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
+        }
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("reclaimed")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Close a settled escrow (terminal). Callable only once the funds have
+    /// actually moved — i.e. from `Released` or `Refunded`. An `Expired` escrow
+    /// must be `refund`ed first so custody is emptied before it can be closed;
+    /// this prevents closing over still-locked funds.
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -996,8 +1151,13 @@ impl EscrowContract {
             state: EscrowState::Funded,
             deadline,
             memo,
-            release_signers,
-            release_threshold,
+            schedule: ReleaseSchedule::none(),
+            released_amount: 0,
+            override_signers: Vec::new(&env),
+            override_threshold: 0,
+            override_nonce: 0,
+            proposed_beneficiary: None,
+            proposed_at_seq: 0,
         };
         store_escrow(&env, id, &escrow);
 
@@ -1090,190 +1250,12 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Release the escrowed funds to the recipient. Only the arbiter may call,
-    /// and only before the deadline — afterward the sender reclaims via `refund`.
-    pub fn release(env: Env, arbiter: Address, id: u64) -> Result<(), Error> {
-        arbiter.require_auth();
-        let mut escrow = Self::load(&env, id)?;
-        if escrow.arbiter != arbiter {
-            return Err(Error::Unauthorized);
-        }
-        if !matches!(escrow.state, EscrowState::Funded) {
-            return Err(Error::InvalidState);
-        }
-        if env.ledger().timestamp() >= escrow.deadline {
-            // Past the deadline the arbiter can no longer release. We do NOT persist
-            // an `Expired` transition here: returning `Err` rolls back every storage
-            // write, so the marker is set through the permissionless `expire`
-            // entrypoint and the funds are reclaimed via `refund`.
-            return Err(Error::EscrowExpired);
-        }
-
-        escrow.state = EscrowState::Released;
-        Self::store(&env, id, &escrow);
-        Self::transfer_assets(&env, &escrow, &escrow.recipient);
-        Self::emit_transfer_events(&env, &escrow);
-        Self::emit_released(&env, id, &escrow, symbol_short!("arbiter"));
-        Ok(())
-    }
-
-    /// Manual release override: releases the escrow to the recipient once at
-    /// least `release_threshold` of the escrow's configured `release_signers`
-    /// have produced a valid Ed25519 signature over the escrow id + `nonce`.
-    /// Works regardless of the deadline, so a quorum can override a stalled or
-    /// disputed arbiter decision. `caller` is just the transaction submitter
-    /// (any account may relay the collected signatures); the signatures
-    /// themselves are what authorizes the release.
-    ///
-    /// Each `(escrow id, nonce)` pair may only ever be consumed once — replaying
-    /// a previously successful signature bundle is rejected with
-    /// [`Error::AlreadySigned`].
-    pub fn release_with_signatures(
-        env: Env,
-        caller: Address,
-        id: u64,
-        nonce: u64,
-        signatures: Vec<ReleaseSignature>,
-    ) -> Result<(), Error> {
-        caller.require_auth();
-        let mut escrow = Self::load(&env, id)?;
-        if escrow.release_signers.is_empty() {
-            // Override path not configured for this escrow.
-            return Err(Error::InvalidInput);
-        }
-
-        // Checked ahead of the state guard so a replayed (id, nonce) is always
-        // reported as `AlreadySigned` — the authoritative replay signal — even
-        // once the escrow itself has moved past `Funded`.
-        let nonce_key = DataKey::UsedNonce(id, nonce);
-        if env.storage().persistent().has(&nonce_key) {
-            return Err(Error::AlreadySigned);
-        }
-        if !matches!(escrow.state, EscrowState::Funded) {
-            return Err(Error::InvalidState);
-        }
-
-        // The payload binds the escrow id and the nonce, so a signature can
-        // neither be replayed against a different escrow nor reused once its
-        // nonce is consumed below.
-        let payload = Self::release_payload(&env, id, nonce);
-        let mut counted: Vec<BytesN<32>> = Vec::new(&env);
-        for entry in signatures.iter() {
-            if !escrow.release_signers.contains(&entry.signer) {
-                return Err(Error::NotASigner);
-            }
-            if counted.contains(&entry.signer) {
-                return Err(Error::AlreadySigned);
-            }
-            // Traps (aborts the whole invocation) if the signature is invalid —
-            // there is no partial-credit path for a bad signature. This calls the
-            // host's `verify_sig_ed25519` function (exposed by soroban-sdk 21.x as
-            // `Crypto::ed25519_verify`).
-            env.crypto()
-                .ed25519_verify(&entry.signer, &payload, &entry.signature);
-            counted.push_back(entry.signer.clone());
-        }
-        if counted.len() < escrow.release_threshold {
-            return Err(Error::ThresholdNotMet);
-        }
-
-        env.storage().persistent().set(&nonce_key, &true);
-        env.storage().persistent().extend_ttl(
-            &nonce_key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        escrow.state = EscrowState::Released;
-        Self::store(&env, id, &escrow);
-        Self::transfer_assets(&env, &escrow, &escrow.recipient);
-        Self::emit_transfer_events(&env, &escrow);
-        Self::emit_released(&env, id, &escrow, symbol_short!("sigs"));
-        Ok(())
-    }
-
-    /// Mark a timed-out escrow `Expired` once its deadline has passed.
-    /// Permissionless status transition (a keeper or UI may call it). Funds are
-    /// NOT moved here — they remain in custody until the sender reclaims them via
-    /// `refund`, which also accepts the `Expired` state.
-    pub fn expire(env: Env, id: u64) -> Result<(), Error> {
-        let mut escrow = Self::load(&env, id)?;
-        if !matches!(escrow.state, EscrowState::Funded) {
-            return Err(Error::InvalidState);
-        }
-        if env.ledger().timestamp() < escrow.deadline {
-            return Err(Error::InvalidState);
-        }
-        escrow.state = EscrowState::Expired;
-        Self::store(&env, id, &escrow);
-        env.events()
-            .publish((symbol_short!("escrow"), symbol_short!("expired")), id);
-        Ok(())
-    }
-
-    /// Refund the escrow back to the sender after the deadline (permissionless
-    /// settlement path used when the escrow was never released — either still
-    /// `Funded` past its deadline, or already marked `Expired`). Returns the real
-    /// tokens to the sender.
-    pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
-        caller.require_auth();
-        let mut escrow = Self::load(&env, id)?;
-        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
-            return Err(Error::InvalidState);
-        }
-        if env.ledger().timestamp() < escrow.deadline {
-            return Err(Error::InvalidState);
-        }
-        escrow.state = EscrowState::Refunded;
-        Self::store(&env, id, &escrow);
-        // Return the real tokens to the sender.
-        Self::transfer_assets(&env, &escrow, &escrow.sender);
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("refunded")),
-            (id, caller, escrow.assets.clone()),
-        );
-        Ok(())
-    }
-
-    /// Refund time-locked escrow after unlock_time has elapsed.
-    pub fn refund_timelock(env: Env, caller: Address, id: u64) -> Result<(), Error> {
-        caller.require_auth();
-        let mut escrow = Self::load(&env, id)?;
-        if escrow.sender != caller {
-            return Err(Error::Unauthorized);
-        }
-        if !matches!(escrow.state, EscrowState::Created) {
-            return Err(Error::InvalidState);
-        }
-        if env.ledger().timestamp() < escrow.deadline {
-            return Err(Error::TimeLockActive);
-        }
-
-        escrow.state = EscrowState::Refunded;
-        Self::store(&env, id, &escrow);
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("ref_tl")),
-            (id, caller),
-        );
-        Ok(())
-    }
-
-    /// Close a settled escrow (terminal). Callable only once the funds have
-    /// actually moved — i.e. from `Released` or `Refunded`. An `Expired` escrow
-    /// must be `refund`ed first so custody is emptied before it can be closed;
-    /// this prevents closing over still-locked funds.
-    pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
-        caller.require_auth();
-        let mut escrow = Self::load(&env, id)?;
-        if !matches!(escrow.state, EscrowState::Released | EscrowState::Refunded) {
-            return Err(Error::InvalidState);
-        }
-        if caller != escrow.sender && caller != escrow.recipient && caller != escrow.arbiter {
-            return Err(Error::Unauthorized);
-        }
-        escrow.state = EscrowState::Closed;
-        Self::store(&env, id, &escrow);
-        Ok(())
+    /// Read the milestone state for an escrow.
+    pub fn milestones(env: Env, id: u64) -> Result<MilestoneSet, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)
     }
 
     // --- views ---
