@@ -458,7 +458,40 @@
                         "symbol": "release_threshold"
                       },
                       "val": {
-                        "u32": 0
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "cliff_time"
+                            },
+                            "val": {
+                              "u64": 0
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "end_time"
+                            },
+                            "val": {
+                              "u64": 0
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "release_type"
+                            },
+                            "val": {
+                              "u32": 0
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "start_time"
+                            },
+                            "val": {
+                              "u64": 0
+                            }
+                          }
+                        ]
                       }
                     },
                     {

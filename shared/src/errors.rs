@@ -87,16 +87,13 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (81-82) ---
+    // --- Escrow (80-81) ---
+    EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
 
     // --- Treasury allowances (83-84) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
-
-    // --- Interface versioning (95-99) ---
-    /// The remote contract's interface version is older than the minimum
-    /// required by the caller, or otherwise incompatible.
-    InterfaceVersionMismatch = 95,
+    AllowanceNotFound = 85,
 }

@@ -20,24 +20,54 @@
 //! Funded ──(arbiter, before deadline)──────────▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(M-of-N override signatures)────────▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(after deadline)────────────────────▶ Refunded ─▶ sender    ─▶ Closed
-//!    └────(after deadline, marker)─────────────▶ Expired ──(refund)───▶ Refunded
+//!    └────(after deadline, marker)─────────────▶ Expired ──(refund)──▶ Refunded
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
 //! deadline passes); funds stay in custody until `refund` returns them to the
 //! sender, so no escrow can be `Closed` with money still locked.
 //!
-//! ## Manual release override
+//! ## Signature-based release override
 //!
-//! An escrow may optionally configure a set of Ed25519 public keys and an
-//! `M`-of-`N` threshold at `create` time. Holders of those keys can jointly
-//! authorize `release_with_signatures` to release the escrow to the recipient
-//! ahead of (or regardless of) the arbiter/deadline path — e.g. an off-chain
-//! dispute-resolution quorum. Each signature is verified on-chain with
-//! `env.crypto().ed25519_verify` (the host's `verify_sig_ed25519` function)
-//! over a payload that binds the escrow id and a caller-chosen nonce; the
-//! nonce is recorded per-escrow the moment release succeeds so the same
-//! signed payload can never be replayed.
+//! Besides the single named `arbiter`, an escrow may name a set of
+//! pre-configured ed25519 public keys (`override_signers`) and a threshold
+//! (`override_threshold`). Anyone may call [`EscrowContract::override_release`]
+//! with a `(nonce, signatures)` pair; the escrow releases early once enough of
+//! the supplied signatures verify against the escrow's pre-configured keys.
+//! This is independent of Soroban account auth — the cryptographic signatures
+//! themselves are the authorization, which lets off-chain systems (or keys not
+//! registered as Soroban accounts) approve a release.
+//!
+//! Every signature must cover a deterministic payload — the contract address,
+//! the network id, the escrow id and the caller-supplied `nonce` — hashed with
+//! SHA-256. The escrow tracks the last-used nonce and only accepts a strictly
+//! greater one, which makes a captured signature unusable a second time
+//! (replay protection).
+//!
+//! ## Milestone-based progressive release
+//!
+//! An escrow may optionally be funded via [`EscrowContract::deposit_with_milestones`]
+//! with a list of basis-point-weighted milestones. Instead of a single arbiter
+//! release, the arbiter approves each milestone individually via
+//! [`EscrowContract::release_milestone`], disbursing funds proportionally. The
+//! final milestone pays the dust-free remainder so the full amount is disbursed.
+//! Plain `release` is blocked on milestone escrows to enforce phased settlement.
+//!
+//! ## Time-lock release schedules
+//!
+//! Escrows support configurable time-locks and gradual release schedules:
+//! - Bullet / Cliff time-locks (`ReleaseType::Cliff`): 100% unlocked at maturity.
+//! - Linear release schedules (`ReleaseType::Linear`): Continuous linear vesting
+//!   from start_time to end_time with optional cliff_time.
+//! - Partial and multiple gradual withdrawals by the beneficiary.
+//! - Deterministic `Error::TimeLockActive` when withdrawing before maturity or cliff.
+
+pub mod storage;
+
+pub use storage::{
+    bump_escrow, get_count, increment_count, load_escrow, store_escrow, DataKey, Escrow,
+    EscrowState, ReleaseSchedule, ReleaseType,
+};
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_RELEASE_SIGNERS,
@@ -113,20 +143,9 @@ pub struct ReleaseSignature {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Escrow {
-    pub sender: Address,
-    pub recipient: Address,
-    pub arbiter: Address,
-    pub assets: Vec<AssetAmount>,
-    pub state: EscrowState,
-    pub deadline: u64,
-    pub memo: String,
-    /// Pre-configured Ed25519 public keys eligible to co-sign a manual release
-    /// override. Empty means the override path is disabled for this escrow.
-    pub release_signers: Vec<BytesN<32>>,
-    /// Number of distinct `release_signers` signatures required to release via
-    /// `release_with_signatures`. `0` when `release_signers` is empty.
-    pub release_threshold: u32,
+pub struct OverrideSignature {
+    pub public_key: BytesN<32>,
+    pub signature: BytesN<64>,
 }
 
 /// A single milestone within a milestone-based escrow. `release_bps` is the
@@ -218,6 +237,687 @@ impl EscrowContract {
         release_threshold: u32,
     ) -> Result<u64, Error> {
         sender.require_auth();
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        if deadline <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
+        Self::validate_assets(&assets)?;
+        Self::validate_override_config(&release_signers, release_threshold)?;
+
+        let id = increment_count(&env)?;
+
+        let mut funded_amount: i128 = 0;
+        for a in assets.iter() {
+            token::TokenClient::new(&env, &a.asset).transfer(
+                &sender,
+                &env.current_contract_address(),
+                &a.amount,
+            );
+            funded_amount = checked_add(funded_amount, a.amount)?;
+        }
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            assets: assets.clone(),
+            state: EscrowState::Funded,
+            deadline,
+            funded_amount,
+            memo,
+            schedule: ReleaseSchedule::none(),
+            released_amount: 0,
+            override_signers: release_signers,
+            override_threshold: release_threshold,
+            override_nonce: 0,
+        };
+        store_escrow(&env, id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("funded")),
+            (id, sender, recipient, assets),
+        );
+        Ok(id)
+    }
+
+    /// Create a funded time-locked escrow with bullet cliff release at `unlock_time`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_timelock(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        assets: Vec<AssetAmount>,
+        unlock_time: u64,
+        memo: String,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        let now = env.ledger().timestamp();
+        if unlock_time <= now {
+            return Err(Error::InvalidInput);
+        }
+        Self::validate_assets(&assets)?;
+
+        let id = increment_count(&env)?;
+
+        let mut funded_amount: i128 = 0;
+        for a in assets.iter() {
+            token::TokenClient::new(&env, &a.asset).transfer(
+                &sender,
+                &env.current_contract_address(),
+                &a.amount,
+            );
+            funded_amount = checked_add(funded_amount, a.amount)?;
+        }
+
+        let schedule = ReleaseSchedule {
+            release_type: ReleaseType::Cliff,
+            start_time: now,
+            cliff_time: unlock_time,
+            end_time: unlock_time,
+        };
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            assets: assets.clone(),
+            state: EscrowState::Funded,
+            deadline: unlock_time,
+            funded_amount,
+            memo,
+            schedule,
+            released_amount: 0,
+            override_signers: Vec::new(&env),
+            override_threshold: 0,
+            override_nonce: 0,
+        };
+        store_escrow(&env, id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("funded")),
+            (id, sender.clone(), recipient.clone(), assets.clone()),
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("init_tl")),
+            (id, sender, recipient, assets, unlock_time),
+        );
+        Ok(id)
+    }
+
+    /// Create a funded escrow with configurable release schedule (Cliff or Linear).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_scheduled(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        assets: Vec<AssetAmount>,
+        schedule: ReleaseSchedule,
+        deadline: u64,
+        memo: String,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        Self::validate_assets(&assets)?;
+        if schedule.start_time > schedule.cliff_time
+            || schedule.cliff_time > schedule.end_time
+            || schedule.end_time <= schedule.start_time
+        {
+            return Err(Error::InvalidInput);
+        }
+        if schedule.end_time <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
+        let effective_deadline = if deadline == 0 {
+            schedule.end_time
+        } else {
+            deadline
+        };
+        if effective_deadline < schedule.end_time {
+            return Err(Error::InvalidInput);
+        }
+
+        let id = increment_count(&env)?;
+
+        let mut funded_amount: i128 = 0;
+        for a in assets.iter() {
+            token::TokenClient::new(&env, &a.asset).transfer(
+                &sender,
+                &env.current_contract_address(),
+                &a.amount,
+            );
+            funded_amount = checked_add(funded_amount, a.amount)?;
+        }
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            assets: assets.clone(),
+            state: EscrowState::Funded,
+            deadline: effective_deadline,
+            funded_amount,
+            memo,
+            schedule: schedule.clone(),
+            released_amount: 0,
+            override_signers: Vec::new(&env),
+            override_threshold: 0,
+            override_nonce: 0,
+        };
+        store_escrow(&env, id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("funded")),
+            (id, sender.clone(), recipient.clone(), assets.clone()),
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("sched")),
+            (
+                id,
+                sender,
+                recipient,
+                assets,
+                funded_amount,
+                schedule.start_time,
+                schedule.end_time,
+            ),
+        );
+        Ok(id)
+    }
+
+    /// Initialize an escrow with time-lock (unfunded version). Manual
+    /// signature override is not available on this path (empty signer set).
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_timelock(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        assets: Vec<AssetAmount>,
+        unlock_time: u64,
+        memo: String,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        if recipient == sender {
+            return Err(Error::InvalidInput);
+        }
+        let now = env.ledger().timestamp();
+        if unlock_time <= now {
+            return Err(Error::InvalidInput);
+        }
+        Self::validate_assets(&assets)?;
+
+        let id = increment_count(&env)?;
+
+        let schedule = ReleaseSchedule {
+            release_type: ReleaseType::Cliff,
+            start_time: now,
+            cliff_time: unlock_time,
+            end_time: unlock_time,
+        };
+
+        let escrow = Escrow {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter,
+            assets: assets.clone(),
+            state: EscrowState::Created,
+            deadline: unlock_time,
+            funded_amount: 0,
+            memo,
+            schedule,
+            released_amount: 0,
+            override_signers: Vec::new(&env),
+            override_threshold: 0,
+            override_nonce: 0,
+        };
+        store_escrow(&env, id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("init_tl")),
+            (id, sender, recipient, assets, unlock_time),
+        );
+        Ok(id)
+    }
+
+    /// Fund an initialized escrow.
+    pub fn fund(env: Env, sender: Address, id: u64) -> Result<(), Error> {
+        sender.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.sender != sender {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
+
+        let mut total: i128 = 0;
+        for a in escrow.assets.iter() {
+            token::TokenClient::new(&env, &a.asset).transfer(
+                &sender,
+                &env.current_contract_address(),
+                &a.amount,
+            );
+            total = checked_add(total, a.amount)?;
+        }
+
+        escrow.funded_amount = total;
+        escrow.state = EscrowState::Funded;
+        store_escrow(&env, id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("funded")),
+            (id, escrow.sender, escrow.recipient, escrow.assets),
+        );
+        Ok(())
+    }
+
+    /// Beneficiary partial or full withdrawal according to release schedule.
+    pub fn withdraw(env: Env, caller: Address, id: u64, amount: i128) -> Result<i128, Error> {
+        caller.require_auth();
+        require_positive_amount(amount)?;
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.recipient != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+
+        let now = env.ledger().timestamp();
+        let claimable = calculate_claimable_amount(&escrow, now)?;
+        if claimable <= 0 {
+            return Err(Error::TimeLockActive);
+        }
+        if amount > claimable {
+            return Err(Error::InsufficientFunds);
+        }
+
+        escrow.released_amount = checked_add(escrow.released_amount, amount)?;
+        if escrow.released_amount == escrow.funded_amount {
+            escrow.state = EscrowState::Released;
+        }
+        store_escrow(&env, id, &escrow);
+
+        for a in escrow.assets.iter() {
+            let send_amount = checked_div(checked_mul(a.amount, amount)?, escrow.funded_amount)?;
+            if send_amount > 0 {
+                token::TokenClient::new(&env, &a.asset).transfer(
+                    &env.current_contract_address(),
+                    &escrow.recipient,
+                    &send_amount,
+                );
+                events::transfer_executed(
+                    &env,
+                    &escrow.sender,
+                    &escrow.recipient,
+                    &a.asset,
+                    send_amount,
+                );
+            }
+        }
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("withdraw")),
+            (id, caller, amount, escrow.released_amount),
+        );
+        Ok(escrow.released_amount)
+    }
+
+    /// Claim all currently available funds from time-locked or scheduled escrow.
+    pub fn claim(env: Env, caller: Address, id: u64) -> Result<i128, Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.recipient != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+
+        if matches!(escrow.state, EscrowState::Funded) {
+            let claimable = if matches!(
+                escrow.schedule.release_type,
+                ReleaseType::Cliff | ReleaseType::Linear
+            ) {
+                calculate_claimable_amount(&escrow, now)?
+            } else {
+                if now < escrow.deadline {
+                    return Err(Error::TimeLockActive);
+                }
+                checked_sub(escrow.funded_amount, escrow.released_amount)?
+            };
+
+            if claimable <= 0 {
+                return Err(Error::TimeLockActive);
+            }
+
+            escrow.released_amount = checked_add(escrow.released_amount, claimable)?;
+            if escrow.released_amount == escrow.funded_amount {
+                escrow.state = EscrowState::Released;
+            }
+            store_escrow(&env, id, &escrow);
+
+            for a in escrow.assets.iter() {
+                let send_amount =
+                    checked_div(checked_mul(a.amount, claimable)?, escrow.funded_amount)?;
+                if send_amount > 0 {
+                    token::TokenClient::new(&env, &a.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.recipient,
+                        &send_amount,
+                    );
+                    events::transfer_executed(
+                        &env,
+                        &escrow.sender,
+                        &escrow.recipient,
+                        &a.asset,
+                        send_amount,
+                    );
+                }
+            }
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("claimed")),
+                (id, caller, claimable),
+            );
+            Ok(claimable)
+        } else if matches!(escrow.state, EscrowState::Created) {
+            if now < escrow.deadline {
+                return Err(Error::TimeLockActive);
+            }
+            escrow.state = EscrowState::Released;
+            store_escrow(&env, id, &escrow);
+            Self::transfer_all(&env, &escrow, &escrow.recipient);
+            for a in escrow.assets.iter() {
+                events::transfer_executed(
+                    &env,
+                    &escrow.sender,
+                    &escrow.recipient,
+                    &a.asset,
+                    a.amount,
+                );
+            }
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("claimed")),
+                (id, caller, escrow.funded_amount),
+            );
+            Ok(escrow.funded_amount)
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    /// Release the escrowed assets to the recipient. Only the arbiter may call,
+    /// and only before the deadline — afterward the sender reclaims via `refund`.
+    ///
+    /// `release_amount` is the amount to release this call. Partial releases are
+    /// supported: the cumulative `released_amount` is tracked on the escrow and
+    /// must not exceed `funded_amount`. A full release transitions the escrow to
+    /// `Released`; a partial release keeps the escrow in `Funded` so that more
+    /// can be released later or the remaining balance can be revoked.
+    pub fn release(
+        env: Env,
+        arbiter: Address,
+        id: u64,
+        release_amount: i128,
+    ) -> Result<(), Error> {
+        arbiter.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.arbiter != arbiter {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        if env.storage().persistent().has(&DataKey::Milestones(id)) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() >= escrow.deadline {
+            return Err(Error::EscrowExpired);
+        }
+        let remaining = escrow
+            .funded_amount
+            .checked_sub(escrow.released_amount)
+            .ok_or(Error::Overflow)?;
+        if release_amount > remaining {
+            return Err(Error::InvalidAmount);
+        }
+
+        escrow.released_amount = escrow.funded_amount;
+        escrow.state = EscrowState::Released;
+        store_escrow(&env, id, &escrow);
+        // Move the real tokens out of custody to the recipient.
+        Self::transfer_all(&env, &escrow, &escrow.recipient);
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &a.asset, a.amount);
+        }
+        events::publish(
+            &env,
+            ContractEvent::EscrowReleased {
+                escrow_id: id,
+                recipient: escrow.recipient.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("released")),
+            (id, arbiter, release_amount),
+        );
+        Ok(())
+    }
+
+    /// Release the escrowed assets to the recipient via the manual signature
+    /// override instead of the named arbiter. Requires at least
+    /// `override_threshold` distinct, valid ed25519 signatures from the
+    /// escrow's pre-configured `override_signers`, each covering a
+    /// deterministic payload built from the contract address, network id,
+    /// escrow id and `nonce`. `nonce` must be strictly greater than the last
+    /// nonce this escrow consumed, which makes a captured signature set
+    /// unusable a second time.
+    ///
+    /// Permissionless by design: the cryptographic signatures are the
+    /// authorization, so any relayer may submit them.
+    pub fn override_release(
+        env: Env,
+        id: u64,
+        nonce: u64,
+        signatures: Vec<OverrideSignature>,
+    ) -> Result<(), Error> {
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.override_signers.is_empty() || escrow.override_threshold == 0 {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() >= escrow.deadline {
+            return Err(Error::EscrowExpired);
+        }
+        if nonce <= escrow.override_nonce {
+            return Err(Error::InvalidNonce);
+        }
+        if signatures.len() < escrow.override_threshold {
+            return Err(Error::ThresholdNotMet);
+        }
+
+        let payload = Self::override_payload(&env, id, nonce);
+        let digest: Bytes = env.crypto().sha256(&payload).into();
+
+        // Every signer must be a distinct, pre-configured key, and every
+        // signature must verify against the deterministic payload. Any single
+        // invalid signature (unknown key, reused key, bad signature) fails the
+        // whole call — signatures are never "partially" honored.
+        let mut seen: Vec<BytesN<32>> = Vec::new(&env);
+        for sig in signatures.iter() {
+            if !escrow.override_signers.contains(&sig.public_key) {
+                return Err(Error::NotASigner);
+            }
+            if seen.contains(&sig.public_key) {
+                return Err(Error::AlreadySigned);
+            }
+            // Panics (aborting the whole invocation) if the signature is invalid.
+            env.crypto()
+                .ed25519_verify(&sig.public_key, &digest, &sig.signature);
+            seen.push_back(sig.public_key.clone());
+        }
+        if seen.len() < escrow.override_threshold {
+            return Err(Error::ThresholdNotMet);
+        }
+
+        escrow.override_nonce = nonce;
+        escrow.state = EscrowState::Released;
+        store_escrow(&env, id, &escrow);
+        Self::transfer_all(&env, &escrow, &escrow.recipient);
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &a.asset, a.amount);
+        }
+        events::publish(
+            &env,
+            ContractEvent::EscrowReleased {
+                escrow_id: id,
+                recipient: escrow.recipient.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("override")),
+            (id, nonce),
+        );
+        Ok(())
+    }
+
+    /// Mark a timed-out escrow `Expired` once its deadline has passed.
+    pub fn expire(env: Env, id: u64) -> Result<(), Error> {
+        let mut escrow = load_escrow(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::InvalidState);
+        }
+        escrow.state = EscrowState::Expired;
+        store_escrow(&env, id, &escrow);
+        env.events()
+            .publish((symbol_short!("escrow"), symbol_short!("expired")), id);
+        Ok(())
+    }
+
+    /// Refund remaining funds back to the sender after the deadline.
+    pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::InvalidState);
+        }
+
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+
+        if remaining > 0 {
+            for a in escrow.assets.iter() {
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                if return_amount > 0 {
+                    token::TokenClient::new(&env, &a.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &return_amount,
+                    );
+                }
+            }
+        }
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("refunded")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Refund time-locked escrow after unlock_time / deadline has elapsed.
+    pub fn refund_timelock(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(
+            escrow.state,
+            EscrowState::Created | EscrowState::Funded | EscrowState::Expired
+        ) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::TimeLockActive);
+        }
+
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+
+        if remaining > 0 {
+            for a in escrow.assets.iter() {
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                if return_amount > 0 {
+                    token::TokenClient::new(&env, &a.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &return_amount,
+                    );
+                }
+            }
+        }
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ref_tl")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Close a settled escrow (terminal).
+    pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Released | EscrowState::Refunded) {
+            return Err(Error::InvalidState);
+        }
+        if caller != escrow.sender && caller != escrow.recipient && caller != escrow.arbiter {
+            return Err(Error::Unauthorized);
+        }
+        escrow.state = EscrowState::Closed;
+        store_escrow(&env, id, &escrow);
+        Ok(())
+    }
+
+    /// Fund an escrow with a milestone-based progressive release schedule.
+    /// `milestones` is an ordered list of basis-point-weighted milestones whose
+    /// weights must sum to exactly 10_000 (100%). The arbiter approves each
+    /// milestone individually via [`EscrowContract::release_milestone`]; plain
+    /// `release` is blocked on milestone escrows to enforce phased settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deposit_with_milestones(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        arbiter: Address,
+        asset: Address,
+        amount: i128,
+        deadline: u64,
+        memo: String,
+        milestones: Vec<MilestoneSpec>,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+        require_positive_amount(amount)?;
         if recipient == sender {
             return Err(Error::InvalidInput);
         }
