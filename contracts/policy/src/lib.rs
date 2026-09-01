@@ -16,30 +16,7 @@
 //! This contract answers: "may `amount` of `asset` flow to `recipient`
 //! right now?" with a deterministic [`Error`] when it may not.
 //!
-//! Functions: `initialize`, `register_policy`, `rotate_policy`, `set_allowance`,
-//! `get_allowance`, `check_allowance`, `update_allowance`, `check_transfer`.
-//!
-//! ## Multi-token allowances
-//!
-//! A policy can attach a per-asset spending allowance to any policy. Each
-//! Stellar asset type (native XLM or a Soroban SAC token) is tracked under its
-//! own `(policy_id, asset)` key, so evaluation is safe against overflow and
-//! cheap (single persistent read/write).
-//!
-//! ## Asset deny list
-//!
-//! Agents source their token lists off-chain, so a policy also owns an on-chain
-//! asset deny list keyed by `(policy_id, asset)` and managed by the policy owner
-//! through `add_asset_blacklist` / `remove_asset_blacklist`. `check_transfer`
-//! probes it once and denies a listed asset with [`Error::PolicyDenied`] and an
-//! `asset_blacklisted` violation reason. The deny list is evaluated after the
-//! allow gates and wins over them, so blacklisting an allow-listed or
-//! whitelisted asset takes effect immediately.
-//!
-//! A dedicated `AssetBlacklisted` error code would read better here, but
-//! [`Error`] already carries the 50 cases a Soroban error enum may declare, so
-//! the deny list reuses [`Error::PolicyDenied`] and is distinguished by its
-//! violation event reason.
+//! Functions: `initialize`, `register_policy`, `rotate_policy`, `check_transfer`.
 
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
@@ -250,44 +227,6 @@ pub struct PolicyContract;
 #[contractimpl]
 #[allow(clippy::too_many_arguments)]
 impl PolicyContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Policy`] in the registry.
-    /// Any other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Policy,
-            wasm_hash,
-        )
-    }
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
             return Err(Error::AlreadyInitialized);
@@ -689,7 +628,10 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        events::policy_blocked(&env, &policy_id, &address);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("blk_add")),
+            (policy_id, address),
+        );
         Ok(())
     }
 
@@ -710,7 +652,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        events::policy_unblocked(&env, &policy_id, &address);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("blk_rem")),
+            (policy_id, address),
+        );
         Ok(())
     }
 
@@ -1038,19 +983,32 @@ impl PolicyInterface for PolicyContract {
         }
         // Check asset whitelist (Issue #37)
         Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
-        // Multi-token allowance gate: reject a spend that would breach the
-        // per-(policy, asset) allowance. An unset allowance is unrestricted.
-        Self::check_allowance(env.clone(), policy_id.clone(), asset.clone(), amount)?;
-        // --- Composite rule evaluation ---
-        let payload = TransactionPayload {
-            asset: asset.clone(),
-            recipient: recipient.clone(),
-            amount,
-        };
-        let rule_result = Self::evaluate_composite_rule(env.clone(), policy_id.clone(), payload)?;
-        if !rule_result {
-            events_policy_violation(&env, &policy_id, "rule_denied");
-            return Err(Error::PolicyDenied);
+        // Check blacklist
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "blacklisted");
+            return Err(Error::PolicyRecipientRestricted);
+        }
+        // Check merchant blacklist
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "merchant_blocked");
+            return Err(Error::PolicyMerchantBlocked);
+        }
+        // Check merchant blacklist
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "merchant_blocked");
+            return Err(Error::PolicyMerchantBlocked);
         }
         Ok(())
     }

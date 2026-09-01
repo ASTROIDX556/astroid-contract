@@ -86,8 +86,6 @@ enum DataKey {
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
-    /// Per-wallet, per-spender, per-asset allowance: (id, spender, asset) -> i128.
-    Allowance(u64, Address, Address),
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -96,18 +94,6 @@ enum DataKey {
 pub struct WalletData {
     pub owner: Address,
     pub state: ResourceState,
-}
-
-/// Result of a dry-run simulation. Reports the projected balances that would
-/// result from executing the operation.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SimResult {
-    pub wallet_id: u64,
-    pub from_balance: i128,
-    pub to_balance: i128,
-    pub asset: Address,
-    pub amount: i128,
 }
 
 #[contract]
@@ -284,7 +270,6 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
-        Self::enforce_rate_limit(&env, wallet_id, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -311,7 +296,6 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
-        Self::enforce_rate_limit(&env, wallet_id, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -686,12 +670,17 @@ impl WalletContract {
             .unwrap_or(0)
     }
 
-    /// Read a spender's current allowance for a wallet's asset (0 if none).
-    pub fn allowance(env: Env, wallet_id: u64, spender: Address, asset: Address) -> i128 {
+    /// Whether the contract-wide circuit breaker is currently tripped.
+    pub fn is_paused(env: Env) -> bool {
+        Self::paused(&env)
+    }
+
+    /// The address currently designated as emergency guardian.
+    pub fn get_guardian(env: Env) -> Result<Address, Error> {
         env.storage()
-            .persistent()
-            .get(&DataKey::Allowance(wallet_id, spender, asset))
-            .unwrap_or(0)
+            .instance()
+            .get(&DataKey::Guardian)
+            .ok_or(Error::NotInitialized)
     }
 
     // --- internal helpers ---

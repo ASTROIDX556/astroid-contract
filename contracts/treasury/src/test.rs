@@ -30,6 +30,7 @@ struct Harness<'a> {
     admin: Address,
     multisig: Address,
     asset: Address,
+    _second_asset: Address,
 }
 
 /// Register a treasury plus a test SAC token, approve that token for routing,
@@ -61,6 +62,7 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         admin,
         multisig,
         asset,
+        _second_asset: second_asset,
     }
 }
 

@@ -288,7 +288,7 @@ fn cannot_close_while_expired() {
 
     let res = h.client.try_close(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
 #[test]

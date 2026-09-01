@@ -17,10 +17,11 @@
 //! only leave through one of three settlement paths:
 //!
 //! ```text
-//! Funded ──(arbiter, before deadline)──────────▶ Released ─▶ recipient ─▶ Closed
-//! Funded ──(M-of-N override signatures)────────▶ Released ─▶ recipient ─▶ Closed
-//! Funded ──(after deadline)────────────────────▶ Refunded ─▶ sender    ─▶ Closed
-//!    └────(after deadline, marker)─────────────▶ Expired ──(refund)──▶ Refunded
+//! Funded ──(arbiter, before deadline+grace)─────▶ Released ─▶ recipient ─▶ Closed
+//! Funded ──(signature override, before deadline)▶ Released ─▶ recipient ─▶ Closed
+//! Funded ──(cancel, before deadline)────────────▶ Refunded ─▶ sender    ─▶ Closed
+//! Funded ──(after deadline+grace, no release)───▶ reclaim  ─▶ sender    ─▶ Closed
+//!    └────(after deadline+grace, marker)────────▶ Expired ──(refund)──▶ Refunded
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
@@ -889,49 +890,7 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Propose a new beneficiary for this escrow. Only the sender or arbiter may
-    /// call. A mandatory ledger-sequence timelock must elapse before the proposal
-    /// can be claimed via [`claim_beneficiary`]. Submitting a new proposal while
-    /// one already exists replaces it (resets the timelock).
-    pub fn propose_beneficiary(
-        env: Env,
-        caller: Address,
-        id: u64,
-        new_beneficiary: Address,
-    ) -> Result<(), Error> {
-        caller.require_auth();
-        let mut escrow = load_escrow(&env, id)?;
-        if caller != escrow.sender && caller != escrow.arbiter {
-            return Err(Error::Unauthorized);
-        }
-        if !matches!(escrow.state, EscrowState::Created | EscrowState::Funded) {
-            return Err(Error::InvalidState);
-        }
-        if new_beneficiary == escrow.recipient {
-            return Err(Error::InvalidInput);
-        }
-        if new_beneficiary == escrow.sender {
-            return Err(Error::InvalidInput);
-        }
-        if new_beneficiary == escrow.arbiter {
-            return Err(Error::InvalidInput);
-        }
-        // Reject the zero address as a beneficiary.
-        if is_zero_address(&env, &new_beneficiary) {
-            return Err(Error::InvalidInput);
-        }
-
-        let current_seq = env.ledger().sequence();
-        escrow.proposed_beneficiary = Some(new_beneficiary.clone());
-        escrow.proposed_at_seq = current_seq;
-        store_escrow(&env, id, &escrow);
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("bene_prp")),
-            (id, caller, new_beneficiary, current_seq),
-        );
-        Ok(())
-    }
-
+    /// Close a settled escrow (terminal).
     /// Cancel an escrow before its fulfillment `deadline` and return any held
     /// funds to the sender. Either the `sender` or the `arbiter` may cancel, but
     /// only while the escrow is still `Funded`/`Created` and before the deadline

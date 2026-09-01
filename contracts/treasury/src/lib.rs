@@ -628,13 +628,23 @@ impl TreasuryContract {
                 .consume(&caller, budget_id, &amount);
         }
 
-        // 3. Streaming payout schedule validation — enforces max payout velocity.
-        if let Some(schedule) = &t.payout_schedule {
-            let now = env.ledger().timestamp();
-            // Reset interval if elapsed
-            if now >= holding.interval_start.saturating_add(schedule.interval_seconds) {
-                holding.interval_payout = 0;
-                holding.interval_start = now;
+        // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
+        //    pre-approved periodic ceilings per (agent, recipient, asset).
+        Self::lock(&env)?;
+
+        let allowance_id = AllowanceId {
+            agent: caller.clone(),
+            recipient: to.clone(),
+            asset: asset.clone(),
+        };
+        if let Some(mut al) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Allowance>(&DataKey::Allowance(allowance_id.clone()))
+        {
+            if al.expires_at != 0 && env.ledger().timestamp() >= al.expires_at {
+                Self::unlock(&env);
+                return Err(Error::AllowanceExpired);
             }
             let new_payout = checked_add(holding.interval_payout, amount)?;
             if new_payout > schedule.max_per_interval {
@@ -996,6 +1006,10 @@ impl TreasuryContract {
         if t.emergency_paused {
             return Err(Error::EmergencyPaused);
         }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
+        Self::unlock(env);
         Ok(())
     }
 

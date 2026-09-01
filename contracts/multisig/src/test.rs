@@ -610,7 +610,6 @@ fn non_signer_cannot_set_or_finalize_threshold() {
 fn non_signer_cannot_change_config() {
     let h = setup(&[1, 1, 1], 2);
     let stranger = Address::generate(&h.env);
-    let _extra = Address::generate(&h.env);
     assert_eq!(
         h.client.try_set_threshold(&stranger, &3),
         Err(Ok(Error::NotASigner))

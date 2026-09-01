@@ -418,10 +418,27 @@ fn get_missing_budget_fails_not_found() {
     assert_eq!(res, Err(Ok(Error::NotFound)));
 }
 
-#[test]
-fn daily_velocity_cap_limits_spend_per_day() {
-    let h = setup();
-    // Budget with daily velocity cap of 300
+// ---------------------------------------------------------------------------
+// Recurring allowance hooks
+// ---------------------------------------------------------------------------
+
+const DAY: u64 = 86_400;
+const WEEK: u64 = 604_800;
+
+/// Assert that the canonical `ContractEvent` with the given variant symbol was
+/// published during the test (single-topic event = the variant name).
+fn assert_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
+    assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
+
+/// Allocate a budget under the harness owner with the common defaults.
+fn allocate(h: &Harness, budget_id: &str, limit: i128, period: Period, rollover: bool) {
     h.client.allocate(
         &h.owner,
         &id(&h.env, "eng"),
