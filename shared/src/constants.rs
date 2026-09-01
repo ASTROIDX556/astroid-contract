@@ -9,6 +9,8 @@ pub const SECONDS_PER_MONTH: u64 = 2_592_000;
 
 /// Approximate number of ledgers closed per day on Stellar (~5s per ledger).
 pub const DAY_IN_LEDGERS: u32 = 17_280;
+/// Approximate number of ledgers closed per hour on Stellar.
+pub const HOUR_IN_LEDGERS: u32 = 720;
 
 /// Instance storage TTL bump (7 days) and the threshold at which we bump.
 pub const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
@@ -23,8 +25,25 @@ pub const MAX_SIGNERS: u32 = 20;
 /// Minimum allowed multisig threshold.
 pub const MIN_THRESHOLD: u32 = 1;
 
+/// Shortest timelock delay (in seconds) that may be configured for multisig
+/// governance changes. Signer-set, weight and threshold modifications always
+/// sit in a pending state for at least this long so the organization has a
+/// window to review and veto them.
+pub const MIN_TIMELOCK_DELAY: u64 = SECONDS_PER_DAY;
+/// Longest timelock delay (in seconds) that may be configured, so a hostile
+/// signer cannot park governance behind an effectively infinite delay.
+pub const MAX_TIMELOCK_DELAY: u64 = 30 * SECONDS_PER_DAY;
+/// How long a matured governance change stays executable before it expires.
+/// Stale proposals must be re-proposed rather than lying dormant indefinitely.
+pub const GOVERNANCE_GRACE_PERIOD: u64 = SECONDS_PER_WEEK;
+
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
 
-/// Upper bound on how many discrete calls a single batch may contain (gas safety).
-pub const MAX_BATCH_CALLS: u32 = 16;
+/// Upper bound on how many distinct assets a single escrow may hold (gas
+/// safety — every asset in the list is iterated on create/release/refund).
+pub const MAX_ESCROW_ASSETS: u32 = 10;
+
+/// Upper bound on how many override-release public keys an escrow may
+/// configure for its signature-based manual release path.
+pub const MAX_RELEASE_SIGNERS: u32 = 10;

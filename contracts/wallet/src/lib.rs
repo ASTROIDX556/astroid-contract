@@ -12,25 +12,74 @@
 //! `Archived`. Outbound value movement is only permitted from an `Active`
 //! wallet; every other state fails safely with a specific error.
 //!
+//! ## Emergency circuit breaker
+//!
+//! The per-wallet states above are the owner's tool: they act on one wallet at
+//! a time and the owner must be in a position to use them. Compromised agent
+//! keys and abnormal on-chain behaviour do not respect that granularity, so the
+//! contract also carries a single contract-wide breaker.
+//!
+//! While tripped, every outbound path — `transfer`, `withdraw` — and the
+//! creation of new wallets are refused with [`Error::WalletPaused`]. Everything
+//! needed to inspect and recover stays live: all views, `deposit`, and the
+//! per-wallet `freeze` / `pause` / `archive` transitions, so an operator can
+//! quarantine individual wallets while the breaker holds the line globally.
+//!
+//! Authority is deliberately asymmetric. A designated guardian can *trip* the
+//! breaker, so reacting to an incident is fast and needs only one key. Only the
+//! admin can *reset* it — point `admin` at the organization's multisig and
+//! resuming operations requires a threshold of signers.
+//!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
+//! `emergency_unpause`, `set_guardian`.
+//!
+//! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
+//! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
+//! Access control is role-based (see [`access`]). Every wallet has an owner,
+//! who is implicitly [`Role::Admin`], and may delegate a role to any number of
+//! other principals so that organization owners, human managers and autonomous
+//! agent executors can share a wallet without sharing all of its powers:
+//!
+//! | Entrypoint                                   | Minimum role |
+//! |----------------------------------------------|--------------|
+//! | `withdraw`, `pause`, `unpause`, `archive`     | `Admin`      |
+//! | `grant_role`, `revoke_role`                   | `Admin`      |
+//! | `transfer`                                    | `Agent`      |
+//! | `freeze`, `unfreeze`                          | `Agent`, or the contract admin |
+//!
+//! A caller whose role is below the requirement — including an `Auditor`, who
+//! holds no mutating power at all — is rejected with [`Error::Unauthorized`].
+//!
+//! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
+//! `unfreeze`, `pause`, `unpause`, `archive`, `grant_role`, `revoke_role`.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted` (shared schema)
-//! plus wallet-scoped state-change events.
+//! plus wallet-scoped state-change and role-administration events.
 
+use crate::access::Role;
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
+use astroid_shared::ensure;
 use astroid_shared::errors::Error;
-use astroid_shared::math::{checked_add, checked_sub};
+use astroid_shared::math::{SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+};
+
+pub mod access;
 
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     /// Emergency/administrative address able to freeze any wallet (instance).
     Admin,
+    /// Designated emergency guardian able to trip the breaker (instance).
+    Guardian,
+    /// Contract-wide emergency pause flag (instance).
+    Paused,
     /// Monotonic wallet id counter (instance).
     WalletCount,
     /// Wallet record: id -> WalletData.
@@ -66,26 +115,111 @@ pub struct WalletContract;
 
 #[contractimpl]
 impl WalletContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Wallet`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Wallet,
+            wasm_hash,
+        )
+    }
     /// Initialize the contract with an emergency admin (may freeze wallets).
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        // The admin is its own guardian until a dedicated one is designated.
+        env.storage().instance().set(&DataKey::Guardian, &admin);
         env.storage().instance().set(&DataKey::WalletCount, &0u64);
+        env.storage().instance().set(&DataKey::Paused, &false);
         Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Designate the emergency guardian allowed to trip the circuit breaker
+    /// (admin only). Set it to a monitoring service or a partner key so an
+    /// incident can be contained without waiting on the admin.
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Guardian, &guardian);
+        Self::bump_instance(&env);
+        events::wallet_guardian(&env, &guardian);
+        Ok(())
+    }
+
+    /// Trip the contract-wide circuit breaker (admin or guardian).
+    ///
+    /// Freezes every outbound movement and the creation of new wallets at once.
+    /// Reads, deposits and the per-wallet recovery transitions stay available.
+    pub fn emergency_pause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_guardian_or_admin(&env, &caller)?;
+        if Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((Symbol::new(&env, "WalletPaused"),), caller);
+        Ok(())
+    }
+
+    /// Reset the circuit breaker and resume normal operation.
+    ///
+    /// Admin only: tripping the breaker is a fast, low-privilege reaction, but
+    /// releasing it puts funds back in motion and must clear the higher bar.
+    pub fn emergency_unpause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((Symbol::new(&env, "WalletUnpaused"),), caller);
         Ok(())
     }
 
     /// Create a new wallet owned by `owner`. Returns the new wallet id.
     pub fn create_wallet(env: Env, owner: Address) -> Result<u64, Error> {
+        Self::when_not_paused(&env)?;
         owner.require_auth();
         let mut count: u64 = env
             .storage()
             .instance()
             .get(&DataKey::WalletCount)
             .ok_or(Error::NotInitialized)?;
-        count = checked_add(count as i128, 1)? as u64;
+        count = (count as i128).safe_add(1)? as u64;
         let id = count;
         let data = WalletData {
             owner: owner.clone(),
@@ -119,9 +253,10 @@ impl WalletContract {
         from.require_auth();
         let wallet = Self::load_wallet(&env, wallet_id)?;
         // Deposits are refused into archived wallets; other states may receive.
-        if wallet.state == ResourceState::Archived {
-            return Err(Error::WalletArchived);
-        }
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
         // Move real tokens into the contract's custody, then credit internally.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -129,15 +264,14 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("deposit")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_deposit(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
-    /// Pay `amount` of `asset` from a wallet to an arbitrary recipient. Only the
-    /// wallet owner may call, and only while the wallet is `Active`.
+    /// Pay `amount` of `asset` from a wallet to an arbitrary recipient. This is
+    /// the routine operational spend, so [`Role::Agent`] is enough - an
+    /// autonomous executor can pay without holding administrative power - and it
+    /// is still only permitted while the wallet is `Active`.
     pub fn transfer(
         env: Env,
         caller: Address,
@@ -147,8 +281,10 @@ impl WalletContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        Self::when_not_paused(&env)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
+        Self::enforce_rate_limit(&env, wallet_id, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -159,8 +295,11 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Withdraw `amount` of `asset` from a wallet back to its owner. Only the
-    /// owner may call, and only while the wallet is `Active`.
+    /// Withdraw `amount` of `asset` from a wallet back to its owner. Funds
+    /// leaving the wallet for its owner is an administrative action, so this
+    /// requires [`Role::Admin`]; agents are deliberately excluded. Only
+    /// permitted while the wallet is `Active`, and the destination is always
+    /// the recorded owner regardless of who calls.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -169,27 +308,29 @@ impl WalletContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
-        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        Self::when_not_paused(&env)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
+        Self::enforce_rate_limit(&env, wallet_id, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
             &wallet.owner,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("withdraw")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_withdraw(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
-    /// Freeze a wallet (owner or admin). Blocks all outbound movement.
+    /// Freeze a wallet. Blocks all outbound movement. Freezing is a safety
+    /// action, so [`Role::Agent`] is enough - an agent that detects trouble can
+    /// stop the bleeding - as is the contract-level emergency admin.
     pub fn freeze(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner_or_admin(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role_or_admin(&env, wallet_id, &caller, Role::Agent)?;
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
+
         wallet.state = ResourceState::Frozen;
         Self::store_wallet(&env, wallet_id, &wallet);
         events::wallet_frozen(&env, wallet_id, &caller);
@@ -203,48 +344,53 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Unfreeze a wallet back to `Active` (owner or admin).
+    /// Unfreeze a wallet back to `Active`. Same gate as `freeze`.
     pub fn unfreeze(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner_or_admin(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role_or_admin(&env, wallet_id, &caller, Role::Agent)?;
         if wallet.state != ResourceState::Frozen {
             return Err(Error::InvalidState);
         }
+
         wallet.state = ResourceState::Active;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("unfrozen"));
         Ok(())
     }
 
-    /// Pause a wallet (owner only). Temporarily blocks outbound movement.
+    /// Pause a wallet ([`Role::Admin`]). Temporarily blocks outbound movement.
     pub fn pause(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         if wallet.state != ResourceState::Active {
             return Err(Error::InvalidState);
         }
+
         wallet.state = ResourceState::Paused;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("paused"));
         Ok(())
     }
 
-    /// Resume a paused wallet (owner only).
+    /// Resume a paused wallet ([`Role::Admin`]).
     pub fn unpause(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         if wallet.state != ResourceState::Paused {
             return Err(Error::InvalidState);
         }
+
         wallet.state = ResourceState::Active;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("unpaused"));
         Ok(())
     }
 
-    /// Archive a wallet (owner only). Terminal state; no further transactions.
+    /// Archive a wallet ([`Role::Admin`]). Terminal state; no further
+    /// transactions.
     pub fn archive(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
-        let mut wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        let mut wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
+
         wallet.state = ResourceState::Archived;
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("archived"));
@@ -465,12 +611,74 @@ impl WalletContract {
 
     // --- views ---
 
+    /// Read the role `account` effectively holds on a wallet, or `None` if it
+    /// holds none. The wallet owner always resolves to [`Role::Admin`].
+    pub fn get_role(env: Env, wallet_id: u64, account: Address) -> Result<Option<Role>, Error> {
+        let wallet = Self::load_wallet(&env, wallet_id)?;
+        Ok(access::effective_role(
+            &env,
+            wallet_id,
+            &wallet.owner,
+            &account,
+        ))
+    }
+
+    /// Whether `account` holds at least `role` on a wallet - the same question
+    /// the entrypoint guards ask, exposed for off-chain callers.
+    pub fn has_role(env: Env, wallet_id: u64, account: Address, role: Role) -> Result<bool, Error> {
+        let wallet = Self::load_wallet(&env, wallet_id)?;
+        Ok(access::require_role(&env, wallet_id, &wallet.owner, &account, role).is_ok())
+    }
+
     /// Read a wallet's owner + state.
     pub fn get_wallet(env: Env, wallet_id: u64) -> Result<WalletData, Error> {
         Self::load_wallet(&env, wallet_id)
     }
 
+    /// Read a wallet's rate-limit config (disabled defaults when unset).
+    pub fn get_rate_limit(env: Env, wallet_id: u64) -> RateLimitConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::RateLimit(wallet_id))
+            .unwrap_or(RateLimitConfig {
+                max_volume: 0,
+                max_count: 0,
+                window_seconds: 0,
+            })
+    }
+
+    /// Read a wallet's outbound usage in the current epoch window (zeros when
+    /// rate limiting is not configured).
+    pub fn get_rate_usage(env: Env, wallet_id: u64) -> RateUsage {
+        let config: RateLimitConfig =
+            match env.storage().instance().get(&DataKey::RateLimit(wallet_id)) {
+                Some(c) => c,
+                None => {
+                    return RateUsage {
+                        volume: 0,
+                        count: 0,
+                    }
+                }
+            };
+        if config.window_seconds == 0 {
+            return RateUsage {
+                volume: 0,
+                count: 0,
+            };
+        }
+        let ts = env.ledger().timestamp();
+        let window = ts - (ts % config.window_seconds);
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateUsage(wallet_id, window))
+            .unwrap_or(RateUsage {
+                volume: 0,
+                count: 0,
+            })
+    }
+
     /// Read a wallet's internal balance for an asset (0 if none recorded).
+    /// Stays available while the breaker is tripped.
     pub fn balance(env: Env, wallet_id: u64, asset: Address) -> i128 {
         env.storage()
             .persistent()
@@ -500,39 +708,141 @@ impl WalletContract {
         Self::bump_wallet(env, id);
     }
 
-    fn require_owner(env: &Env, id: u64, caller: &Address) -> Result<WalletData, Error> {
+    /// Authenticate `caller`, then require it to hold at least `required` on the
+    /// wallet. The wallet is loaded first so an unknown id reports
+    /// [`Error::NotFound`] rather than an authorization failure.
+    fn require_wallet_role(
+        env: &Env,
+        id: u64,
+        caller: &Address,
+        required: Role,
+    ) -> Result<WalletData, Error> {
         caller.require_auth();
         let wallet = Self::load_wallet(env, id)?;
-        if &wallet.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        access::require_role(env, id, &wallet.owner, caller, required)?;
+
         Ok(wallet)
     }
 
-    fn require_owner_or_admin(env: &Env, id: u64, caller: &Address) -> Result<WalletData, Error> {
+    /// As [`Self::require_wallet_role`], but the contract-level emergency admin
+    /// also passes regardless of any per-wallet role.
+    fn require_wallet_role_or_admin(
+        env: &Env,
+        id: u64,
+        caller: &Address,
+        required: Role,
+    ) -> Result<WalletData, Error> {
         caller.require_auth();
         let wallet = Self::load_wallet(env, id)?;
         let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
-        let is_admin = admin.map(|a| &a == caller).unwrap_or(false);
-        if &wallet.owner != caller && !is_admin {
-            return Err(Error::Unauthorized);
+        if admin.map(|a| &a == caller).unwrap_or(false) {
+            return Ok(wallet);
         }
+        access::require_role(env, id, &wallet.owner, caller, required)?;
+
         Ok(wallet)
     }
 
-    fn require_active(wallet: &WalletData) -> Result<(), Error> {
-        match wallet.state {
-            ResourceState::Active => Ok(()),
-            ResourceState::Frozen => Err(Error::WalletFrozen),
-            ResourceState::Paused => Err(Error::WalletPaused),
-            ResourceState::Archived => Err(Error::WalletArchived),
+    fn paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// The circuit breaker guard applied to every value-moving entrypoint.
+    fn when_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::paused(env) {
+            return Err(Error::WalletPaused);
         }
+        Ok(())
+    }
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if &admin != caller {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_guardian_or_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let guardian: Option<Address> = env.storage().instance().get(&DataKey::Guardian);
+        let allowed = &admin == caller || guardian.map(|g| &g == caller).unwrap_or(false);
+        if !allowed {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_active(wallet: &WalletData) -> Result<(), Error> {
+        ensure!(wallet.state != ResourceState::Frozen, Error::WalletFrozen);
+        ensure!(wallet.state != ResourceState::Paused, Error::WalletPaused);
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
+        Ok(())
+    }
+
+    /// Enforce a wallet's rate limit for an outbound transaction of `amount`
+    /// and record it against the current epoch window. Returns
+    /// [`Error::RateLimitExceeded`] when either the window volume or transaction
+    /// count cap would be exceeded; the caller's whole invocation reverts on
+    /// error, so no usage or balance change is committed for rejected transfers.
+    fn enforce_rate_limit(env: &Env, wallet_id: u64, amount: i128) -> Result<(), Error> {
+        let config: RateLimitConfig =
+            match env.storage().instance().get(&DataKey::RateLimit(wallet_id)) {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+        if config.window_seconds == 0 {
+            return Ok(());
+        }
+        let ts = env.ledger().timestamp();
+        let window = ts - (ts % config.window_seconds);
+        let key = DataKey::RateUsage(wallet_id, window);
+        let usage: RateUsage = env.storage().persistent().get(&key).unwrap_or(RateUsage {
+            volume: 0,
+            count: 0,
+        });
+
+        if config.max_count != 0 && usage.count >= config.max_count {
+            return Err(Error::RateLimitExceeded);
+        }
+        let new_volume = checked_add(usage.volume, amount)?;
+        if config.max_volume != 0 && new_volume > config.max_volume {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        let updated = RateUsage {
+            volume: new_volume,
+            count: checked_add(usage.count as i128, 1)? as u32,
+        };
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
     }
 
     fn credit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
         let key = DataKey::Balance(id, asset.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let updated = checked_add(current, amount)?;
+        let updated = current.safe_add(amount)?;
         env.storage().persistent().set(&key, &updated);
         env.storage().persistent().extend_ttl(
             &key,
@@ -548,7 +858,8 @@ impl WalletContract {
         if current < amount {
             return Err(Error::InsufficientFunds);
         }
-        let updated = checked_sub(current, amount)?;
+        let updated = current.safe_sub(amount)?;
+
         env.storage().persistent().set(&key, &updated);
         env.storage().persistent().extend_ttl(
             &key,
