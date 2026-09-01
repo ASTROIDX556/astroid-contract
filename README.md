@@ -66,7 +66,7 @@ Registry ──► Wallet ──► Treasury
 
 ```bash
 # Prerequisites: Rust stable + Stellar CLI
-cargo install --locked stellar-cli --features opt
+cargo install --locked stellar-cli
 
 # Build all contracts
 stellar contract build

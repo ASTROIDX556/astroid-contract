@@ -428,17 +428,13 @@
               },
               {
                 "symbol": "register"
+              },
+              {
+                "string": "acme"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "acme"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                }
-              ]
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
             }
           }
         }
@@ -514,10 +510,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "module"
-              },
-              {
-                "symbol": "register"
+                "symbol": "RegistryModuleUpdated"
               }
             ],
             "data": {
@@ -532,6 +525,35 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                 }
               ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "module"
+              },
+              {
+                "symbol": "register"
+              },
+              {
+                "string": "acme"
+              },
+              {
+                "u32": 0
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
             }
           }
         }
@@ -608,18 +630,15 @@
               },
               {
                 "symbol": "remove"
+              },
+              {
+                "string": "acme"
+              },
+              {
+                "u32": 0
               }
             ],
-            "data": {
-              "vec": [
-                {
-                  "string": "acme"
-                },
-                {
-                  "u32": 0
-                }
-              ]
-            }
+            "data": "void"
           }
         }
       },
