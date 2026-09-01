@@ -75,17 +75,12 @@ pub enum Error {
     /// weights or the threshold.
     UnauthorizedModification = 92,
 
-    // --- Proposal (71-79) ---
-    ProposalExpired = 71,
-    InvalidProposalState = 72,
-    ProposalNotApproved = 73,
-    NotAnApprover = 74,
-    CancellationWindowClosed = 75,
-    /// A prerequisite proposal has not executed, so the dependent proposal may
-    /// not execute yet.
-    PrerequisiteNotMet = 78,
-    /// A declared dependency would close a cycle in the dependency graph.
-    CircularDependencyDetected = 79,
+    // --- Proposal (70-79) ---
+    ProposalExpired = 70,
+    InvalidProposalState = 71,
+    ProposalNotApproved = 72,
+    NotAnApprover = 73,
+    QuorumNotMet = 74,
 
     // --- Escrow (80-81) ---
     EscrowExpired = 80,

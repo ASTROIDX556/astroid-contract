@@ -94,8 +94,8 @@ pub struct ProposalContext {
 }
 
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
-/// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
-/// the ids of proposals that must have executed before this one may execute.
+/// to approve; `threshold` approvals move it to `Approved`. Execution also
+/// requires `quorum` participating approvers.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposal {
@@ -106,6 +106,7 @@ pub struct Proposal {
     /// proposal's own id. Empty for a proposal with no dependencies.
     pub dependencies: Vec<u64>,
     pub threshold: u32,
+    pub quorum: u32,
     pub approvals: u32,
     pub state: ProposalState,
     pub created_at: u64,
@@ -221,6 +222,63 @@ impl ProposalContract {
         expires_at: u64,
         grace_period: u64,
     ) -> Result<u64, Error> {
+        Self::create_proposal(
+            env,
+            proposer,
+            org,
+            wallet,
+            policy,
+            tx_ref,
+            approvers,
+            threshold,
+            threshold,
+            expires_at,
+        )
+    }
+
+    /// Create a proposal with separate approval and participation thresholds.
+    /// Quorum is the minimum number of eligible approvers that must participate
+    /// before an approved proposal can execute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_quorum(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        tx_ref: String,
+        approvers: Vec<Address>,
+        threshold: u32,
+        quorum: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        Self::create_proposal(
+            env,
+            proposer,
+            org,
+            wallet,
+            policy,
+            tx_ref,
+            approvers,
+            threshold,
+            quorum,
+            expires_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_proposal(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        tx_ref: String,
+        approvers: Vec<Address>,
+        threshold: u32,
+        quorum: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
         proposer.require_auth();
         require_non_empty(&context.org)?;
         let n = approvers.len();
@@ -230,15 +288,8 @@ impl ProposalContract {
         if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
         }
-        if let Some(dep) = deposit.first() {
-            if dep.amount <= 0 {
-                return Err(Error::InvalidAmount);
-            }
-            TokenClient::new(&env, &dep.asset).transfer(
-                &proposer,
-                &env.current_contract_address(),
-                &dep.amount,
-            );
+        if quorum == 0 || quorum > n {
+            return Err(Error::InvalidThreshold);
         }
         if expires_at != 0 && expires_at <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
@@ -279,6 +330,7 @@ impl ProposalContract {
             approvers,
             dependencies: deps,
             threshold,
+            quorum,
             approvals: 0,
             deposit,
             state: ProposalState::Pending,
@@ -444,7 +496,9 @@ impl ProposalContract {
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
-        Self::ensure_dependencies_met(&env, &proposal)?;
+        if proposal.approvals < proposal.quorum {
+            return Err(Error::QuorumNotMet);
+        }
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(

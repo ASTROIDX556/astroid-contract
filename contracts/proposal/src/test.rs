@@ -67,41 +67,18 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
     )
 }
 
-/// `create_with_deps` in its fallible form, for the rejection paths.
-fn try_create_with_deps(h: &Harness, deps: &[u64]) -> Result<u64, Error> {
-    h.client
-        .try_create(
-            &h.proposer,
-            &ProposalContext {
-                org: String::from_str(&h.env, "acme"),
-                wallet: String::from_str(&h.env, "wallet-1"),
-                policy: String::from_str(&h.env, "policy-1"),
-                tx_ref: String::from_str(&h.env, "tx-ref-1"),
-            },
-            &approver_vec(h),
-            &dep_vec(h, deps),
-            &2,
-            &soroban_sdk::vec![&h.env],
-            &0,
-            &0,
-        )
-        .map(|ok| ok.unwrap())
-        .map_err(|err| err.unwrap())
-}
-
-fn dep_vec(h: &Harness, deps: &[u64]) -> Vec<u64> {
-    let mut v = Vec::new(&h.env);
-    for d in deps {
-        v.push_back(*d);
-    }
-    v
-}
-
-/// Drive a proposal all the way to `Executed`.
-fn approve_and_execute(h: &Harness, id: u64) {
-    h.client.approve(&h.approvers[0], &id);
-    h.client.approve(&h.approvers[1], &id);
-    h.client.execute(&h.proposer, &id);
+fn create_with_quorum(h: &Harness, threshold: u32, quorum: u32, expires_at: u64) -> u64 {
+    h.client.create_with_quorum(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &String::from_str(&h.env, "tx-ref-1"),
+        &approver_vec(h),
+        &threshold,
+        &quorum,
+        &expires_at,
+    )
 }
 
 #[test]
@@ -125,6 +102,57 @@ fn full_lifecycle_to_closed() {
 
     h.client.close(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Closed);
+}
+
+#[test]
+fn majority_vote_without_quorum_cannot_execute() {
+    let h = setup(3);
+    let id = create_with_quorum(&h, 2, 3, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::QuorumNotMet)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn quorum_allows_execution_when_reached() {
+    let h = setup(3);
+    let id = create_with_quorum(&h, 2, 3, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.approve(&h.approvers[2], &id);
+
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn zero_quorum_is_rejected() {
+    let h = setup(3);
+    let res = h.client.try_create_with_quorum(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &String::from_str(&h.env, "tx-ref-1"),
+        &approver_vec(&h),
+        &1,
+        &0,
+        &5_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+}
+
+#[test]
+fn zero_participation_cannot_execute() {
+    let h = setup(3);
+    let id = create_with_quorum(&h, 1, 2, 5_000);
+
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::ProposalNotApproved)));
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
 }
 
 #[test]
