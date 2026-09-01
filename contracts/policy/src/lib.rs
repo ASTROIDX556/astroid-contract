@@ -20,11 +20,144 @@
 
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::events::ContractEvent;
-use astroid_shared::validation::require_non_empty;
+use astroid_shared::math::{checked_add, checked_sub};
+use astroid_shared::validation::{require_non_empty, require_non_negative_amount};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
+
+/// Maximum recursion depth for composite rule evaluation to prevent stack
+/// overflows and excessive gas consumption on-chain.
+const MAX_RULE_DEPTH: u32 = 10;
+
+/// A transaction payload submitted for policy evaluation.
+///
+/// This struct carries the essential fields of a proposed transfer so the
+/// composite rule engine can assess it against the full policy tree.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionPayload {
+    /// The Stellar asset contract address being transferred.
+    pub asset: Address,
+    /// The intended recipient of the transfer.
+    pub recipient: Address,
+    /// The amount being transferred (in base units).
+    pub amount: i128,
+}
+
+/// The operation performed by a rule node.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RuleOp {
+    /// Leaf: transfer amount must be at most `value_i128`.
+    MaxAmount = 0,
+    /// Leaf: recipient must equal `value_address`.
+    AllowedRecipient = 1,
+    /// Leaf: asset must equal `value_address`.
+    AllowedAsset = 2,
+    /// Leaf: recipient must be on the on-chain blacklist.
+    RecipientBlacklisted = 3,
+    /// Leaf: recipient must be on the merchant blacklist.
+    MerchantBlacklisted = 4,
+    /// Branch: **all** children must evaluate to `true`.
+    And = 5,
+    /// Branch: **at least one** child must evaluate to `true`.
+    Or = 6,
+    /// Branch: negates the single child rule.
+    Not = 7,
+}
+
+/// A single node in a flattened composite rule tree.
+///
+/// Branch nodes (`And`, `Or`, `Not`) reference their children by index range
+/// into the enclosing [`RuleTree`] vector. Leaf nodes use
+/// `children_start == children_end == 0`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleNode {
+    /// The operation this node performs.
+    pub op: RuleOp,
+    /// Payload for leaf nodes that carry an amount threshold.
+    pub value_i128: i128,
+    /// Payload for leaf nodes that carry an address.
+    pub value_address: Address,
+    /// Index of the first child in the tree vector (`0` = no children).
+    pub children_start: u32,
+    /// One past the last child index (`0` = no children).
+    pub children_end: u32,
+}
+
+/// A flattened composite policy rule tree.
+///
+/// The root node is always at index **0**.  Children of a branch node at index
+/// `i` occupy the contiguous range `[children_start, children_end)` in the
+/// same vector.
+///
+/// **Gas safety:** Evaluation is depth-limited to [`MAX_RULE_DEPTH`].
+pub type RuleTree = soroban_sdk::Vec<RuleNode>;
+
+/// Evaluate a node in a [`RuleTree`] against `payload`.
+///
+/// `depth` is decremented on every recursive call; returns
+/// `Err(Error::InvalidInput)` when exhausted (stack/gas protection).
+fn evaluate_node(
+    env: &Env,
+    tree: &RuleTree,
+    node_idx: u32,
+    payload: &TransactionPayload,
+    depth: u32,
+) -> Result<bool, Error> {
+    if depth == 0 {
+        return Err(Error::InvalidInput);
+    }
+    let remaining = depth - 1;
+    let node = tree.get(node_idx).ok_or(Error::InvalidInput)?;
+    match node.op {
+        RuleOp::MaxAmount => Ok(payload.amount <= node.value_i128),
+        RuleOp::AllowedRecipient => Ok(payload.recipient == node.value_address),
+        RuleOp::AllowedAsset => Ok(payload.asset == node.value_address),
+        RuleOp::RecipientBlacklisted => Ok(env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(payload.recipient.clone()))),
+        RuleOp::MerchantBlacklisted => Ok(env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(payload.recipient.clone()))),
+        RuleOp::And => {
+            if node.children_start == node.children_end {
+                return Err(Error::InvalidInput);
+            }
+            for i in node.children_start..node.children_end {
+                if !evaluate_node(env, tree, i, payload, remaining)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        RuleOp::Or => {
+            if node.children_start == node.children_end {
+                return Err(Error::InvalidInput);
+            }
+            for i in node.children_start..node.children_end {
+                if evaluate_node(env, tree, i, payload, remaining)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        RuleOp::Not => {
+            if node.children_start + 1 != node.children_end {
+                return Err(Error::InvalidInput);
+            }
+            let result = evaluate_node(env, tree, node.children_start, payload, remaining)?;
+            Ok(!result)
+        }
+    }
+}
 
 /// On-chain representation of a registered policy.
 #[contracttype]
@@ -56,9 +189,36 @@ enum DataKey {
     CategoryBlacklist(String),
     /// Per-policy asset whitelist: (policy_id, asset) -> true.
     AssetWhitelist(String, Address),
+    /// Per-policy asset deny list: (policy_id, asset) -> (). Keyed by policy so
+    /// each policy governs only its own assets.
+    AssetBlacklist(String, Address),
     /// Whether an org uses a permissive (all-assets-allowed) or restrictive
     /// (whitelist-enforced) asset mode. Stored per policy_id.
     AssetWhitelistEnabled(String),
+    /// Per-(policy, asset) multi-token spending allowance.
+    Allowance(String, Address),
+    /// Composite rule tree for a policy (set via `set_composite_rule`).
+    CompositeRule(String),
+}
+
+/// A per-asset spending allowance attached to a policy.
+///
+/// Multiple Stellar asset types (native XLM and Soroban SAC tokens) are tracked
+/// independently under the (policy_id, asset) key, so a policy can express a
+/// granular quota per token rather than a single default denomination.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetAllowance {
+    /// The policy this allowance belongs to.
+    pub policy_id: String,
+    /// The asset contract address (SAC) or the native XLM contract.
+    pub asset: Address,
+    /// Cumulative spending limit for this asset. `0` means disabled.
+    pub limit: i128,
+    /// Amount already spent against the limit.
+    pub spent: i128,
+    /// Unix timestamp the allowance expires at (`0` = never).
+    pub expires_at: u64,
 }
 
 #[contract]
@@ -109,10 +269,7 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("registd")),
-            policy_id,
-        );
+        events::policy_registered(&env, &policy_id);
         Ok(())
     }
 
@@ -134,10 +291,7 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rotated")),
-            policy_id,
-        );
+        events::policy_rotated(&env, &policy_id);
         Ok(())
     }
 
@@ -179,10 +333,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &true);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("asset_add")),
-            (policy_id, asset),
-        );
+        events::policy_asset_added(&env, &policy_id, &asset);
         Ok(())
     }
 
@@ -203,11 +354,51 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("asset_rem")),
-            (policy_id, asset),
-        );
+        events::policy_asset_removed(&env, &policy_id, &asset);
         Ok(())
+    }
+
+    /// Blacklist an asset for a policy (owner only). Once listed, no transfer
+    /// evaluated against `policy_id` may move that token, whatever the policy's
+    /// other asset gates say.
+    pub fn add_asset_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &());
+        events::policy_asset_blocked(&env, &policy_id, &asset);
+        Ok(())
+    }
+
+    /// Remove an asset from a policy's blacklist (owner only).
+    pub fn remove_asset_blacklist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::AssetBlacklist(policy_id.clone(), asset.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        events::policy_asset_unblocked(&env, &policy_id, &asset);
+        Ok(())
+    }
+
+    /// Whether `asset` is blacklisted under `policy_id`.
+    pub fn is_asset_blacklisted(env: Env, policy_id: String, asset: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::AssetBlacklist(policy_id, asset))
     }
 
     /// Enable or disable the asset whitelist for a policy (owner only).
@@ -257,19 +448,61 @@ impl PolicyContract {
         policy_id: String,
         address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::Blacklist(address.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
+        events::policy_blocked(&env, &policy_id, &address);
+        Ok(())
+    }
+
+    /// Approve `token` for spends under `policy_id` (owner only). Unlisted
+    /// assets are rejected by `check_transfer` with `TokenNotWhitelisted`.
+    pub fn add_to_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        token: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(policy_id.clone(), token.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &());
         env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_add")),
-            (policy_id, address),
+            (symbol_short!("policy"), symbol_short!("wht_add")),
+            (policy_id, token),
+        );
+        Ok(())
+    }
+
+    /// Revoke an approved `token` from the whitelist (owner only).
+    pub fn remove_from_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        token: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(policy_id.clone(), token.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wht_rem")),
+            (policy_id, token),
         );
         Ok(())
     }
@@ -281,20 +514,13 @@ impl PolicyContract {
         policy_id: String,
         address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::Blacklist(address.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_rem")),
-            (policy_id, address),
-        );
+        events::policy_unblocked(&env, &policy_id, &address);
         Ok(())
     }
 
@@ -315,10 +541,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("merch_add")),
-            (policy_id, merchant_address),
-        );
+        events::policy_merchant_blocked(&env, &policy_id, &merchant_address);
         Ok(())
     }
 
@@ -339,10 +562,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("merch_rem")),
-            (policy_id, merchant_address),
-        );
+        events::policy_merchant_unblocked(&env, &policy_id, &merchant_address);
         Ok(())
     }
 
@@ -364,10 +584,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("cat_add")),
-            (policy_id, category),
-        );
+        events::policy_category_blocked(&env, &policy_id, &category);
         Ok(())
     }
 
@@ -388,10 +605,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("cat_rem")),
-            (policy_id, category),
-        );
+        events::policy_category_unblocked(&env, &policy_id, &category);
         Ok(())
     }
 
@@ -446,7 +660,7 @@ impl PolicyContract {
     }
 
     /// Check if a spending category is restricted. Returns Ok(()) if the category
-    /// is allowed, or PolicyCategoryRestricted if it's blacklisted.
+    /// is allowed, or PolicyDenied if it's blacklisted.
     pub fn check_category(env: Env, policy_id: String, category: String) -> Result<(), Error> {
         // Empty category is always allowed
         if category.is_empty() {
@@ -459,9 +673,217 @@ impl PolicyContract {
             .has(&DataKey::CategoryBlacklist(category.clone()))
         {
             events_policy_violation(&env, &policy_id, "category_restricted");
-            return Err(Error::PolicyCategoryRestricted);
+            return Err(Error::PolicyDenied);
         }
         Ok(())
+    }
+
+    // --- multi-token allowances ---
+
+    /// Create or update the spending allowance for `(policy_id, asset)`.
+    /// `owner` only. Rejects a negative limit. `expires_at == 0` means never.
+    pub fn set_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+        limit: i128,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        require_non_negative_amount(limit)?;
+        // Updating an allowance keeps existing spend so limits are enforced
+        // cumulatively across updates.
+        let mut allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
+        allowance.limit = limit;
+        allowance.expires_at = expires_at;
+        allowance.policy_id = policy_id.clone();
+        allowance.asset = asset.clone();
+        env.storage().persistent().set(
+            &DataKey::Allowance(policy_id.clone(), asset.clone()),
+            &allowance,
+        );
+        events::policy_allowance_set(&env, &policy_id, &asset, limit);
+        Ok(())
+    }
+
+    /// Remove the spending allowance for `(policy_id, asset)`. `owner` only.
+    pub fn remove_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Allowance(policy_id.clone(), asset.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        events::policy_allowance_removed(&env, &policy_id, &asset);
+        Ok(())
+    }
+
+    /// Read the current allowance for `(policy_id, asset)`. Returns the stored
+    /// record, or a zeroed record when none has been configured (so callers can
+    /// treat an unset allowance as "unrestricted").
+    pub fn get_allowance(env: Env, policy_id: String, asset: Address) -> AssetAllowance {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(policy_id.clone(), asset.clone()))
+            .unwrap_or(AssetAllowance {
+                policy_id,
+                asset,
+                limit: 0,
+                spent: 0,
+                expires_at: 0,
+            })
+    }
+
+    /// Check whether spending `amount` of `asset` under `policy_id` is within
+    /// the configured allowance. Returns the remaining headroom after the spend
+    /// (0 = the allowance would be fully consumed, which is permitted). An
+    /// unset allowance is unrestricted. Returns
+    /// [`Error::PolicyAllowanceExceeded`] when the spend would breach the
+    /// allowance.
+    pub fn check_allowance(
+        env: Env,
+        policy_id: String,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        require_non_negative_amount(amount)?;
+        let allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
+        // No configured allowance => unrestricted for this asset.
+        if allowance.limit == 0 {
+            return Ok(i128::MAX);
+        }
+        if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
+            events_policy_violation(&env, &policy_id, "allowance_expired");
+            return Err(Error::PolicyDenied);
+        }
+        let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
+        if amount > headroom_after_spend {
+            events_policy_violation(&env, &policy_id, "allowance_exceeded");
+            return Err(Error::PolicyAllowanceExceeded);
+        }
+        checked_sub(headroom_after_spend, amount)
+    }
+
+    /// Atomically consume `amount` against the `(policy_id, asset)` allowance.
+    /// Returns `Ok(())` when the allowance was decremented, or
+    /// [`Error::PolicyAllowanceExceeded`] when it would be breached.
+    pub fn update_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        require_non_negative_amount(amount)?;
+        let mut allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
+        // No configured allowance => nothing to enforce.
+        if allowance.limit == 0 {
+            return Ok(());
+        }
+        if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
+            return Err(Error::PolicyDenied);
+        }
+        let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
+        if amount > headroom_after_spend {
+            return Err(Error::PolicyAllowanceExceeded);
+        }
+        allowance.spent = checked_add(allowance.spent, amount)?;
+        env.storage().persistent().set(
+            &DataKey::Allowance(policy_id.clone(), asset.clone()),
+            &allowance,
+        );
+        events::policy_allowance_used(&env, &policy_id, &asset, amount, allowance.spent);
+        Ok(())
+    }
+
+    // --- composite rules ---
+
+    /// Register or replace the composite rule tree for a policy.
+    ///
+    /// The rule tree is evaluated during `check_transfer` **after** all the
+    /// standard scalar gates (blocklist, max amount, recipient, asset, etc.)
+    /// have passed. If the rule tree evaluates to `false`, the transfer is
+    /// denied with [`Error::PolicyDenied`].
+    ///
+    /// `owner` only. The tree must contain at least one node with the root at
+    /// index 0.
+    pub fn set_composite_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        rule_tree: RuleTree,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        if rule_tree.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        let key = DataKey::CompositeRule(policy_id.clone());
+        env.storage().persistent().set(&key, &rule_tree);
+        events::policy_rule_set(&env, &policy_id);
+        Ok(())
+    }
+
+    /// Remove the composite rule tree for a policy (owner only).
+    pub fn clear_composite_rule(env: Env, caller: Address, policy_id: String) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::CompositeRule(policy_id.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        events::policy_rule_cleared(&env, &policy_id);
+        Ok(())
+    }
+
+    /// Read the composite rule tree for a policy, if one is set.
+    pub fn get_composite_rule(env: Env, policy_id: String) -> Result<RuleTree, Error> {
+        let key = DataKey::CompositeRule(policy_id.clone());
+        env.storage().persistent().get(&key).ok_or(Error::NotFound)
+    }
+
+    /// Evaluate a composite rule tree against a transaction payload.
+    ///
+    /// Returns `Ok(true)` when the rule permits the transaction, or
+    /// `Err(Error::PolicyDenied)` when it denies it. If no composite rule
+    /// is registered for the policy the function returns `Ok(true)` (permissive
+    /// default — standard scalar gates still apply).
+    pub fn evaluate_composite_rule(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<bool, Error> {
+        let key = DataKey::CompositeRule(policy_id.clone());
+        let tree: RuleTree = match env.storage().persistent().get(&key) {
+            Some(t) => t,
+            None => return Ok(true),
+        };
+        if tree.is_empty() {
+            return Ok(true);
+        }
+        evaluate_node(&env, &tree, 0, &payload, MAX_RULE_DEPTH)
     }
 
     // --- views ---
@@ -478,9 +900,19 @@ impl PolicyContract {
             .get(&DataKey::Policy(id.clone()))
             .ok_or(Error::NotFound)
     }
+
+    /// Authenticate `caller` and require it to own `policy_id`.
+    fn require_policy_owner(env: &Env, caller: &Address, policy_id: &String) -> Result<(), Error> {
+        caller.require_auth();
+        if Self::load(env, policy_id)?.owner != *caller {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
 }
 
 /// Allow the interface trait to call `check_transfer` on this contract.
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl PolicyInterface for PolicyContract {
     /// Evaluate a transfer request against the named policy. All gates must pass.
@@ -516,7 +948,7 @@ impl PolicyInterface for PolicyContract {
             .has(&DataKey::MerchantBlacklist(recipient.clone()))
         {
             events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
+            return Err(Error::PolicyDenied);
         }
         // --- Allowance / amount gates ---
         if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
@@ -538,6 +970,16 @@ impl PolicyInterface for PolicyContract {
                 events_policy_violation(&env, &policy_id, "bad_asset");
                 return Err(Error::PolicyDenied);
             }
+        }
+        // The asset deny list wins over every allow gate, so blacklisting an
+        // allow-listed or whitelisted asset takes effect immediately.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::AssetBlacklist(policy_id.clone(), asset.clone()))
+        {
+            events_policy_violation(&env, &policy_id, "asset_blacklisted");
+            return Err(Error::PolicyDenied);
         }
         // Check asset whitelist (Issue #37)
         Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
@@ -569,6 +1011,14 @@ impl PolicyInterface for PolicyContract {
             return Err(Error::PolicyMerchantBlocked);
         }
         Ok(())
+    }
+
+    /// Clean query the wallet/treasury can call before touching an external SAC
+    /// address: is `token` approved for spends under `policy_id`?
+    fn is_token_allowed(env: Env, policy_id: String, token: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Whitelist(policy_id, token))
     }
 }
 
