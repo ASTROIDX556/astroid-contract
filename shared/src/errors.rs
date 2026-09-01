@@ -85,8 +85,7 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-82) ---
-    EscrowExpired = 80,
+    // --- Escrow (81-82) ---
     TimeLockActive = 81,
     GraceActive = 82,
 

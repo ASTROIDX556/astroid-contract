@@ -182,7 +182,7 @@ fn release_after_deadline_is_refused() {
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_release(&h.arbiter, &id, &5_000);
-    assert_eq!(res, Err(Ok(Error::EscrowExpired)));
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
@@ -976,7 +976,7 @@ fn release_after_grace_is_refused() {
         .ledger()
         .with_mut(|l| l.timestamp = START + 200 + GRACE);
     let res = h.client.try_release(&h.arbiter, &id, &5_000);
-    assert_eq!(res, Err(Ok(Error::EscrowExpired)));
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }

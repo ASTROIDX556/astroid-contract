@@ -769,7 +769,7 @@ impl EscrowContract {
             // persist an `Expired` transition here: returning `Err` rolls back every
             // storage write, so the marker is set through the permissionless `expire`
             // entrypoint and the funds are reclaimed via `refund` / `reclaim`.
-            return Err(Error::EscrowExpired);
+            return Err(Error::InvalidState);
         }
         let remaining = escrow
             .funded_amount
@@ -827,7 +827,7 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
         if env.ledger().timestamp() >= escrow.deadline {
-            return Err(Error::EscrowExpired);
+            return Err(Error::InvalidState);
         }
         if nonce <= escrow.override_nonce {
             return Err(Error::InvalidNonce);
