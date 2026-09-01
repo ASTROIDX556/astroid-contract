@@ -2,9 +2,9 @@
 extern crate std;
 
 use crate::{BatchCall, MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_shared::constants::MAX_BATCH_CALLS;
+use astroid_shared::constants::{MAX_BATCH_CALLS, MIN_TIMELOCK_DELAY};
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Ledger};
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
     Val, Vec,
@@ -77,6 +77,11 @@ fn setup(weights: &[u32], threshold: u32) -> Harness {
     }
 }
 
+fn advance(h: &Harness, seconds: u64) {
+    let now = h.env.ledger().timestamp();
+    h.env.ledger().set_timestamp(now + seconds);
+}
+
 fn payload(env: &Env) -> Bytes {
     Bytes::from_array(env, &[1, 2, 3, 4])
 }
@@ -114,7 +119,7 @@ fn zero_weight_rejected_on_init() {
     sv.push_back(sw(&Address::generate(&env), 0));
     sv.push_back(sw(&Address::generate(&env), 1));
     let res = client.try_initialize(&sv, &1);
-    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
+    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
 }
 
 #[test]
@@ -226,7 +231,7 @@ fn time_lock_blocks_early_execution() {
     h.client.approve(&h.signers[1], &id);
     // Threshold met (4), but time lock not reached.
     let res = h.client.try_execute(&h.signers[0], &id);
-    assert_eq!(res, Err(Ok(Error::TimeLocked)));
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
 
     // Advance past the lock.
     h.env.ledger().set_timestamp(6_000);
@@ -259,6 +264,360 @@ fn emergency_lock_blocks_actions() {
     h.client.execute(&h.signers[0], &id);
     assert!(h.client.get_proposal(&id).executed);
 }
+
+/// Move the ledger clock forward by `seconds`.
+fn advance(h: &Harness, seconds: u64) {
+    let now = h.env.ledger().timestamp();
+    h.env.ledger().set_timestamp(now + seconds);
+}
+
+/// Assert an event with the given `(category, action)` tuple topic was emitted.
+fn assert_event(env: &Env, category: Symbol, action: Symbol) {
+    let want_category: Val = category.into_val(env);
+    let want_action: Val = action.into_val(env);
+    let found =
+        env.events().all().iter().any(|(_id, topics, _data)| {
+            topics.contains(want_category) && topics.contains(want_action)
+        });
+    assert!(found, "expected a matching event to be emitted");
+}
+
+// --- timelocked governance ---
+
+#[test]
+fn threshold_change_applies_only_after_the_timelock() {
+    let h = setup(&[1, 1, 1], 2);
+    let id = h.client.propose_threshold_change(&h.signers[0], &3);
+
+    // Parked, not applied: the live threshold is untouched.
+    assert_eq!(h.client.get_threshold(), 2);
+    let pending = h.client.get_pending_change(&id);
+    assert_eq!(pending.proposer, h.signers[0]);
+    assert_eq!(pending.change, GovernanceChange::Threshold(3));
+    assert_eq!(pending.eta, pending.proposed_at + MIN_TIMELOCK_DELAY);
+    assert_eq!(pending.expires_at, pending.eta + GOVERNANCE_GRACE_PERIOD);
+    assert!(!pending.executed);
+    assert!(!pending.cancelled);
+
+    // One second short of the delay is still too early.
+    advance(&h, MIN_TIMELOCK_DELAY - 1);
+    assert_eq!(
+        h.client.try_execute_threshold_change(&h.signers[1], &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(h.client.get_threshold(), 2);
+
+    // Exactly at the eta the change goes through.
+    advance(&h, 1);
+    h.client.execute_threshold_change(&h.signers[1], &id);
+    assert_eq!(h.client.get_threshold(), 3);
+    assert!(h.client.get_pending_change(&id).executed);
+}
+
+#[test]
+fn cancelled_change_never_executes() {
+    let h = setup(&[1, 1, 1], 2);
+    let id = h.client.propose_threshold_change(&h.signers[0], &3);
+
+    // Any signer may veto during the review window.
+    h.client.cancel_threshold_change(&h.signers[1], &id);
+    let pending = h.client.get_pending_change(&id);
+    assert!(pending.cancelled);
+    assert!(!pending.executed);
+
+    advance(&h, MIN_TIMELOCK_DELAY);
+    assert_eq!(
+        h.client.try_execute_threshold_change(&h.signers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(h.client.get_threshold(), 2);
+}
+
+#[test]
+fn a_change_can_only_be_settled_once() {
+    let h = setup(&[1, 1, 1], 2);
+    let id = h.client.propose_threshold_change(&h.signers[0], &3);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &id);
+
+    assert_eq!(
+        h.client.try_execute_threshold_change(&h.signers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_cancel_threshold_change(&h.signers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+}
+
+#[test]
+fn matured_change_expires_after_the_grace_period() {
+    let h = setup(&[1, 1, 1], 2);
+    let id = h.client.propose_threshold_change(&h.signers[0], &3);
+    advance(&h, MIN_TIMELOCK_DELAY + GOVERNANCE_GRACE_PERIOD);
+    assert_eq!(
+        h.client.try_execute_threshold_change(&h.signers[0], &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(h.client.get_threshold(), 2);
+}
+
+#[test]
+fn set_threshold_stores_pending_change() {
+    let h = setup(&[1, 1, 1], 2);
+    h.env.ledger().set_sequence_number(100);
+    h.client.set_threshold(&h.signers[0], &3);
+    // Threshold is not yet changed.
+    assert_eq!(h.client.get_threshold(), 2);
+    let pending = h.client.get_pending_threshold();
+    assert_eq!(pending.new_threshold, 3);
+    assert_eq!(pending.effective_from, 100);
+}
+
+#[test]
+fn set_threshold_same_value_fails() {
+    let h = setup(&[1, 1, 1], 2);
+    let res = h.client.try_set_threshold(&h.signers[0], &2);
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+}
+
+#[test]
+fn set_threshold_bounds_enforced() {
+    let h = setup(&[1, 1, 1], 2);
+    // Threshold larger than signer count is rejected.
+    let res = h.client.try_set_threshold(&h.signers[0], &4);
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    // Threshold of 0 is rejected (below MIN_THRESHOLD).
+    let res = h.client.try_set_threshold(&h.signers[0], &0);
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+}
+
+#[test]
+fn finalize_threshold_before_delay_fails() {
+    let h = setup(&[1, 1, 1], 2);
+    h.env.ledger().set_sequence_number(100);
+    h.client.set_threshold(&h.signers[0], &3);
+    // Try to finalize immediately — not enough ledgers have passed.
+    let res = h.client.try_finalize_threshold(&h.signers[0]);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    // Threshold unchanged.
+
+    assert_eq!(h.client.get_threshold(), 2);
+}
+
+#[test]
+fn cancellation_still_works_while_emergency_locked() {
+    let h = setup(&[1, 1, 1], 2);
+    let id = h.client.propose_threshold_change(&h.signers[0], &3);
+    h.client.set_emergency_lock(&h.signers[0], &true);
+
+    // Proposing and executing are frozen, but a hostile change can still be
+    // withdrawn — freezing the multisig must not trap a pending modification.
+    assert_eq!(
+        h.client.try_propose_threshold_change(&h.signers[0], &1),
+        Err(Ok(Error::EmergencyLock))
+    );
+    advance(&h, MIN_TIMELOCK_DELAY);
+    assert_eq!(
+        h.client.try_execute_threshold_change(&h.signers[0], &id),
+        Err(Ok(Error::EmergencyLock))
+    );
+    h.client.cancel_threshold_change(&h.signers[1], &id);
+    assert!(h.client.get_pending_change(&id).cancelled);
+}
+
+#[test]
+fn non_signer_cannot_touch_governance() {
+    let h = setup(&[1, 1, 1], 2);
+    let stranger = Address::generate(&h.env);
+    let extra = Address::generate(&h.env);
+
+    assert_eq!(
+        h.client.try_propose_threshold_change(&stranger, &1),
+        Err(Ok(Error::UnauthorizedModification))
+    );
+    assert_eq!(
+        h.client.try_propose_signer_addition(&stranger, &extra, &1),
+        Err(Ok(Error::UnauthorizedModification))
+    );
+    assert_eq!(
+        h.client
+            .try_propose_weight_change(&stranger, &h.signers[0], &5),
+        Err(Ok(Error::UnauthorizedModification))
+    );
+
+    let id = h.client.propose_threshold_change(&h.signers[0], &3);
+    assert_eq!(
+        h.client.try_cancel_threshold_change(&stranger, &id),
+        Err(Ok(Error::UnauthorizedModification))
+    );
+    advance(&h, MIN_TIMELOCK_DELAY);
+    assert_eq!(
+        h.client.try_execute_threshold_change(&stranger, &id),
+        Err(Ok(Error::UnauthorizedModification))
+    );
+}
+
+#[test]
+fn threshold_bounds_enforced_at_proposal_time() {
+    // Weights 1, 1, 1 total 3, threshold 2.
+    let h = setup(&[1, 1, 1], 2);
+    // A threshold above the total weight can never be met, so it is not parked.
+    assert_eq!(
+        h.client.try_propose_threshold_change(&h.signers[0], &4),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    // Zero is below MIN_THRESHOLD.
+    assert_eq!(
+        h.client.try_propose_threshold_change(&h.signers[0], &0),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    assert_eq!(h.client.get_change_count(), 0);
+
+    let id = h.client.propose_threshold_change(&h.signers[0], &3);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &id);
+    assert_eq!(h.client.get_threshold(), 3);
+}
+
+#[test]
+fn finalize_threshold_after_delay_succeeds() {
+    let h = setup(&[1, 1, 1], 2);
+    h.env.ledger().set_sequence_number(100);
+    h.client.set_threshold(&h.signers[0], &3);
+    // Advance past the delay.
+    h.env
+        .ledger()
+        .set_sequence_number(100 + THRESHOLD_CHANGE_DELAY_LEDGERS);
+    h.client.finalize_threshold(&h.signers[0]);
+    assert_eq!(h.client.get_threshold(), 3);
+}
+
+#[test]
+fn execution_revalidates_against_live_state() {
+    // Weights 2, 1, 1 (total 4) with threshold 2.
+    let h = setup(&[2, 1, 1], 2);
+    // Removing signer[0] leaves total weight 2, which satisfies the threshold
+    // that is live right now, so the proposal is accepted.
+    let removal = h
+        .client
+        .propose_signer_removal(&h.signers[1], &h.signers[0]);
+    // Concurrently, the threshold is raised to 4.
+    let raise = h.client.propose_threshold_change(&h.signers[1], &4);
+
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &raise);
+    assert_eq!(h.client.get_threshold(), 4);
+
+    // The removal is now unsafe — it would leave the multisig unusable — and is
+    // rejected on the re-validation performed just before it is applied.
+    assert_eq!(
+        h.client
+            .try_execute_threshold_change(&h.signers[1], &removal),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    assert!(h.client.is_signer(&h.signers[0]));
+}
+
+#[test]
+fn finalize_threshold_no_pending_fails() {
+    let h = setup(&[1, 1, 1], 2);
+    let res = h.client.try_finalize_threshold(&h.signers[0]);
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn set_threshold_overwrites_pending_change() {
+    let h = setup(&[1, 1, 1], 2);
+    h.env.ledger().set_sequence_number(100);
+    h.client.set_threshold(&h.signers[0], &3);
+    // Change mind before finalization.
+    h.env.ledger().set_sequence_number(150);
+    h.client.set_threshold(&h.signers[0], &1);
+    let pending = h.client.get_pending_threshold();
+    assert_eq!(pending.new_threshold, 1);
+    assert_eq!(pending.effective_from, 150);
+    // Finalize the new pending change after the delay.
+    h.env
+        .ledger()
+        .set_sequence_number(150 + THRESHOLD_CHANGE_DELAY_LEDGERS);
+    h.client.finalize_threshold(&h.signers[0]);
+    assert_eq!(h.client.get_threshold(), 1);
+}
+
+#[test]
+fn non_signer_cannot_set_or_finalize_threshold() {
+    let h = setup(&[1, 1, 1], 2);
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_set_threshold(&stranger, &3),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(
+        h.client.try_finalize_threshold(&stranger),
+        Err(Ok(Error::NotASigner))
+    );
+}
+
+#[test]
+fn non_signer_cannot_change_config() {
+    let h = setup(&[1, 1, 1], 2);
+    let stranger = Address::generate(&h.env);
+    let _extra = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_set_threshold(&stranger, &3),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(
+        h.client.try_finalize_threshold(&stranger),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(
+        h.client.try_execute_threshold_change(&stranger, &1),
+        Err(Ok(Error::UnauthorizedModification))
+    );
+}
+
+#[test]
+fn timelock_delay_is_itself_governed() {
+    let h = setup(&[1, 1, 1], 2);
+    assert_eq!(h.client.get_timelock_delay(), MIN_TIMELOCK_DELAY);
+
+    // Out-of-range delays are refused up front.
+    assert_eq!(
+        h.client
+            .try_propose_timelock_delay_change(&h.signers[0], &(MIN_TIMELOCK_DELAY - 1)),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        h.client
+            .try_propose_timelock_delay_change(&h.signers[0], &(MAX_TIMELOCK_DELAY + 1)),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // A change raised under the old delay keeps the eta it was given...
+    let early = h.client.propose_threshold_change(&h.signers[0], &3);
+    let longer = 3 * MIN_TIMELOCK_DELAY;
+    let delay_change = h
+        .client
+        .propose_timelock_delay_change(&h.signers[0], &longer);
+
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client
+        .execute_threshold_change(&h.signers[0], &delay_change);
+    assert_eq!(h.client.get_timelock_delay(), longer);
+
+    // ...so it still executes on its original schedule.
+    h.client.execute_threshold_change(&h.signers[0], &early);
+    assert_eq!(h.client.get_threshold(), 3);
+
+    // New proposals pick up the longer delay.
+    let later = h.client.propose_threshold_change(&h.signers[0], &2);
+    let pending = h.client.get_pending_change(&later);
+    assert_eq!(pending.eta, pending.proposed_at + longer);
+}
+
+// --- timelocked signer-set changes ---
 
 #[test]
 fn add_and_remove_signer_with_weight() {
@@ -295,7 +654,11 @@ fn update_signer_weight_and_reach_threshold() {
     // Weights 1, 1 with threshold 2.
     let h = setup(&[1, 1], 2);
     // Bump signer[0] to weight 5; must keep total >= threshold (ok).
-    h.client.set_signer_weight(&h.signers[1], &h.signers[0], &5);
+    let id = h
+        .client
+        .propose_weight_change(&h.signers[1], &h.signers[0], &5);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &id);
     let stored = h.client.get_signers();
     assert!(stored
         .iter()
@@ -323,7 +686,7 @@ fn cannot_drop_total_weight_below_threshold() {
     // Lowering signer[0] weight to 1 would drop total to 2 < 3 -> rejected.
     let res = h
         .client
-        .try_set_signer_weight(&h.signers[1], &h.signers[0], &1);
+        .try_propose_weight_change(&h.signers[1], &h.signers[0], &1);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
 
@@ -334,8 +697,10 @@ fn set_threshold_bounds_enforced() {
     // Threshold larger than total weight is rejected.
     let res = h.client.try_set_threshold(&h.signers[0], &4);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
-    // Valid update works.
+    // Valid update works (deferred via set_threshold + finalize_threshold).
     h.client.set_threshold(&h.signers[0], &3);
+    h.env.ledger().set_sequence_number(17_280); // advance past THRESHOLD_CHANGE_DELAY_LEDGERS
+    h.client.finalize_threshold(&h.signers[0]);
     assert_eq!(h.client.get_threshold(), 3);
 }
 
@@ -353,8 +718,9 @@ fn non_signer_cannot_change_config() {
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
-        h.client.try_set_signer_weight(&stranger, &h.signers[0], &5),
-        Err(Ok(Error::NotASigner))
+        h.client
+            .try_propose_weight_change(&stranger, &h.signers[0], &5),
+        Err(Ok(Error::UnauthorizedModification))
     );
 }
 
@@ -369,8 +735,14 @@ struct BatchHarness {
 }
 
 /// Register the multisig plus a stateful helper contract and initialize with
-/// `n` signers and the given threshold.
+/// `n` signers of weight 1 and the given threshold.
 fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
+    let weights: std::vec::Vec<u32> = (0..n).map(|_| 1).collect();
+    setup_batch_weighted(&weights, threshold)
+}
+
+/// As [`setup_batch`], but with an explicit voting weight per signer.
+fn setup_batch_weighted(weights: &[u32], threshold: u32) -> BatchHarness {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiSigContract);
@@ -381,12 +753,9 @@ fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
 
     let mut signers = std::vec::Vec::new();
     let mut sv = Vec::new(&env);
-    for _ in 0..n {
+    for w in weights {
         let a = Address::generate(&env);
-        sv.push_back(SignerWeight {
-            address: a.clone(),
-            weight: 1,
-        });
+        sv.push_back(sw(&a, *w));
         signers.push(a);
     }
     client.initialize(&sv, &threshold);
@@ -636,4 +1005,103 @@ fn batch_blocked_by_emergency_lock() {
         &approvers(&h.env, &h.signers, &[1]),
     );
     assert_eq!(res, Err(Ok(Error::EmergencyLock)));
+}
+
+#[test]
+fn batch_execution_uses_signer_weights() {
+    // A single heavy signer carries the batch on its own.
+    let h = setup_batch_weighted(&[5, 1, 1], 5);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    h.client.execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[]),
+    );
+    assert_eq!(h.helper_client.get(&1), 100);
+
+    // The two light signers together fall short of the same threshold.
+    let res = h.client.try_execute_batch(
+        &h.signers[1],
+        &2,
+        &calls,
+        &approvers(&h.env, &h.signers, &[2]),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+// --- standalone threshold verification ---
+
+#[test]
+fn verify_threshold_accumulates_weight_of_distinct_signers() {
+    let h = setup(&[3, 2, 1], 5);
+    let weight = h.client.verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
+    assert_eq!(weight, 5);
+}
+
+#[test]
+fn verify_threshold_below_threshold_is_refused() {
+    let h = setup(&[3, 2, 1], 5);
+    let res = h.client.try_verify_threshold(
+        &h.signers[1],
+        &approvers(&h.env, &h.signers, &[2]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+#[test]
+fn verify_threshold_counts_a_repeated_signatory_once() {
+    let h = setup(&[3, 2, 1], 5);
+    // s0 listed as its own signatory must not stack its weight to 6.
+    let res = h.client.try_verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[0]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+#[test]
+fn verify_threshold_rejects_unregistered_signatories() {
+    let h = setup(&[3, 2, 1], 5);
+    let stranger = Address::generate(&h.env);
+    let signatories = vec![&h.env, stranger];
+    let res = h
+        .client
+        .try_verify_threshold(&h.signers[0], &signatories, &payload(&h.env));
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_verify_threshold(
+        &stranger,
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn verify_threshold_is_blocked_by_the_emergency_lock() {
+    let h = setup(&[3, 2, 1], 5);
+    h.client.set_emergency_lock(&h.signers[0], &true);
+    let res = h.client.try_verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::EmergencyLock)));
+}
+
+#[test]
+fn weight_views_report_the_configured_weights() {
+    let h = setup(&[3, 2, 1], 5);
+    assert_eq!(h.client.get_signer_weight(&h.signers[0]), 3);
+    assert_eq!(h.client.get_signer_weight(&h.signers[2]), 1);
+    assert_eq!(h.client.get_signer_weight(&Address::generate(&h.env)), 0);
+    assert_eq!(h.client.get_total_weight(), 6);
 }

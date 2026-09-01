@@ -4,8 +4,9 @@ extern crate std;
 use crate::{Budget, BudgetContract, BudgetContractClient, Period};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
+use soroban_sdk::testutils::Events;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, String};
+use soroban_sdk::{Address, Env, IntoVal, String, Symbol, Val};
 
 struct Harness {
     env: Env,
