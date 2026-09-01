@@ -2,9 +2,9 @@
 extern crate std;
 
 use crate::{BatchCall, MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_shared::constants::MAX_BATCH_CALLS;
+use astroid_shared::constants::{MAX_BATCH_CALLS, MIN_TIMELOCK_DELAY};
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Ledger};
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
     Val, Vec,
@@ -77,6 +77,11 @@ fn setup(weights: &[u32], threshold: u32) -> Harness {
     }
 }
 
+fn advance(h: &Harness, seconds: u64) {
+    let now = h.env.ledger().timestamp();
+    h.env.ledger().set_timestamp(now + seconds);
+}
+
 fn payload(env: &Env) -> Bytes {
     Bytes::from_array(env, &[1, 2, 3, 4])
 }
@@ -114,7 +119,7 @@ fn zero_weight_rejected_on_init() {
     sv.push_back(sw(&Address::generate(&env), 0));
     sv.push_back(sw(&Address::generate(&env), 1));
     let res = client.try_initialize(&sv, &1);
-    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
+    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
 }
 
 #[test]
@@ -226,7 +231,7 @@ fn time_lock_blocks_early_execution() {
     h.client.approve(&h.signers[1], &id);
     // Threshold met (4), but time lock not reached.
     let res = h.client.try_execute(&h.signers[0], &id);
-    assert_eq!(res, Err(Ok(Error::TimeLocked)));
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
 
     // Advance past the lock.
     h.env.ledger().set_timestamp(6_000);
@@ -295,7 +300,11 @@ fn update_signer_weight_and_reach_threshold() {
     // Weights 1, 1 with threshold 2.
     let h = setup(&[1, 1], 2);
     // Bump signer[0] to weight 5; must keep total >= threshold (ok).
-    h.client.set_signer_weight(&h.signers[1], &h.signers[0], &5);
+    let id = h
+        .client
+        .propose_weight_change(&h.signers[1], &h.signers[0], &5);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &id);
     let stored = h.client.get_signers();
     assert!(stored
         .iter()
@@ -323,7 +332,7 @@ fn cannot_drop_total_weight_below_threshold() {
     // Lowering signer[0] weight to 1 would drop total to 2 < 3 -> rejected.
     let res = h
         .client
-        .try_set_signer_weight(&h.signers[1], &h.signers[0], &1);
+        .try_propose_weight_change(&h.signers[1], &h.signers[0], &1);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
 
@@ -334,8 +343,10 @@ fn set_threshold_bounds_enforced() {
     // Threshold larger than total weight is rejected.
     let res = h.client.try_set_threshold(&h.signers[0], &4);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
-    // Valid update works.
+    // Valid update works (deferred via set_threshold + finalize_threshold).
     h.client.set_threshold(&h.signers[0], &3);
+    h.env.ledger().set_sequence_number(17_280); // advance past THRESHOLD_CHANGE_DELAY_LEDGERS
+    h.client.finalize_threshold(&h.signers[0]);
     assert_eq!(h.client.get_threshold(), 3);
 }
 
@@ -353,8 +364,9 @@ fn non_signer_cannot_change_config() {
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
-        h.client.try_set_signer_weight(&stranger, &h.signers[0], &5),
-        Err(Ok(Error::NotASigner))
+        h.client
+            .try_propose_weight_change(&stranger, &h.signers[0], &5),
+        Err(Ok(Error::UnauthorizedModification))
     );
 }
 
@@ -369,8 +381,14 @@ struct BatchHarness {
 }
 
 /// Register the multisig plus a stateful helper contract and initialize with
-/// `n` signers and the given threshold.
+/// `n` signers of weight 1 and the given threshold.
 fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
+    let weights: std::vec::Vec<u32> = (0..n).map(|_| 1).collect();
+    setup_batch_weighted(&weights, threshold)
+}
+
+/// As [`setup_batch`], but with an explicit voting weight per signer.
+fn setup_batch_weighted(weights: &[u32], threshold: u32) -> BatchHarness {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiSigContract);
@@ -381,12 +399,9 @@ fn setup_batch(n: u32, threshold: u32) -> BatchHarness {
 
     let mut signers = std::vec::Vec::new();
     let mut sv = Vec::new(&env);
-    for _ in 0..n {
+    for w in weights {
         let a = Address::generate(&env);
-        sv.push_back(SignerWeight {
-            address: a.clone(),
-            weight: 1,
-        });
+        sv.push_back(sw(&a, *w));
         signers.push(a);
     }
     client.initialize(&sv, &threshold);
@@ -636,4 +651,103 @@ fn batch_blocked_by_emergency_lock() {
         &approvers(&h.env, &h.signers, &[1]),
     );
     assert_eq!(res, Err(Ok(Error::EmergencyLock)));
+}
+
+#[test]
+fn batch_execution_uses_signer_weights() {
+    // A single heavy signer carries the batch on its own.
+    let h = setup_batch_weighted(&[5, 1, 1], 5);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    h.client.execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[]),
+    );
+    assert_eq!(h.helper_client.get(&1), 100);
+
+    // The two light signers together fall short of the same threshold.
+    let res = h.client.try_execute_batch(
+        &h.signers[1],
+        &2,
+        &calls,
+        &approvers(&h.env, &h.signers, &[2]),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+// --- standalone threshold verification ---
+
+#[test]
+fn verify_threshold_accumulates_weight_of_distinct_signers() {
+    let h = setup(&[3, 2, 1], 5);
+    let weight = h.client.verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
+    assert_eq!(weight, 5);
+}
+
+#[test]
+fn verify_threshold_below_threshold_is_refused() {
+    let h = setup(&[3, 2, 1], 5);
+    let res = h.client.try_verify_threshold(
+        &h.signers[1],
+        &approvers(&h.env, &h.signers, &[2]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+#[test]
+fn verify_threshold_counts_a_repeated_signatory_once() {
+    let h = setup(&[3, 2, 1], 5);
+    // s0 listed as its own signatory must not stack its weight to 6.
+    let res = h.client.try_verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[0]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+#[test]
+fn verify_threshold_rejects_unregistered_signatories() {
+    let h = setup(&[3, 2, 1], 5);
+    let stranger = Address::generate(&h.env);
+    let signatories = vec![&h.env, stranger];
+    let res = h
+        .client
+        .try_verify_threshold(&h.signers[0], &signatories, &payload(&h.env));
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_verify_threshold(
+        &stranger,
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn verify_threshold_is_blocked_by_the_emergency_lock() {
+    let h = setup(&[3, 2, 1], 5);
+    h.client.set_emergency_lock(&h.signers[0], &true);
+    let res = h.client.try_verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1]),
+        &payload(&h.env),
+    );
+    assert_eq!(res, Err(Ok(Error::EmergencyLock)));
+}
+
+#[test]
+fn weight_views_report_the_configured_weights() {
+    let h = setup(&[3, 2, 1], 5);
+    assert_eq!(h.client.get_signer_weight(&h.signers[0]), 3);
+    assert_eq!(h.client.get_signer_weight(&h.signers[2]), 1);
+    assert_eq!(h.client.get_signer_weight(&Address::generate(&h.env)), 0);
+    assert_eq!(h.client.get_total_weight(), 6);
 }

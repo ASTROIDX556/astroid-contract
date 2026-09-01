@@ -12,6 +12,30 @@
 //! `Archived`. Outbound value movement is only permitted from an `Active`
 //! wallet; every other state fails safely with a specific error.
 //!
+//! ## Emergency circuit breaker
+//!
+//! The per-wallet states above are the owner's tool: they act on one wallet at
+//! a time and the owner must be in a position to use them. Compromised agent
+//! keys and abnormal on-chain behaviour do not respect that granularity, so the
+//! contract also carries a single contract-wide breaker.
+//!
+//! While tripped, every outbound path — `transfer`, `withdraw` — and the
+//! creation of new wallets are refused with [`Error::WalletPaused`]. Everything
+//! needed to inspect and recover stays live: all views, `deposit`, and the
+//! per-wallet `freeze` / `pause` / `archive` transitions, so an operator can
+//! quarantine individual wallets while the breaker holds the line globally.
+//!
+//! Authority is deliberately asymmetric. A designated guardian can *trip* the
+//! breaker, so reacting to an incident is fast and needs only one key. Only the
+//! admin can *reset* it — point `admin` at the organization's multisig and
+//! resuming operations requires a threshold of signers.
+//!
+//! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
+//! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
+//! `emergency_unpause`, `set_guardian`.
+//!
+//! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
+//! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
 //! Access control is role-based (see [`access`]). Every wallet has an owner,
 //! who is implicitly [`Role::Admin`], and may delegate a role to any number of
 //! other principals so that organization owners, human managers and autonomous
@@ -41,7 +65,9 @@ use astroid_shared::math::{SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+};
 
 pub mod access;
 
@@ -50,6 +76,10 @@ pub mod access;
 enum DataKey {
     /// Emergency/administrative address able to freeze any wallet (instance).
     Admin,
+    /// Designated emergency guardian able to trip the breaker (instance).
+    Guardian,
+    /// Contract-wide emergency pause flag (instance).
+    Paused,
     /// Monotonic wallet id counter (instance).
     WalletCount,
     /// Wallet record: id -> WalletData.
@@ -98,19 +128,104 @@ pub struct WalletContract;
 
 #[contractimpl]
 impl WalletContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Wallet`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Wallet,
+            wasm_hash,
+        )
+    }
     /// Initialize the contract with an emergency admin (may freeze wallets).
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        // The admin is its own guardian until a dedicated one is designated.
+        env.storage().instance().set(&DataKey::Guardian, &admin);
         env.storage().instance().set(&DataKey::WalletCount, &0u64);
+        env.storage().instance().set(&DataKey::Paused, &false);
         Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Designate the emergency guardian allowed to trip the circuit breaker
+    /// (admin only). Set it to a monitoring service or a partner key so an
+    /// incident can be contained without waiting on the admin.
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Guardian, &guardian);
+        Self::bump_instance(&env);
+        events::wallet_guardian(&env, &guardian);
+        Ok(())
+    }
+
+    /// Trip the contract-wide circuit breaker (admin or guardian).
+    ///
+    /// Freezes every outbound movement and the creation of new wallets at once.
+    /// Reads, deposits and the per-wallet recovery transitions stay available.
+    pub fn emergency_pause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_guardian_or_admin(&env, &caller)?;
+        if Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((Symbol::new(&env, "WalletPaused"),), caller);
+        Ok(())
+    }
+
+    /// Reset the circuit breaker and resume normal operation.
+    ///
+    /// Admin only: tripping the breaker is a fast, low-privilege reaction, but
+    /// releasing it puts funds back in motion and must clear the higher bar.
+    pub fn emergency_unpause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((Symbol::new(&env, "WalletUnpaused"),), caller);
         Ok(())
     }
 
     /// Create a new wallet owned by `owner`. Returns the new wallet id.
     pub fn create_wallet(env: Env, owner: Address) -> Result<u64, Error> {
+        Self::when_not_paused(&env)?;
         owner.require_auth();
         let mut count: u64 = env
             .storage()
@@ -162,10 +277,7 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("deposit")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_deposit(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -182,6 +294,7 @@ impl WalletContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
+        Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
         Self::enforce_rate_limit(&env, wallet_id, amount)?;
@@ -208,6 +321,7 @@ impl WalletContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
+        Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
         Self::enforce_rate_limit(&env, wallet_id, amount)?;
@@ -217,10 +331,7 @@ impl WalletContract {
             &wallet.owner,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("withdraw")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_withdraw(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -321,10 +432,7 @@ impl WalletContract {
             return Err(Error::InvalidInput);
         }
         access::set_role(&env, wallet_id, &account, role);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (wallet_id, account, role),
-        );
+        events::wallet_role_granted(&env, wallet_id, &account, role);
         Ok(())
     }
 
@@ -341,11 +449,39 @@ impl WalletContract {
     ) -> Result<(), Error> {
         Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         access::clear_role(&env, wallet_id, &account)?;
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (wallet_id, account),
-        );
+        events::wallet_role_revoked(&env, wallet_id, &account);
         Ok(())
+    }
+
+    /// Dispatch a wallet operation from an authorized caller.
+    ///
+    /// The `caller` must be one of:
+    /// - the wallet's **owner** (verified against on-chain wallet state), or
+    /// - a **registered module** for this wallet's organization, confirmed via
+    ///   the on-chain registry contract.
+    ///
+    /// This is the primary entrypoint for organizational modules (multisig,
+    /// treasury, policy, etc.) to execute wallet operations on behalf of the
+    /// organization. Direct owner calls to `transfer` / `freeze` etc. remain
+    /// available for backwards compatibility.
+    ///
+    /// # Errors
+    /// - [`Error::UnauthorizedDispatch`] if the caller is neither the owner nor
+    ///   a registered module.
+    /// - Propagates any error from the underlying wallet operation.
+    pub fn dispatch(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        action: WalletAction,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Authorize: caller must be the wallet owner, the wallet admin, or a
+        // registered module for this wallet's organization.
+        Self::require_registered_caller(&env, &caller, wallet_id)?;
+
+        Self::execute_dispatch(&env, wallet_id, &action)
     }
 
     // --- views ---
@@ -417,11 +553,25 @@ impl WalletContract {
     }
 
     /// Read a wallet's internal balance for an asset (0 if none recorded).
+    /// Stays available while the breaker is tripped.
     pub fn balance(env: Env, wallet_id: u64, asset: Address) -> i128 {
         env.storage()
             .persistent()
             .get(&DataKey::Balance(wallet_id, asset))
             .unwrap_or(0)
+    }
+
+    /// Whether the contract-wide circuit breaker is currently tripped.
+    pub fn is_paused(env: Env) -> bool {
+        Self::paused(&env)
+    }
+
+    /// The address currently designated as emergency guardian.
+    pub fn get_guardian(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Guardian)
+            .ok_or(Error::NotInitialized)
     }
 
     // --- internal helpers ---
@@ -471,6 +621,49 @@ impl WalletContract {
         access::require_role(env, id, &wallet.owner, caller, required)?;
 
         Ok(wallet)
+    }
+
+    fn paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// The circuit breaker guard applied to every value-moving entrypoint.
+    fn when_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::paused(env) {
+            return Err(Error::WalletPaused);
+        }
+        Ok(())
+    }
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if &admin != caller {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_guardian_or_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let guardian: Option<Address> = env.storage().instance().get(&DataKey::Guardian);
+        let allowed = &admin == caller || guardian.map(|g| &g == caller).unwrap_or(false);
+        if !allowed {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
     }
 
     fn require_active(wallet: &WalletData) -> Result<(), Error> {

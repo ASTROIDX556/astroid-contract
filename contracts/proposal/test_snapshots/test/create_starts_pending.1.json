@@ -18,16 +18,40 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "acme"
-                },
-                {
-                  "string": "wallet-1"
-                },
-                {
-                  "string": "policy-1"
-                },
-                {
-                  "string": "tx-ref-1"
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "string": "acme"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy"
+                      },
+                      "val": {
+                        "string": "policy-1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tx_ref"
+                      },
+                      "val": {
+                        "string": "tx-ref-1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "wallet"
+                      },
+                      "val": {
+                        "string": "wallet-1"
+                      }
+                    }
+                  ]
                 },
                 {
                   "vec": [
@@ -43,22 +67,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 5000
                 },
-<<<<<<< HEAD
-                "void",
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
-=======
                 {
                   "u64": 0
->>>>>>> origin/main
                 }
               ]
             }
@@ -144,9 +165,47 @@
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deadline"
-=======
+                        "symbol": "context"
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "org"
+                            },
+                            "val": {
+                              "string": "acme"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "policy"
+                            },
+                            "val": {
+                              "string": "policy-1"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "tx_ref"
+                            },
+                            "val": {
+                              "string": "tx-ref-1"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "wallet"
+                            },
+                            "val": {
+                              "string": "wallet-1"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "created_at"
                       },
                       "val": {
@@ -155,8 +214,23 @@
                     },
                     {
                       "key": {
+                        "symbol": "dependencies"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
->>>>>>> origin/main
                       },
                       "val": {
                         "u64": 5000
@@ -164,45 +238,10 @@
                     },
                     {
                       "key": {
-<<<<<<< HEAD
-                        "symbol": "deposit_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 0
-                        }
-=======
                         "symbol": "grace_period"
                       },
                       "val": {
                         "u64": 0
->>>>>>> origin/main
-                      }
-                    },
-                    {
-                      "key": {
-<<<<<<< HEAD
-                        "symbol": "deposit_asset"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-=======
->>>>>>> origin/main
-                        "symbol": "org"
-                      },
-                      "val": {
-                        "string": "acme"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "policy"
-                      },
-                      "val": {
-                        "string": "policy-1"
                       }
                     },
                     {
@@ -227,22 +266,6 @@
                       },
                       "val": {
                         "u32": 2
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "tx_ref"
-                      },
-                      "val": {
-                        "string": "tx-ref-1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "wallet"
-                      },
-                      "val": {
-                        "string": "wallet-1"
                       }
                     }
                   ]
@@ -425,16 +448,40 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "acme"
-                },
-                {
-                  "string": "wallet-1"
-                },
-                {
-                  "string": "policy-1"
-                },
-                {
-                  "string": "tx-ref-1"
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "string": "acme"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy"
+                      },
+                      "val": {
+                        "string": "policy-1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tx_ref"
+                      },
+                      "val": {
+                        "string": "tx-ref-1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "wallet"
+                      },
+                      "val": {
+                        "string": "wallet-1"
+                      }
+                    }
+                  ]
                 },
                 {
                   "vec": [
@@ -450,22 +497,19 @@
                   ]
                 },
                 {
+                  "vec": []
+                },
+                {
                   "u32": 2
+                },
+                {
+                  "vec": []
                 },
                 {
                   "u64": 5000
                 },
-<<<<<<< HEAD
-                "void",
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 0
-                  }
-=======
                 {
                   "u64": 0
->>>>>>> origin/main
                 }
               ]
             }
