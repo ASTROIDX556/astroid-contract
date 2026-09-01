@@ -28,11 +28,12 @@ pub enum Error {
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
-    PolicyMerchantBlocked = 23,
-    PolicyCategoryRestricted = 24,
-    AssetNotWhitelisted = 25,
+    /// The asset is not in the organization's whitelist.
+    AssetNotWhitelisted = 24,
     /// A proposed spend would breach a per-asset spending allowance.
-    PolicyAllowanceExceeded = 26,
+    PolicyAllowanceExceeded = 25,
+    /// A conditional policy rule denied the transaction.
+    RuleDenied = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,

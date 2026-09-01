@@ -41,6 +41,8 @@
 //! the deny list reuses [`Error::PolicyDenied`] and is distinguished by its
 //! violation event reason.
 
+pub mod policy_rules;
+
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
@@ -707,7 +709,7 @@ impl PolicyContract {
     }
 
     /// Check if a spending category is restricted. Returns Ok(()) if the category
-    /// is allowed, or PolicyCategoryRestricted if it's blacklisted.
+    /// is allowed, or PolicyDenied if it's blacklisted.
     pub fn check_category(env: Env, policy_id: String, category: String) -> Result<(), Error> {
         // Empty category is always allowed
         if category.is_empty() {
@@ -720,7 +722,7 @@ impl PolicyContract {
             .has(&DataKey::CategoryBlacklist(category.clone()))
         {
             events_policy_violation(&env, &policy_id, "category_restricted");
-            return Err(Error::PolicyCategoryRestricted);
+            return Err(Error::PolicyDenied);
         }
         Ok(())
     }
@@ -954,7 +956,54 @@ impl PolicyContract {
         Self::load(&env, &policy_id)
     }
 
-    // --- internels ---
+    /// Return the conditional rules registered for `policy_id`.
+    pub fn get_rules(env: Env, policy_id: String) -> soroban_sdk::Vec<PolicyRule> {
+        policy_rules::load_rules(&env, &policy_id)
+    }
+
+    // --- rule management ---
+
+    /// Append a conditional rule to a policy (owner only).
+    pub fn add_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        rule: PolicyRule,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        policy_rules::add_rule(&env, &policy_id, rule)?;
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_add")),
+            policy_id,
+        );
+        Ok(())
+    }
+
+    /// Remove a conditional rule by id (owner only).
+    pub fn remove_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        rule_id: String,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        policy_rules::remove_rule(&env, &policy_id, &rule_id)?;
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_rm")),
+            (policy_id, rule_id),
+        );
+        Ok(())
+    }
+
+    // --- internals ---
 
     fn load(env: &Env, id: &String) -> Result<Policy, Error> {
         env.storage()
@@ -1009,7 +1058,7 @@ impl PolicyInterface for PolicyContract {
             .has(&DataKey::MerchantBlacklist(recipient.clone()))
         {
             events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
+            return Err(Error::PolicyDenied);
         }
         // --- Allowance / amount gates ---
         if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
