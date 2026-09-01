@@ -58,6 +58,7 @@ fn allows_spend_below_max() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
+    p.add_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
     assert!(p
         .try_check_transfer(&String::from_str(&env, "max_txn"), &asset, &recip, &999_999,)
         .is_ok());
@@ -71,13 +72,16 @@ fn denies_spend_above_max() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
-    let r = p.try_check_transfer(
-        &String::from_str(&env, "max_txn"),
-        &asset,
-        &recip,
-        &1_000_001,
+    p.add_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    assert_eq!(
+        p.try_check_transfer(
+            &String::from_str(&env, "max_txn"),
+            &asset,
+            &recip,
+            &1_000_001
+        ),
+        Err(Ok(Error::PolicyDenied))
     );
-    assert!(r.is_err());
 }
 
 #[test]
@@ -100,6 +104,7 @@ fn allowlist_recipient_enforced() {
         &None,
         &0,
     );
+    client.add_to_whitelist(&owner, &String::from_str(&env, "vendor_list"), &asset);
 
     assert!(client
         .try_check_transfer(&String::from_str(&env, "vendor_list"), &asset, &allowed, &1,)
@@ -117,6 +122,7 @@ fn disable_denies_everything() {
     let owner = Address::generate(&env);
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
+    p.add_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
     p.set_enabled(&owner, &String::from_str(&env, "max_txn"), &false);
     assert!(p
         .try_check_transfer(
@@ -136,6 +142,8 @@ fn standard_policy_violation_event_emitted() {
     let p = setup(&env, &owner);
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
+    p.add_to_whitelist(&owner, &String::from_str(&env, "max_txn"), &asset);
+    // Amount above the configured max triggers a policy denial -> violation event.
     let _ = p.try_check_transfer(
         &String::from_str(&env, "max_txn"),
         &asset,

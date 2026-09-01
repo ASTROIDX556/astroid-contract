@@ -521,6 +521,55 @@ impl PolicyContract {
         Ok(())
     }
 
+    /// Approve `token` for spends under `policy_id` (owner only). Unlisted
+    /// assets are rejected by `check_transfer` with `TokenNotWhitelisted`.
+    pub fn add_to_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        token: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(policy_id.clone(), token.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &());
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wht_add")),
+            (policy_id, token),
+        );
+        Ok(())
+    }
+
+    /// Revoke an approved `token` from the whitelist (owner only).
+    pub fn remove_from_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        token: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        let key = DataKey::Whitelist(policy_id.clone(), token.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wht_rem")),
+            (policy_id, token),
+        );
+        Ok(())
+    }
+
     /// Remove an address from the restricted blacklist (owner only).
     pub fn remove_blacklist(
         env: Env,
@@ -1052,6 +1101,14 @@ impl PolicyInterface for PolicyContract {
             return Err(Error::PolicyDenied);
         }
         Ok(())
+    }
+
+    /// Clean query the wallet/treasury can call before touching an external SAC
+    /// address: is `token` approved for spends under `policy_id`?
+    fn is_token_allowed(env: Env, policy_id: String, token: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Whitelist(policy_id, token))
     }
 }
 
