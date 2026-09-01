@@ -1,11 +1,10 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{ProposalContext, ProposalContract, ProposalContractClient, ProposalState};
-use astroid_shared::constants::MAX_DEPENDENCIES;
+use crate::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, String, Vec};
+use soroban_sdk::{symbol_short, vec, Address, Env, IntoVal, String, TryIntoVal, Val, Vec};
 
 struct Harness {
     env: Env,
@@ -43,13 +42,24 @@ fn approver_vec(h: &Harness) -> Vec<Address> {
     v
 }
 
-/// Create an independent proposal (no prerequisites).
-fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
-    create_with_deps(h, threshold, expires_at, &[])
+/// Build a `Vec<Address>` from the approver allow-list by index, for supplying
+/// a specific signature/quorum set to `execute`.
+fn signer_subset(h: &Harness, idx: &[usize]) -> Vec<Address> {
+    let mut v = Vec::new(&h.env);
+    for i in idx {
+        v.push_back(h.approvers[*i].clone());
+    }
+    v
 }
 
-/// Create a proposal that depends on `deps`.
-fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> u64 {
+/// Approve enough approvers (indices `0..n`) so the proposal reaches `Approved`.
+fn approve_up_to(h: &Harness, id: u64, n: usize) {
+    for i in 0..n {
+        h.client.approve(&h.approvers[i], &id);
+    }
+}
+
+fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
     h.client.create(
         &h.proposer,
         &ProposalContext {
@@ -59,7 +69,6 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
             tx_ref: String::from_str(&h.env, "tx-ref-1"),
         },
         &approver_vec(h),
-        &dep_vec(h, deps),
         &threshold,
         &soroban_sdk::vec![&h.env],
         &expires_at,
@@ -97,7 +106,8 @@ fn full_lifecycle_to_closed() {
     assert_eq!(approvals, 2);
     assert_eq!(h.client.state(&id), ProposalState::Approved);
 
-    h.client.execute(&h.proposer, &id);
+    h.client
+        .execute(&h.proposer, &id, &1, &signer_subset(&h, &[0, 1]));
     assert_eq!(h.client.state(&id), ProposalState::Executed);
 
     h.client.close(&h.proposer, &id);
@@ -160,8 +170,105 @@ fn execute_before_approved_fails() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);
     h.client.approve(&h.approvers[0], &id); // only 1 of 2
-    let res = h.client.try_execute(&h.proposer, &id);
+    let res = h
+        .client
+        .try_execute(&h.proposer, &id, &1, &signer_subset(&h, &[0, 1]));
     assert_eq!(res, Err(Ok(Error::ProposalNotApproved)));
+}
+
+#[test]
+fn execute_requires_quorum_of_signer_signatures() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_up_to(&h, id, 2);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // A single verified signature (out of threshold 2) cannot reach quorum.
+    let below = h
+        .client
+        .try_execute(&h.proposer, &id, &1, &signer_subset(&h, &[0]));
+    assert_eq!(below, Err(Ok(Error::QuorumNotMet)));
+
+    // A full quorum executes the proposal.
+    h.client
+        .execute(&h.proposer, &id, &1, &signer_subset(&h, &[0, 1]));
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execute_rejects_unknown_signer() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_up_to(&h, id, 2);
+    let stranger = Address::generate(&h.env);
+    let mut signers = Vec::new(&h.env);
+    signers.push_back(h.approvers[0].clone());
+    signers.push_back(stranger);
+
+    let res = h.client.try_execute(&h.proposer, &id, &1, &signers);
+    assert_eq!(res, Err(Ok(Error::InvalidSignature)));
+}
+
+#[test]
+fn execute_prevents_double_execution() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_up_to(&h, id, 2);
+    h.client
+        .execute(&h.proposer, &id, &1, &signer_subset(&h, &[0, 1]));
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+
+    // Re-execution with a fresh signature quorum is still rejected.
+    let again = h
+        .client
+        .try_execute(&h.proposer, &id, &2, &signer_subset(&h, &[0, 1]));
+    assert_eq!(again, Err(Ok(Error::ProposalNotApproved)));
+}
+
+#[test]
+fn execute_counts_duplicate_signatures_once() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_up_to(&h, id, 2);
+
+    // Duplicated entries must not inflate the quorum: still 1 distinct < 2.
+    let only_dupes = vec![&h.env, h.approvers[0].clone(), h.approvers[0].clone()];
+    let below = h.client.try_execute(&h.proposer, &id, &1, &only_dupes);
+    assert_eq!(below, Err(Ok(Error::QuorumNotMet)));
+
+    // A repeated approved signer still counts once: two distinct = threshold.
+    let with_dupe = vec![
+        &h.env,
+        h.approvers[0].clone(),
+        h.approvers[0].clone(),
+        h.approvers[1].clone(),
+    ];
+    h.client.execute(&h.proposer, &id, &2, &with_dupe);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execute_publishes_execution_event_with_identifier() {
+    use soroban_sdk::testutils::Events as _;
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_up_to(&h, id, 2);
+    let execution_id = 42u64;
+    h.client
+        .execute(&h.proposer, &id, &execution_id, &signer_subset(&h, &[0, 1]));
+
+    let expected_data = (id, execution_id, h.proposer.clone());
+    let executed: Val = symbol_short!("executed").into_val(&h.env);
+    let found = h.env.events().all().iter().any(|event| {
+        event.1.contains(&executed) && {
+            let data: Result<(u64, u64, Address), _> = event.2.try_into_val(&h.env);
+            data == Ok(expected_data.clone())
+        }
+    });
+    assert!(
+        found,
+        "expected an executed event carrying the execution identifier"
+    );
 }
 
 #[test]
@@ -244,7 +351,6 @@ fn create_with_bad_threshold_fails() {
             tx_ref: String::from_str(&h.env, "tx-ref-1"),
         },
         &approver_vec(&h),
-        &dep_vec(&h, &[]),
         &3,
         &soroban_sdk::vec![&h.env],
         &5_000,
@@ -265,7 +371,6 @@ fn create_with_past_expiry_fails() {
             tx_ref: String::from_str(&h.env, "tx-ref-1"),
         },
         &approver_vec(&h),
-        &dep_vec(&h, &[]),
         &1,
         &soroban_sdk::vec![&h.env],
         &500, // in the past (now = 1000)

@@ -745,6 +745,7 @@ impl RegistryInterface for RegistryContract {
         Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
+        let address: Address = env
         let val = env
             .storage()
             .persistent()
@@ -760,7 +761,7 @@ impl RegistryInterface for RegistryContract {
             return Err(Error::ModuleDeprecated);
         }
         Self::bump(&env, &key);
-        Ok(val)
+        Ok(address)
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
