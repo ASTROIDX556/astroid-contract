@@ -19,6 +19,15 @@ pub enum Error {
     NotInitialized = 5,
     AlreadyInitialized = 6,
 
+    // --- Value / arithmetic (10-19) ---
+    InsufficientFunds = 10,
+    Overflow = 11,
+    Underflow = 12,
+    InvalidAmount = 13,
+    MathOverflow = 14,
+    DivisionByZero = 15,
+
+    // --- Policy (20-29) ---
     // --- Value / arithmetic (10-12) ---
     InsufficientFunds = 10,
     Overflow = 11,
@@ -34,13 +43,20 @@ pub enum Error {
     // --- Registry (30-31) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
+    /// System-wide emergency pause: all critical registry operations are halted.
+    ContractPaused = 32,
 
+    // --- Budget (40-49) ---
     // --- Budget (40-44) ---
     BudgetExceeded = 40,
     BudgetFrozen = 41,
     BudgetArchived = 42,
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
+    VelocityExceeded = 45,
+
+    // --- Treasury (91-99) ---
+    PayoutScheduleViolated = 91,
 
     // --- Wallet (50-54) ---
     WalletFrozen = 50,
@@ -49,6 +65,8 @@ pub enum Error {
     InvalidState = 53,
     ReserveViolation = 54,
 
+    // --- Multisig / approvals (60-69) ---
+    InvalidSignature = 60,
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
     AlreadySigned = 62,
@@ -73,12 +91,10 @@ pub enum Error {
     InvalidProposalState = 72,
     ProposalNotApproved = 73,
     NotAnApprover = 74,
-    CancellationWindowClosed = 75,
-    /// A prerequisite proposal has not executed, so the dependent proposal may
-    /// not execute yet.
-    PrerequisiteNotMet = 78,
-    /// A declared dependency would close a cycle in the dependency graph.
-    CircularDependencyDetected = 79,
+    /// The aggregated count of verified approver signatures did not reach the
+    /// configured threshold at execution time.
+    QuorumNotMet = 75,
+    CancellationWindowClosed = 76,
 
     // --- Escrow (80-82, 85-86) ---
     EscrowExpired = 80,
