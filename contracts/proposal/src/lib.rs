@@ -104,57 +104,28 @@ enum DataKey {
     ProposalCount,
     Proposal(u64),
     Approval(u64, Address),
+    /// Stores the delegation map: delegator → delegatee.
+    DelegationMap,
 }
+
+/// Maximum delegation chain depth to prevent gas exhaustion.
+const MAX_DELEGATION_DEPTH: u32 = 10;
 
 #[contract]
 pub struct ProposalContract;
 
 #[contractimpl]
 impl ProposalContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Proposal`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Proposal,
-            wasm_hash,
-        )
-    }
-    /// Initialize the id counter. Idempotent-guarded.
+    /// Initialize the id counter and the delegation map. Idempotent-guarded.
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::ProposalCount) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
+        let delegation_map: Map<Address, Address> = Map::new(env);
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegationMap, &delegation_map);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -272,9 +243,7 @@ impl ProposalContract {
             .persistent()
             .set(&DataKey::Proposal(id), &proposal);
         Self::bump(&env, id);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProposalCount, &count);
+        env.storage().instance().set(&DataKey::ProposalCount, &count);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -285,6 +254,10 @@ impl ProposalContract {
 
     /// Approve a proposal. Caller must be on the approver allow-list and may
     /// approve only once. Reaching `threshold` transitions to `Approved`.
+    ///
+    /// Vote weight is 1 (direct) + any delegated voting power. Delegated power
+    /// is resolved by following delegation chains from other approvers to the
+    /// caller, up to `MAX_DELEGATION_DEPTH`.
     pub fn approve(env: Env, caller: Address, id: u64) -> Result<u32, Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
@@ -302,7 +275,10 @@ impl ProposalContract {
             return Err(Error::AlreadySigned);
         }
         env.storage().persistent().set(&akey, &true);
-        proposal.approvals = checked_add(proposal.approvals as i128, 1)? as u32;
+        // Count the caller's direct vote plus any delegated votes.
+        let delegated = Self::count_delegated_power(&env, &caller)?;
+        let vote_weight = checked_add(1i128, delegated as i128)? as u32;
+        proposal.approvals = checked_add(proposal.approvals as i128, vote_weight as i128)? as u32;
         if proposal.approvals >= proposal.threshold {
             proposal.state = ProposalState::Approved;
         }
@@ -499,6 +475,80 @@ impl ProposalContract {
         Ok(())
     }
 
+    // --- delegation ---
+
+    /// Delegate voting power to another address. The delegatee will receive
+    /// the delegator's voting weight when approving proposals. Prevents
+    /// circular delegations and enforces a maximum chain depth.
+    pub fn delegate(env: Env, caller: Address, delegatee: Address) -> Result<(), Error> {
+        caller.require_auth();
+        if caller == delegatee {
+            return Err(Error::InvalidInput);
+        }
+        // Prevent circular delegations by checking if delegatee already
+        // delegates (directly or transitively) back to caller.
+        if Self::would_create_cycle(&env, &caller, &delegatee, 0)? {
+            return Err(Error::CircularDelegation);
+        }
+        let mut delegation_map: Map<Address, Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationMap)
+            .unwrap_or_else(|| Map::new(env));
+        delegation_map.set(caller.clone(), delegatee.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegationMap, &delegation_map);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("delegated")),
+            (caller, delegatee),
+        );
+        Ok(())
+    }
+
+    /// Revoke a previously set delegation. After revocation, the caller's
+    /// voting power is no longer forwarded to the former delegatee.
+    pub fn revoke_delegation(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+        let mut delegation_map: Map<Address, Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationMap)
+            .unwrap_or_else(|| Map::new(env));
+        if !delegation_map.contains_key(caller.clone()) {
+            return Err(Error::NotFound);
+        }
+        delegation_map.remove(caller.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegationMap, &delegation_map);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("undeleg")),
+            caller,
+        );
+        Ok(())
+    }
+
+    /// View: return the delegatee for a given delegator, if any.
+    pub fn get_delegation(env: Env, delegator: Address) -> Option<Address> {
+        let delegation_map: Map<Address, Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationMap)
+            .unwrap_or_else(|| Map::new(env));
+        delegation_map.get(delegator)
+    }
+
+    /// View: compute the total delegated voting power arriving at `addr`.
+    /// Iterates the delegation map to find all delegators whose chain
+    /// terminates at `addr`, respecting MAX_DELEGATION_DEPTH.
+    pub fn get_delegated_power(env: Env, addr: Address) -> u32 {
+        Self::count_delegated_power(&env, &addr).unwrap_or(0)
+    }
+
     // --- views ---
 
     pub fn get(env: Env, id: u64) -> Result<Proposal, Error> {
@@ -519,9 +569,7 @@ impl ProposalContract {
     }
 
     fn store(env: &Env, id: u64, proposal: &Proposal) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(id), proposal);
+        env.storage().persistent().set(&DataKey::Proposal(id), proposal);
         Self::bump(env, id);
     }
 
@@ -549,6 +597,81 @@ impl ProposalContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    /// Check if delegating from `delegator` to `delegatee` would create a
+    /// cycle. Traverses the delegation chain starting from `delegatee` to see
+    /// if it eventually reaches `delegator`.
+    fn would_create_cycle(
+        env: &Env,
+        delegator: &Address,
+        delegatee: &Address,
+        depth: u32,
+    ) -> Result<bool, Error> {
+        if depth >= MAX_DELEGATION_DEPTH {
+            return Err(Error::DelegationDepthExceeded);
+        }
+        let delegation_map: Map<Address, Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationMap)
+            .unwrap_or_else(|| Map::new(env));
+        match delegation_map.get(delegatee.clone()) {
+            Some(next_addr) => {
+                if next_addr == *delegator {
+                    return Ok(true);
+                }
+                Self::would_create_cycle(env, delegator, &next_addr, depth + 1)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Count how many delegators have delegated their voting power to `addr`
+    /// (transitively). Iterates the delegation map and resolves each chain
+    /// to see if it terminates at `addr`.
+    fn count_delegated_power(env: &Env, addr: &Address) -> Result<u32, Error> {
+        let delegation_map: Map<Address, Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationMap)
+            .unwrap_or_else(|| Map::new(env));
+        let mut count: u32 = 0;
+        // Iterate all delegators to find those whose chain ends at `addr`.
+        let delegator_addresses: Vec<Address> = delegation_map.keys();
+        for delegator in delegator_addresses.iter() {
+            let delegatee = delegation_map.get(delegator.clone()).unwrap();
+            // Follow the chain from this delegator's delegatee.
+            if Self::resolve_delegation(env, &delegatee, addr, 1)? {
+                count = checked_add(count as i128, 1)? as u32;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Follow a delegation chain from `current` to see if it reaches `target`.
+    /// `depth` starts at 1 (the first hop is already resolved by the caller).
+    fn resolve_delegation(
+        env: &Env,
+        current: &Address,
+        target: &Address,
+        depth: u32,
+    ) -> Result<bool, Error> {
+        if depth >= MAX_DELEGATION_DEPTH {
+            return Err(Error::DelegationDepthExceeded);
+        }
+        if *current == *target {
+            return Ok(true);
+        }
+        let delegation_map: Map<Address, Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationMap)
+            .unwrap_or_else(|| Map::new(env));
+        match delegation_map.get(current.clone()) {
+            Some(next) => Self::resolve_delegation(env, &next, target, depth + 1),
+            None => Ok(false),
+        }
     }
 }
 

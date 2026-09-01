@@ -1156,8 +1156,6 @@ impl EscrowContract {
             override_signers: Vec::new(&env),
             override_threshold: 0,
             override_nonce: 0,
-            proposed_beneficiary: None,
-            proposed_at_seq: 0,
         };
         store_escrow(&env, id, &escrow);
 
