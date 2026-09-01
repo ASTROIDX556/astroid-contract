@@ -19,6 +19,7 @@ pub mod constants;
 pub mod errors;
 pub mod events;
 pub mod math;
+pub mod telemetry;
 pub mod types;
 pub mod validation;
 
