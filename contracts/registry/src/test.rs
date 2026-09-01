@@ -5,7 +5,7 @@ use crate::{RegistryContract, RegistryContractClient, RegistryRole};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{testutils::Events, Address, Env, IntoVal, String, Symbol, Val};
+use soroban_sdk::{testutils::Events, Address, Env, IntoVal, String, Symbol, Val, Vec};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -55,6 +55,44 @@ fn register_and_lookup_org_and_module() {
     let wallet = Address::generate(&env);
     client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
     assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn batch_register_modules_updates_multiple_entries_atomically() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let wallet = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let policy = Address::generate(&env);
+    let kinds = Vec::from_array(&env, [ModuleKind::Wallet, ModuleKind::Treasury, ModuleKind::Policy]);
+    let addrs = Vec::from_array(&env, [wallet.clone(), treasury.clone(), policy.clone()]);
+
+    client.batch_register_modules(&owner, &org, &kinds, &addrs);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Treasury), treasury);
+    assert_eq!(client.lookup(&org, &ModuleKind::Policy), policy);
+    assert_event(&env, "RegistryModuleBatchUpdated");
+}
+
+#[test]
+fn batch_register_modules_rolls_back_on_invalid_input() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let wallet = Address::generate(&env);
+    let policy = Address::generate(&env);
+    let kinds = Vec::from_array(&env, [ModuleKind::Wallet, ModuleKind::Policy, ModuleKind::Policy]);
+    let addrs = Vec::from_array(&env, [wallet.clone(), policy.clone(), policy.clone()]);
+
+    let res = client.try_batch_register_modules(&owner, &org, &kinds, &addrs);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(client.try_lookup(&org, &ModuleKind::Wallet), Err(Ok(Error::NotFound)));
+    assert_eq!(client.try_lookup(&org, &ModuleKind::Policy), Err(Ok(Error::NotFound)));
 }
 
 #[test]
