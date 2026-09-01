@@ -65,6 +65,7 @@ use astroid_shared::constants::{
     PERSISTENT_LIFETIME_THRESHOLD, THRESHOLD_CHANGE_DELAY_LEDGERS,
 };
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::validation::require_time_reached;
 use soroban_sdk::{
@@ -297,10 +298,7 @@ impl MultiSigContract {
         });
         env.storage().instance().set(&DataKey::Signers, &signers);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("signer"), symbol_short!("added")),
-            (signer, weight),
-        );
+        events::multisig_signer_added(&env, &signer, weight);
         Ok(())
     }
 
@@ -344,10 +342,7 @@ impl MultiSigContract {
             .instance()
             .set(&DataKey::PendingThreshold, &pending);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("threshold"), symbol_short!("pending")),
-            (threshold, env.ledger().sequence()),
-        );
+        events::multisig_threshold_pending(&env, threshold, env.ledger().sequence());
         Ok(())
     }
 
@@ -375,10 +370,7 @@ impl MultiSigContract {
             .instance()
             .set(&DataKey::Threshold, &pending.new_threshold);
         env.storage().instance().remove(&DataKey::PendingThreshold);
-        env.events().publish(
-            (symbol_short!("threshold"), symbol_short!("changed")),
-            pending.new_threshold,
-        );
+        events::multisig_threshold_changed(&env, pending.new_threshold);
         Self::bump_instance(&env);
         Ok(())
     }
@@ -490,10 +482,7 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Change(proposal_id), &pending);
         Self::bump_change(&env, proposal_id);
-        env.events().publish(
-            (symbol_short!("govchange"), symbol_short!("executed")),
-            (proposal_id, caller, kind),
-        );
+        events::multisig_govchange_executed(&env, proposal_id, &caller, kind);
         Ok(())
     }
 
@@ -517,10 +506,7 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Change(proposal_id), &pending);
         Self::bump_change(&env, proposal_id);
-        env.events().publish(
-            (symbol_short!("govchange"), symbol_short!("cancelled")),
-            (proposal_id, caller, kind),
-        );
+        events::multisig_govchange_cancelled(&env, proposal_id, &caller, kind);
         Ok(())
     }
 
@@ -686,10 +672,7 @@ impl MultiSigContract {
             .set(&DataKey::ProposalCount, &count);
         Self::bump_instance(&env);
 
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("created")),
-            (id, proposer),
-        );
+        astroid_shared::events::proposal_created(&env, id, &proposer);
         Ok(id)
     }
 
@@ -715,9 +698,11 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         Self::bump_proposal(&env, proposal_id);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("approved")),
-            (proposal_id, caller, proposal.approval_weight),
+        astroid_shared::events::proposal_approved(
+            &env,
+            proposal_id,
+            &caller,
+            proposal.approval_weight,
         );
         Ok(proposal.approval_weight)
     }
@@ -745,10 +730,7 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         Self::bump_proposal(&env, proposal_id);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("executed")),
-            proposal_id,
-        );
+        events::multisig_proposal_executed(&env, proposal_id);
         Ok(())
     }
 
@@ -830,10 +812,7 @@ impl MultiSigContract {
         }
 
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("batch"), symbol_short!("executed")),
-            (nonce, caller, calls.len()),
-        );
+        events::multisig_batch_executed(&env, nonce, &caller, calls.len());
         Ok(())
     }
 
@@ -1128,10 +1107,7 @@ impl MultiSigContract {
         env.storage().instance().set(&DataKey::ChangeCount, &count);
         Self::bump_instance(env);
 
-        env.events().publish(
-            (symbol_short!("govchange"), symbol_short!("proposed")),
-            (id, caller.clone(), kind, eta),
-        );
+        events::multisig_govchange_proposed(&env, id, &caller, kind, eta);
         Ok(id)
     }
 
@@ -1196,10 +1172,7 @@ impl MultiSigContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::Threshold, new_threshold);
-                env.events().publish(
-                    (symbol_short!("threshold"), symbol_short!("changed")),
-                    *new_threshold,
-                );
+                events::multisig_threshold_changed(&env, *new_threshold);
             }
             GovernanceChange::SignerWeight(signer, weight) => {
                 let mut signers = Self::signers(env)?;
@@ -1208,10 +1181,7 @@ impl MultiSigContract {
                 updated.weight = *weight;
                 signers.set(idx, updated);
                 env.storage().instance().set(&DataKey::Signers, &signers);
-                env.events().publish(
-                    (symbol_short!("signer"), symbol_short!("weight")),
-                    (signer.clone(), *weight),
-                );
+                events::multisig_signer_weight(&env, &signer, *weight);
             }
             GovernanceChange::AddSigner(signer, weight) => {
                 let mut signers = Self::signers(env)?;
@@ -1220,27 +1190,18 @@ impl MultiSigContract {
                     weight: *weight,
                 });
                 env.storage().instance().set(&DataKey::Signers, &signers);
-                env.events().publish(
-                    (symbol_short!("signer"), symbol_short!("added")),
-                    (signer.clone(), *weight),
-                );
+                events::multisig_signer_added(&env, &signer, *weight);
             }
             GovernanceChange::RemoveSigner(signer) => {
                 let mut signers = Self::signers(env)?;
                 let idx = Self::index_of(&signers, signer)?;
                 signers.remove(idx);
                 env.storage().instance().set(&DataKey::Signers, &signers);
-                env.events().publish(
-                    (symbol_short!("signer"), symbol_short!("removed")),
-                    signer.clone(),
-                );
+                events::multisig_signer_removed(&env, &signer);
             }
             GovernanceChange::TimelockDelay(delay) => {
                 env.storage().instance().set(&DataKey::TimelockDelay, delay);
-                env.events().publish(
-                    (symbol_short!("timelock"), symbol_short!("changed")),
-                    *delay,
-                );
+                events::multisig_timelock_changed(&env, *delay);
             }
         }
         Self::bump_instance(env);

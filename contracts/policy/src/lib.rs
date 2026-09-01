@@ -45,6 +45,7 @@ pub mod policy_rules;
 
 use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::validation::{require_non_empty, require_non_negative_amount};
@@ -331,10 +332,7 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("registd")),
-            policy_id,
-        );
+        events::policy_registered(&env, &policy_id);
         Ok(())
     }
 
@@ -356,10 +354,7 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rotated")),
-            policy_id,
-        );
+        events::policy_rotated(&env, &policy_id);
         Ok(())
     }
 
@@ -401,10 +396,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &true);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("asset_add")),
-            (policy_id, asset),
-        );
+        events::policy_asset_added(&env, &policy_id, &asset);
         Ok(())
     }
 
@@ -425,10 +417,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("asset_rem")),
-            (policy_id, asset),
-        );
+        events::policy_asset_removed(&env, &policy_id, &asset);
         Ok(())
     }
 
@@ -447,10 +436,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &());
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("ablk_add")),
-            (policy_id, asset),
-        );
+        events::policy_asset_blocked(&env, &policy_id, &asset);
         Ok(())
     }
 
@@ -467,10 +453,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("ablk_rem")),
-            (policy_id, asset),
-        );
+        events::policy_asset_unblocked(&env, &policy_id, &asset);
         Ok(())
     }
 
@@ -534,10 +517,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_add")),
-            (policy_id, address),
-        );
+        events::policy_blocked(&env, &policy_id, &address);
         Ok(())
     }
 
@@ -554,10 +534,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_rem")),
-            (policy_id, address),
-        );
+        events::policy_unblocked(&env, &policy_id, &address);
         Ok(())
     }
 
@@ -578,10 +555,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("merch_add")),
-            (policy_id, merchant_address),
-        );
+        events::policy_merchant_blocked(&env, &policy_id, &merchant_address);
         Ok(())
     }
 
@@ -602,10 +576,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("merch_rem")),
-            (policy_id, merchant_address),
-        );
+        events::policy_merchant_unblocked(&env, &policy_id, &merchant_address);
         Ok(())
     }
 
@@ -627,10 +598,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("cat_add")),
-            (policy_id, category),
-        );
+        events::policy_category_blocked(&env, &policy_id, &category);
         Ok(())
     }
 
@@ -651,10 +619,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("cat_rem")),
-            (policy_id, category),
-        );
+        events::policy_category_unblocked(&env, &policy_id, &category);
         Ok(())
     }
 
@@ -677,10 +642,7 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_add")),
-            (policy_id, address),
-        );
+        events::policy_blocked(&env, &policy_id, &address);
         Ok(())
     }
 
@@ -701,10 +663,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_rem")),
-            (policy_id, address),
-        );
+        events::policy_unblocked(&env, &policy_id, &address);
         Ok(())
     }
 
@@ -756,10 +715,7 @@ impl PolicyContract {
             &DataKey::Allowance(policy_id.clone(), asset.clone()),
             &allowance,
         );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("allow_set")),
-            (policy_id, asset, limit),
-        );
+        events::policy_allowance_set(&env, &policy_id, &asset, limit);
         Ok(())
     }
 
@@ -780,10 +736,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("allow_rem")),
-            (policy_id, asset),
-        );
+        events::policy_allowance_removed(&env, &policy_id, &asset);
         Ok(())
     }
 
@@ -862,10 +815,7 @@ impl PolicyContract {
             &DataKey::Allowance(policy_id.clone(), asset.clone()),
             &allowance,
         );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("allow_use")),
-            (policy_id, asset, amount, allowance.spent),
-        );
+        events::policy_allowance_used(&env, &policy_id, &asset, amount, allowance.spent);
         Ok(())
     }
 
@@ -896,10 +846,7 @@ impl PolicyContract {
         }
         let key = DataKey::CompositeRule(policy_id.clone());
         env.storage().persistent().set(&key, &rule_tree);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rule_set")),
-            policy_id,
-        );
+        events::policy_rule_set(&env, &policy_id);
         Ok(())
     }
 
@@ -915,10 +862,7 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rule_clr")),
-            policy_id,
-        );
+        events::policy_rule_cleared(&env, &policy_id);
         Ok(())
     }
 

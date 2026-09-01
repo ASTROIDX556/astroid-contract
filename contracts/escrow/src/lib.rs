@@ -358,10 +358,7 @@ impl EscrowContract {
         };
         store_escrow(&env, id, &escrow);
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, sender, recipient, assets),
-        );
+        events::escrow_funded(&env, id, &sender, &recipient, &assets);
         Ok(id)
     }
 
@@ -424,14 +421,8 @@ impl EscrowContract {
         };
         store_escrow(&env, id, &escrow);
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, sender.clone(), recipient.clone(), assets.clone()),
-        );
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("init_tl")),
-            (id, sender, recipient, assets, unlock_time),
-        );
+        events::escrow_funded(&env, id, &sender, &recipient, &assets);
+        events::escrow_init_timelock(&env, id, &sender, &recipient, &assets, unlock_time);
         Ok(id)
     }
 
@@ -501,21 +492,16 @@ impl EscrowContract {
         };
         store_escrow(&env, id, &escrow);
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, sender.clone(), recipient.clone(), assets.clone()),
-        );
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("sched")),
-            (
-                id,
-                sender,
-                recipient,
-                assets,
-                funded_amount,
-                schedule.start_time,
-                schedule.end_time,
-            ),
+        events::escrow_funded(&env, id, &sender, &recipient, &assets);
+        events::escrow_init_scheduled(
+            &env,
+            id,
+            &sender,
+            &recipient,
+            &assets,
+            funded_amount,
+            schedule.start_time,
+            schedule.end_time,
         );
         Ok(id)
     }
@@ -572,10 +558,7 @@ impl EscrowContract {
         };
         store_escrow(&env, id, &escrow);
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("init_tl")),
-            (id, sender, recipient, assets, unlock_time),
-        );
+        events::escrow_init_timelock(&env, id, &sender, &recipient, &assets, unlock_time);
         Ok(id)
     }
 
@@ -604,10 +587,7 @@ impl EscrowContract {
         escrow.state = EscrowState::Funded;
         store_escrow(&env, id, &escrow);
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, escrow.sender, escrow.recipient, escrow.assets),
-        );
+        events::escrow_funded(&env, id, &escrow.sender, &escrow.recipient, &escrow.assets);
         Ok(())
     }
 
@@ -655,10 +635,7 @@ impl EscrowContract {
                 );
             }
         }
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("withdraw")),
-            (id, caller, amount, escrow.released_amount),
-        );
+        events::escrow_withdrawn(&env, id, &caller, amount, escrow.released_amount);
         Ok(escrow.released_amount)
     }
 
@@ -713,10 +690,7 @@ impl EscrowContract {
                     );
                 }
             }
-            env.events().publish(
-                (symbol_short!("escrow"), symbol_short!("claimed")),
-                (id, caller, claimable),
-            );
+            events::escrow_claimed(&env, id, &caller, claimable);
             Ok(claimable)
         } else if matches!(escrow.state, EscrowState::Created) {
             if now < escrow.deadline + escrow.grace_period {
@@ -734,10 +708,7 @@ impl EscrowContract {
                     a.amount,
                 );
             }
-            env.events().publish(
-                (symbol_short!("escrow"), symbol_short!("claimed")),
-                (id, caller, escrow.funded_amount),
-            );
+            events::escrow_claimed(&env, id, &caller, escrow.funded_amount);
             Ok(escrow.funded_amount)
         } else {
             Err(Error::InvalidState)
@@ -795,10 +766,7 @@ impl EscrowContract {
                 assets: escrow.assets.clone(),
             },
         );
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("released")),
-            (id, arbiter, release_amount),
-        );
+        events::escrow_released(&env, id, &arbiter, release_amount);
         Ok(())
     }
 
@@ -875,10 +843,7 @@ impl EscrowContract {
                 assets: escrow.assets.clone(),
             },
         );
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("override")),
-            (id, nonce),
-        );
+        events::escrow_override(&env, id, nonce);
         Ok(())
     }
 
@@ -935,10 +900,7 @@ impl EscrowContract {
                 }
             }
         }
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("refunded")),
-            (id, caller),
-        );
+        events::escrow_refunded(&env, id, &caller);
         Ok(())
     }
 
@@ -977,10 +939,7 @@ impl EscrowContract {
                 }
             }
         }
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("ref_tl")),
-            (id, caller),
-        );
+        events::escrow_refund_timelock(&env, id, &caller);
         Ok(())
     }
 
@@ -1009,10 +968,7 @@ impl EscrowContract {
         }
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("cancelled")),
-            (id, caller),
-        );
+        events::escrow_cancelled(&env, id, &caller);
         Ok(())
     }
 
@@ -1044,10 +1000,7 @@ impl EscrowContract {
         for a in escrow.assets.iter() {
             events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
         }
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("reclaimed")),
-            (id, caller),
-        );
+        events::escrow_reclaimed(&env, id, &caller);
         Ok(())
     }
 
@@ -1161,10 +1114,7 @@ impl EscrowContract {
         };
         store_escrow(&env, id, &escrow);
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("milestone")),
-            (id, sender, recipient, asset, amount),
-        );
+        events::escrow_milestone(&env, id, &sender, &recipient, &asset, amount);
         Ok(id)
     }
 
@@ -1246,10 +1196,7 @@ impl EscrowContract {
             store_escrow(&env, id, &escrow);
         }
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("ms_rel")),
-            (id, caller, index, payout),
-        );
+        events::escrow_milestone_release(&env, id, &caller, index, payout);
         Ok(())
     }
 

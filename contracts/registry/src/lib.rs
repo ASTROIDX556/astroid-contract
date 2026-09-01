@@ -45,9 +45,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -175,8 +173,7 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("init")), admin);
+        astroid_shared::events::registry_initialized(&env, &admin);
         Ok(())
     }
 
@@ -197,10 +194,7 @@ impl RegistryContract {
         }
         env.storage().persistent().set(&key, &owner);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("register"), org.clone()),
-            owner,
-        );
+        astroid_shared::events::registry_org_registered(&env, &org, &owner);
         Ok(())
     }
 
@@ -233,10 +227,7 @@ impl RegistryContract {
                 new_owner: new_owner.clone(),
             },
         );
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("owner"), org.clone()),
-            new_owner,
-        );
+        astroid_shared::events::registry_org_owner(&env, &org, &new_owner);
         Ok(())
     }
 
@@ -271,15 +262,7 @@ impl RegistryContract {
                 address: address.clone(),
             },
         );
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("register"),
-                org.clone(),
-                kind,
-            ),
-            address,
-        );
+        astroid_shared::events::registry_module_registered(&env, &org, kind, &address);
         Ok(())
     }
 
@@ -303,10 +286,7 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &true);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("deprecate")),
-            (org, kind),
-        );
+        astroid_shared::events::registry_module_deprecated(&env, &org, kind);
         Ok(())
     }
 
@@ -327,10 +307,7 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &false);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("restore")),
-            (org, kind),
-        );
+        astroid_shared::events::registry_module_restored(&env, &org, kind);
         Ok(())
     }
 
@@ -374,15 +351,7 @@ impl RegistryContract {
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
         }
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("remove"),
-                org.clone(),
-                kind,
-            ),
-            (),
-        );
+        astroid_shared::events::registry_module_removed(&env, &org, kind);
         Ok(())
     }
 
@@ -411,10 +380,7 @@ impl RegistryContract {
         let key = DataKey::OrgRole(org.clone(), account.clone());
         env.storage().persistent().set(&key, &role);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (org, account, role),
-        );
+        astroid_shared::events::registry_role_granted(&env, &org, &account, role);
         Ok(())
     }
 
@@ -437,10 +403,7 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (org, account),
-        );
+        astroid_shared::events::registry_role_revoked(&env, &org, &account);
         Ok(())
     }
 
@@ -487,15 +450,7 @@ impl RegistryContract {
             env.storage().persistent().set(&lkey, &version);
             Self::bump(&env, &lkey);
         }
-        env.events().publish(
-            (
-                symbol_short!("version"),
-                symbol_short!("register"),
-                kind,
-                version,
-            ),
-            address,
-        );
+        astroid_shared::events::registry_version_registered(&env, kind, version, &address);
         Ok(())
     }
 
@@ -551,10 +506,7 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events().publish(
-            (symbol_short!("registry"), symbol_short!("setadmin")),
-            new_admin,
-        );
+        astroid_shared::events::registry_set_admin(&env, &new_admin);
         Ok(())
     }
 
@@ -578,8 +530,7 @@ impl RegistryContract {
                 frozen: true,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
+        astroid_shared::events::registry_frozen(&env, &org);
         Ok(())
     }
 
@@ -604,8 +555,7 @@ impl RegistryContract {
                 frozen: false,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
+        astroid_shared::events::registry_unfrozen(&env, &org);
         Ok(())
     }
 
@@ -653,10 +603,7 @@ impl RegistryContract {
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         env.storage().persistent().set(&key, &true);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("approved")),
-            (kind, wasm_hash),
-        );
+        astroid_shared::events::registry_wasm_approved(&env, kind, &wasm_hash);
         Ok(())
     }
 
@@ -674,10 +621,7 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("removed")),
-            (kind, wasm_hash),
-        );
+        astroid_shared::events::registry_wasm_removed(&env, kind, &wasm_hash);
         Ok(())
     }
 

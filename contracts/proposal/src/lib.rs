@@ -44,6 +44,7 @@ use astroid_shared::constants::{
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::math::checked_add;
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
@@ -296,10 +297,7 @@ impl ProposalContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("created")),
-            (id, proposer),
-        );
+        events::proposal_created(&env, id, &proposer);
         Ok(id)
     }
 
@@ -327,10 +325,7 @@ impl ProposalContract {
             proposal.state = ProposalState::Approved;
         }
         Self::store(&env, id, &proposal);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("approved")),
-            (id, caller, proposal.approvals),
-        );
+        events::proposal_approved(&env, id, &caller, proposal.approvals);
         Ok(proposal.approvals)
     }
 
@@ -354,10 +349,7 @@ impl ProposalContract {
             );
         }
         Self::store(&env, id, &proposal);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("rejected")),
-            (id, caller),
-        );
+        events::proposal_rejected(&env, id, &caller);
         Ok(())
     }
 

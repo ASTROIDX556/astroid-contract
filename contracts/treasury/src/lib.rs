@@ -363,10 +363,7 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, amount)?;
         Self::store_holding(&env, &asset, &h);
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("deposited")),
-            (asset.clone(), amount),
-        );
+        events::treasury_deposited(&env, &asset, amount);
         // Pull tokens into the contract's own custody.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -659,10 +656,7 @@ impl TreasuryContract {
                 total,
             },
         );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("batchpay")),
-            (asset, payments.len(), total),
-        );
+        events::treasury_batchpay(&env, &asset, payments.len(), total);
 
         Self::unlock(&env);
         Self::unlock(&env);
@@ -710,10 +704,7 @@ impl TreasuryContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         env.storage().instance().set(&count_key, &count);
-        env.events().publish(
-            (symbol_short!("milestone"), symbol_short!("init")),
-            (count, total_amount, milestones),
-        );
+        events::treasury_milestone_init(&env, count, total_amount, milestones);
         Ok(count)
     }
 
@@ -768,10 +759,7 @@ impl TreasuryContract {
             &d.to,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("milestone"), symbol_short!("disbursed")),
-            (milestone_id, d.disbursed, amount),
-        );
+        events::treasury_milestone_disbursed(&env, milestone_id, d.disbursed, amount);
         Self::unlock(&env);
         Ok(())
     }
