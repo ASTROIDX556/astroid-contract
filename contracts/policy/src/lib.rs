@@ -967,6 +967,7 @@ impl PolicyContract {
 }
 
 /// Allow the interface trait to call `check_transfer` on this contract.
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl PolicyInterface for PolicyContract {
     /// Evaluate a transfer request against the named policy. All gates must pass.
