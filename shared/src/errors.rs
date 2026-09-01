@@ -69,7 +69,7 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
-    UnauthorizedDispatch = 54,
+    AllowanceExceeded = 54,
 
     // --- Multisig / approvals (60-69) ---
     InvalidSignature = 60,
@@ -106,21 +106,17 @@ pub enum Error {
     CancellationWindowClosed = 76,
 
     // --- Escrow (80-89) ---
-    EscrowExpired = 80,
-    TimeLockActive = 81,
-    CancellationWindowClosed = 75,
-    /// A prerequisite proposal has not executed, so the dependent proposal may
-    /// not execute yet.
-    PrerequisiteNotMet = 78,
-    /// A declared dependency would close a cycle in the dependency graph.
-    CircularDependencyDetected = 79,
+    ConditionNotMet = 80,
+    EscrowNotFunded = 81,
+    EscrowExpired = 82,
+    InvalidCondition = 83,
+    TimeLockActive = 84,
 
-    // --- Escrow (80-82) ---
-    EscrowExpired = 80,
-    TimeLockActive = 81,
-    GraceActive = 82,
-
-    // --- Treasury allowances (83-84) ---
-    AllowanceExceeded = 83,
-    AllowanceExpired = 84,
+    // --- Treasury (90-99) ---
+    /// Accumulated approval weight is below the configured threshold.
+    InsufficientWeight = 90,
+    /// Treasury is under emergency pause — all operations blocked.
+    EmergencyPaused = 91,
+    /// Asset is not on the treasury whitelist.
+    AssetNotWhitelisted = 92,
 }
