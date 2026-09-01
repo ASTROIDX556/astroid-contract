@@ -48,9 +48,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -79,17 +77,11 @@ enum DataKey {
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
-    /// Approved WASM hashes: (kind, hash) -> bool.
-    ApprovedWasm(ModuleKind, BytesN<32>),
+    /// Role assignments: (org slug, address) -> Role.
+    Role(String, Address),
 }
 
-/// A delegated administrative role over one organization's registry records.
-///
-/// One role per account keeps the ledger footprint to a single small entry per
-/// delegation. Roles are capability-scoped rather than ranked: `PolicyManager`
-/// is not "less" than `TreasuryOperator`, it simply reaches different module
-/// kinds. Discriminants are part of the public ABI and MUST NOT be reordered or
-/// reused once released.
+/// Granular roles for fine-grained permission control within an organization.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryRole {
@@ -144,6 +136,46 @@ pub struct RegistryContract;
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl RegistryContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        Self::check_paused(&env)?;
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Organization`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        Self::check_paused(&env)?;
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Organization,
+            wasm_hash,
+        )
+    }
     /// Initialize the registry with its administrator. Callable once.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -153,8 +185,7 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("init")), admin);
+        astroid_shared::events::registry_initialized(&env, &admin);
         Ok(())
     }
 
@@ -165,6 +196,7 @@ impl RegistryContract {
         org: String,
         owner: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         require_non_empty(&org)?;
         Self::require_admin(&env, &caller)?;
@@ -174,10 +206,7 @@ impl RegistryContract {
         }
         env.storage().persistent().set(&key, &owner);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("register"), org.clone()),
-            owner,
-        );
+        astroid_shared::events::registry_org_registered(&env, &org, &owner);
         Ok(())
     }
 
@@ -189,6 +218,7 @@ impl RegistryContract {
         org: String,
         new_owner: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         let key = DataKey::Org(org.clone());
@@ -209,16 +239,12 @@ impl RegistryContract {
                 new_owner: new_owner.clone(),
             },
         );
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("owner"), org.clone()),
-            new_owner,
-        );
+        astroid_shared::events::registry_org_owner(&env, &org, &new_owner);
         Ok(())
     }
 
     /// Register (or update) a module address for an organization. Callable by
-    /// the protocol admin, the organization owner, or an account holding a
-    /// delegated [`RegistryRole`] that reaches this [`ModuleKind`].
+    /// the admin, org owner, or module manager.
     pub fn register_module(
         env: Env,
         caller: Address,
@@ -226,9 +252,9 @@ impl RegistryContract {
         kind: ModuleKind,
         address: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
-        caller.require_auth();
-        Self::require_module_permission(&env, &caller, &org, kind)?;
+        Self::require_module_manager(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
@@ -251,15 +277,7 @@ impl RegistryContract {
                 address: address.clone(),
             },
         );
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("register"),
-                org.clone(),
-                kind,
-            ),
-            address,
-        );
+        astroid_shared::events::registry_module_registered(&env, &org, kind, &address);
         Ok(())
     }
 
@@ -440,9 +458,9 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
-        caller.require_auth();
-        Self::require_module_permission(&env, &caller, &org, kind)?;
+        Self::require_module_manager(&env, &caller, &org)?;
         let key = DataKey::Module(org.clone(), kind);
         ensure!(env.storage().persistent().has(&key), Error::NotFound);
         env.storage().persistent().remove(&key);
@@ -484,6 +502,7 @@ impl RegistryContract {
         account: Address,
         role: RegistryRole,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         let owner = Self::require_root_owner(&env, &caller, &org)?;
@@ -493,10 +512,7 @@ impl RegistryContract {
         let key = DataKey::OrgRole(org.clone(), account.clone());
         env.storage().persistent().set(&key, &role);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (org, account, role),
-        );
+        astroid_shared::events::registry_role_granted(&env, &org, &account, role);
         Ok(())
     }
 
@@ -519,10 +535,7 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (org, account),
-        );
+        astroid_shared::events::registry_role_revoked(&env, &org, &account);
         Ok(())
     }
 
@@ -547,8 +560,8 @@ impl RegistryContract {
     }
 
     /// Record a contract implementation address for a `(kind, version)` pair and
-    /// advance the latest-version pointer if newer. Admin-gated; this is what
-    /// powers the version-lookup upgrade strategy.
+    /// advance the latest-version pointer if newer. Callable by the admin or
+    /// version manager. This is what powers the version-lookup upgrade strategy.
     pub fn register_version(
         env: Env,
         caller: Address,
@@ -556,8 +569,13 @@ impl RegistryContract {
         version: u32,
         address: Address,
     ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::require_admin(&env, &caller)?;
-        ensure!(version != 0, Error::InvalidInput);
+        // TODO: Enable version manager role for version registration
+        // For now, keep admin-only for security
+        if version == 0 {
+            return Err(Error::InvalidInput);
+        }
         let vkey = DataKey::Version(kind, version);
         env.storage().persistent().set(&vkey, &address);
         Self::bump(&env, &vkey);
@@ -568,15 +586,7 @@ impl RegistryContract {
             env.storage().persistent().set(&lkey, &version);
             Self::bump(&env, &lkey);
         }
-        env.events().publish(
-            (
-                symbol_short!("version"),
-                symbol_short!("register"),
-                kind,
-                version,
-            ),
-            address,
-        );
+        astroid_shared::events::registry_version_registered(&env, kind, version, &address);
         Ok(())
     }
 
@@ -626,15 +636,13 @@ impl RegistryContract {
 
     /// Rotate the admin. Only the current admin may do this.
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+        Self::check_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events().publish(
-            (symbol_short!("registry"), symbol_short!("setadmin")),
-            new_admin,
-        );
+        astroid_shared::events::registry_set_admin(&env, &new_admin);
         Ok(())
     }
 
@@ -658,8 +666,7 @@ impl RegistryContract {
                 frozen: true,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
+        astroid_shared::events::registry_frozen(&env, &org);
         Ok(())
     }
 
@@ -684,53 +691,66 @@ impl RegistryContract {
                 frozen: false,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
+        astroid_shared::events::registry_unfrozen(&env, &org);
         Ok(())
     }
 
-    /// Record an approved WASM hash for a specific module kind.
-    pub fn add_approved_wasm(
+    /// Grant a role to an address for an organization. Admin or org owner may
+    /// grant roles. Org owners cannot grant Admin role.
+    pub fn grant_role(
         env: Env,
         caller: Address,
-        kind: ModuleKind,
-        wasm_hash: BytesN<32>,
+        org: String,
+        address: Address,
+        role: Role,
     ) -> Result<(), Error> {
-        Self::require_admin(&env, &caller)?;
-        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
-        env.storage().persistent().set(&key, &true);
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+        // Only admin can grant Admin role
+        if role == Role::Admin && !Self::is_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+        // Admin or org owner can grant other roles
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let key = DataKey::Role(org.clone(), address.clone());
+        env.storage().persistent().set(&key, &role);
         Self::bump(&env, &key);
         env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("approved")),
-            (kind, wasm_hash),
+            (symbol_short!("role"), symbol_short!("grant")),
+            (org, address, role_name(&role)),
         );
         Ok(())
     }
 
-    /// Remove/deprecate a previously approved WASM hash.
-    pub fn remove_approved_wasm(
+    /// Revoke a role from an address for an organization. Admin or org owner may
+    /// revoke roles.
+    pub fn revoke_role(
         env: Env,
         caller: Address,
-        kind: ModuleKind,
-        wasm_hash: BytesN<32>,
+        org: String,
+        address: Address,
     ) -> Result<(), Error> {
-        Self::require_admin(&env, &caller)?;
-        let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let key = DataKey::Role(org.clone(), address.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
         env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("removed")),
-            (kind, wasm_hash),
+            (symbol_short!("role"), symbol_short!("revoke")),
+            (org, address),
         );
         Ok(())
     }
 
-    /// Read-only check to see if a WASM hash is approved for a given kind.
-    pub fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool {
-        let key = DataKey::ApprovedWasm(kind, wasm_hash);
-        env.storage().persistent().get(&key).unwrap_or(false)
+    /// Get the role assigned to an address for an organization.
+    pub fn get_role(env: Env, org: String, address: Address) -> Result<Option<Role>, Error> {
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::Role(org, address)))
     }
 
     // --- internal helpers ---
@@ -742,6 +762,17 @@ impl RegistryContract {
                 .get::<_, bool>(&DataKey::Frozen)
                 .unwrap_or(false),
             Error::RegistryFrozen
+        );
+        Ok(())
+    }
+
+    fn check_paused(env: &Env) -> Result<(), Error> {
+        ensure!(
+            !env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Paused)
+                .unwrap_or(false),
+            Error::ContractPaused
         );
         Ok(())
     }
@@ -817,6 +848,60 @@ impl RegistryContract {
         }
     }
 
+    /// Check if the caller has at least the required role for the organization.
+    /// Admin always has access regardless of role assignment.
+    fn require_role(
+        env: &Env,
+        caller: &Address,
+        org: &String,
+        required_role: Role,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        // Admin always has full access
+        if Self::is_admin(env, caller) {
+            return Ok(());
+        }
+        // Check if caller has the required role or higher
+        let caller_role: Option<Role> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Role(org.clone(), caller.clone()));
+        match caller_role {
+            Some(role) => {
+                // Role hierarchy: Admin > OrgOwner > ModuleManager > VersionManager
+                let role_level = role_level(&role);
+                let required_level = role_level(&required_role);
+                if role_level <= required_level {
+                    Ok(())
+                } else {
+                    Err(Error::Unauthorized)
+                }
+            }
+            None => Err(Error::Unauthorized),
+        }
+    }
+
+    /// Get the numeric level of a role (lower = more privileged).
+    fn role_level(role: &Role) -> u8 {
+        match role {
+            Role::Admin => 0,
+            Role::OrgOwner => 1,
+            Role::ModuleManager => 2,
+            Role::VersionManager => 3,
+        }
+    }
+
+    /// Check if the caller can manage modules (Admin, OrgOwner, or ModuleManager).
+    fn require_module_manager(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
+        Self::require_role(env, caller, org, Role::ModuleManager)
+    }
+
+    /// Check if the caller can manage versions (Admin or VersionManager).
+    fn require_version_manager(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
+        // Version management is a global operation; org param is used for role lookup
+        Self::require_role(env, caller, org, Role::VersionManager)
+    }
+
     fn bump(env: &Env, key: &DataKey) {
         env.storage().persistent().extend_ttl(
             key,
@@ -833,8 +918,10 @@ impl RegistryContract {
 #[contractimpl]
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
+        let address: Address = env
         let val = env
             .storage()
             .persistent()
@@ -850,10 +937,11 @@ impl RegistryInterface for RegistryContract {
             return Err(Error::ModuleDeprecated);
         }
         Self::bump(&env, &key);
-        Ok(val)
+        Ok(address)
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
+        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
         let key = DataKey::Org(org);
         let recorded: Address = env
@@ -863,6 +951,17 @@ impl RegistryInterface for RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(recorded == owner)
+    }
+}
+
+/// Convert a role to its string name for event emission.
+fn role_name(role: &Role) -> soroban_sdk::Symbol {
+    use soroban_sdk::symbol_short;
+    match role {
+        Role::Admin => symbol_short!("admin"),
+        Role::OrgOwner => symbol_short!("org_owner"),
+        Role::ModuleManager => symbol_short!("mod_mgr"),
+        Role::VersionManager => symbol_short!("ver_mgr"),
     }
 }
 
