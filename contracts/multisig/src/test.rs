@@ -1,13 +1,10 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{BatchCall, GovernanceChange, MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_shared::constants::{
-    GOVERNANCE_GRACE_PERIOD, MAX_BATCH_CALLS, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY,
-    THRESHOLD_CHANGE_DELAY_LEDGERS,
-};
+use crate::{BatchCall, MultiSigContract, MultiSigContractClient, SignerWeight};
+use astroid_shared::constants::{MAX_BATCH_CALLS, MIN_TIMELOCK_DELAY};
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events, Ledger};
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
     Val, Vec,
@@ -78,6 +75,11 @@ fn setup(weights: &[u32], threshold: u32) -> Harness {
         client,
         signers,
     }
+}
+
+fn advance(h: &Harness, seconds: u64) {
+    let now = h.env.ledger().timestamp();
+    h.env.ledger().set_timestamp(now + seconds);
 }
 
 fn payload(env: &Env) -> Bytes {
@@ -621,24 +623,14 @@ fn timelock_delay_is_itself_governed() {
 fn add_and_remove_signer_with_weight() {
     let h = setup(&[1, 1, 1], 2);
     let new_signer = Address::generate(&h.env);
-
-    let add = h
-        .client
-        .propose_signer_addition(&h.signers[0], &new_signer, &3);
-    assert!(!h.client.is_signer(&new_signer));
-    advance(&h, MIN_TIMELOCK_DELAY);
-    h.client.execute_threshold_change(&h.signers[0], &add);
-
+    h.client.add_signer(&h.signers[0], &new_signer, &3);
     assert!(h.client.is_signer(&new_signer));
     let stored = h.client.get_signers();
     assert!(stored
         .iter()
         .any(|s| s.address == new_signer && s.weight == 3));
 
-    let remove = h.client.propose_signer_removal(&h.signers[0], &new_signer);
-    assert!(h.client.is_signer(&new_signer));
-    advance(&h, MIN_TIMELOCK_DELAY);
-    h.client.execute_threshold_change(&h.signers[0], &remove);
+    h.client.remove_signer(&h.signers[0], &new_signer);
     assert!(!h.client.is_signer(&new_signer));
 }
 
@@ -646,18 +638,14 @@ fn add_and_remove_signer_with_weight() {
 fn cannot_add_signer_with_zero_weight() {
     let h = setup(&[1, 1, 1], 2);
     let extra = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_propose_signer_addition(&h.signers[0], &extra, &0);
+    let res = h.client.try_add_signer(&h.signers[0], &extra, &0);
     assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
 }
 
 #[test]
 fn cannot_add_duplicate_signer() {
     let h = setup(&[1, 1, 1], 2);
-    let res = h
-        .client
-        .try_propose_signer_addition(&h.signers[0], &h.signers[1], &1);
+    let res = h.client.try_add_signer(&h.signers[0], &h.signers[1], &1);
     assert_eq!(res, Err(Ok(Error::AlreadyExists)));
 }
 
@@ -692,9 +680,7 @@ fn cannot_drop_total_weight_below_threshold() {
     // Weights 2, 1 with threshold 3.
     let h = setup(&[2, 1], 3);
     // Removing signer[0] (weight 2) leaves 1 < 3 -> rejected.
-    let res = h
-        .client
-        .try_propose_signer_removal(&h.signers[1], &h.signers[0]);
+    let res = h.client.try_remove_signer(&h.signers[1], &h.signers[0]);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 
     // Lowering signer[0] weight to 1 would drop total to 2 < 3 -> rejected.
@@ -702,60 +688,39 @@ fn cannot_drop_total_weight_below_threshold() {
         .client
         .try_propose_weight_change(&h.signers[1], &h.signers[0], &1);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
-
-    // Zero weights are never admissible.
-    let res = h
-        .client
-        .try_propose_weight_change(&h.signers[1], &h.signers[0], &0);
-    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
 }
 
 #[test]
-fn governance_changes_for_unknown_signers_and_ids_are_rejected() {
+fn set_threshold_bounds_enforced() {
+    // Weights 1, 1, 1 total 3, threshold 2.
+    let h = setup(&[1, 1, 1], 2);
+    // Threshold larger than total weight is rejected.
+    let res = h.client.try_set_threshold(&h.signers[0], &4);
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    // Valid update works (deferred via set_threshold + finalize_threshold).
+    h.client.set_threshold(&h.signers[0], &3);
+    h.env.ledger().set_sequence_number(17_280); // advance past THRESHOLD_CHANGE_DELAY_LEDGERS
+    h.client.finalize_threshold(&h.signers[0]);
+    assert_eq!(h.client.get_threshold(), 3);
+}
+
+#[test]
+fn non_signer_cannot_change_config() {
     let h = setup(&[1, 1, 1], 2);
     let stranger = Address::generate(&h.env);
+    let extra = Address::generate(&h.env);
     assert_eq!(
-        h.client
-            .try_propose_signer_removal(&h.signers[0], &stranger),
+        h.client.try_add_signer(&stranger, &extra, &1),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(
+        h.client.try_set_threshold(&stranger, &1),
         Err(Ok(Error::NotASigner))
     );
     assert_eq!(
         h.client
-            .try_propose_weight_change(&h.signers[0], &stranger, &2),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client.try_execute_threshold_change(&h.signers[0], &99),
-        Err(Ok(Error::NotFound))
-    );
-}
-
-#[test]
-fn governance_events_are_emitted() {
-    let h = setup(&[1, 1, 1], 2);
-    let proposed = h.client.propose_threshold_change(&h.signers[0], &3);
-    assert_event(
-        &h.env,
-        symbol_short!("govchange"),
-        symbol_short!("proposed"),
-    );
-
-    advance(&h, MIN_TIMELOCK_DELAY);
-    h.client.execute_threshold_change(&h.signers[0], &proposed);
-    assert_event(
-        &h.env,
-        symbol_short!("govchange"),
-        symbol_short!("executed"),
-    );
-    // The pre-timelock effect event is still published on application.
-    assert_event(&h.env, symbol_short!("threshold"), symbol_short!("changed"));
-
-    let cancelled = h.client.propose_threshold_change(&h.signers[0], &2);
-    h.client.cancel_threshold_change(&h.signers[1], &cancelled);
-    assert_event(
-        &h.env,
-        symbol_short!("govchange"),
-        symbol_short!("cancelled"),
+            .try_propose_weight_change(&stranger, &h.signers[0], &5),
+        Err(Ok(Error::UnauthorizedModification))
     );
 }
 

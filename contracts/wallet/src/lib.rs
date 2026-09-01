@@ -86,6 +86,10 @@ enum DataKey {
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
+    /// Rate-limit config per wallet: id -> RateLimitConfig.
+    RateLimit(u64),
+    /// Rate-limit usage per wallet and epoch window: (id, window_start) -> RateUsage.
+    RateUsage(u64, u64),
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -94,6 +98,29 @@ enum DataKey {
 pub struct WalletData {
     pub owner: Address,
     pub state: ResourceState,
+}
+
+/// Per-wallet rate-limit configuration. Limits are enforced per fixed epoch
+/// window of `window_seconds`, aligned to the ledger timestamp. A value of `0`
+/// means "unlimited" for `max_volume`/`max_count`; `window_seconds == 0`
+/// disables rate limiting entirely (the default for wallets without a config).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitConfig {
+    /// Maximum cumulative outbound volume per window (0 = unlimited).
+    pub max_volume: i128,
+    /// Maximum outbound transactions per window (0 = unlimited).
+    pub max_count: u32,
+    /// Window size in seconds (0 = rate limiting disabled).
+    pub window_seconds: u64,
+}
+
+/// Cumulative outbound usage recorded for a wallet within a single epoch window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateUsage {
+    pub volume: i128,
+    pub count: u32,
 }
 
 #[contract]
@@ -160,10 +187,7 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Guardian, &guardian);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("guardian")),
-            guardian,
-        );
+        events::wallet_guardian(&env, &guardian);
         Ok(())
     }
 
@@ -253,10 +277,7 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("deposit")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_deposit(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -276,6 +297,7 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
+        Self::enforce_rate_limit(&env, wallet_id, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -302,16 +324,14 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
+        Self::enforce_rate_limit(&env, wallet_id, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
             &wallet.owner,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("withdraw")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_withdraw(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -412,10 +432,7 @@ impl WalletContract {
             return Err(Error::InvalidInput);
         }
         access::set_role(&env, wallet_id, &account, role);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (wallet_id, account, role),
-        );
+        events::wallet_role_granted(&env, wallet_id, &account, role);
         Ok(())
     }
 
@@ -432,10 +449,7 @@ impl WalletContract {
     ) -> Result<(), Error> {
         Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         access::clear_role(&env, wallet_id, &account)?;
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (wallet_id, account),
-        );
+        events::wallet_role_revoked(&env, wallet_id, &account);
         Ok(())
     }
 
@@ -494,6 +508,48 @@ impl WalletContract {
     /// Read a wallet's owner + state.
     pub fn get_wallet(env: Env, wallet_id: u64) -> Result<WalletData, Error> {
         Self::load_wallet(&env, wallet_id)
+    }
+
+    /// Read a wallet's rate-limit config (disabled defaults when unset).
+    pub fn get_rate_limit(env: Env, wallet_id: u64) -> RateLimitConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::RateLimit(wallet_id))
+            .unwrap_or(RateLimitConfig {
+                max_volume: 0,
+                max_count: 0,
+                window_seconds: 0,
+            })
+    }
+
+    /// Read a wallet's outbound usage in the current epoch window (zeros when
+    /// rate limiting is not configured).
+    pub fn get_rate_usage(env: Env, wallet_id: u64) -> RateUsage {
+        let config: RateLimitConfig =
+            match env.storage().instance().get(&DataKey::RateLimit(wallet_id)) {
+                Some(c) => c,
+                None => {
+                    return RateUsage {
+                        volume: 0,
+                        count: 0,
+                    }
+                }
+            };
+        if config.window_seconds == 0 {
+            return RateUsage {
+                volume: 0,
+                count: 0,
+            };
+        }
+        let ts = env.ledger().timestamp();
+        let window = ts - (ts % config.window_seconds);
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateUsage(wallet_id, window))
+            .unwrap_or(RateUsage {
+                volume: 0,
+                count: 0,
+            })
     }
 
     /// Read a wallet's internal balance for an asset (0 if none recorded).
@@ -616,6 +672,49 @@ impl WalletContract {
         ensure!(
             wallet.state != ResourceState::Archived,
             Error::WalletArchived
+        );
+        Ok(())
+    }
+
+    /// Enforce a wallet's rate limit for an outbound transaction of `amount`
+    /// and record it against the current epoch window. Returns
+    /// [`Error::RateLimitExceeded`] when either the window volume or transaction
+    /// count cap would be exceeded; the caller's whole invocation reverts on
+    /// error, so no usage or balance change is committed for rejected transfers.
+    fn enforce_rate_limit(env: &Env, wallet_id: u64, amount: i128) -> Result<(), Error> {
+        let config: RateLimitConfig =
+            match env.storage().instance().get(&DataKey::RateLimit(wallet_id)) {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+        if config.window_seconds == 0 {
+            return Ok(());
+        }
+        let ts = env.ledger().timestamp();
+        let window = ts - (ts % config.window_seconds);
+        let key = DataKey::RateUsage(wallet_id, window);
+        let usage: RateUsage = env.storage().persistent().get(&key).unwrap_or(RateUsage {
+            volume: 0,
+            count: 0,
+        });
+
+        if config.max_count != 0 && usage.count >= config.max_count {
+            return Err(Error::RateLimitExceeded);
+        }
+        let new_volume = checked_add(usage.volume, amount)?;
+        if config.max_volume != 0 && new_volume > config.max_volume {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        let updated = RateUsage {
+            volume: new_volume,
+            count: checked_add(usage.count as i128, 1)? as u32,
+        };
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
         );
         Ok(())
     }
