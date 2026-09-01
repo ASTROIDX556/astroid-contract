@@ -44,6 +44,7 @@ use astroid_shared::constants::{
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::math::checked_add;
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
@@ -81,22 +82,31 @@ impl ProposalState {
     }
 }
 
+/// Off-chain context bundled with every proposal so the backend can
+/// reconstruct why money moved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalContext {
+    pub org: String,
+    pub wallet: String,
+    pub policy: String,
+    pub tx_ref: String,
+}
+
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
-/// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
-/// the ids of proposals that must have executed before this one may execute.
+/// to approve; `threshold` approvals move it to `Approved`. Execution also
+/// requires `quorum` participating approvers.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposal {
     pub proposer: Address,
-    pub org: String,
-    /// Links (opaque references owned by the backend / other contracts).
-    pub wallet: String,
-    pub policy: String,
+    pub context: ProposalContext,
     pub approvers: Vec<Address>,
     /// Prerequisite proposal ids, deduplicated and each strictly less than this
     /// proposal's own id. Empty for a proposal with no dependencies.
     pub dependencies: Vec<u64>,
     pub threshold: u32,
+    pub quorum: u32,
     pub approvals: u32,
     pub state: ProposalState,
     pub created_at: u64,
@@ -133,6 +143,44 @@ pub struct ProposalContract;
 
 #[contractimpl]
 impl ProposalContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Proposal`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Proposal,
+            wasm_hash,
+        )
+    }
     /// Initialize the id counter. Idempotent-guarded.
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::ProposalCount) {
@@ -166,9 +214,7 @@ impl ProposalContract {
     pub fn create(
         env: Env,
         proposer: Address,
-        org: String,
-        wallet: String,
-        policy: String,
+        context: ProposalContext,
         approvers: Vec<Address>,
         dependencies: Vec<u64>,
         threshold: u32,
@@ -176,8 +222,65 @@ impl ProposalContract {
         expires_at: u64,
         grace_period: u64,
     ) -> Result<u64, Error> {
+        Self::create_proposal(
+            env,
+            proposer,
+            org,
+            wallet,
+            policy,
+            tx_ref,
+            approvers,
+            threshold,
+            threshold,
+            expires_at,
+        )
+    }
+
+    /// Create a proposal with separate approval and participation thresholds.
+    /// Quorum is the minimum number of eligible approvers that must participate
+    /// before an approved proposal can execute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_quorum(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        tx_ref: String,
+        approvers: Vec<Address>,
+        threshold: u32,
+        quorum: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        Self::create_proposal(
+            env,
+            proposer,
+            org,
+            wallet,
+            policy,
+            tx_ref,
+            approvers,
+            threshold,
+            quorum,
+            expires_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_proposal(
+        env: Env,
+        proposer: Address,
+        org: String,
+        wallet: String,
+        policy: String,
+        tx_ref: String,
+        approvers: Vec<Address>,
+        threshold: u32,
+        quorum: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
         proposer.require_auth();
-        require_non_empty(&org)?;
+        require_non_empty(&context.org)?;
         let n = approvers.len();
         if n == 0 || n > MAX_APPROVERS {
             return Err(Error::InvalidInput);
@@ -185,15 +288,8 @@ impl ProposalContract {
         if threshold == 0 || threshold > n {
             return Err(Error::InvalidThreshold);
         }
-        if let Some(dep) = deposit.first() {
-            if dep.amount <= 0 {
-                return Err(Error::InvalidAmount);
-            }
-            TokenClient::new(&env, &dep.asset).transfer(
-                &proposer,
-                &env.current_contract_address(),
-                &dep.amount,
-            );
+        if quorum == 0 || quorum > n {
+            return Err(Error::InvalidThreshold);
         }
         if expires_at != 0 && expires_at <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
@@ -230,12 +326,11 @@ impl ProposalContract {
 
         let proposal = Proposal {
             proposer: proposer.clone(),
-            org,
-            wallet,
-            policy,
+            context,
             approvers,
             dependencies: deps,
             threshold,
+            quorum,
             approvals: 0,
             deposit,
             state: ProposalState::Pending,
@@ -254,10 +349,7 @@ impl ProposalContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("created")),
-            (id, proposer),
-        );
+        events::proposal_created(&env, id, &proposer);
         Ok(id)
     }
 
@@ -285,10 +377,7 @@ impl ProposalContract {
             proposal.state = ProposalState::Approved;
         }
         Self::store(&env, id, &proposal);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("approved")),
-            (id, caller, proposal.approvals),
-        );
+        events::proposal_approved(&env, id, &caller, proposal.approvals);
         Ok(proposal.approvals)
     }
 
@@ -312,10 +401,7 @@ impl ProposalContract {
             );
         }
         Self::store(&env, id, &proposal);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("rejected")),
-            (id, caller),
-        );
+        events::proposal_rejected(&env, id, &caller);
         Ok(())
     }
 
@@ -410,7 +496,9 @@ impl ProposalContract {
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
-        Self::ensure_dependencies_met(&env, &proposal)?;
+        if proposal.approvals < proposal.quorum {
+            return Err(Error::QuorumNotMet);
+        }
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(

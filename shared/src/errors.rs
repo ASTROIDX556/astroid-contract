@@ -28,15 +28,18 @@ pub enum Error {
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
-    PolicyMerchantBlocked = 23,
-    PolicyCategoryRestricted = 24,
-    AssetNotWhitelisted = 25,
+    /// The asset is not in the organization's whitelist.
+    AssetNotWhitelisted = 24,
     /// A proposed spend would breach a per-asset spending allowance.
-    PolicyAllowanceExceeded = 26,
+    PolicyAllowanceExceeded = 25,
+    /// A conditional policy rule denied the transaction.
+    RuleDenied = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
+    /// System-wide emergency pause: all critical registry operations are halted.
+    ContractPaused = 32,
 
     // --- Budget (40-44) ---
     BudgetExceeded = 40,
@@ -50,6 +53,7 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    UnauthorizedDispatch = 54,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
@@ -71,19 +75,14 @@ pub enum Error {
     /// weights or the threshold.
     UnauthorizedModification = 92,
 
-    // --- Proposal (71-79) ---
-    ProposalExpired = 71,
-    InvalidProposalState = 72,
-    ProposalNotApproved = 73,
-    NotAnApprover = 74,
-    CancellationWindowClosed = 75,
-    /// A prerequisite proposal has not executed, so the dependent proposal may
-    /// not execute yet.
-    PrerequisiteNotMet = 78,
-    /// A declared dependency would close a cycle in the dependency graph.
-    CircularDependencyDetected = 79,
+    // --- Proposal (70-79) ---
+    ProposalExpired = 70,
+    InvalidProposalState = 71,
+    ProposalNotApproved = 72,
+    NotAnApprover = 73,
+    QuorumNotMet = 74,
 
-    // --- Escrow (80-82) ---
+    // --- Escrow (80-81) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
@@ -91,4 +90,5 @@ pub enum Error {
     // --- Treasury allowances (83-84) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
+    AllowanceNotFound = 85,
 }

@@ -441,6 +441,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "refund_window"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "released_amount"
                       },
                       "val": {
@@ -1704,7 +1712,7 @@
             ],
             "data": {
               "error": {
-                "contract": 80
+                "contract": 53
               }
             }
           }
@@ -1725,7 +1733,7 @@
               },
               {
                 "error": {
-                  "contract": 80
+                  "contract": 53
                 }
               }
             ],
@@ -1750,7 +1758,7 @@
               },
               {
                 "error": {
-                  "contract": 80
+                  "contract": 53
                 }
               }
             ],
@@ -1933,6 +1941,14 @@
                   },
                   "val": {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "refund_window"
+                  },
+                  "val": {
+                    "u64": 0
                   }
                 },
                 {
