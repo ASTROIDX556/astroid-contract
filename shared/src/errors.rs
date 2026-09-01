@@ -38,6 +38,8 @@ pub enum Error {
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
+    /// System-wide emergency pause: all critical registry operations are halted.
+    ContractPaused = 32,
 
     // --- Budget (40-44) ---
     BudgetExceeded = 40,

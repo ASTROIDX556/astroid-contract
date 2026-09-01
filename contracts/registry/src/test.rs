@@ -331,6 +331,312 @@ fn standard_events_emitted() {
 }
 
 // ---------------------------------------------------------------------------
+// System-wide emergency pause
+// ---------------------------------------------------------------------------
+
+#[test]
+fn admin_can_pause_and_unpause() {
+    let (env, client, admin) = setup();
+    assert!(!client.is_paused());
+    client.pause(&admin);
+    assert!(client.is_paused());
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn non_admin_cannot_pause() {
+    let (env, client, _admin) = setup();
+    let stranger = Address::generate(&env);
+    assert_eq!(client.try_pause(&stranger), Err(Ok(Error::Unauthorized)));
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn non_admin_cannot_unpause() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_unpause(&stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(client.is_paused());
+}
+
+#[test]
+fn paused_registry_blocks_register_org() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    assert_eq!(
+        client.try_register_org(&admin, &org, &owner),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_set_org_owner() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    client.pause(&admin);
+    let new_owner = Address::generate(&env);
+    assert_eq!(
+        client.try_set_org_owner(&owner, &org, &new_owner),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_register_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    client.pause(&admin);
+    let wallet = Address::generate(&env);
+    assert_eq!(
+        client.try_register_module(&owner, &org, &ModuleKind::Wallet, &wallet),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_lookup() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.pause(&admin);
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_verify_owner() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    client.pause(&admin);
+    assert_eq!(
+        client.try_verify_owner(&org, &owner),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_grant_role() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    client.pause(&admin);
+    let delegate = Address::generate(&env);
+    assert_eq!(
+        client.try_grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_remove_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.pause(&admin);
+    assert_eq!(
+        client.try_remove_module(&owner, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_deprecate_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.pause(&admin);
+    assert_eq!(
+        client.try_deprecate_module(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_reactivate_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
+    client.pause(&admin);
+    assert_eq!(
+        client.try_reactivate_module(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_register_version() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    let addr = Address::generate(&env);
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_set_admin() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    let new_admin = Address::generate(&env);
+    assert_eq!(
+        client.try_set_admin(&admin, &new_admin),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_add_approved_wasm() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    let wasm = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    assert_eq!(
+        client.try_add_approved_wasm(&admin, &ModuleKind::Wallet, &wasm),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_remove_approved_wasm() {
+    let (env, client, admin) = setup();
+    let wasm = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &wasm);
+    client.pause(&admin);
+    assert_eq!(
+        client.try_remove_approved_wasm(&admin, &ModuleKind::Wallet, &wasm),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn pause_unpause_emits_events() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    assert_event(&env, "ContractPaused");
+    client.unpause(&admin);
+    assert_event(&env, "ContractPaused");
+}
+
+#[test]
+fn operations_succeed_after_unpause() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    assert_eq!(
+        client.try_register_org(&admin, &org, &owner),
+        Err(Ok(Error::ContractPaused))
+    );
+    client.unpause(&admin);
+    client.register_org(&admin, &org, &owner);
+    assert_eq!(client.get_org_owner(&org), owner);
+}
+
+#[test]
+fn revoke_role_works_while_paused() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let delegate = Address::generate(&env);
+    client.grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager);
+    client.pause(&admin);
+    // Revocation must work while paused so owners can withdraw access during incidents.
+    client.revoke_role(&owner, &org, &delegate);
+    assert_eq!(client.get_role(&org, &delegate), None);
+}
+
+#[test]
+fn freeze_works_while_paused() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    client.pause(&admin);
+    // Org owners must be able to freeze even while paused.
+    client.freeze(&owner, &org);
+}
+
+#[test]
+fn unfreeze_works_while_paused() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    client.freeze(&owner, &org);
+    client.pause(&admin);
+    // Unfreeze must work even while paused so owners can recover.
+    client.unfreeze(&owner, &org);
+}
+
+#[test]
+fn get_module_address_works_while_paused() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.pause(&admin);
+    // Read-only accessors must work while paused.
+    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn paused_registry_blocks_upgrade() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    h.registry
+        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
+    h.member.pause(&h.admin);
+    assert_eq!(
+        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_registry_blocks_set_upgrade_authority() {
+    let h = setup_upgrade();
+    h.member.pause(&h.admin);
+    assert_eq!(
+        h.member
+            .try_set_upgrade_authority(&h.admin, &h.admin, &h.registry_id),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Role-based permission delegation
 // ---------------------------------------------------------------------------
 
