@@ -30,7 +30,6 @@ struct Harness<'a> {
     admin: Address,
     multisig: Address,
     asset: Address,
-    _second_asset: Address,
 }
 
 /// Register a treasury plus a test SAC token, approve that token for routing,
@@ -62,7 +61,6 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         admin,
         multisig,
         asset,
-        _second_asset: second_asset,
     }
 }
 
@@ -335,4 +333,175 @@ fn payout_schedule_invalid_params_rejected() {
     // interval_seconds must be positive
     let res = h.client.try_set_payout_schedule(&h.admin, &100, &0);
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+// -----------------------------------------------------------------------
+// Batch transfer (issue #96)
+// -----------------------------------------------------------------------
+
+#[test]
+fn batch_transfer_pays_all_recipients_atomically() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    let c = Address::generate(&h.env);
+    let payments = vec![
+        &h.env,
+        Payment {
+            recipient: a.clone(),
+            amount: 100,
+        },
+        Payment {
+            recipient: b.clone(),
+            amount: 250,
+        },
+        Payment {
+            recipient: c.clone(),
+            amount: 50,
+        },
+    ];
+
+    h.client.batch_transfer(&h.admin, &h.asset, &payments);
+
+    // Every recipient got exactly their leg; custody and internal accounting
+    // reflect the aggregate (100 + 250 + 50 = 400).
+    assert_eq!(token_balance(&h, &a), 100);
+    assert_eq!(token_balance(&h, &b), 250);
+    assert_eq!(token_balance(&h, &c), 50);
+    assert_eq!(token_balance(&h, &h.client.address), 600);
+    let holding = h.client.holding(&h.asset);
+    assert_eq!(holding.total_in, 600);
+    assert_eq!(holding.total_out, 400);
+
+    // A structured summary event is published for the batch.
+    assert_event(&h.env, "BatchTransferExecuted");
+}
+
+#[test]
+fn batch_transfer_overdraw_reverts_atomically() {
+    let h = setup("vault", 500);
+    h.client.deposit(&h.admin, &h.asset, &500);
+
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    let payments = vec![
+        &h.env,
+        Payment {
+            recipient: a.clone(),
+            amount: 300,
+        },
+        Payment {
+            recipient: b.clone(),
+            amount: 300, // pushes the total (600) past the 500 balance
+        },
+    ];
+
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
+    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+
+    // Atomicity: no recipient was paid and the ledger is untouched.
+    assert_eq!(token_balance(&h, &a), 0);
+    assert_eq!(token_balance(&h, &b), 0);
+    assert_eq!(token_balance(&h, &h.client.address), 500);
+    assert_eq!(h.client.holding(&h.asset).total_in, 500);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+}
+
+#[test]
+fn batch_transfer_empty_or_oversized_rejected() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // Empty batch.
+    let empty = Vec::new(&h.env);
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &empty);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+
+    // Batch exceeding the maximum payout count.
+    let mut too_many = Vec::new(&h.env);
+    for _ in 0..MAX_BATCH_PAYMENTS + 1 {
+        too_many.push_back(Payment {
+            recipient: Address::generate(&h.env),
+            amount: 1,
+        });
+    }
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &too_many);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn batch_transfer_rejects_zero_leg_atomically() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    let payments = vec![
+        &h.env,
+        Payment {
+            recipient: a.clone(),
+            amount: 100,
+        },
+        Payment {
+            recipient: b.clone(),
+            amount: 0, // zero-amount leg is invalid
+        },
+    ];
+
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+
+    // Nothing moved.
+    assert_eq!(token_balance(&h, &a), 0);
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+}
+
+#[test]
+fn batch_transfer_rejected_when_not_admin() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    let intruder = Address::generate(&h.env);
+    let payments = vec![
+        &h.env,
+        Payment {
+            recipient: Address::generate(&h.env),
+            amount: 100,
+        },
+    ];
+    let res = h.client.try_batch_transfer(&intruder, &h.asset, &payments);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+}
+
+#[test]
+fn batch_transfer_respects_payout_schedule() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    // Streaming velocity cap: 300 per interval.
+    h.client.set_payout_schedule(&h.admin, &300, &3_600);
+
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    let payments = vec![
+        &h.env,
+        Payment {
+            recipient: a.clone(),
+            amount: 200,
+        },
+        Payment {
+            recipient: b.clone(),
+            amount: 200, // aggregate 400 > 300 cap
+        },
+    ];
+
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
+    assert_eq!(res, Err(Ok(Error::PayoutScheduleViolated)));
+
+    // Atomicity: nothing paid.
+    assert_eq!(token_balance(&h, &a), 0);
+    assert_eq!(token_balance(&h, &b), 0);
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
 }
