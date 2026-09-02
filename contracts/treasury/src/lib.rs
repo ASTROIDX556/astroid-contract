@@ -387,9 +387,7 @@ impl TreasuryContract {
     pub fn emergency_pause(env: Env, caller: Address) -> Result<(), Error> {
         caller.require_auth();
         let mut t = Self::load(&env);
-        let emergency_admin = t
-            .emergency_admin
-            .ok_or(Error::Unauthorized)?;
+        let emergency_admin = t.emergency_admin.ok_or(Error::Unauthorized)?;
         if caller != emergency_admin {
             return Err(Error::Unauthorized);
         }

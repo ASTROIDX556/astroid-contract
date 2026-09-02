@@ -542,20 +542,8 @@ fn override_release_rejects_replayed_nonce() {
     signers.push_back(signer_public_key(&h, &key2));
 
     // Two escrows sharing the same override signer set.
-    let id1 = create(
-        &h,
-        &assets_of(&h, &[2_000]),
-        START + 100_000,
-        &signers,
-        2,
-    );
-    let id2 = create(
-        &h,
-        &assets_of(&h, &[3_000]),
-        START + 100_000,
-        &signers,
-        2,
-    );
+    let id1 = create(&h, &assets_of(&h, &[2_000]), START + 100_000, &signers, 2);
+    let id2 = create(&h, &assets_of(&h, &[3_000]), START + 100_000, &signers, 2);
 
     let nonce = 7u64;
     let mut sigs1 = Vec::new(&h.env);

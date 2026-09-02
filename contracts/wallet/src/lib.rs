@@ -460,9 +460,10 @@ impl WalletContract {
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()), &amount);
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            &amount,
+        );
         env.storage().persistent().extend_ttl(
             &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
             constants::PERSISTENT_LIFETIME_THRESHOLD,
@@ -492,12 +493,17 @@ impl WalletContract {
         let current: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()))
+            .get(&DataKey::Allowance(
+                wallet_id,
+                spender.clone(),
+                asset.clone(),
+            ))
             .unwrap_or(0);
         let updated = checked_add(current, amount)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()), &updated);
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            &updated,
+        );
         env.storage().persistent().extend_ttl(
             &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
             constants::PERSISTENT_LIFETIME_THRESHOLD,
@@ -528,15 +534,20 @@ impl WalletContract {
         let current: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()))
+            .get(&DataKey::Allowance(
+                wallet_id,
+                spender.clone(),
+                asset.clone(),
+            ))
             .unwrap_or(0);
         if current < amount {
             return Err(Error::AllowanceExceeded);
         }
         let updated = checked_sub(current, amount)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(wallet_id, spender.clone(), asset.clone()), &updated);
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            &updated,
+        );
         env.storage().persistent().extend_ttl(
             &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
             constants::PERSISTENT_LIFETIME_THRESHOLD,
@@ -567,7 +578,11 @@ impl WalletContract {
         let allowance: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::Allowance(wallet_id, caller.clone(), asset.clone()))
+            .get(&DataKey::Allowance(
+                wallet_id,
+                caller.clone(),
+                asset.clone(),
+            ))
             .unwrap_or(0);
         if allowance < amount {
             return Err(Error::AllowanceExceeded);

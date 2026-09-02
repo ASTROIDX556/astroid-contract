@@ -515,7 +515,8 @@ fn set_daily_velocity_cap_works() {
         &0,
     );
     // Set velocity cap
-    h.client.set_daily_velocity_cap(&h.owner, &id(&h.env, "eng"), &500);
+    h.client
+        .set_daily_velocity_cap(&h.owner, &id(&h.env, "eng"), &500);
     let b: Budget = h.client.get(&id(&h.env, "eng"));
     assert_eq!(b.daily_velocity_cap, 500);
     // Spend within new cap
@@ -538,7 +539,9 @@ fn set_daily_velocity_cap_negative_rejected() {
         &0,
         &0,
     );
-    let res = h.client.try_set_daily_velocity_cap(&h.owner, &id(&h.env, "eng"), &-100);
+    let res = h
+        .client
+        .try_set_daily_velocity_cap(&h.owner, &id(&h.env, "eng"), &-100);
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
 }
 

@@ -146,16 +146,7 @@ impl ProposalContract {
         grace_period: u64,
     ) -> Result<u64, Error> {
         Self::create_proposal(
-            env,
-            proposer,
-            org,
-            wallet,
-            policy,
-            tx_ref,
-            approvers,
-            threshold,
-            threshold,
-            expires_at,
+            env, proposer, org, wallet, policy, tx_ref, approvers, threshold, threshold, expires_at,
         )
     }
 
@@ -176,16 +167,7 @@ impl ProposalContract {
         expires_at: u64,
     ) -> Result<u64, Error> {
         Self::create_proposal(
-            env,
-            proposer,
-            org,
-            wallet,
-            policy,
-            tx_ref,
-            approvers,
-            threshold,
-            quorum,
-            expires_at,
+            env, proposer, org, wallet, policy, tx_ref, approvers, threshold, quorum, expires_at,
         )
     }
 
@@ -243,7 +225,9 @@ impl ProposalContract {
             .persistent()
             .set(&DataKey::Proposal(id), &proposal);
         Self::bump(&env, id);
-        env.storage().instance().set(&DataKey::ProposalCount, &count);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &count);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -569,7 +553,9 @@ impl ProposalContract {
     }
 
     fn store(env: &Env, id: u64, proposal: &Proposal) {
-        env.storage().persistent().set(&DataKey::Proposal(id), proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), proposal);
         Self::bump(env, id);
     }
 

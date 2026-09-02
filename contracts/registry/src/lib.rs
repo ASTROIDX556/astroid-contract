@@ -14,6 +14,17 @@
 //! new contract versions (e.g. Wallet v1 → v2 → v3) can be introduced without
 //! breaking consumers (PRD Doc 7 §Upgrade Strategy).
 //!
+//! ## Interface version compatibility
+//!
+//! Because contracts upgrade independently, the registry also validates the
+//! *shared interface* version a registered module advertises against the
+//! minimum compatibility bound the organization declares for that module kind.
+//! Before a module is routed to (`lookup`) or re-pointed at a newer
+//! implementation (`register_module_with_version`), the implementation's
+//! [`Version`] must satisfy the organization's bound — otherwise the call is
+//! rejected with the deterministic [`Error::InterfaceVersionIncompatible`].
+//! See [`astroid_interfaces::version`] for the versioning rules.
+//!
 //! Security model (PRD Doc 10): validate caller → ownership → inputs →
 //! permissions → fail safely → emit events. All mutating calls are admin- or
 //! owner-gated and require Soroban auth.
@@ -24,23 +35,25 @@
 //! contact with a real organization: the people who rotate a policy contract
 //! are usually not the people who hold ultimate ownership, and handing them the
 //! root key to do it defeats the point of having one. The registry therefore
-//! records a [`RegistryRole`] per `(organization, account)` and checks it on the
+//! records a [`Role`] per `(organization, account)` and checks it on the
 //! org-scoped modifications, so an owner can delegate narrow administrative
 //! powers to sub-accounts or secondary operational keys without transferring
 //! ownership:
 //!
-//! | Role               | May register/remove modules of kind                |
-//! |--------------------|----------------------------------------------------|
-//! | `Owner`            | any kind (a delegated co-owner for module records) |
-//! | `ModuleUpgrader`   | any kind (repointing modules at new versions)      |
-//! | `PolicyManager`    | `Policy`                                           |
-//! | `TreasuryOperator` | `Treasury`, `Budget`, `Escrow`                     |
+//! | Role             | May register/remove modules of kind                    |
+//! |------------------|-------------------------------------------------------|
+//! | `Admin`          | anything (protocol-wide administration)               |
+//! | `OrgOwner`       | anything for their own organization                   |
+//! | `ModuleManager`  | any kind (repointing modules at new versions)         |
+//! | `VersionManager` | reserved for the global version table                  |
 //!
-//! Delegation is deliberately bounded. Root actions — transferring ownership,
-//! the emergency freeze, and administering roles themselves — stay with the
-//! recorded org owner and the protocol admin, so no grant can be used to
-//! escalate into ownership or to widen its own reach.
+//! Roles are totally ordered by privilege (lower rank = more privileged), so a
+//! guard for `ModuleManager` is also satisfied by `OrgOwner` and `Admin`.
+//! Delegation is deliberately bounded: only the recorded org owner or the
+//! protocol admin may grant or revoke, and the root actions (ownership
+//! transfer, emergency freeze, role administration) stay with them as well.
 
+use astroid_interfaces::version::{require_compatible, Version, CURRENT_VERSION};
 use astroid_interfaces::RegistryInterface;
 use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use astroid_shared::ensure;
@@ -48,7 +61,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::types::ModuleKind;
 use astroid_shared::validation::require_non_empty;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
@@ -77,8 +90,16 @@ enum DataKey {
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+    /// System-wide pause status (instance).
+    Paused,
     /// Role assignments: (org slug, address) -> Role.
     Role(String, Address),
+    /// Interface version a registered module implementation advertises:
+    /// (org slug, kind) -> Version.
+    ModuleInterfaceVersion(String, ModuleKind),
+    /// Minimum compatible interface version the organization requires for a
+    /// module kind: (org slug, kind) -> Version.
+    MinInterfaceVersion(String, ModuleKind),
 }
 
 /// Granular roles for fine-grained permission control within an organization.
@@ -97,6 +118,24 @@ pub enum RegistryRole {
     /// May repoint any of the organization's modules, which is what rolling a
     /// module forward to a new implementation version amounts to.
     ModuleUpgrader = 3,
+}
+
+/// Organization-scoped operational roles.
+///
+/// Discriminants are part of the public ABI and MUST NOT be reordered once
+/// released. Lower rank means more privilege, so an `OrgOwner` satisfies a
+/// `ModuleManager` guard.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// Protocol-wide administrator. Satisfies every guard.
+    Admin = 0,
+    /// Recorded organization owner.
+    OrgOwner = 1,
+    /// May register/remove/rotate modules for the organization.
+    ModuleManager = 2,
+    /// Reserved for managing the global version table.
+    VersionManager = 3,
 }
 
 /// A composite view of a registered module returned by [`RegistryContract::get_module`].
@@ -245,6 +284,11 @@ impl RegistryContract {
 
     /// Register (or update) a module address for an organization. Callable by
     /// the admin, org owner, or module manager.
+    ///
+    /// This is the convenience path that assumes the implementation speaks the
+    /// protocol's current interface ([`CURRENT_VERSION`]). Use
+    /// [`Self::register_module_with_version`] to declare a specific interface
+    /// version and have it validated against the organization's minimum bound.
     pub fn register_module(
         env: Env,
         caller: Address,
@@ -281,6 +325,131 @@ impl RegistryContract {
         Ok(())
     }
 
+    /// Register (or update) a module address together with the **interface
+    /// version** the implementation advertises.
+    ///
+    /// This is the upgrade-aware registration path: `version` is validated
+    /// against the organization's minimum compatibility bound for `kind` (see
+    /// [`Self::set_min_interface_version`]) *before* the module is recorded, so
+    /// a newer implementation that does not meet — or a rollback that violates —
+    /// the bound is rejected with [`Error::InterfaceVersionIncompatible`] and no
+    /// state is written.
+    ///
+    /// Callable by the admin, org owner, or module manager.
+    pub fn register_module_with_version(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        address: Address,
+        version: Version,
+    ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
+        Self::check_frozen(&env)?;
+        Self::require_module_manager(&env, &caller, &org)?;
+        // Registration-time compatibility gate: an org that declares a minimum
+        // compatible interface version must not be pointed at an implementation
+        // that violates it.
+        if let Some(min) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinInterfaceVersion(org.clone(), kind))
+        {
+            require_compatible(version, min)?;
+        }
+        let key = DataKey::Module(org.clone(), kind);
+        env.storage().persistent().set(&key, &address);
+        Self::bump(&env, &key);
+        let vkey = DataKey::ModuleInterfaceVersion(org.clone(), kind);
+        env.storage().persistent().set(&vkey, &version);
+        Self::bump(&env, &vkey);
+        // A (re)registration points at a fresh implementation, so any prior
+        // deprecation flag and migration target must not carry over.
+        let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+        if env.storage().persistent().has(&dkey) {
+            env.storage().persistent().remove(&dkey);
+        }
+        let gkey = DataKey::ModuleMigration(org.clone(), kind);
+        if env.storage().persistent().has(&gkey) {
+            env.storage().persistent().remove(&gkey);
+        }
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryModuleUpdated {
+                org: org.clone(),
+                kind,
+                address: address.clone(),
+            },
+        );
+        astroid_shared::events::registry_module_registered(&env, &org, kind, &address);
+        env.events().publish(
+            (
+                symbol_short!("interface"),
+                symbol_short!("version"),
+                org,
+                kind,
+            ),
+            version,
+        );
+        Ok(())
+    }
+
+    /// Atomically register (or update) several module addresses for an
+    /// organization in a single call. Callable by the admin, org owner, or
+    /// module manager.
+    ///
+    /// All lists must be non-empty and of equal length, and no `kind` may
+    /// appear twice — otherwise the whole batch is rejected with
+    /// [`Error::InvalidInput`] *before* any state is written, so a partial
+    /// registration can never occur.
+    pub fn batch_register_modules(
+        env: Env,
+        caller: Address,
+        org: String,
+        kinds: Vec<ModuleKind>,
+        addresses: Vec<Address>,
+    ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
+        Self::check_frozen(&env)?;
+        Self::require_module_manager(&env, &caller, &org)?;
+        if kinds.is_empty() || kinds.len() != addresses.len() {
+            return Err(Error::InvalidInput);
+        }
+        // Reject duplicate kinds up-front so an invalid batch never partially
+        // writes module records.
+        for i in 0..kinds.len() {
+            for j in (i + 1)..kinds.len() {
+                if kinds.get(i).unwrap() == kinds.get(j).unwrap() {
+                    return Err(Error::InvalidInput);
+                }
+            }
+        }
+        for i in 0..kinds.len() {
+            let kind = kinds.get(i).unwrap();
+            let address = addresses.get(i).unwrap();
+            let key = DataKey::Module(org.clone(), kind);
+            env.storage().persistent().set(&key, &address);
+            Self::bump(&env, &key);
+            let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+            if env.storage().persistent().has(&dkey) {
+                env.storage().persistent().remove(&dkey);
+            }
+            let gkey = DataKey::ModuleMigration(org.clone(), kind);
+            if env.storage().persistent().has(&gkey) {
+                env.storage().persistent().remove(&gkey);
+            }
+        }
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryModuleBatchUpdated {
+                org: org.clone(),
+                kinds,
+                addresses,
+            },
+        );
+        Ok(())
+    }
+
     /// Mark a registered module as deprecated. Admin-gated. Once flagged,
     /// [`Self::lookup`] rejects new interactions with [`Error::ModuleDeprecated`]
     /// while the raw address remains readable through [`Self::get_module_address`]
@@ -300,10 +469,7 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &true);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("deprecate")),
-            (org, kind),
-        );
+        astroid_shared::events::registry_module_deprecated(&env, &org, kind);
         Ok(())
     }
 
@@ -323,10 +489,7 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &false);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("restore")),
-            (org, kind),
-        );
+        astroid_shared::events::registry_module_restored(&env, &org, kind);
         Ok(())
     }
 
@@ -342,10 +505,14 @@ impl RegistryContract {
     /// Intended for legacy migrations and admin tooling that must still reach a
     /// deprecated implementation.
     pub fn get_module_address(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
-        env.storage()
+        let key = DataKey::Module(org, kind);
+        let val = env
+            .storage()
             .persistent()
-            .get(&DataKey::Module(org, kind))
-            .ok_or(Error::NotFound)
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
     }
 
     /// Link a registered module to its successor implementation. Admin-gated.
@@ -464,9 +631,9 @@ impl RegistryContract {
         let key = DataKey::Module(org.clone(), kind);
         ensure!(env.storage().persistent().has(&key), Error::NotFound);
         env.storage().persistent().remove(&key);
-        // Drop the deprecation flag and migration target together with the
-        // record so a later re-registration starts clean and lookups report
-        // NotFound rather than ModuleDeprecated for a removed module.
+        // Drop the deprecation flag, migration target and recorded interface
+        // version together with the record so a later re-registration starts
+        // clean and lookups report NotFound rather than a stale state.
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
@@ -474,6 +641,10 @@ impl RegistryContract {
         let gkey = DataKey::ModuleMigration(org.clone(), kind);
         if env.storage().persistent().has(&gkey) {
             env.storage().persistent().remove(&gkey);
+        }
+        let vkey = DataKey::ModuleInterfaceVersion(org.clone(), kind);
+        if env.storage().persistent().has(&vkey) {
+            env.storage().persistent().remove(&vkey);
         }
         env.events().publish(
             (
@@ -484,6 +655,7 @@ impl RegistryContract {
             ),
             (),
         );
+        astroid_shared::events::registry_module_removed(&env, &org, kind);
         Ok(())
     }
 
@@ -492,60 +664,57 @@ impl RegistryContract {
     /// grant, so a delegated role can never be used to widen its own reach or
     /// to mint further delegations.
     ///
-    /// Granting to the org owner is refused: the owner already reaches every
-    /// module kind, so the record would be redundant and could only mislead
-    /// anyone reading the delegation list.
+    /// Org owners cannot be granted the `Admin` role; that is reserved for the
+    /// protocol admin.
     pub fn grant_role(
         env: Env,
         caller: Address,
         org: String,
-        account: Address,
-        role: RegistryRole,
+        address: Address,
+        role: Role,
     ) -> Result<(), Error> {
-        Self::check_paused(&env)?;
         Self::check_frozen(&env)?;
-        caller.require_auth();
-        let owner = Self::require_root_owner(&env, &caller, &org)?;
-        if account == owner {
-            return Err(Error::InvalidInput);
+        // Only admin can grant Admin role
+        if role == Role::Admin && !Self::is_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
         }
-        let key = DataKey::OrgRole(org.clone(), account.clone());
+        // Admin or org owner can grant other roles
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let key = DataKey::Role(org.clone(), address.clone());
         env.storage().persistent().set(&key, &role);
         Self::bump(&env, &key);
-        astroid_shared::events::registry_role_granted(&env, &org, &account, role);
+        env.events().publish(
+            (symbol_short!("role"), symbol_short!("grant")),
+            (org, address, role_name(&role)),
+        );
         Ok(())
     }
 
-    /// Revoke whatever role `account` holds over `org`. Only the recorded
-    /// organization owner or the protocol admin may revoke.
-    ///
-    /// Fails with [`Error::NotFound`] when the account holds no delegated role,
-    /// so a revocation is never silently a no-op — an owner who believes they
-    /// have withdrawn access has actually withdrawn it.
+    /// Revoke a role from an address for an organization. Admin or org owner may
+    /// revoke roles.
     pub fn revoke_role(
         env: Env,
         caller: Address,
         org: String,
-        account: Address,
+        address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        Self::require_root_owner(&env, &caller, &org)?;
-        let key = DataKey::OrgRole(org.clone(), account.clone());
+        Self::check_frozen(&env)?;
+        Self::require_admin_or_org_owner(&env, &caller, &org)?;
+        let key = DataKey::Role(org.clone(), address.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        astroid_shared::events::registry_role_revoked(&env, &org, &account);
+        env.events().publish(
+            (symbol_short!("role"), symbol_short!("revoke")),
+            (org, address),
+        );
         Ok(())
     }
 
-    /// Read the role `account` holds over `org`, or `None` if it holds none.
-    ///
-    /// The org owner is reported as [`RegistryRole::Owner`] even though no
-    /// record is stored for them, so callers see the effective permission
-    /// rather than a storage detail.
-    pub fn get_role(env: Env, org: String, account: Address) -> Option<RegistryRole> {
-        Self::effective_role(&env, &org, &account)
+    /// Get the role assigned to an address for an organization.
+    pub fn get_role(env: Env, org: String, address: Address) -> Result<Option<Role>, Error> {
+        Ok(env.storage().persistent().get(&DataKey::Role(org, address)))
     }
 
     /// Whether `account` may register or remove the `kind` module for `org` —
@@ -557,6 +726,125 @@ impl RegistryContract {
         Self::effective_role(&env, &org, &account)
             .map(|role| role.may_manage(kind))
             .unwrap_or(false)
+    }
+
+    // --- interface version compatibility ---
+
+    /// Declare the **minimum compatible interface version** the organization
+    /// requires for a module kind. Admin-gated.
+    ///
+    /// Once set, this bound is enforced in two places:
+    /// - [`Self::register_module_with_version`] rejects any implementation whose
+    ///   advertised [`Version`] is not compatible with the bound, and
+    /// - [`Self::lookup`] (and [`Self::check_interface_compatibility`]) refuses
+    ///   to route to a registered module whose interface version violates it.
+    ///
+    /// The organization must already exist (otherwise [`Error::NotFound`]).
+    pub fn set_min_interface_version(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        min: Version,
+    ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        ensure!(
+            env.storage().persistent().has(&DataKey::Org(org.clone())),
+            Error::NotFound
+        );
+        let key = DataKey::MinInterfaceVersion(org, kind);
+        env.storage().persistent().set(&key, &min);
+        Self::bump(&env, &key);
+        Ok(())
+    }
+
+    /// Clear the minimum compatible interface version bound for a module kind.
+    /// Admin-gated. Fails with [`Error::NotFound`] when no bound is set.
+    pub fn clear_min_interface_version(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<(), Error> {
+        Self::check_paused(&env)?;
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        let key = DataKey::MinInterfaceVersion(org, kind);
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Read the minimum compatible interface version bound for a module kind,
+    /// or [`Error::NotFound`] when none has been set.
+    pub fn get_min_interface_version(
+        env: Env,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<Version, Error> {
+        let key = DataKey::MinInterfaceVersion(org, kind);
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
+    }
+
+    /// Read the interface version recorded for a registered module, or
+    /// [`Error::NotFound`] when the module is not registered or was registered
+    /// without an explicit version.
+    pub fn get_module_interface_version(
+        env: Env,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<Version, Error> {
+        let key = DataKey::ModuleInterfaceVersion(org, kind);
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
+    }
+
+    /// Verify a registered module against the organization's minimum
+    /// compatibility bound, returning the module's effective interface version.
+    ///
+    /// - [`Err(Error::NotFound)`] when the module is not registered,
+    /// - [`Err(Error::InterfaceVersionIncompatible)`] when the module's
+    ///   interface version does not satisfy the bound,
+    /// - [`Ok(version)`] otherwise. Modules registered through the plain
+    ///   [`Self::register_module`] path are presumed to implement
+    ///   [`CURRENT_VERSION`].
+    pub fn check_interface_compatibility(
+        env: Env,
+        org: String,
+        kind: ModuleKind,
+    ) -> Result<Version, Error> {
+        let key = DataKey::Module(org.clone(), kind);
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        Self::bump(&env, &key);
+        let actual = Self::effective_interface_version(&env, &org, kind)?;
+        let min: Option<Version> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinInterfaceVersion(org, kind));
+        match min {
+            Some(min) => {
+                require_compatible(actual, min)?;
+                Ok(actual)
+            }
+            None => Ok(actual),
+        }
     }
 
     /// Record a contract implementation address for a `(kind, version)` pair and
@@ -695,64 +983,6 @@ impl RegistryContract {
         Ok(())
     }
 
-    /// Grant a role to an address for an organization. Admin or org owner may
-    /// grant roles. Org owners cannot grant Admin role.
-    pub fn grant_role(
-        env: Env,
-        caller: Address,
-        org: String,
-        address: Address,
-        role: Role,
-    ) -> Result<(), Error> {
-        Self::check_frozen(&env)?;
-        caller.require_auth();
-        // Only admin can grant Admin role
-        if role == Role::Admin && !Self::is_admin(&env, &caller) {
-            return Err(Error::Unauthorized);
-        }
-        // Admin or org owner can grant other roles
-        Self::require_admin_or_org_owner(&env, &caller, &org)?;
-        let key = DataKey::Role(org.clone(), address.clone());
-        env.storage().persistent().set(&key, &role);
-        Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("grant")),
-            (org, address, role_name(&role)),
-        );
-        Ok(())
-    }
-
-    /// Revoke a role from an address for an organization. Admin or org owner may
-    /// revoke roles.
-    pub fn revoke_role(
-        env: Env,
-        caller: Address,
-        org: String,
-        address: Address,
-    ) -> Result<(), Error> {
-        Self::check_frozen(&env)?;
-        caller.require_auth();
-        Self::require_admin_or_org_owner(&env, &caller, &org)?;
-        let key = DataKey::Role(org.clone(), address.clone());
-        if !env.storage().persistent().has(&key) {
-            return Err(Error::NotFound);
-        }
-        env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoke")),
-            (org, address),
-        );
-        Ok(())
-    }
-
-    /// Get the role assigned to an address for an organization.
-    pub fn get_role(env: Env, org: String, address: Address) -> Result<Option<Role>, Error> {
-        Ok(env
-            .storage()
-            .persistent()
-            .get(&DataKey::Role(org, address)))
-    }
-
     // --- internal helpers ---
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
@@ -795,20 +1025,20 @@ impl RegistryContract {
         Ok(())
     }
 
-    /// Require the caller to be the *recorded* organization owner (or the
-    /// protocol admin) and return that owner. Used for the root actions that
-    /// are deliberately not delegable, so a delegated role can never administer
-    /// roles or otherwise escalate.
-    fn require_root_owner(env: &Env, caller: &Address, org: &String) -> Result<Address, Error> {
+    /// Require the caller to be the protocol admin or the recorded organization
+    /// owner.
+    fn require_admin_or_org_owner(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
+        caller.require_auth();
+        if Self::is_admin(env, caller) {
+            return Ok(());
+        }
         let owner: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Org(org.clone()))
             .ok_or(Error::NotFound)?;
-        if &owner != caller && !Self::is_admin(env, caller) {
-            return Err(Error::Unauthorized);
-        }
-        Ok(owner)
+        ensure!(&owner == caller, Error::Unauthorized);
+        Ok(())
     }
 
     /// Resolve the role `account` effectively holds over `org`, treating the
@@ -826,30 +1056,24 @@ impl RegistryContract {
             .get(&DataKey::OrgRole(org.clone(), account.clone()))
     }
 
-    /// Permission guard for the org-scoped module registrations: the protocol
-    /// admin, the org owner, or a delegated role that reaches `kind`.
-    fn require_module_permission(
+    /// The interface version a registered module effectively speaks: the
+    /// explicitly recorded one when present, otherwise the protocol's current
+    /// interface version.
+    fn effective_interface_version(
         env: &Env,
-        caller: &Address,
         org: &String,
         kind: ModuleKind,
-    ) -> Result<(), Error> {
-        if Self::is_admin(env, caller) {
-            return Ok(());
-        }
-        // An unknown organization has no owner and no roles, so it reports
-        // NotFound rather than a permission failure.
-        if !env.storage().persistent().has(&DataKey::Org(org.clone())) {
-            return Err(Error::NotFound);
-        }
-        match Self::effective_role(env, org, caller) {
-            Some(role) if role.may_manage(kind) => Ok(()),
-            _ => Err(Error::Unauthorized),
-        }
+    ) -> Result<Version, Error> {
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::ModuleInterfaceVersion(org.clone(), kind))
+            .unwrap_or(CURRENT_VERSION))
     }
 
     /// Check if the caller has at least the required role for the organization.
-    /// Admin always has access regardless of role assignment.
+    /// Admin always has access regardless of role assignment. The recorded org
+    /// owner is treated as an implicit [`Role::OrgOwner`].
     fn require_role(
         env: &Env,
         caller: &Address,
@@ -861,23 +1085,29 @@ impl RegistryContract {
         if Self::is_admin(env, caller) {
             return Ok(());
         }
-        // Check if caller has the required role or higher
+        // Check if caller has the required role or higher; the recorded org
+        // owner implicitly holds OrgOwner even though no record is stored.
         let caller_role: Option<Role> = env
             .storage()
             .persistent()
             .get(&DataKey::Role(org.clone(), caller.clone()));
-        match caller_role {
-            Some(role) => {
-                // Role hierarchy: Admin > OrgOwner > ModuleManager > VersionManager
-                let role_level = role_level(&role);
-                let required_level = role_level(&required_role);
-                if role_level <= required_level {
-                    Ok(())
+        let granted = match caller_role {
+            Some(role) => role,
+            None => {
+                let owner: Option<Address> =
+                    env.storage().persistent().get(&DataKey::Org(org.clone()));
+                if owner.as_ref() == Some(caller) {
+                    Role::OrgOwner
                 } else {
-                    Err(Error::Unauthorized)
+                    return Err(Error::Unauthorized);
                 }
             }
-            None => Err(Error::Unauthorized),
+        };
+        // Role hierarchy: Admin > OrgOwner > ModuleManager > VersionManager
+        if Self::role_level(&granted) <= Self::role_level(&required_role) {
+            Ok(())
+        } else {
+            Err(Error::Unauthorized)
         }
     }
 
@@ -894,12 +1124,6 @@ impl RegistryContract {
     /// Check if the caller can manage modules (Admin, OrgOwner, or ModuleManager).
     fn require_module_manager(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
         Self::require_role(env, caller, org, Role::ModuleManager)
-    }
-
-    /// Check if the caller can manage versions (Admin or VersionManager).
-    fn require_version_manager(env: &Env, caller: &Address, org: &String) -> Result<(), Error> {
-        // Version management is a global operation; org param is used for role lookup
-        Self::require_role(env, caller, org, Role::VersionManager)
     }
 
     fn bump(env: &Env, key: &DataKey) {
@@ -922,7 +1146,6 @@ impl RegistryInterface for RegistryContract {
         Self::check_frozen(&env)?;
         let key = DataKey::Module(org.clone(), kind);
         let address: Address = env
-        let val = env
             .storage()
             .persistent()
             .get(&key)
@@ -931,10 +1154,21 @@ impl RegistryInterface for RegistryContract {
         if env
             .storage()
             .persistent()
-            .get::<_, bool>(&DataKey::ModuleDeprecated(org, kind))
+            .get::<_, bool>(&DataKey::ModuleDeprecated(org.clone(), kind))
             .unwrap_or(false)
         {
             return Err(Error::ModuleDeprecated);
+        }
+        // Interface-version routing guard: when the organization declares a
+        // minimum compatible interface version for this module kind, calls must
+        // not be routed to an implementation that violates it.
+        if let Some(min) = env
+            .storage()
+            .persistent()
+            .get::<_, Version>(&DataKey::MinInterfaceVersion(org.clone(), kind))
+        {
+            let actual = Self::effective_interface_version(&env, &org, kind)?;
+            require_compatible(actual, min)?;
         }
         Self::bump(&env, &key);
         Ok(address)
