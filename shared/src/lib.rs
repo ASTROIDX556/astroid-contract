@@ -13,12 +13,14 @@
 //! - [`types`]      — `#[contracttype]` values reused by multiple contracts.
 //! - [`math`]       — checked `i128` arithmetic (never wraps, returns errors).
 //! - [`validation`] — small guard helpers (positive amounts, time windows, ...).
+//! - [`storage`]    — compact fixed-size storage-key building blocks.
 //! - [`constants`] — protocol-wide constants (time units, storage TTLs, limits).
 
 pub mod constants;
 pub mod errors;
 pub mod events;
 pub mod math;
+pub mod storage;
 pub mod telemetry;
 pub mod types;
 pub mod validation;
