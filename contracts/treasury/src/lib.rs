@@ -14,6 +14,27 @@
 //! Cross-contract calls go through the typed clients generated from
 //! [`astroid_interfaces`], keeping the graph acyclic: `Treasury → {Policy, Budget}`.
 //!
+//! ## Asset whitelist
+//!
+//! Policy and budget gates constrain *how much* may move and *to whom*, but
+//! neither says anything about *which token contract* is being invoked. An
+//! agent that can name an arbitrary `Address` as the asset can point the
+//! treasury at a hostile Stellar asset contract, whose `transfer` is arbitrary
+//! code running with the treasury as the authorizer.
+//!
+//! Every routing decision is therefore checked against a persistent whitelist
+//! of approved token contracts before any value moves:
+//!
+//! ```text
+//! asset whitelisted → admin auth → policy.check_transfer → budget.consume → assets move
+//! ```
+//!
+//! The whitelist is governance-managed (`add_approved_asset` /
+//! `remove_approved_asset`, both admin-gated — point `admin` at the
+//! organization's multisig to require a threshold of signers) and unapproved
+//! assets are refused deterministically with [`Error::AssetNotAuthorized`] on
+//! both inflows and outflows.
+//!
 //! [`TreasuryContract::batch_transfer`] applies the same gate chain to a whole
 //! vector of payouts in a single, atomic invocation: the cumulative amount is
 //! accumulated with checked math and validated against the treasury balance
@@ -21,10 +42,12 @@
 //! the fee of one transaction. If any leg fails, the host reverts the entire
 //! invocation and no recipient is paid.
 //!
-//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
-//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`,
-//! `set_allowance`, `remove_allowance`, `allowance`, `init_milestone_disbursement`,
-//! `release_next_milestone`, `get`, `holding`.
+//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`,
+//! `add_approved_asset`, `remove_approved_asset`, `freeze`, `unfreeze`,
+//! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `set_allowance`,
+//! `remove_allowance`, `allowance`, `init_milestone_disbursement`,
+//! `release_next_milestone`, `get`, `holding`, `is_approved_asset`,
+//! `approved_asset_count`.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -37,8 +60,19 @@ use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::{Payment, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
+
+/// Streaming payout schedule configuration. Limits how much can be paid out
+/// within a given time interval to enforce a maximum streaming velocity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutSchedule {
+    /// Maximum amount that can be paid out per interval.
+    pub max_per_interval: i128,
+    /// Length of the interval in seconds.
+    pub interval_seconds: u64,
+}
 
 /// Stored treasury record.
 #[contracttype]
@@ -77,6 +111,10 @@ pub struct Holding {
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
+    /// Amount paid out in the current interval (for streaming validation).
+    pub interval_payout: i128,
+    /// Start of the current payout interval (unix seconds).
+    pub interval_start: u64,
 }
 
 /// Composite key identifying a withdrawal allowance scoped to a specific agent
@@ -110,12 +148,18 @@ pub struct Allowance {
 enum DataKey {
     Treasury,
     Holding(Address),
+    /// Whitelist membership: token contract address -> approved (persistent).
+    ApprovedAsset(Address),
+    /// Number of currently approved assets (instance).
+    ApprovedAssetCount,
     ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
     Milestone(u64),
     MilestoneCount,
     Allowance(AllowanceId),
+    /// Streaming payout schedule configuration (instance).
+    PayoutSchedule,
 }
 
 #[contract]
@@ -123,6 +167,44 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Treasury`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Treasury,
+            wasm_hash,
+        )
+    }
     /// Create a treasury for `org`, gated on the admin's signature.
     pub fn initialize(env: Env, org: String, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Treasury) {
@@ -181,6 +263,104 @@ impl TreasuryContract {
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("budget")), ());
         Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Set the streaming payout schedule (admin). Enforces a maximum payout
+    /// velocity per interval for all withdrawals and batch transfers.
+    pub fn set_payout_schedule(
+        env: Env,
+        caller: Address,
+        max_per_interval: i128,
+        interval_seconds: u64,
+    ) -> Result<(), Error> {
+        if max_per_interval <= 0 {
+            return Err(Error::InvalidInput);
+        }
+        if interval_seconds == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let t = Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(
+            &DataKey::PayoutSchedule,
+            &PayoutSchedule {
+                max_per_interval,
+                interval_seconds,
+            },
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("payout"),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("payout")),
+            (max_per_interval, interval_seconds),
+        );
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Clear the streaming payout schedule (admin).
+    pub fn clear_payout_schedule(env: Env, caller: Address) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        env.storage().instance().remove(&DataKey::PayoutSchedule);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("payout"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("payout")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Approve a token contract for use by this treasury (governance-gated).
+    ///
+    /// Only whitelisted assets may be deposited, withdrawn or bound to a budget
+    /// envelope, so this is the single point at which an organization decides
+    /// which token contracts its funds are ever routed through.
+    pub fn add_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedAsset(asset.clone());
+        if env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        let count = checked_add(Self::approved_count(&env) as i128, 1)? as u32;
+        Self::store_approved_count(&env, count);
+        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_add"));
+        Ok(())
+    }
+
+    /// Revoke a token contract's approval (governance-gated).
+    ///
+    /// Existing internal accounting for the asset is deliberately left intact
+    /// so a revoked holding stays inspectable; what stops is any further
+    /// routing through it.
+    pub fn remove_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedAsset(asset.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        let count = Self::approved_count(&env).saturating_sub(1);
+        Self::store_approved_count(&env, count);
+        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_rm"));
         Ok(())
     }
 
@@ -250,14 +430,14 @@ impl TreasuryContract {
         from.require_auth();
         let t = Self::load(&env);
         Self::require_active(&t)?;
+        // Inbound routing is validated too: an unapproved token contract is
+        // never invoked, not even to pull funds in.
+        Self::require_approved_asset(&env, &asset)?;
         Self::lock(&env)?;
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, amount)?;
         Self::store_holding(&env, &asset, &h);
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("deposited")),
-            (asset.clone(), amount),
-        );
+        events::treasury_deposited(&env, &asset, amount);
         // Pull tokens into the contract's own custody.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -278,6 +458,7 @@ impl TreasuryContract {
     ) -> Result<(), Error> {
         let _t = Self::require_admin(&env, &admin)?;
         require_non_empty(&budget_id)?;
+        Self::require_approved_asset(&env, &asset)?;
         let mut h = Self::load_holding(&env, &asset);
         h.budget_id = Some(budget_id);
         Self::store_holding(&env, &asset, &h);
@@ -388,7 +569,11 @@ impl TreasuryContract {
         }
         caller.require_auth();
 
-        // 1. Policy verification — the policy contract evaluates the spend.
+        // 1. Routing validation — refuse to invoke a token contract the
+        //    organization has not approved, before any gate is consulted.
+        Self::require_approved_asset(&env, &asset)?;
+
+        // 2. Policy verification — the policy contract evaluates the spend.
         if let Some(policy_addr) = &t.policy {
             PolicyClient::new(&env, policy_addr).check_transfer(
                 &String::from_str(&env, "active"),
@@ -398,7 +583,7 @@ impl TreasuryContract {
             );
         }
 
-        // 2. Budget consumption — aborts if the envelope lacks headroom.
+        // 3. Budget consumption — aborts if the envelope lacks headroom.
         let mut holding = Self::load_holding(&env, &asset);
         if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
             astroid_interfaces::BudgetClient::new(&env, budget_addr)
@@ -408,7 +593,7 @@ impl TreasuryContract {
         // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
         //    pre-approved periodic ceilings per (agent, recipient, asset).
         Self::lock(&env)?;
-        
+
         let allowance_id = AllowanceId {
             agent: caller.clone(),
             recipient: to.clone(),
@@ -432,6 +617,25 @@ impl TreasuryContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Allowance(allowance_id), &al);
+        }
+
+        // 3b. Streaming payout schedule — enforce max payout velocity per interval.
+        if let Some(schedule) = Self::payout_schedule(&env) {
+            let now = env.ledger().timestamp();
+            if now
+                >= holding
+                    .interval_start
+                    .saturating_add(schedule.interval_seconds)
+            {
+                holding.interval_payout = 0;
+                holding.interval_start = now;
+            }
+            let new_payout = checked_add(holding.interval_payout, amount)?;
+            if new_payout > schedule.max_per_interval {
+                Self::unlock(&env);
+                return Err(Error::PayoutScheduleViolated);
+            }
+            holding.interval_payout = new_payout;
         }
 
         // 4. Debit the internal ledger, then move real tokens out of custody.
@@ -505,6 +709,25 @@ impl TreasuryContract {
             return Err(Error::InsufficientFunds);
         }
 
+        // 3. Streaming payout schedule — cap the aggregate batch payout against
+        //    the current interval's velocity, same as a single withdrawal.
+        if let Some(schedule) = Self::payout_schedule(&env) {
+            let now = env.ledger().timestamp();
+            if now
+                >= holding
+                    .interval_start
+                    .saturating_add(schedule.interval_seconds)
+            {
+                holding.interval_payout = 0;
+                holding.interval_start = now;
+            }
+            let new_payout = checked_add(holding.interval_payout, total)?;
+            if new_payout > schedule.max_per_interval {
+                return Err(Error::PayoutScheduleViolated);
+            }
+            holding.interval_payout = new_payout;
+        }
+
         // 3. Policy verification — each leg is evaluated on its own, because
         //    per-recipient and per-amount gates are what the policy encodes.
         if let Some(policy_addr) = &t.policy {
@@ -545,12 +768,8 @@ impl TreasuryContract {
                 total,
             },
         );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("batchpay")),
-            (asset, payments.len(), total),
-        );
+        events::treasury_batchpay(&env, &asset, payments.len(), total);
 
-        Self::unlock(&env);
         Self::unlock(&env);
         Ok(())
     }
@@ -596,10 +815,7 @@ impl TreasuryContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         env.storage().instance().set(&count_key, &count);
-        env.events().publish(
-            (symbol_short!("milestone"), symbol_short!("init")),
-            (count, total_amount, milestones),
-        );
+        events::treasury_milestone_init(&env, count as u32, total_amount, milestones);
         Ok(count)
     }
 
@@ -654,9 +870,11 @@ impl TreasuryContract {
             &d.to,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("milestone"), symbol_short!("disbursed")),
-            (milestone_id, d.disbursed, amount),
+        events::treasury_milestone_disbursed(
+            &env,
+            milestone_id as u32,
+            d.disbursed as i128,
+            amount,
         );
         Self::unlock(&env);
         Ok(())
@@ -668,6 +886,19 @@ impl TreasuryContract {
 
     pub fn holding(env: Env, asset: Address) -> Holding {
         Self::load_holding(&env, &asset)
+    }
+
+    /// Whether `asset` is currently approved for routing.
+    pub fn is_approved_asset(env: Env, asset: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovedAsset(asset))
+            .unwrap_or(false)
+    }
+
+    /// Number of token contracts currently on the whitelist.
+    pub fn approved_asset_count(env: Env) -> u32 {
+        Self::approved_count(&env)
     }
 
     // --- internals ---
@@ -686,6 +917,11 @@ impl TreasuryContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Load the configured streaming payout schedule, if any.
+    fn payout_schedule(env: &Env) -> Option<PayoutSchedule> {
+        env.storage().instance().get(&DataKey::PayoutSchedule)
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
         let t = Self::load(env);
         if t.admin != *caller {
@@ -693,6 +929,56 @@ impl TreasuryContract {
         }
         caller.require_auth();
         Ok(t)
+    }
+
+    /// Reject any routing through a token contract that governance has not
+    /// approved. The whitelist starts empty, so a freshly initialized treasury
+    /// moves nothing until an asset is explicitly approved.
+    fn require_approved_asset(env: &Env, asset: &Address) -> Result<(), Error> {
+        if !env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApprovedAsset(asset.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::AssetNotAuthorized);
+        }
+        env.storage().persistent().extend_ttl(
+            &DataKey::ApprovedAsset(asset.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    fn approved_count(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedAssetCount)
+            .unwrap_or(0)
+    }
+
+    fn store_approved_count(env: &Env, count: u32) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovedAssetCount, &count);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Publish a whitelist change under both the contract-local tuple topic and
+    /// the canonical cross-cutting schema.
+    fn emit_asset_change(env: &Env, t: &Treasury, asset: &Address, action: Symbol) {
+        env.events()
+            .publish((symbol_short!("treasury"), action.clone()), asset.clone());
+        events::publish(
+            env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action,
+            },
+        );
     }
 
     fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
@@ -715,7 +1001,7 @@ impl TreasuryContract {
         if frozen {
             return Err(Error::InvalidState);
         }
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 
@@ -746,7 +1032,7 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .set(&DataKey::ReentrancyLock, &true);
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 
@@ -765,6 +1051,8 @@ impl TreasuryContract {
                 total_in: 0,
                 total_out: 0,
                 budget_id: None,
+                interval_payout: 0,
+                interval_start: 0,
             })
     }
 

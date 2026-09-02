@@ -132,7 +132,7 @@
                   "symbol": "Module"
                 },
                 {
-                  "string": "acme"
+                  "bytes": "822b33ad87c148a0a20a5ba7cd5ebcaa68d36a18e7aad165554903f52ca82757"
                 },
                 {
                   "u32": 0
@@ -155,7 +155,7 @@
                       "symbol": "Module"
                     },
                     {
-                      "string": "acme"
+                      "bytes": "822b33ad87c148a0a20a5ba7cd5ebcaa68d36a18e7aad165554903f52ca82757"
                     },
                     {
                       "u32": 0
@@ -164,58 +164,46 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          518400
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "ModuleDeprecated"
-                },
-                {
-                  "string": "acme"
-                },
-                {
-                  "u32": 0
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
+                  "map": [
                     {
-                      "symbol": "ModuleDeprecated"
+                      "key": {
+                        "symbol": "address"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
                     },
                     {
-                      "string": "acme"
+                      "key": {
+                        "symbol": "deprecated"
+                      },
+                      "val": {
+                        "bool": false
+                      }
                     },
                     {
-                      "u32": 0
+                      "key": {
+                        "symbol": "interface_major"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "interface_minor"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "migration_target"
+                      },
+                      "val": "void"
                     }
                   ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "bool": false
                 }
               }
             },
@@ -234,7 +222,7 @@
                   "symbol": "Org"
                 },
                 {
-                  "string": "acme"
+                  "bytes": "822b33ad87c148a0a20a5ba7cd5ebcaa68d36a18e7aad165554903f52ca82757"
                 }
               ]
             },
@@ -254,7 +242,7 @@
                       "symbol": "Org"
                     },
                     {
-                      "string": "acme"
+                      "bytes": "822b33ad87c148a0a20a5ba7cd5ebcaa68d36a18e7aad165554903f52ca82757"
                     }
                   ]
                 },
@@ -708,13 +696,17 @@
               },
               {
                 "string": "acme"
-              },
-              {
-                "u32": 0
               }
             ],
             "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              "vec": [
+                {
+                  "u32": 0
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                }
+              ]
             }
           }
         }

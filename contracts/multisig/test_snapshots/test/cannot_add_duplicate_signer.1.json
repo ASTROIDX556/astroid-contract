@@ -177,12 +177,12 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "TimelockDelay"
+                              "symbol": "TierCount"
                             }
                           ]
                         },
                         "val": {
-                          "u64": 86400
+                          "u32": 0
                         }
                       }
                     ]
@@ -349,7 +349,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "propose_signer_addition"
+                "symbol": "add_signer"
               }
             ],
             "data": {
@@ -382,7 +382,7 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "propose_signer_addition"
+                "symbol": "add_signer"
               }
             ],
             "data": {
@@ -443,7 +443,7 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "propose_signer_addition"
+                  "symbol": "add_signer"
                 },
                 {
                   "vec": [

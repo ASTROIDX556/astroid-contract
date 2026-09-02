@@ -54,10 +54,10 @@ fn mul_underflow() {
 fn mul_large_values() {
     // Both large positive — still fits.
     assert_eq!(checked_mul(1_000_000, 1_000_000), Ok(1_000_000_000_000));
-    // Large negative * large positive — overflow.
+    // Large negative * large positive — well within i128 range.
     assert_eq!(
         checked_mul(-1_000_000_000_000i128, 1_000_000_000_000i128),
-        Err(Error::Overflow)
+        Ok(-1_000_000_000_000_000_000_000_000i128)
     );
 }
 
@@ -185,11 +185,10 @@ fn abs_extremes() {
 
 #[test]
 fn math_additional_edge_cases() {
-    // Underflow only when the result drops below the minimum value. Per the
-    // helper contracts, `checked_add`/`checked_mul` report any wrap as Overflow
-    // while `checked_sub` reports wraps as Underflow.
+    // Per the helper contracts, any wrap (including subtraction below the
+    // minimum value) reports as Overflow.
     assert_eq!(checked_sub(0, 1), Ok(-1));
-    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Underflow));
+    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Overflow));
     assert_eq!(checked_add(i128::MIN, -1), Err(Error::Overflow));
     // Multiplication overflow on the extreme negative bound.
     assert_eq!(checked_mul(i128::MIN, -1), Err(Error::Overflow));
@@ -258,14 +257,47 @@ fn time_validation() {
 fn constants_are_sane() {
     const _: () = {
         assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
-    };
-    const _: () = {
         assert!(MAX_SIGNERS >= 1);
     };
-    const _: () = {
-        assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
-    };
-    const _: () = {
-        assert!(MAX_SIGNERS >= 1);
-    };
+}
+
+// ---------------------------------------------------------------------------
+// SafeAdd / SafeSub / SafeMul / SafeDiv traits (checked safety)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn safe_add_checked_overflow() {
+    use crate::math::SafeAdd;
+    assert_eq!(i128::MAX.safe_add(1), Err(Error::Overflow));
+    assert_eq!(i128::MAX.safe_add(i128::MAX), Err(Error::Overflow));
+    assert_eq!(5i128.safe_add(7), Ok(12));
+    assert_eq!((-5i128).safe_add(5), Ok(0));
+}
+
+#[test]
+fn safe_sub_checked_underflow() {
+    use crate::math::SafeSub;
+    assert_eq!((i128::MIN).safe_sub(1), Err(Error::Overflow));
+    assert_eq!((10i128).safe_sub(3), Ok(7));
+    assert_eq!((10i128).safe_sub(10), Ok(0));
+    assert_eq!((i128::MIN).safe_sub(0), Ok(i128::MIN));
+}
+
+#[test]
+fn safe_mul_checked_overflow() {
+    use crate::math::SafeMul;
+    assert_eq!(i128::MAX.safe_mul(2), Err(Error::Overflow));
+    assert_eq!(i128::MIN.safe_mul(-1), Err(Error::Overflow));
+    assert_eq!((2i128).safe_mul(3), Ok(6));
+    assert_eq!((0i128).safe_mul(i128::MAX), Ok(0));
+}
+
+#[test]
+fn safe_div_checked_zero_and_overflow() {
+    use crate::math::SafeDiv;
+    assert_eq!((1i128).safe_div(0), Err(Error::InvalidInput));
+    assert_eq!((0i128).safe_div(0), Err(Error::InvalidInput));
+    assert_eq!(i128::MIN.safe_div(-1), Err(Error::Overflow));
+    assert_eq!((20i128).safe_div(5), Ok(4));
+    assert_eq!((-20i128).safe_div(5), Ok(-4));
 }
