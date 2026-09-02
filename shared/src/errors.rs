@@ -25,12 +25,13 @@ pub enum Error {
     NotInitialized = 5,
     AlreadyInitialized = 6,
 
-    // --- Value / arithmetic (10-12) ---
+    // --- Value / arithmetic (10-15) ---
     InsufficientFunds = 10,
     Overflow = 11,
-    InvalidAmount = 12,
+    Underflow = 12,
+    InvalidAmount = 13,
 
-    // --- Policy (20-27) ---
+    // --- Policy (20-29) ---
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,

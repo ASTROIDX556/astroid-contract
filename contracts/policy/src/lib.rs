@@ -636,7 +636,7 @@ impl PolicyContract {
     }
 
     /// Remove a recipient address from the blocklist (owner only).
-    pub fn remove_from_blocklist(
+    pub fn remove_whitelist(
         env: Env,
         caller: Address,
         policy_id: String,
