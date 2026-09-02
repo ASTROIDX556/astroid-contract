@@ -44,6 +44,11 @@ pub const MAX_APPROVERS: u32 = 32;
 /// safety — every asset in the list is iterated on create/release/refund).
 pub const MAX_ESCROW_ASSETS: u32 = 10;
 
+/// Upper bound on how many individual payouts a single treasury batch transfer
+/// may contain (gas safety — every leg is validated and moved in one atomic
+/// invocation).
+pub const MAX_BATCH_PAYMENTS: u32 = 32;
+
 /// Upper bound on how many override-release public keys an escrow may
 /// configure for its signature-based manual release path.
 pub const MAX_RELEASE_SIGNERS: u32 = 10;

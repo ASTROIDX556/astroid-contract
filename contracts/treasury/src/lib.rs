@@ -63,22 +63,31 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
 
+/// Streaming payout schedule configuration. Limits how much can be paid out
+/// within a given time interval to enforce a maximum streaming velocity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutSchedule {
+    /// Maximum amount that can be paid out per interval.
+    pub max_per_interval: i128,
+    /// Length of the interval in seconds.
+    pub interval_seconds: u64,
+}
+
 /// Stored treasury record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Treasury {
     pub org: String,
     pub admin: Address,
-    /// Emergency admin able to trigger emergency pause.
-    pub emergency_admin: Option<Address>,
+    /// Organization's multisig contract — authorized for emergency freeze/unfreeze.
+    pub multisig: Option<Address>,
     /// Organization's Policy contract — consulted on every spend.
     pub policy: Option<Address>,
     /// Organization's Budget contract root.
     pub budget: Option<Address>,
     /// Lifecycle state shared with wallets.
     pub state: ResourceState,
-    /// Whether the treasury is under emergency pause.
-    pub emergency_paused: bool,
 }
 
 /// Per-asset accounting within the treasury.
@@ -139,8 +148,18 @@ pub struct Allowance {
 enum DataKey {
     Treasury,
     Holding(Address),
-    /// Whitelisted asset flag: asset -> bool.
-    WhitelistedAsset(Address),
+    /// Whitelist membership: token contract address -> approved (persistent).
+    ApprovedAsset(Address),
+    /// Number of currently approved assets (instance).
+    ApprovedAssetCount,
+    ReentrancyLock,
+    /// Emergency circuit breaker freeze flag (persistent).
+    Frozen,
+    Milestone(u64),
+    MilestoneCount,
+    Allowance(AllowanceId),
+    /// Streaming payout schedule configuration (instance).
+    PayoutSchedule,
 }
 
 #[contract]
@@ -197,11 +216,10 @@ impl TreasuryContract {
             &Treasury {
                 org: org.clone(),
                 admin: admin.clone(),
-                emergency_admin: None,
+                multisig: None,
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
-                emergency_paused: false,
             },
         );
         env.storage()
@@ -249,7 +267,7 @@ impl TreasuryContract {
     }
 
     /// Set the streaming payout schedule (admin). Enforces a maximum payout
-    /// velocity per interval for all withdrawals.
+    /// velocity per interval for all withdrawals and batch transfers.
     pub fn set_payout_schedule(
         env: Env,
         caller: Address,
@@ -262,12 +280,17 @@ impl TreasuryContract {
         if interval_seconds == 0 {
             return Err(Error::InvalidInput);
         }
-        let mut t = Self::require_admin(&env, &caller)?;
-        t.payout_schedule = Some(PayoutSchedule {
-            max_per_interval,
-            interval_seconds,
-        });
-        Self::store(&env, &t);
+        let t = Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(
+            &DataKey::PayoutSchedule,
+            &PayoutSchedule {
+                max_per_interval,
+                interval_seconds,
+            },
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         events::publish(
             &env,
             events::ContractEvent::TreasuryConfigUpdated {
@@ -279,28 +302,70 @@ impl TreasuryContract {
             (symbol_short!("treasury"), symbol_short!("payout")),
             (max_per_interval, interval_seconds),
         );
+        Self::unlock(&env);
         Ok(())
     }
 
     /// Clear the streaming payout schedule (admin).
     pub fn clear_payout_schedule(env: Env, caller: Address) -> Result<(), Error> {
-        let mut t = Self::require_admin(&env, &caller)?;
-        t.payout_schedule = None;
-        Self::store(&env, &t);
+        let t = Self::require_admin(&env, &caller)?;
+        env.storage().instance().remove(&DataKey::PayoutSchedule);
         events::publish(
             &env,
             events::ContractEvent::TreasuryConfigUpdated {
                 org: t.org.clone(),
-                action: symbol_short!("payout_clr"),
+                action: symbol_short!("payout"),
             },
         );
         env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("payout_clr")), ());
+            .publish((symbol_short!("treasury"), symbol_short!("payout")), ());
+        Self::unlock(&env);
         Ok(())
     }
 
-    /// Freeze the treasury; all outflows are rejected while frozen.
-    pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
+    /// Approve a token contract for use by this treasury (governance-gated).
+    ///
+    /// Only whitelisted assets may be deposited, withdrawn or bound to a budget
+    /// envelope, so this is the single point at which an organization decides
+    /// which token contracts its funds are ever routed through.
+    pub fn add_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedAsset(asset.clone());
+        if env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        let count = checked_add(Self::approved_count(&env) as i128, 1)? as u32;
+        Self::store_approved_count(&env, count);
+        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_add"));
+        Ok(())
+    }
+
+    /// Revoke a token contract's approval (governance-gated).
+    ///
+    /// Existing internal accounting for the asset is deliberately left intact
+    /// so a revoked holding stays inspectable; what stops is any further
+    /// routing through it.
+    pub fn remove_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedAsset(asset.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        let count = Self::approved_count(&env).saturating_sub(1);
+        Self::store_approved_count(&env, count);
+        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_rm"));
+        Ok(())
+    }
+
+    /// Wire the multisig contract authorized for emergency freeze/unfreeze.
+    pub fn set_multisig(env: Env, caller: Address, multisig: Address) -> Result<(), Error> {
         let mut t = Self::require_admin(&env, &caller)?;
         t.multisig = Some(multisig);
         Self::store(&env, &t);
@@ -357,120 +422,22 @@ impl TreasuryContract {
         Ok(())
     }
 
-    // --- emergency pause mechanism ---
-
-    /// Set the emergency admin address. Only the current admin may call.
-    pub fn set_emergency_admin(
-        env: Env,
-        caller: Address,
-        emergency_admin: Address,
-    ) -> Result<(), Error> {
-        let mut t = Self::require_admin(&env, &caller)?;
-        t.emergency_admin = Some(emergency_admin.clone());
-        Self::store(&env, &t);
-        events::publish(
-            &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("em_admin"),
-            },
-        );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("em_admin")),
-            emergency_admin,
-        );
-        Ok(())
-    }
-
-    /// Trigger emergency pause. Only the emergency admin may call.
-    /// Blocks all deposits and withdrawals until cleared.
-    pub fn emergency_pause(env: Env, caller: Address) -> Result<(), Error> {
-        caller.require_auth();
-        let mut t = Self::load(&env);
-        let emergency_admin = t.emergency_admin.ok_or(Error::Unauthorized)?;
-        if caller != emergency_admin {
-            return Err(Error::Unauthorized);
-        }
-        t.emergency_paused = true;
-        Self::store(&env, &t);
-        events::publish(
-            &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("em_pause"),
-            },
-        );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("em_pause")), ());
-        Ok(())
-    }
-
-    /// Clear emergency pause. Only the admin may call.
-    pub fn emergency_unpause(env: Env, caller: Address) -> Result<(), Error> {
-        let mut t = Self::require_admin(&env, &caller)?;
-        t.emergency_paused = false;
-        Self::store(&env, &t);
-        events::publish(
-            &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("unem_pa"),
-            },
-        );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("unem_pa")), ());
-        Ok(())
-    }
-
-    // --- asset whitelist ---
-
-    /// Add an asset to the treasury whitelist. Only the admin may call.
-    /// Whitelisted assets are the only ones that can be deposited or withdrawn.
-    pub fn whitelist_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &caller)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::WhitelistedAsset(asset.clone()), &true);
-        env.storage().persistent().extend_ttl(
-            &DataKey::WhitelistedAsset(asset.clone()),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("wl_asset")),
-            asset,
-        );
-        Ok(())
-    }
-
-    /// Remove an asset from the treasury whitelist. Only the admin may call.
-    pub fn remove_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &caller)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::WhitelistedAsset(asset.clone()), &false);
-        env.storage().persistent().extend_ttl(
-            &DataKey::WhitelistedAsset(asset.clone()),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("rm_asset")),
-            asset,
-        );
-        Ok(())
-    }
-
     /// Deposit assets into the treasury (any funder may authorize). Moves real
     /// SAC tokens from `from` into the treasury's custody, then credits the
-    /// internal per-asset accounting. Only whitelisted assets are accepted.
+    /// internal per-asset accounting.
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
         let t = Self::load(&env);
         Self::require_active(&t)?;
-        Self::require_not_emergency_paused(&t)?;
-        Self::require_whitelisted(&env, &asset)?;
+        // Inbound routing is validated too: an unapproved token contract is
+        // never invoked, not even to pull funds in.
+        Self::require_approved_asset(&env, &asset)?;
+        Self::lock(&env)?;
+        let mut h = Self::load_holding(&env, &asset);
+        h.total_in = checked_add(h.total_in, amount)?;
+        Self::store_holding(&env, &asset, &h);
+        events::treasury_deposited(&env, &asset, amount);
         // Pull tokens into the contract's own custody.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -585,8 +552,7 @@ impl TreasuryContract {
     }
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
-    /// must clear policy and budget gates before the ledger is debited. Only
-    /// whitelisted assets may be withdrawn; emergency pause blocks all withdrawals.
+    /// must clear policy and budget gates before the ledger is debited.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -598,8 +564,6 @@ impl TreasuryContract {
         Self::check_frozen(&env)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
-        Self::require_not_emergency_paused(&t)?;
-        Self::require_whitelisted(&env, &asset)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
         }
@@ -644,8 +608,31 @@ impl TreasuryContract {
                 Self::unlock(&env);
                 return Err(Error::AllowanceExpired);
             }
+            let remaining = checked_sub(al.limit, al.spent)?;
+            if amount > remaining {
+                Self::unlock(&env);
+                return Err(Error::AllowanceExceeded);
+            }
+            al.spent = checked_add(al.spent, amount)?;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Allowance(allowance_id), &al);
+        }
+
+        // 3b. Streaming payout schedule — enforce max payout velocity per interval.
+        if let Some(schedule) = Self::payout_schedule(&env) {
+            let now = env.ledger().timestamp();
+            if now
+                >= holding
+                    .interval_start
+                    .saturating_add(schedule.interval_seconds)
+            {
+                holding.interval_payout = 0;
+                holding.interval_start = now;
+            }
             let new_payout = checked_add(holding.interval_payout, amount)?;
             if new_payout > schedule.max_per_interval {
+                Self::unlock(&env);
                 return Err(Error::PayoutScheduleViolated);
             }
             holding.interval_payout = new_payout;
@@ -722,6 +709,25 @@ impl TreasuryContract {
             return Err(Error::InsufficientFunds);
         }
 
+        // 3. Streaming payout schedule — cap the aggregate batch payout against
+        //    the current interval's velocity, same as a single withdrawal.
+        if let Some(schedule) = Self::payout_schedule(&env) {
+            let now = env.ledger().timestamp();
+            if now
+                >= holding
+                    .interval_start
+                    .saturating_add(schedule.interval_seconds)
+            {
+                holding.interval_payout = 0;
+                holding.interval_start = now;
+            }
+            let new_payout = checked_add(holding.interval_payout, total)?;
+            if new_payout > schedule.max_per_interval {
+                return Err(Error::PayoutScheduleViolated);
+            }
+            holding.interval_payout = new_payout;
+        }
+
         // 3. Policy verification — each leg is evaluated on its own, because
         //    per-recipient and per-amount gates are what the policy encodes.
         if let Some(policy_addr) = &t.policy {
@@ -764,7 +770,6 @@ impl TreasuryContract {
         );
         events::treasury_batchpay(&env, &asset, payments.len(), total);
 
-        Self::unlock(&env);
         Self::unlock(&env);
         Ok(())
     }
@@ -810,7 +815,7 @@ impl TreasuryContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         env.storage().instance().set(&count_key, &count);
-        events::treasury_milestone_init(&env, count, total_amount, milestones);
+        events::treasury_milestone_init(&env, count as u32, total_amount, milestones);
         Ok(count)
     }
 
@@ -865,7 +870,12 @@ impl TreasuryContract {
             &d.to,
             &amount,
         );
-        events::treasury_milestone_disbursed(&env, milestone_id, d.disbursed, amount);
+        events::treasury_milestone_disbursed(
+            &env,
+            milestone_id as u32,
+            d.disbursed as i128,
+            amount,
+        );
         Self::unlock(&env);
         Ok(())
     }
@@ -878,12 +888,17 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
-    /// Check whether an asset is whitelisted for this treasury.
-    pub fn is_whitelisted(env: Env, asset: Address) -> bool {
+    /// Whether `asset` is currently approved for routing.
+    pub fn is_approved_asset(env: Env, asset: Address) -> bool {
         env.storage()
             .persistent()
-            .get(&DataKey::WhitelistedAsset(asset))
+            .get(&DataKey::ApprovedAsset(asset))
             .unwrap_or(false)
+    }
+
+    /// Number of token contracts currently on the whitelist.
+    pub fn approved_asset_count(env: Env) -> u32 {
+        Self::approved_count(&env)
     }
 
     // --- internals ---
@@ -900,6 +915,11 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Load the configured streaming payout schedule, if any.
+    fn payout_schedule(env: &Env) -> Option<PayoutSchedule> {
+        env.storage().instance().get(&DataKey::PayoutSchedule)
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
@@ -1000,9 +1020,14 @@ impl TreasuryContract {
         }
     }
 
-    fn require_not_emergency_paused(t: &Treasury) -> Result<(), Error> {
-        if t.emergency_paused {
-            return Err(Error::EmergencyPaused);
+    fn lock(env: &Env) -> Result<(), Error> {
+        let is_locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentrancyLock)
+            .unwrap_or(false);
+        if is_locked {
+            return Err(Error::InvalidState);
         }
         env.storage()
             .instance()
@@ -1011,16 +1036,10 @@ impl TreasuryContract {
         Ok(())
     }
 
-    fn require_whitelisted(env: &Env, asset: &Address) -> Result<(), Error> {
-        let whitelisted: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::WhitelistedAsset(asset.clone()))
-            .unwrap_or(false);
-        if !whitelisted {
-            return Err(Error::AssetNotWhitelisted);
-        }
-        Ok(())
+    fn unlock(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &false);
     }
 
     fn load_holding(env: &Env, asset: &Address) -> Holding {
