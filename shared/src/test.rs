@@ -260,3 +260,44 @@ fn constants_are_sane() {
         assert!(MAX_SIGNERS >= 1);
     };
 }
+
+// ---------------------------------------------------------------------------
+// SafeAdd / SafeSub / SafeMul / SafeDiv traits (checked safety)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn safe_add_checked_overflow() {
+    use crate::math::SafeAdd;
+    assert_eq!(i128::MAX.safe_add(1), Err(Error::Overflow));
+    assert_eq!(i128::MAX.safe_add(i128::MAX), Err(Error::Overflow));
+    assert_eq!(5i128.safe_add(7), Ok(12));
+    assert_eq!((-5i128).safe_add(5), Ok(0));
+}
+
+#[test]
+fn safe_sub_checked_underflow() {
+    use crate::math::SafeSub;
+    assert_eq!((i128::MIN).safe_sub(1), Err(Error::Overflow));
+    assert_eq!((10i128).safe_sub(3), Ok(7));
+    assert_eq!((10i128).safe_sub(10), Ok(0));
+    assert_eq!((i128::MIN).safe_sub(0), Ok(i128::MIN));
+}
+
+#[test]
+fn safe_mul_checked_overflow() {
+    use crate::math::SafeMul;
+    assert_eq!(i128::MAX.safe_mul(2), Err(Error::Overflow));
+    assert_eq!(i128::MIN.safe_mul(-1), Err(Error::Overflow));
+    assert_eq!((2i128).safe_mul(3), Ok(6));
+    assert_eq!((0i128).safe_mul(i128::MAX), Ok(0));
+}
+
+#[test]
+fn safe_div_checked_zero_and_overflow() {
+    use crate::math::SafeDiv;
+    assert_eq!((1i128).safe_div(0), Err(Error::InvalidInput));
+    assert_eq!((0i128).safe_div(0), Err(Error::InvalidInput));
+    assert_eq!(i128::MIN.safe_div(-1), Err(Error::Overflow));
+    assert_eq!((20i128).safe_div(5), Ok(4));
+    assert_eq!((-20i128).safe_div(5), Ok(-4));
+}
