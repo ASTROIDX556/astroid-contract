@@ -16,6 +16,7 @@
 //! another contract crate at compile time.
 
 pub mod upgrade;
+pub mod version;
 
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;

@@ -2,6 +2,7 @@
 extern crate std;
 
 use crate::{RegistryContract, RegistryContractClient, Role};
+use astroid_interfaces::version::Version;
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::testutils::Address as _;
@@ -67,7 +68,10 @@ fn batch_register_modules_updates_multiple_entries_atomically() {
     let wallet = Address::generate(&env);
     let treasury = Address::generate(&env);
     let policy = Address::generate(&env);
-    let kinds = Vec::from_array(&env, [ModuleKind::Wallet, ModuleKind::Treasury, ModuleKind::Policy]);
+    let kinds = Vec::from_array(
+        &env,
+        [ModuleKind::Wallet, ModuleKind::Treasury, ModuleKind::Policy],
+    );
     let addrs = Vec::from_array(&env, [wallet.clone(), treasury.clone(), policy.clone()]);
 
     client.batch_register_modules(&owner, &org, &kinds, &addrs);
@@ -86,13 +90,22 @@ fn batch_register_modules_rolls_back_on_invalid_input() {
 
     let wallet = Address::generate(&env);
     let policy = Address::generate(&env);
-    let kinds = Vec::from_array(&env, [ModuleKind::Wallet, ModuleKind::Policy, ModuleKind::Policy]);
+    let kinds = Vec::from_array(
+        &env,
+        [ModuleKind::Wallet, ModuleKind::Policy, ModuleKind::Policy],
+    );
     let addrs = Vec::from_array(&env, [wallet.clone(), policy.clone(), policy.clone()]);
 
     let res = client.try_batch_register_modules(&owner, &org, &kinds, &addrs);
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
-    assert_eq!(client.try_lookup(&org, &ModuleKind::Wallet), Err(Ok(Error::NotFound)));
-    assert_eq!(client.try_lookup(&org, &ModuleKind::Policy), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Policy),
+        Err(Ok(Error::NotFound))
+    );
 }
 
 #[test]
@@ -555,10 +568,7 @@ fn grant_and_revoke_role_work() {
     let user = Address::generate(&env);
     // Grant role
     client.grant_role(&owner, &org, &user, &Role::ModuleManager);
-    assert_eq!(
-        client.get_role(&org, &user),
-        Some(Role::ModuleManager)
-    );
+    assert_eq!(client.get_role(&org, &user), Some(Role::ModuleManager));
     // Revoke role
     client.revoke_role(&owner, &org, &user);
     assert_eq!(client.get_role(&org, &user), None);
@@ -600,4 +610,225 @@ fn admin_can_grant_admin_role() {
     // Admin can grant Admin role
     client.grant_role(&admin, &org, &user, &Role::Admin);
     assert_eq!(client.get_role(&org, &user), Some(Role::Admin));
+}
+
+#[test]
+fn register_module_with_version_compatible_update() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // Organization requires at least Wallet interface 1.0.
+    client.set_min_interface_version(&admin, &org, &ModuleKind::Wallet, &Version::new(1, 0));
+
+    let wallet = Address::generate(&env);
+    // A compatible update (same major, newer minor) is accepted.
+    client.register_module_with_version(
+        &owner,
+        &org,
+        &ModuleKind::Wallet,
+        &wallet,
+        &Version::new(1, 2),
+    );
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+    assert_eq!(
+        client.get_module_interface_version(&org, &ModuleKind::Wallet),
+        Version::new(1, 2)
+    );
+    assert_eq!(
+        client.check_interface_compatibility(&org, &ModuleKind::Wallet),
+        Version::new(1, 2)
+    );
+}
+
+#[test]
+fn register_module_with_version_rejects_incompatible() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    client.set_min_interface_version(&admin, &org, &ModuleKind::Wallet, &Version::new(1, 2));
+
+    let wallet = Address::generate(&env);
+    // An older minor violates the bound and is refused before any state is written.
+    let res = client.try_register_module_with_version(
+        &owner,
+        &org,
+        &ModuleKind::Wallet,
+        &wallet,
+        &Version::new(1, 1),
+    );
+    assert_eq!(res, Err(Ok(Error::InterfaceVersionIncompatible)));
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+
+    // A different major (breaking change) is likewise refused.
+    let res = client.try_register_module_with_version(
+        &owner,
+        &org,
+        &ModuleKind::Wallet,
+        &wallet,
+        &Version::new(2, 0),
+    );
+    assert_eq!(res, Err(Ok(Error::InterfaceVersionIncompatible)));
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn lookup_rejects_legacy_module_once_bound_raised() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    // A legacy registration (no explicit interface version) speaks CURRENT_VERSION.
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+
+    // Raising the bound above the current interface version blocks routing.
+    client.set_min_interface_version(&admin, &org, &ModuleKind::Wallet, &Version::new(1, 2));
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::InterfaceVersionIncompatible))
+    );
+    assert_eq!(
+        client.try_check_interface_compatibility(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::InterfaceVersionIncompatible))
+    );
+
+    // Clearing the bound restores routing.
+    client.clear_min_interface_version(&admin, &org, &ModuleKind::Wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn bound_raise_blocks_then_in_band_upgrade_restores_routing() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // Register a v1.1 module, then raise the bound to v1.2.
+    let wallet = Address::generate(&env);
+    client.register_module_with_version(
+        &owner,
+        &org,
+        &ModuleKind::Wallet,
+        &wallet,
+        &Version::new(1, 1),
+    );
+    client.set_min_interface_version(&admin, &org, &ModuleKind::Wallet, &Version::new(1, 2));
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::InterfaceVersionIncompatible))
+    );
+
+    // An in-band upgrade to v1.3 restores routing.
+    let upgraded = Address::generate(&env);
+    client.register_module_with_version(
+        &owner,
+        &org,
+        &ModuleKind::Wallet,
+        &upgraded,
+        &Version::new(1, 3),
+    );
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), upgraded);
+}
+
+#[test]
+fn min_interface_version_is_admin_gated() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_set_min_interface_version(
+            &stranger,
+            &org,
+            &ModuleKind::Wallet,
+            &Version::new(1, 0)
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Even the org owner cannot set the bound: admin-only.
+    assert_eq!(
+        client.try_set_min_interface_version(
+            &owner,
+            &org,
+            &ModuleKind::Wallet,
+            &Version::new(1, 0)
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+    // ...and no bound was recorded.
+    assert_eq!(
+        client.try_get_min_interface_version(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn min_interface_version_requires_existing_org() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    assert_eq!(
+        client.try_set_min_interface_version(
+            &admin,
+            &org,
+            &ModuleKind::Wallet,
+            &Version::new(1, 0)
+        ),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn clear_min_interface_version_roundtrip() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // No bound recorded yet.
+    assert_eq!(
+        client.try_get_min_interface_version(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_clear_min_interface_version(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+
+    client.set_min_interface_version(&admin, &org, &ModuleKind::Wallet, &Version::new(1, 1));
+    assert_eq!(
+        client.get_min_interface_version(&org, &ModuleKind::Wallet),
+        Version::new(1, 1)
+    );
+
+    client.clear_min_interface_version(&admin, &org, &ModuleKind::Wallet);
+    assert_eq!(
+        client.try_get_min_interface_version(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn check_interface_compatibility_requires_registered_module() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    assert_eq!(
+        client.try_check_interface_compatibility(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
 }

@@ -709,7 +709,11 @@ impl BudgetContract {
         if budget.daily_velocity_cap <= 0 {
             return false;
         }
-        if now >= budget.daily_window_start.saturating_add(constants::SECONDS_PER_DAY) {
+        if now
+            >= budget
+                .daily_window_start
+                .saturating_add(constants::SECONDS_PER_DAY)
+        {
             budget.daily_spent = 0;
             budget.daily_window_start = now;
             return true;

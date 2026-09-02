@@ -764,6 +764,12 @@ pub enum ContractEvent {
         kind: ModuleKind,
         address: Address,
     },
+    /// Several modules were registered or updated atomically in one batch.
+    RegistryModuleBatchUpdated {
+        org: String,
+        kinds: Vec<ModuleKind>,
+        addresses: Vec<Address>,
+    },
     /// An organization's owner changed.
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
@@ -838,6 +844,16 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "RegistryModuleUpdated"),),
                 (org, kind, address),
+            );
+        }
+        ContractEvent::RegistryModuleBatchUpdated {
+            org,
+            kinds,
+            addresses,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryModuleBatchUpdated"),),
+                (org, kinds, addresses),
             );
         }
         ContractEvent::OrgOwnerChanged { org, new_owner } => {
