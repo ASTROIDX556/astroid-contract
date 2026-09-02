@@ -24,6 +24,12 @@
                   "bytes": "01020304"
                 },
                 {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
                   "u64": 5000
                 }
               ]
@@ -239,10 +245,21 @@
                     },
                     {
                       "key": {
+                        "symbol": "amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "approvals"
                       },
                       "val": {
-                        "u32": 2
+                        "u32": 4
                       }
                     },
                     {
@@ -313,12 +330,36 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ChangeCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "EmergencyLock"
                             }
                           ]
                         },
                         "val": {
                           "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "LastBatchNonce"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
                         }
                       },
                       {
@@ -344,10 +385,44 @@
                         "val": {
                           "vec": [
                             {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              "map": [
+                                {
+                                  "key": {
+                                    "symbol": "address"
+                                  },
+                                  "val": {
+                                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                                  }
+                                },
+                                {
+                                  "key": {
+                                    "symbol": "weight"
+                                  },
+                                  "val": {
+                                    "u32": 2
+                                  }
+                                }
+                              ]
                             },
                             {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              "map": [
+                                {
+                                  "key": {
+                                    "symbol": "address"
+                                  },
+                                  "val": {
+                                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                                  }
+                                },
+                                {
+                                  "key": {
+                                    "symbol": "weight"
+                                  },
+                                  "val": {
+                                    "u32": 2
+                                  }
+                                }
+                              ]
                             }
                           ]
                         }
@@ -361,7 +436,31 @@
                           ]
                         },
                         "val": {
-                          "u32": 2
+                          "u32": 4
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TimelockDelay"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 86400
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TierCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 0
                         }
                       }
                     ]
@@ -520,15 +619,49 @@
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "address"
+                          },
+                          "val": {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "weight"
+                          },
+                          "val": {
+                            "u32": 2
+                          }
+                        }
+                      ]
                     },
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "address"
+                          },
+                          "val": {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "weight"
+                          },
+                          "val": {
+                            "u32": 2
+                          }
+                        }
+                      ]
                     }
                   ]
                 },
                 {
-                  "u32": 2
+                  "u32": 4
                 }
               ]
             }
@@ -586,6 +719,12 @@
                 },
                 {
                   "bytes": "01020304"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
                 },
                 {
                   "u64": 5000
@@ -707,7 +846,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "u32": 2
+                  "u32": 4
                 }
               ]
             }
@@ -732,7 +871,7 @@
               }
             ],
             "data": {
-              "u32": 2
+              "u32": 4
             }
           }
         }
@@ -789,7 +928,7 @@
             ],
             "data": {
               "error": {
-                "contract": 65
+                "contract": 91
               }
             }
           }
@@ -810,7 +949,7 @@
               },
               {
                 "error": {
-                  "contract": 65
+                  "contract": 91
                 }
               }
             ],
@@ -835,7 +974,7 @@
               },
               {
                 "error": {
-                  "contract": 65
+                  "contract": 91
                 }
               }
             ],
@@ -994,10 +1133,21 @@
                 },
                 {
                   "key": {
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "approvals"
                   },
                   "val": {
-                    "u32": 2
+                    "u32": 4
                   }
                 },
                 {
