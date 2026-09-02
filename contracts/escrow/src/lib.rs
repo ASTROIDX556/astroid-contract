@@ -846,6 +846,7 @@ impl EscrowContract {
             (symbol_short!("escrow"), symbol_short!("refunded")),
             (id, caller),
         );
+        events::escrow_refunded(&env, id, &sender);
         Ok(())
     }
 
