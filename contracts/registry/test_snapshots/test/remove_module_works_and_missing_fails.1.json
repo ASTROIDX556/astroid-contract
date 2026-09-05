@@ -106,7 +106,7 @@
                   "symbol": "Org"
                 },
                 {
-                  "string": "acme"
+                  "bytes": "822b33ad87c148a0a20a5ba7cd5ebcaa68d36a18e7aad165554903f52ca82757"
                 }
               ]
             },
@@ -126,7 +126,7 @@
                       "symbol": "Org"
                     },
                     {
-                      "string": "acme"
+                      "bytes": "822b33ad87c148a0a20a5ba7cd5ebcaa68d36a18e7aad165554903f52ca82757"
                     }
                   ]
                 },
@@ -547,13 +547,17 @@
               },
               {
                 "string": "acme"
-              },
-              {
-                "u32": 0
               }
             ],
             "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              "vec": [
+                {
+                  "u32": 0
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                }
+              ]
             }
           }
         }
@@ -639,6 +643,36 @@
               }
             ],
             "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "module"
+              },
+              {
+                "symbol": "remove"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "acme"
+                },
+                {
+                  "u32": 0
+                }
+              ]
+            }
           }
         }
       },

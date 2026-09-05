@@ -107,6 +107,44 @@ pub struct WalletContract;
 
 #[contractimpl]
 impl WalletContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Wallet`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Wallet,
+            wasm_hash,
+        )
+    }
     /// Initialize the contract with an emergency admin (may freeze wallets).
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -128,10 +166,7 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Guardian, &guardian);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("guardian")),
-            guardian,
-        );
+        events::wallet_guardian(&env, &guardian);
         Ok(())
     }
 
@@ -221,10 +256,7 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("deposit")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_deposit(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -276,10 +308,7 @@ impl WalletContract {
             &wallet.owner,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("withdraw")),
-            (wallet_id, asset, amount),
-        );
+        events::wallet_withdraw(&env, wallet_id, &asset, amount);
         Ok(())
     }
 
@@ -358,52 +387,230 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Delegate `role` on a wallet to `account`, replacing any role it already
-    /// held. Requires [`Role::Admin`], so the owner (implicitly `Admin`) or an
-    /// admin it has already delegated to may administer roles.
-    ///
-    /// Granting to the owner is refused: the owner is implicitly `Admin`, so the
-    /// grant would either be redundant or an attempted demotion that the guards
-    /// would ignore anyway. Refusing it keeps the stored roles honest.
-    pub fn grant_role(
+    // --- dry-run simulation interface ---
+
+    /// Simulate a transfer without mutating state. Validates ownership, wallet
+    /// state, and balance, then returns the projected balances. Useful for UIs
+    /// and off-chain callers to preview whether a transfer would succeed.
+    pub fn simulate_transfer(
         env: Env,
         caller: Address,
         wallet_id: u64,
-        account: Address,
-        role: Role,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<SimResult, Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        Self::require_active(&wallet)?;
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet_id, asset.clone()))
+            .unwrap_or(0);
+        if current < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        Ok(SimResult {
+            wallet_id,
+            from_balance: checked_sub(current, amount)?,
+            to_balance: amount,
+            asset,
+            amount,
+        })
+    }
+
+    /// Simulate a withdrawal without mutating state. Validates ownership, wallet
+    /// state, and balance, then returns the projected balances.
+    pub fn simulate_withdraw(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        asset: Address,
+        amount: i128,
+    ) -> Result<SimResult, Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        Self::require_active(&wallet)?;
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet_id, asset.clone()))
+            .unwrap_or(0);
+        if current < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        Ok(SimResult {
+            wallet_id,
+            from_balance: checked_sub(current, amount)?,
+            to_balance: amount,
+            asset,
+            amount,
+        })
+    }
+
+    // --- multi-token allowance tracking ---
+
+    /// Approve `spender` to spend up to `amount` of `asset` from a wallet.
+    /// Only the wallet owner may call. Sets the allowance to `amount`.
+    pub fn approve(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        spender: Address,
+        asset: Address,
+        amount: i128,
     ) -> Result<(), Error> {
-        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
         if wallet.state == ResourceState::Archived {
             return Err(Error::WalletArchived);
         }
-        if account == wallet.owner {
-            return Err(Error::InvalidInput);
-        }
-        access::set_role(&env, wallet_id, &account, role);
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            &amount,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (wallet_id, account, role),
+            (symbol_short!("wallet"), symbol_short!("approve")),
+            (wallet_id, spender, asset, amount),
         );
         Ok(())
     }
 
-    /// Revoke whatever role `account` holds on a wallet. Requires
-    /// [`Role::Admin`]. Fails with [`Error::NotFound`] when the account holds no
-    /// granted role, so a revocation is never silently a no-op.
-    ///
-    /// Permitted on an archived wallet so role records can still be cleaned up.
-    pub fn revoke_role(
+    /// Increase a spender's allowance by `amount`. Only the wallet owner may call.
+    pub fn increase_allowance(
         env: Env,
         caller: Address,
         wallet_id: u64,
-        account: Address,
+        spender: Address,
+        asset: Address,
+        amount: i128,
     ) -> Result<(), Error> {
-        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
-        access::clear_role(&env, wallet_id, &account)?;
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (wallet_id, account),
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        if wallet.state == ResourceState::Archived {
+            return Err(Error::WalletArchived);
+        }
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(
+                wallet_id,
+                spender.clone(),
+                asset.clone(),
+            ))
+            .unwrap_or(0);
+        let updated = checked_add(current, amount)?;
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            &updated,
         );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("inc_allw")),
+            (wallet_id, spender, asset, updated),
+        );
+        Ok(())
+    }
+
+    /// Decrease a spender's allowance by `amount`. Only the wallet owner may call.
+    /// Fails if the resulting allowance would be negative.
+    pub fn decrease_allowance(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        spender: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let wallet = Self::require_owner(&env, wallet_id, &caller)?;
+        if wallet.state == ResourceState::Archived {
+            return Err(Error::WalletArchived);
+        }
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(
+                wallet_id,
+                spender.clone(),
+                asset.clone(),
+            ))
+            .unwrap_or(0);
+        if current < amount {
+            return Err(Error::AllowanceExceeded);
+        }
+        let updated = checked_sub(current, amount)?;
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            &updated,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, spender.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("dec_allw")),
+            (wallet_id, spender, asset, updated),
+        );
+        Ok(())
+    }
+
+    /// Transfer `amount` of `asset` from a wallet to `to`, drawing on the
+    /// caller's allowance. The caller must be an approved spender. Deducts the
+    /// allowance, debits the wallet, and moves tokens.
+    pub fn transfer_from(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        caller.require_auth();
+        let wallet = Self::load_wallet(&env, wallet_id)?;
+        Self::require_active(&wallet)?;
+        let allowance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(
+                wallet_id,
+                caller.clone(),
+                asset.clone(),
+            ))
+            .unwrap_or(0);
+        if allowance < amount {
+            return Err(Error::AllowanceExceeded);
+        }
+        Self::debit(&env, wallet_id, &asset, amount)?;
+        // Decrease allowance after successful debit.
+        let new_allowance = checked_sub(allowance, amount)?;
+        env.storage().persistent().set(
+            &DataKey::Allowance(wallet_id, caller.clone(), asset.clone()),
+            &new_allowance,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Allowance(wallet_id, caller.clone(), asset.clone()),
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
+        );
+        token::TokenClient::new(&env, &asset).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
+        events::transfer_executed(&env, &env.current_contract_address(), &to, &asset, amount);
         Ok(())
     }
 
@@ -431,6 +638,48 @@ impl WalletContract {
     /// Read a wallet's owner + state.
     pub fn get_wallet(env: Env, wallet_id: u64) -> Result<WalletData, Error> {
         Self::load_wallet(&env, wallet_id)
+    }
+
+    /// Read a wallet's rate-limit config (disabled defaults when unset).
+    pub fn get_rate_limit(env: Env, wallet_id: u64) -> RateLimitConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::RateLimit(wallet_id))
+            .unwrap_or(RateLimitConfig {
+                max_volume: 0,
+                max_count: 0,
+                window_seconds: 0,
+            })
+    }
+
+    /// Read a wallet's outbound usage in the current epoch window (zeros when
+    /// rate limiting is not configured).
+    pub fn get_rate_usage(env: Env, wallet_id: u64) -> RateUsage {
+        let config: RateLimitConfig =
+            match env.storage().instance().get(&DataKey::RateLimit(wallet_id)) {
+                Some(c) => c,
+                None => {
+                    return RateUsage {
+                        volume: 0,
+                        count: 0,
+                    }
+                }
+            };
+        if config.window_seconds == 0 {
+            return RateUsage {
+                volume: 0,
+                count: 0,
+            };
+        }
+        let ts = env.ledger().timestamp();
+        let window = ts - (ts % config.window_seconds);
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateUsage(wallet_id, window))
+            .unwrap_or(RateUsage {
+                volume: 0,
+                count: 0,
+            })
     }
 
     /// Read a wallet's internal balance for an asset (0 if none recorded).
@@ -553,6 +802,49 @@ impl WalletContract {
         ensure!(
             wallet.state != ResourceState::Archived,
             Error::WalletArchived
+        );
+        Ok(())
+    }
+
+    /// Enforce a wallet's rate limit for an outbound transaction of `amount`
+    /// and record it against the current epoch window. Returns
+    /// [`Error::RateLimitExceeded`] when either the window volume or transaction
+    /// count cap would be exceeded; the caller's whole invocation reverts on
+    /// error, so no usage or balance change is committed for rejected transfers.
+    fn enforce_rate_limit(env: &Env, wallet_id: u64, amount: i128) -> Result<(), Error> {
+        let config: RateLimitConfig =
+            match env.storage().instance().get(&DataKey::RateLimit(wallet_id)) {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+        if config.window_seconds == 0 {
+            return Ok(());
+        }
+        let ts = env.ledger().timestamp();
+        let window = ts - (ts % config.window_seconds);
+        let key = DataKey::RateUsage(wallet_id, window);
+        let usage: RateUsage = env.storage().persistent().get(&key).unwrap_or(RateUsage {
+            volume: 0,
+            count: 0,
+        });
+
+        if config.max_count != 0 && usage.count >= config.max_count {
+            return Err(Error::RateLimitExceeded);
+        }
+        let new_volume = checked_add(usage.volume, amount)?;
+        if config.max_volume != 0 && new_volume > config.max_volume {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        let updated = RateUsage {
+            volume: new_volume,
+            count: checked_add(usage.count as i128, 1)? as u32,
+        };
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::PERSISTENT_LIFETIME_THRESHOLD,
+            constants::PERSISTENT_BUMP_AMOUNT,
         );
         Ok(())
     }

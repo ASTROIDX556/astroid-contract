@@ -24,6 +24,12 @@
                   "bytes": "01020304"
                 },
                 {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
                   "u64": 0
                 }
               ]
@@ -143,7 +149,18 @@
                     },
                     {
                       "key": {
-                        "symbol": "approval_weight"
+                        "symbol": "amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "approvals"
                       },
                       "val": {
                         "u32": 1
@@ -350,12 +367,12 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "TimelockDelay"
+                              "symbol": "TierCount"
                             }
                           ]
                         },
                         "val": {
-                          "u64": 86400
+                          "u32": 0
                         }
                       }
                     ]
@@ -568,6 +585,12 @@
                 },
                 {
                   "bytes": "01020304"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
                 },
                 {
                   "u64": 0

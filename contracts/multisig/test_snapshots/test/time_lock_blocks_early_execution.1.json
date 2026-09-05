@@ -24,6 +24,12 @@
                   "bytes": "01020304"
                 },
                 {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
                   "u64": 5000
                 }
               ]
@@ -239,7 +245,18 @@
                     },
                     {
                       "key": {
-                        "symbol": "approval_weight"
+                        "symbol": "amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "approvals"
                       },
                       "val": {
                         "u32": 4
@@ -432,6 +449,18 @@
                         },
                         "val": {
                           "u64": 86400
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TierCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 0
                         }
                       }
                     ]
@@ -690,6 +719,12 @@
                 },
                 {
                   "bytes": "01020304"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
                 },
                 {
                   "u64": 5000
@@ -1098,7 +1133,18 @@
                 },
                 {
                   "key": {
-                    "symbol": "approval_weight"
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "approvals"
                   },
                   "val": {
                     "u32": 4
