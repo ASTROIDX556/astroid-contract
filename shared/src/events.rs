@@ -1088,3 +1088,19 @@ pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
     let topics = (symbol_short!("wallet"), symbol_short!("batch"));
     env.events().publish(topics, (wallet_id, call_count));
 }
+
+/// `WalletBatchValidated` — topic `("wallet", "batch_validated")`. Published by
+/// the wallet after a policy- and budget-validated batch run completes.
+pub fn wallet_batch_validated(
+    env: &Env,
+    wallet_id: u64,
+    executed: u32,
+    total_amount: i128,
+    budget_remaining: i128,
+) {
+    let topics = (symbol_short!("wallet"), Symbol::new(env, "batch_validated"));
+    env.events().publish(
+        topics,
+        (wallet_id, executed, total_amount, budget_remaining),
+    );
+}

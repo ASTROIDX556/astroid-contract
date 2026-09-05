@@ -25,7 +25,7 @@ fn assert_event(env: &Env, variant: &str) {
 }
 
 struct Harness<'a> {
-    env: Env,
+    env: soroban_sdk::Env,
     client: TreasuryContractClient<'a>,
     admin: Address,
     multisig: Address,

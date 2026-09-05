@@ -30,7 +30,7 @@ pub enum Error {
     Overflow = 11,
     InvalidAmount = 12,
 
-    // --- Policy (20-27) ---
+    // --- Policy (20-23, 25) ---
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
@@ -43,7 +43,7 @@ pub enum Error {
     /// A conditional policy rule evaluated to a hard deny.
     RuleDenied = 27,
 
-    // --- Registry (30-39) ---
+    // --- Registry (30-31) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
     /// System-wide emergency pause: all critical registry operations are halted.
@@ -109,6 +109,8 @@ pub enum Error {
     EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
+    EscrowNotExpired = 85,
+    EscrowAlreadySettled = 86,
 
     // --- Treasury (83-86) ---
     AllowanceExceeded = 83,

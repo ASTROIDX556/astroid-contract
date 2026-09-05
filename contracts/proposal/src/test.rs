@@ -570,6 +570,68 @@ fn too_many_dependencies_rejected() {
 }
 
 #[test]
+fn blocked_execution_emits_dependency_failure_event() {
+    let h = setup(3);
+    let first = create(&h, 2, 5_000);
+    let second = create_with_deps(&h, 2, 5_000, &[first]);
+
+    // Fully approved, but the prerequisite has not executed.
+    h.client.approve(&h.approvers[0], &second);
+    h.client.approve(&h.approvers[1], &second);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &second),
+        Err(Ok(Error::PrerequisiteNotMet))
+    );
+    assert!(emitted(&h.env, "dep_fail"));
+    assert!(!emitted(&h.env, "dep_ok"));
+}
+
+#[test]
+fn satisfied_chain_emits_dependency_success_event() {
+    let h = setup(3);
+    let first = create(&h, 2, 5_000);
+    let second = create_with_deps(&h, 2, 5_000, &[first]);
+
+    approve_and_execute(&h, first);
+    h.client.approve(&h.approvers[0], &second);
+    h.client.approve(&h.approvers[1], &second);
+    h.client.execute(&h.proposer, &second);
+    assert_eq!(h.client.state(&second), ProposalState::Executed);
+
+    assert!(emitted(&h.env, "dep_ok"));
+    assert!(!emitted(&h.env, "dep_fail"));
+}
+
+#[test]
+fn is_executed_reflects_completion_states() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+
+    // Not executed while pending or merely approved.
+    assert!(!h.client.is_executed(&id));
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert!(!h.client.is_executed(&id));
+
+    // Executed, and still satisfied once tidied away into Closed.
+    h.client.execute(&h.proposer, &id);
+    assert!(h.client.is_executed(&id));
+    h.client.close(&h.proposer, &id);
+    assert!(h.client.is_executed(&id));
+}
+
+#[test]
+fn failed_is_never_executed() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+    assert!(!h.client.is_executed(&id));
+}
+
+#[test]
 fn fail_requires_approval_and_the_proposer() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);

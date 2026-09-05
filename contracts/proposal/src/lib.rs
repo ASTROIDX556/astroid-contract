@@ -23,6 +23,11 @@
 //! executed state without the genuine signer set. After `Executed` it may be
 //! `Closed`. An already-executed proposal can never be executed again.
 //!
+//! Every time a chain is validated, the contract publishes a structured event
+//! so watchers can follow dependency resolution: `("proposal", "dep_ok")` when
+//! all prerequisites have executed, or `("proposal", "dep_fail")` with the id
+//! of the first unmet prerequisite when the chain is blocked.
+//!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
 //! `close`.
 
@@ -567,13 +572,26 @@ impl ProposalContract {
     /// prerequisite that has been cancelled, rejected, expired or explicitly
     /// marked `Failed` can never become executed, but it is reported the same
     /// way: the dependent proposal simply cannot run.
-    fn ensure_dependencies_met(env: &Env, proposal: &Proposal) -> Result<(), Error> {
+    ///
+    /// Dependency resolution is observable: validation publishes
+    /// `("proposal", "dep_ok")` when the whole chain is satisfied, or
+    /// `("proposal", "dep_fail")` carrying the id of the first unmet
+    /// prerequisite when it is not.
+    fn ensure_dependencies_met(env: &Env, id: u64, proposal: &Proposal) -> Result<(), Error> {
         for dep in proposal.dependencies.iter() {
             let prerequisite = Self::load(env, dep)?;
             if !prerequisite.state.has_executed() {
+                env.events().publish(
+                    (symbol_short!("proposal"), symbol_short!("dep_fail")),
+                    (id, dep),
+                );
                 return Err(Error::PrerequisiteNotMet);
             }
         }
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("dep_ok")),
+            (id, proposal.dependencies.clone()),
+        );
         Ok(())
     }
 

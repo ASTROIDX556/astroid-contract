@@ -1098,7 +1098,7 @@ impl MultiSigContract {
                     return Err(Error::AlreadyExists);
                 }
                 if signers.len() >= MAX_SIGNERS {
-                    return Err(Error::TooManySigners);
+                    return Err(Error::InvalidThreshold);
                 }
                 // Total weight only grows here, so the threshold stays
                 // satisfiable; the check is purely an overflow guard.
