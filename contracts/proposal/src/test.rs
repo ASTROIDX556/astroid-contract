@@ -4,8 +4,8 @@ extern crate std;
 use crate::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, String, Vec};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
+use soroban_sdk::{Address, Env, IntoVal, String, Symbol, Val, Vec};
 
 struct Harness {
     env: Env,
@@ -20,7 +20,30 @@ fn setup(num_approvers: u32) -> Harness {
     env.ledger().set_timestamp(1_000);
     let contract_id = env.register_contract(None, ProposalContract);
     let client = ProposalContractClient::new(&env, &contract_id);
-    client.initialize();
+    client.initialize(&0);
+
+    let proposer = Address::generate(&env);
+    let mut approvers = std::vec::Vec::new();
+    for _ in 0..num_approvers {
+        approvers.push(Address::generate(&env));
+    }
+    Harness {
+        env,
+        client,
+        proposer,
+        approvers,
+    }
+}
+
+/// Like [`setup`], but with a mandatory non-zero timelock configured at
+/// initialization.
+fn setup_timelocked(num_approvers: u32, timelock: u64) -> Harness {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let contract_id = env.register_contract(None, ProposalContract);
+    let client = ProposalContractClient::new(&env, &contract_id);
+    client.initialize(&timelock);
 
     let proposer = Address::generate(&env);
     let mut approvers = std::vec::Vec::new();
@@ -89,6 +112,15 @@ fn dep_vec(h: &Harness, deps: &[u64]) -> Vec<u64> {
         v.push_back(*d);
     }
     v
+}
+
+/// Whether any event carrying `symbol` in its topics has been emitted.
+fn emitted(env: &Env, symbol: &str) -> bool {
+    let want: Val = Symbol::new(env, symbol).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want))
 }
 
 /// Drive a proposal all the way to `Executed`.
@@ -425,6 +457,68 @@ fn too_many_dependencies_rejected() {
 }
 
 #[test]
+fn blocked_execution_emits_dependency_failure_event() {
+    let h = setup(3);
+    let first = create(&h, 2, 5_000);
+    let second = create_with_deps(&h, 2, 5_000, &[first]);
+
+    // Fully approved, but the prerequisite has not executed.
+    h.client.approve(&h.approvers[0], &second);
+    h.client.approve(&h.approvers[1], &second);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &second),
+        Err(Ok(Error::PrerequisiteNotMet))
+    );
+    assert!(emitted(&h.env, "dep_fail"));
+    assert!(!emitted(&h.env, "dep_ok"));
+}
+
+#[test]
+fn satisfied_chain_emits_dependency_success_event() {
+    let h = setup(3);
+    let first = create(&h, 2, 5_000);
+    let second = create_with_deps(&h, 2, 5_000, &[first]);
+
+    approve_and_execute(&h, first);
+    h.client.approve(&h.approvers[0], &second);
+    h.client.approve(&h.approvers[1], &second);
+    h.client.execute(&h.proposer, &second);
+    assert_eq!(h.client.state(&second), ProposalState::Executed);
+
+    assert!(emitted(&h.env, "dep_ok"));
+    assert!(!emitted(&h.env, "dep_fail"));
+}
+
+#[test]
+fn is_executed_reflects_completion_states() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+
+    // Not executed while pending or merely approved.
+    assert!(!h.client.is_executed(&id));
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert!(!h.client.is_executed(&id));
+
+    // Executed, and still satisfied once tidied away into Closed.
+    h.client.execute(&h.proposer, &id);
+    assert!(h.client.is_executed(&id));
+    h.client.close(&h.proposer, &id);
+    assert!(h.client.is_executed(&id));
+}
+
+#[test]
+fn failed_is_never_executed() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+    assert!(!h.client.is_executed(&id));
+}
+
+#[test]
 fn fail_requires_approval_and_the_proposer() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);
@@ -488,4 +582,100 @@ fn test_cancellation_grace_window() {
     h.client.cancel(&h.proposer, &id2); // works since 160 < 151 + 50 (created at 151)
 
     assert_eq!(h.client.state(&id2), crate::ProposalState::Cancelled);
+}
+
+// ------------------------------------------------------------- timelock ----
+
+/// Full approval, then a `get` view handy for timelock assertions.
+fn approve_to_threshold(h: &Harness, id: u64) {
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn approval_records_timestamp_used_by_the_timelock() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    assert_eq!(h.client.get(&id).approved_at, 0);
+
+    // Ledger time is 1_000 from setup: approval stamps exactly that moment.
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+
+    // Execution is refused well inside the 100s window.
+    h.env.ledger().set_timestamp(1_050);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // approved_at survives execution, recorded in the executed state too.
+    h.env.ledger().set_timestamp(1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+}
+
+#[test]
+fn execute_within_timelock_window_is_refused() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // One second before the delay elapses the proposal is still locked.
+    h.env.ledger().set_timestamp(1_099);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Exactly at release time execution is allowed (gate is `< release_at`).
+    h.env.ledger().set_timestamp(1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execute_after_timelock_window_succeeds() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // Long past the window, execution proceeds normally and emits "executed".
+    h.env.ledger().set_timestamp(5_000);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+
+    // Close still works from the executed state (timelock is behind us).
+    h.client.close(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Closed);
+}
+
+#[test]
+fn zero_timelock_allows_immediate_execution() {
+    let h = setup(3); // timelock 0 — the historical behaviour.
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn timelock_only_gates_execution_not_state_transitions() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // The timelock does not affect dependency queries or the completion view.
+    assert!(h.client.dependencies_met(&id));
+    assert!(!h.client.is_executed(&id));
+
+    // Marking the proposal failed inside the window is still permitted.
+    h.env.ledger().set_timestamp(1_050);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+    assert!(!h.client.is_executed(&id));
 }

@@ -31,8 +31,9 @@
 //! resuming operations requires a threshold of signers.
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
-//! `emergency_unpause`, `set_guardian`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `batch_execute`,
+//! `batch_execute_validated`, `set_policy`, `set_budget`,
+//! `emergency_pause`, `emergency_unpause`, `set_guardian`.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
 //! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
@@ -58,6 +59,7 @@
 //! plus wallet-scoped state-change and role-administration events.
 
 use crate::access::Role;
+use astroid_interfaces::{BudgetClient, PolicyClient};
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
@@ -66,7 +68,7 @@ use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
 };
 
 pub mod access;
@@ -82,6 +84,10 @@ enum DataKey {
     Paused,
     /// Monotonic wallet id counter (instance).
     WalletCount,
+    /// Policy contract consulted when validating batch actions (instance).
+    Policy,
+    /// Budget contract consulted when consuming batch action value (instance).
+    Budget,
     /// Wallet record: id -> WalletData.
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
