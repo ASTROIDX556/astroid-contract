@@ -30,6 +30,8 @@ pub enum Error {
     PolicyRecipientRestricted = 22,
     PolicyMerchantBlocked = 23,
     AssetNotWhitelisted = 25,
+    /// A proposed spend would breach a per-asset spending allowance.
+    PolicyAllowanceExceeded = 26,
 
     // --- Registry (30-31) ---
     RegistryFrozen = 30,
@@ -42,12 +44,11 @@ pub enum Error {
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
 
-    // --- Wallet (50-54) ---
+    // --- Wallet (50-53) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
-    ReserveViolation = 54,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
@@ -80,7 +81,7 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-82, 85-86) ---
+    // --- Escrow (80-82) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
