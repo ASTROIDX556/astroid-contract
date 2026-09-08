@@ -1,15 +1,16 @@
-extern crate std;
-
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, BytesN, Env, String, Vec,
+    token, vec, Address, Bytes, BytesN, Env, String, Vec,
 };
 
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 
-use crate::{EscrowContract, EscrowContractClient, EscrowState, ReleaseSignature};
+use crate::{
+    EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, OverrideSignature,
+    ReleaseSchedule, ReleaseType,
+};
 
 const START: u64 = 1_000;
 const GRACE: u64 = 1_000;
@@ -17,16 +18,14 @@ const GRACE: u64 = 1_000;
 struct Harness<'a> {
     env: Env,
     client: EscrowContractClient<'a>,
-    asset: Address,
-    asset2: Address,
+    asset_a: Address,
+    asset_b: Address,
     sender: Address,
     recipient: Address,
     arbiter: Address,
 }
 
-/// Register an escrow contract plus two test SAC tokens, and mint `funded` of
-/// each asset to the sender so `create` moves real value into custody.
-fn setup(funded: i128) -> Harness<'static> {
+fn setup(funded_a: i128, funded_b: i128) -> Harness<'static> {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = START);
@@ -35,27 +34,30 @@ fn setup(funded: i128) -> Harness<'static> {
     let client = EscrowContractClient::new(&env, &id);
     client.initialize();
 
-    let token_admin = Address::generate(&env);
-    let asset = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+    let token_admin_a = Address::generate(&env);
+    let asset_a = env
+        .register_stellar_asset_contract_v2(token_admin_a)
         .address();
-    let asset2 = env
-        .register_stellar_asset_contract_v2(token_admin)
+    let token_admin_b = Address::generate(&env);
+    let asset_b = env
+        .register_stellar_asset_contract_v2(token_admin_b)
         .address();
 
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let arbiter = Address::generate(&env);
-    if funded > 0 {
-        token::StellarAssetClient::new(&env, &asset).mint(&sender, &funded);
-        token::StellarAssetClient::new(&env, &asset2).mint(&sender, &funded);
+    if funded_a > 0 {
+        token::StellarAssetClient::new(&env, &asset_a).mint(&sender, &funded_a);
+    }
+    if funded_b > 0 {
+        token::StellarAssetClient::new(&env, &asset_b).mint(&sender, &funded_b);
     }
 
     Harness {
         env,
         client,
-        asset,
-        asset2,
+        asset_a,
+        asset_b,
         sender,
         recipient,
         arbiter,
@@ -66,29 +68,35 @@ fn balance(h: &Harness, asset: &Address, who: &Address) -> i128 {
     token::TokenClient::new(&h.env, asset).balance(who)
 }
 
-fn assets_of(h: &Harness, amounts: &[i128]) -> Vec<AssetAmount> {
-    let mut v = Vec::new(&h.env);
-    let tokens = [&h.asset, &h.asset2];
-    for (i, amount) in amounts.iter().enumerate() {
-        v.push_back(AssetAmount {
-            asset: tokens[i].clone(),
-            amount: *amount,
-        });
-    }
-    v
+fn one_asset(h: &Harness, amount: i128) -> Vec<AssetAmount> {
+    vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount,
+        },
+    ]
+}
+
+fn two_assets(h: &Harness, amount_a: i128, amount_b: i128) -> Vec<AssetAmount> {
+    vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: amount_a,
+        },
+        AssetAmount {
+            asset: h.asset_b.clone(),
+            amount: amount_b,
+        },
+    ]
 }
 
 fn no_signers(h: &Harness) -> Vec<BytesN<32>> {
     Vec::new(&h.env)
 }
 
-fn create(
-    h: &Harness,
-    assets: &Vec<AssetAmount>,
-    deadline: u64,
-    release_signers: &Vec<BytesN<32>>,
-    release_threshold: u32,
-) -> u64 {
+fn create(h: &Harness, assets: &Vec<AssetAmount>, deadline: u64, grace_period: u64) -> u64 {
     h.client.create(
         &h.sender,
         &h.recipient,
@@ -97,8 +105,8 @@ fn create(
         &deadline,
         &grace_period,
         &String::from_str(&h.env, "payment"),
-        release_signers,
-        &release_threshold,
+        &no_signers(h),
+        &0,
     )
 }
 
@@ -106,25 +114,20 @@ fn keypair(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-fn signer_public_key(h: &Harness, key: &SigningKey) -> BytesN<32> {
-    BytesN::from_array(&h.env, &key.verifying_key().to_bytes())
+fn public_key(env: &Env, kp: &SigningKey) -> BytesN<32> {
+    BytesN::from_array(env, &kp.verifying_key().to_bytes())
 }
 
-/// Builds the exact payload `release_with_signatures` verifies against:
-/// escrow id followed by nonce, both big-endian — matching
-/// `EscrowContract::release_payload` byte-for-byte.
-fn payload_bytes(id: u64, nonce: u64) -> [u8; 16] {
-    let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&id.to_be_bytes());
-    buf[8..16].copy_from_slice(&nonce.to_be_bytes());
-    buf
-}
-
-fn sign(h: &Harness, key: &SigningKey, id: u64, nonce: u64) -> ReleaseSignature {
-    let sig = key.sign(&payload_bytes(id, nonce));
-    ReleaseSignature {
-        signer: signer_public_key(h, key),
-        signature: BytesN::from_array(&h.env, &sig.to_bytes()),
+fn sign_override(h: &Harness, kp: &SigningKey, id: u64, nonce: u64) -> OverrideSignature {
+    let contract = h.client.address.clone();
+    let digest: [u8; 32] = h.env.as_contract(&contract, || {
+        let payload: Bytes = EscrowContract::override_payload(&h.env, id, nonce);
+        h.env.crypto().sha256(&payload).to_array()
+    });
+    let signature = kp.sign(&digest).to_bytes();
+    OverrideSignature {
+        public_key: public_key(&h.env, kp),
+        signature: BytesN::from_array(&h.env, &signature),
     }
 }
 
@@ -135,58 +138,26 @@ fn milestone_spec(env: &Env, description: &str, bps: u32) -> MilestoneSpec {
     }
 }
 
-// ── Beneficiary proposal helpers ───────────────────────────────────────
-
-fn propose(h: &Harness, caller: &Address, id: u64, new_beneficiary: &Address) {
-    h.client.propose_beneficiary(caller, &id, new_beneficiary);
-}
-
-fn try_propose(
-    h: &Harness,
-    caller: &Address,
-    id: u64,
-    new_beneficiary: &Address,
-) -> Result<Result<(), soroban_sdk::ConversionError>, Result<Error, soroban_sdk::InvokeError>> {
-    h.client
-        .try_propose_beneficiary(caller, &id, new_beneficiary)
-}
-
-fn try_claim(
-    h: &Harness,
-    caller: &Address,
-    id: u64,
-) -> Result<Result<(), soroban_sdk::ConversionError>, Result<Error, soroban_sdk::InvokeError>> {
-    h.client.try_claim_beneficiary(caller, &id)
-}
-
-fn advance_ledgers(h: &Harness, delta: u32) {
-    h.env.ledger().with_mut(|l| l.sequence_number += delta);
-}
-
 // --- Core multi-asset tests ---
 
 #[test]
-fn full_cycle_create_release_multi_asset() {
-    let h = setup(10_000);
-    let assets = assets_of(&h, &[6_000, 4_000]);
-    let signers = no_signers(&h);
-    let id = create(&h, &assets, START + 86_400, &signers, 0);
+fn full_cycle_create_release() {
+    let h = setup(10_000, 5_000);
+    let assets = two_assets(&h, 10_000, 5_000);
+    let id = create(&h, &assets, START + 86_400, 0);
     assert_eq!(id, 1);
-
-    // Both assets moved into custody, out of the sender's account.
-    assert_eq!(balance(&h, &h.asset, &h.sender), 4_000);
-    assert_eq!(balance(&h, &h.asset2, &h.sender), 6_000);
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 6_000);
-    assert_eq!(balance(&h, &h.asset2, &h.client.address), 4_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.sender), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 5_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-    assert_eq!(h.client.get(&id).assets.len(), 2);
 
     h.client.release(&h.arbiter, &id, &10_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(balance(&h, &h.asset, &h.recipient), 6_000);
-    assert_eq!(balance(&h, &h.asset2, &h.recipient), 4_000);
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 0);
-    assert_eq!(balance(&h, &h.asset2, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 0);
 
     h.client.close(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Closed);
@@ -194,61 +165,56 @@ fn full_cycle_create_release_multi_asset() {
 
 #[test]
 fn non_arbiter_cannot_release() {
-    let h = setup(5_000);
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     let intruder = Address::generate(&h.env);
 
     let res = h.client.try_release(&intruder, &id, &5_000);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 5_000);
-    assert_eq!(balance(&h, &h.asset, &h.recipient), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 }
 
 #[test]
 fn release_after_deadline_is_refused() {
-    let h = setup(5_000);
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_release(&h.arbiter, &id, &5_000);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(res, Err(Ok(Error::EscrowExpired)));
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
 #[test]
 fn refund_returns_funds_after_deadline() {
-    let h = setup(5_000);
-    let assets = assets_of(&h, &[5_000, 2_000]);
-    let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
+    let h = setup(5_000, 2_000);
+    let id = create(&h, &two_assets(&h, 5_000, 2_000), START + 100, 0);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.refund(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.asset2, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 0);
-    assert_eq!(balance(&h, &h.asset2, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.sender), 2_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 0);
 }
 
 #[test]
 fn refund_before_deadline_rejected() {
-    let h = setup(5_000);
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     let res = h.client.try_refund(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
 #[test]
 fn expire_marks_then_refund_returns() {
-    let h = setup(5_000);
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     let early = h.client.try_expire(&id);
     assert_eq!(early, Err(Ok(Error::InvalidState)));
@@ -256,33 +222,32 @@ fn expire_marks_then_refund_returns() {
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.expire(&id);
     assert_eq!(h.client.get(&id).state, EscrowState::Expired);
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 5_000);
-    assert_eq!(balance(&h, &h.asset, &h.sender), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
 
     h.client.refund(&h.sender, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
 }
 
 #[test]
 fn released_escrow_cannot_be_refunded() {
     let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100);
-    h.client.release(&h.arbiter, &id);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+    h.client.release(&h.arbiter, &id, &5_000);
 
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     let res = h.client.try_refund(&h.sender, &id);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
-    assert_eq!(balance(&h, &h.asset, &h.recipient), 5_000);
-    assert_eq!(balance(&h, &h.asset, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
 }
 
 #[test]
 fn cannot_close_while_expired() {
-    let h = setup(5_000);
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100, &no_signers(&h), 0);
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
     h.env.ledger().with_mut(|l| l.timestamp = START + 200);
     h.client.expire(&id);
 
@@ -293,294 +258,407 @@ fn cannot_close_while_expired() {
 
 #[test]
 fn create_rejects_bad_input() {
-    let h = setup(5_000);
-    let signers = no_signers(&h);
-
-    // recipient == sender
+    let h = setup(5_000, 0);
     let r1 = h.client.try_create(
         &h.sender,
         &h.sender,
         &h.arbiter,
-        &assets_of(&h, &[1_000]),
+        &one_asset(&h, 1_000),
         &(START + 100),
         &0,
         &String::from_str(&h.env, "x"),
-        &signers,
+        &no_signers(&h),
         &0,
     );
     assert_eq!(r1, Err(Ok(Error::InvalidInput)));
-
-    // deadline in the past
     let r2 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &assets_of(&h, &[1_000]),
+        &one_asset(&h, 1_000),
         &(START - 500),
         &0,
         &String::from_str(&h.env, "x"),
-        &signers,
+        &no_signers(&h),
         &0,
     );
     assert_eq!(r2, Err(Ok(Error::InvalidInput)));
-
-    // non-positive amount
     let r3 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &assets_of(&h, &[0]),
+        &one_asset(&h, 0),
         &(START + 100),
         &0,
         &String::from_str(&h.env, "x"),
-        &signers,
+        &no_signers(&h),
         &0,
     );
     assert_eq!(r3, Err(Ok(Error::InvalidAmount)));
-
-    // empty asset list
     let r4 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
         &Vec::new(&h.env),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
-        &signers,
+        &no_signers(&h),
         &0,
     );
     assert_eq!(r4, Err(Ok(Error::InvalidInput)));
-
-    // duplicate asset in the list
-    let dup = {
-        let mut v = Vec::new(&h.env);
-        v.push_back(AssetAmount {
-            asset: h.asset.clone(),
-            amount: 100,
-        });
-        v.push_back(AssetAmount {
-            asset: h.asset.clone(),
-            amount: 200,
-        });
-        v
-    };
+    let dup = vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 1_000,
+        },
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 500,
+        },
+    ];
     let r5 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
         &dup,
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
-        &signers,
+        &no_signers(&h),
         &0,
     );
     assert_eq!(r5, Err(Ok(Error::InvalidInput)));
-
-    // No successful escrow was created, so the sender keeps every token.
-    assert_eq!(balance(&h, &h.asset, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
 }
 
 #[test]
-fn create_rejects_bad_release_signer_config() {
-    let h = setup(5_000);
-    let key1 = signer_key(1);
-    let pk1 = signer_public_key(&h, &key1);
-    let mut one_signer = Vec::new(&h.env);
-    one_signer.push_back(pk1.clone());
+fn create_rejects_bad_override_config() {
+    let h = setup(5_000, 0);
+    let signer = public_key(&h.env, &keypair(1));
+    let signers = vec![&h.env, signer];
 
-    // threshold above signer count
     let r1 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &assets_of(&h, &[1_000]),
+        &one_asset(&h, 1_000),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
-        &one_signer,
-        &2,
+        &signers,
+        &0,
     );
     assert_eq!(r1, Err(Ok(Error::InvalidThreshold)));
 
-    // nonzero threshold with no signers configured
     let r2 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &assets_of(&h, &[1_000]),
+        &one_asset(&h, 1_000),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
-        &no_signers(&h),
-        &1,
+        &signers,
+        &2,
     );
     assert_eq!(r2, Err(Ok(Error::InvalidThreshold)));
 
-    // duplicate signer key
-    let mut dup_signers = Vec::new(&h.env);
-    dup_signers.push_back(pk1.clone());
-    dup_signers.push_back(pk1);
     let r3 = h.client.try_create(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &assets_of(&h, &[1_000]),
+        &one_asset(&h, 1_000),
         &(START + 100),
+        &0,
         &String::from_str(&h.env, "x"),
-        &dup_signers,
+        &Vec::new(&h.env),
         &1,
     );
-    assert_eq!(r3, Err(Ok(Error::InvalidInput)));
+    assert_eq!(r3, Err(Ok(Error::InvalidThreshold)));
 }
 
+// --- Override release tests ---
+
 #[test]
-fn override_release_with_threshold_signatures_succeeds_before_deadline() {
-    let h = setup(5_000);
-    let key1 = signer_key(1);
-    let key2 = signer_key(2);
-    let key3 = signer_key(3);
-    let mut signers = Vec::new(&h.env);
-    signers.push_back(signer_public_key(&h, &key1));
-    signers.push_back(signer_public_key(&h, &key2));
-    signers.push_back(signer_public_key(&h, &key3));
+fn override_release_with_threshold_signatures_releases_funds() {
+    let h = setup(5_000, 1_000);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
 
-    let assets = assets_of(&h, &[5_000]);
-    // Deadline far in the future — the override must work despite it.
-    let id = create(&h, &assets, START + 100_000, &signers, 2);
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &two_assets(&h, 5_000, 1_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "override"),
+        &signers,
+        &2,
+    );
 
-    let nonce = 42u64;
-    let mut sigs = Vec::new(&h.env);
-    sigs.push_back(sign(&h, &key1, id, nonce));
-    sigs.push_back(sign(&h, &key2, id, nonce));
+    let nonce = 1u64;
+    let sig1 = sign_override(&h, &kp1, id, nonce);
+    let sig2 = sign_override(&h, &kp2, id, nonce);
+    let sigs = vec![&h.env, sig1, sig2];
 
-    let caller = Address::generate(&h.env);
-    h.client
-        .release_with_signatures(&caller, &id, &nonce, &sigs);
+    h.client.override_release(&id, &nonce, &sigs);
 
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(balance(&h, &h.asset, &h.recipient), 5_000);
-    assert!(h.client.nonce_used(&id, &nonce));
-}
-
-#[test]
-fn override_release_below_threshold_rejected() {
-    let h = setup(5_000);
-    let key1 = signer_key(1);
-    let key2 = signer_key(2);
-    let mut signers = Vec::new(&h.env);
-    signers.push_back(signer_public_key(&h, &key1));
-    signers.push_back(signer_public_key(&h, &key2));
-
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100_000, &signers, 2);
-
-    let nonce = 1u64;
-    let mut sigs = Vec::new(&h.env);
-    sigs.push_back(sign(&h, &key1, id, nonce));
-
-    let caller = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_release_with_signatures(&caller, &id, &nonce, &sigs);
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
-    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-    assert!(!h.client.nonce_used(&id, &nonce));
-}
-
-#[test]
-fn override_release_rejects_signer_not_in_set() {
-    let h = setup(5_000);
-    let key1 = signer_key(1);
-    let outsider = signer_key(99);
-    let mut signers = Vec::new(&h.env);
-    signers.push_back(signer_public_key(&h, &key1));
-
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100_000, &signers, 1);
-
-    let nonce = 1u64;
-    let mut sigs = Vec::new(&h.env);
-    sigs.push_back(sign(&h, &outsider, id, nonce));
-
-    let caller = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_release_with_signatures(&caller, &id, &nonce, &sigs);
-    assert_eq!(res, Err(Ok(Error::NotASigner)));
-}
-
-#[test]
-fn override_release_rejects_duplicate_signer_in_submission() {
-    let h = setup(5_000);
-    let key1 = signer_key(1);
-    let key2 = signer_key(2);
-    let mut signers = Vec::new(&h.env);
-    signers.push_back(signer_public_key(&h, &key1));
-    signers.push_back(signer_public_key(&h, &key2));
-
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100_000, &signers, 2);
-
-    let nonce = 1u64;
-    let mut sigs = Vec::new(&h.env);
-    let s1 = sign(&h, &key1, id, nonce);
-    sigs.push_back(s1.clone());
-    sigs.push_back(s1);
-
-    let caller = Address::generate(&h.env);
-    let res = h
-        .client
-        .try_release_with_signatures(&caller, &id, &nonce, &sigs);
-    assert_eq!(res, Err(Ok(Error::AlreadySigned)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.recipient), 1_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
 }
 
 #[test]
 fn override_release_rejects_replayed_nonce() {
-    let h = setup(5_000);
-    let key1 = signer_key(1);
-    let key2 = signer_key(2);
-    let mut signers = Vec::new(&h.env);
-    signers.push_back(signer_public_key(&h, &key1));
-    signers.push_back(signer_public_key(&h, &key2));
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let signers = vec![&h.env, public_key(&h.env, &kp1)];
 
-    // Two escrows sharing the same override signer set.
-    let id1 = create(&h, &assets_of(&h, &[2_000]), START + 100_000, &signers, 2);
-    let id2 = create(&h, &assets_of(&h, &[3_000]), START + 100_000, &signers, 2);
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "override"),
+        &signers,
+        &1,
+    );
 
-    let nonce = 7u64;
-    let mut sigs1 = Vec::new(&h.env);
-    sigs1.push_back(sign(&h, &key1, id1, nonce));
-    sigs1.push_back(sign(&h, &key2, id1, nonce));
-
-    let caller = Address::generate(&h.env);
+    let nonce = 1u64;
+    let sig = sign_override(&h, &kp1, id, nonce);
     h.client
-        .release_with_signatures(&caller, &id1, &nonce, &sigs1);
+        .override_release(&id, &nonce, &vec![&h.env, sig.clone()]);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
 
-    // Replaying the exact same (id, nonce, signatures) a second time must fail —
-    // the nonce for id1 is already consumed.
-    let replay = h
+    let res = h
         .client
-        .try_release_with_signatures(&caller, &id1, &nonce, &sigs1);
-    assert_eq!(replay, Err(Ok(Error::AlreadySigned)));
-
-    // Signatures minted for id1 must not authorize release of id2 — the payload
-    // binds the escrow id, so verification itself fails (host trap).
-    let cross_escrow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.client
-            .release_with_signatures(&caller, &id2, &nonce, &sigs1);
-    }));
-    assert!(cross_escrow.is_err());
-    assert_eq!(h.client.get(&id2).state, EscrowState::Funded);
+        .try_override_release(&id, &nonce, &vec![&h.env, sig]);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
 }
 
 #[test]
-fn override_release_without_configured_signers_rejected() {
-    let h = setup(5_000);
-    let assets = assets_of(&h, &[5_000]);
-    let id = create(&h, &assets, START + 100_000, &no_signers(&h), 0);
+fn override_release_requires_strictly_increasing_nonce() {
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
 
-    let caller = Address::generate(&h.env);
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "override"),
+        &signers,
+        &2,
+    );
+
+    let sig1 = sign_override(&h, &kp1, id, 0);
+    let sig2 = sign_override(&h, &kp2, id, 0);
     let res = h
         .client
-        .try_release_with_signatures(&caller, &id, &0u64, &Vec::new(&h.env));
+        .try_override_release(&id, &0u64, &vec![&h.env, sig1, sig2]);
+    assert_eq!(res, Err(Ok(Error::InvalidNonce)));
+}
+
+#[test]
+fn override_release_rejects_insufficient_signatures() {
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
+
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "override"),
+        &signers,
+        &2,
+    );
+
+    let sig1 = sign_override(&h, &kp1, id, 1);
+    let res = h
+        .client
+        .try_override_release(&id, &1u64, &vec![&h.env, sig1]);
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+}
+
+#[test]
+fn override_release_rejects_unknown_signer() {
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let outsider = keypair(99);
+    let signers = vec![&h.env, public_key(&h.env, &kp1)];
+
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "override"),
+        &signers,
+        &1,
+    );
+
+    let bad_sig = sign_override(&h, &outsider, id, 1);
+    let res = h
+        .client
+        .try_override_release(&id, &1u64, &vec![&h.env, bad_sig]);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn override_release_rejects_duplicate_signer_in_one_call() {
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
+
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "override"),
+        &signers,
+        &2,
+    );
+
+    let sig1 = sign_override(&h, &kp1, id, 1);
+    let res = h
+        .client
+        .try_override_release(&id, &1u64, &vec![&h.env, sig1.clone(), sig1]);
+    assert_eq!(res, Err(Ok(Error::AlreadySigned)));
+}
+
+#[test]
+fn override_release_disabled_without_configured_signers() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 1_000, 0);
+
+    let kp1 = keypair(1);
+    let sig1 = sign_override(&h, &kp1, id, 1);
+    let res = h
+        .client
+        .try_override_release(&id, &1u64, &vec![&h.env, sig1]);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+// --- Milestone tests ---
+
+#[test]
+fn milestone_partial_then_full_release() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 4_000),
+        milestone_spec(&h.env, "build", 6_000),
+    ];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "project"),
+        &specs,
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    let set = h.client.milestones(&id);
+    assert!(set.milestones.get(0).unwrap().released);
+    assert_eq!(set.released_amount, 4_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+
+    h.client.close(&h.arbiter, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Closed);
+}
+
+#[test]
+fn milestone_unauthorized_approval_rejected() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    let res = h.client.try_release_milestone(&h.sender, &id, &0);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
+
+#[test]
+fn milestone_double_release_rejected() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    let res = h.client.try_release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+}
+
+#[test]
+fn milestone_bps_must_total_100() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 4_000),
+        milestone_spec(&h.env, "b", 5_000),
+    ];
+    let res = h.client.try_deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 10_000);
 }
@@ -599,7 +677,7 @@ fn plain_release_blocked_on_milestone_escrow() {
         &String::from_str(&h.env, "p"),
         &specs,
     );
-    let res = h.client.try_release(&h.arbiter, &id);
+    let res = h.client.try_release(&h.arbiter, &id, &10_000);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 }
@@ -856,6 +934,7 @@ fn initialize_and_fund_timelock_lifecycle() {
         &h.arbiter,
         &one_asset(&h, 5_000),
         &(START + 500),
+        &0,
         &String::from_str(&h.env, "unfunded"),
     );
     assert_eq!(h.client.get(&id).state, EscrowState::Created);
@@ -1031,7 +1110,34 @@ fn reclaim_rejected_after_release() {
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
 }
 
-// --- Clawback tests ---
+// --- bounded refund window ---
+
+/// Create a funded escrow whose refund window closes `refund_window` seconds
+/// after refunds open at `deadline + grace_period`.
+fn create_windowed(
+    h: &Harness,
+    assets: &Vec<AssetAmount>,
+    deadline: u64,
+    grace_period: u64,
+    refund_window: u64,
+) -> u64 {
+    h.client.create_with_refund_window(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        assets,
+        &deadline,
+        &grace_period,
+        &refund_window,
+        &String::from_str(&h.env, "payment"),
+        &no_signers(h),
+        &0,
+    )
+}
+
+fn at(h: &Harness, ts: u64) {
+    h.env.ledger().with_mut(|l| l.timestamp = ts);
+}
 
 #[test]
 fn unbounded_window_is_the_default() {
@@ -1134,128 +1240,4 @@ fn an_absurd_window_saturates_instead_of_overflowing() {
     at(&h, START + 10_000_000);
     assert!(h.client.is_refundable(&id));
     h.client.refund(&h.sender, &id);
-}
-
-#[test]
-fn create_accepts_and_stores_expiration() {
-    let h = setup(5_000);
-    let deadline = START + 86_400;
-    let id = create(&h, 5_000, deadline);
-    let escrow = h.client.get(&id);
-    // The expiration parameter is persisted verbatim on the escrow record.
-    assert_eq!(escrow.deadline, deadline);
-    assert_eq!(escrow.state, EscrowState::Funded);
-}
-
-#[test]
-fn release_post_expiration_returns_escrow_expired() {
-    let h = setup(7_000);
-    let id = create(&h, 7_000, START + 100);
-    // Advance the ledger beyond the deadline.
-    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
-    // A release attempt after expiration must deterministically fail with
-    // `EscrowExpired` and must NOT move any funds.
-    let res = h.client.try_release(&h.arbiter, &id);
-    assert_eq!(res, Err(Ok(Error::EscrowExpired)));
-    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-    assert_eq!(balance(&h, &h.client.address), 7_000);
-    assert_eq!(balance(&h, &h.recipient), 0);
-}
-
-#[test]
-fn expire_before_deadline_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    // Cannot mark expired while still inside the release window.
-    let early = h.client.try_expire(&id);
-    assert_eq!(early, Err(Ok(Error::InvalidState)));
-    // Still funded, funds untouched.
-    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-    assert_eq!(balance(&h, &h.client.address), 5_000);
-}
-
-#[test]
-fn cancel_before_deadline_rejected() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    // Auto-cancellation is gated by the deadline.
-    let res = h.client.try_cancel(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
-    assert_eq!(balance(&h, &h.client.address), 5_000);
-    assert_eq!(balance(&h, &h.sender), 0);
-}
-
-#[test]
-fn cancel_after_deadline_refunds_depositor() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-
-    // Permissionless: any caller may cancel once expired.
-    let third_party = Address::generate(&h.env);
-    h.client.cancel(&third_party, &id);
-
-    // Auto-cancellation marks the escrow Refunded and returns the locked funds
-    // to the original depositor (the sender), emptying custody.
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-    assert_eq!(balance(&h, &h.recipient), 0);
-}
-
-#[test]
-fn cancel_after_expire_refunds_depositor() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-
-    // Mark expired first, then cancel — both paths converge on a refund.
-    h.client.expire(&id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
-    h.client.cancel(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-}
-
-#[test]
-fn escrow_creation_emits_structured_event() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    // A structured contract event ("escrow", "funded") must have been emitted.
-    assert!(
-        has_escrow_event(&h, "escrow", "funded"),
-        "expected an escrow `funded` creation event for id {id}"
-    );
-}
-
-#[test]
-fn expired_refund_emits_structured_event() {
-    let h = setup(5_000);
-    let id = create(&h, 5_000, START + 100);
-    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
-    h.client.refund(&h.sender, &id);
-
-    assert!(
-        has_escrow_event(&h, "escrow", "refunded"),
-        "expected an escrow `refunded` event for id {id}"
-    );
-}
-
-/// Returns true if any contract event with the given `(category, action)` topic
-/// pair was emitted during the test so far.
-fn has_escrow_event(h: &Harness, category: &str, action: &str) -> bool {
-    let cat = Symbol::new(&h.env, category);
-    let act = Symbol::new(&h.env, action);
-    h.env.events().all().iter().any(|(_addr, topics, _data)| {
-        let topic0: Symbol = topics
-            .get(0)
-            .and_then(|v| v.try_into_val(&h.env).ok())
-            .unwrap_or_else(|| Symbol::new(&h.env, ""));
-        let topic1: Symbol = topics
-            .get(1)
-            .and_then(|v| v.try_into_val(&h.env).ok())
-            .unwrap_or_else(|| Symbol::new(&h.env, ""));
-        topic0 == cat && topic1 == act
-    })
 }

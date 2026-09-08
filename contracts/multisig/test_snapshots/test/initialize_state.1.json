@@ -180,12 +180,12 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "TierCount"
+                              "symbol": "TimelockDelay"
                             }
                           ]
                         },
                         "val": {
-                          "u32": 0
+                          "u64": 86400
                         }
                       }
                     ]

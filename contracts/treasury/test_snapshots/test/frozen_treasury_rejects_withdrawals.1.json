@@ -507,25 +507,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "interval_payout"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 0
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "interval_start"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "total_in"
                       },
                       "val": {

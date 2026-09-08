@@ -63,17 +63,6 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
 
-/// Streaming payout schedule configuration. Limits how much can be paid out
-/// within a given time interval to enforce a maximum streaming velocity.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayoutSchedule {
-    /// Maximum amount that can be paid out per interval.
-    pub max_per_interval: i128,
-    /// Length of the interval in seconds.
-    pub interval_seconds: u64,
-}
-
 /// Stored treasury record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,10 +100,6 @@ pub struct Holding {
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
-    /// Amount paid out in the current interval (for streaming validation).
-    pub interval_payout: i128,
-    /// Start of the current payout interval (unix seconds).
-    pub interval_start: u64,
 }
 
 /// Composite key identifying a withdrawal allowance scoped to a specific agent
@@ -158,8 +143,6 @@ enum DataKey {
     Milestone(u64),
     MilestoneCount,
     Allowance(AllowanceId),
-    /// Streaming payout schedule configuration (instance).
-    PayoutSchedule,
 }
 
 #[contract]
@@ -262,63 +245,6 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("budget")), ());
-        Self::unlock(&env);
-        Ok(())
-    }
-
-    /// Set the streaming payout schedule (admin). Enforces a maximum payout
-    /// velocity per interval for all withdrawals and batch transfers.
-    pub fn set_payout_schedule(
-        env: Env,
-        caller: Address,
-        max_per_interval: i128,
-        interval_seconds: u64,
-    ) -> Result<(), Error> {
-        if max_per_interval <= 0 {
-            return Err(Error::InvalidInput);
-        }
-        if interval_seconds == 0 {
-            return Err(Error::InvalidInput);
-        }
-        let t = Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(
-            &DataKey::PayoutSchedule,
-            &PayoutSchedule {
-                max_per_interval,
-                interval_seconds,
-            },
-        );
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        events::publish(
-            &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("payout"),
-            },
-        );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("payout")),
-            (max_per_interval, interval_seconds),
-        );
-        Self::unlock(&env);
-        Ok(())
-    }
-
-    /// Clear the streaming payout schedule (admin).
-    pub fn clear_payout_schedule(env: Env, caller: Address) -> Result<(), Error> {
-        let t = Self::require_admin(&env, &caller)?;
-        env.storage().instance().remove(&DataKey::PayoutSchedule);
-        events::publish(
-            &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("payout"),
-            },
-        );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("payout")), ());
         Self::unlock(&env);
         Ok(())
     }
@@ -437,7 +363,10 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, amount)?;
         Self::store_holding(&env, &asset, &h);
-        events::treasury_deposited(&env, &asset, amount);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("deposited")),
+            (asset.clone(), amount),
+        );
         // Pull tokens into the contract's own custody.
         token::TokenClient::new(&env, &asset).transfer(
             &from,
@@ -619,25 +548,6 @@ impl TreasuryContract {
                 .set(&DataKey::Allowance(allowance_id), &al);
         }
 
-        // 3b. Streaming payout schedule — enforce max payout velocity per interval.
-        if let Some(schedule) = Self::payout_schedule(&env) {
-            let now = env.ledger().timestamp();
-            if now
-                >= holding
-                    .interval_start
-                    .saturating_add(schedule.interval_seconds)
-            {
-                holding.interval_payout = 0;
-                holding.interval_start = now;
-            }
-            let new_payout = checked_add(holding.interval_payout, amount)?;
-            if new_payout > schedule.max_per_interval {
-                Self::unlock(&env);
-                return Err(Error::PayoutScheduleViolated);
-            }
-            holding.interval_payout = new_payout;
-        }
-
         // 4. Debit the internal ledger, then move real tokens out of custody.
         if holding.total_in < amount {
             Self::unlock(&env);
@@ -709,25 +619,6 @@ impl TreasuryContract {
             return Err(Error::InsufficientFunds);
         }
 
-        // 3. Streaming payout schedule — cap the aggregate batch payout against
-        //    the current interval's velocity, same as a single withdrawal.
-        if let Some(schedule) = Self::payout_schedule(&env) {
-            let now = env.ledger().timestamp();
-            if now
-                >= holding
-                    .interval_start
-                    .saturating_add(schedule.interval_seconds)
-            {
-                holding.interval_payout = 0;
-                holding.interval_start = now;
-            }
-            let new_payout = checked_add(holding.interval_payout, total)?;
-            if new_payout > schedule.max_per_interval {
-                return Err(Error::PayoutScheduleViolated);
-            }
-            holding.interval_payout = new_payout;
-        }
-
         // 3. Policy verification — each leg is evaluated on its own, because
         //    per-recipient and per-amount gates are what the policy encodes.
         if let Some(policy_addr) = &t.policy {
@@ -768,8 +659,12 @@ impl TreasuryContract {
                 total,
             },
         );
-        events::treasury_batchpay(&env, &asset, payments.len(), total);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("batchpay")),
+            (asset, payments.len(), total),
+        );
 
+        Self::unlock(&env);
         Self::unlock(&env);
         Ok(())
     }
@@ -815,7 +710,10 @@ impl TreasuryContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         env.storage().instance().set(&count_key, &count);
-        events::treasury_milestone_init(&env, count as u32, total_amount, milestones);
+        env.events().publish(
+            (symbol_short!("milestone"), symbol_short!("init")),
+            (count, total_amount, milestones),
+        );
         Ok(count)
     }
 
@@ -870,11 +768,9 @@ impl TreasuryContract {
             &d.to,
             &amount,
         );
-        events::treasury_milestone_disbursed(
-            &env,
-            milestone_id as u32,
-            d.disbursed as i128,
-            amount,
+        env.events().publish(
+            (symbol_short!("milestone"), symbol_short!("disbursed")),
+            (milestone_id, d.disbursed, amount),
         );
         Self::unlock(&env);
         Ok(())
@@ -915,11 +811,6 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    /// Load the configured streaming payout schedule, if any.
-    fn payout_schedule(env: &Env) -> Option<PayoutSchedule> {
-        env.storage().instance().get(&DataKey::PayoutSchedule)
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
@@ -1051,8 +942,6 @@ impl TreasuryContract {
                 total_in: 0,
                 total_out: 0,
                 budget_id: None,
-                interval_payout: 0,
-                interval_start: 0,
             })
     }
 

@@ -16,7 +16,6 @@
 //! another contract crate at compile time.
 
 pub mod upgrade;
-pub mod version;
 
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
@@ -46,10 +45,6 @@ pub trait PolicyInterface {
         recipient: Address,
         amount: i128,
     ) -> Result<(), Error>;
-
-    /// Returns `true` if `token` is on the approved whitelist for `policy_id`.
-    /// Wallets and the treasury query this before moving any external SAC asset.
-    fn is_token_allowed(env: Env, policy_id: String, token: Address) -> bool;
 }
 
 /// Budget enforcement surface. Contracts call `consume` to atomically debit a
