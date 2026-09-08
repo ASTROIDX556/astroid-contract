@@ -54,7 +54,9 @@ fn mul_underflow() {
 fn mul_large_values() {
     // Both large positive — still fits.
     assert_eq!(checked_mul(1_000_000, 1_000_000), Ok(1_000_000_000_000));
-    // Large negative * large positive — well within i128 range.
+    // True overflow: max * 2 wraps past the upper bound.
+    assert_eq!(checked_mul(i128::MAX, 2), Err(Error::Overflow));
+    // Large negative * large positive — fits in i128 (order 10^24).
     assert_eq!(
         checked_mul(-1_000_000_000_000i128, 1_000_000_000_000i128),
         Ok(-1_000_000_000_000_000_000_000_000i128)
@@ -185,8 +187,8 @@ fn abs_extremes() {
 
 #[test]
 fn math_additional_edge_cases() {
-    // Per the helper contracts, any wrap (including subtraction below the
-    // minimum value) reports as Overflow.
+    // Underflow only when the result drops below the minimum value. All wraps
+    // are reported as Overflow by the checked helpers.
     assert_eq!(checked_sub(0, 1), Ok(-1));
     assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Overflow));
     assert_eq!(checked_add(i128::MIN, -1), Err(Error::Overflow));
@@ -257,47 +259,166 @@ fn time_validation() {
 fn constants_are_sane() {
     const _: () = {
         assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
+    };
+    const _: () = {
+        assert!(MAX_SIGNERS >= 1);
+    };
+    const _: () = {
+        assert!(INSTANCE_LIFETIME_THRESHOLD < INSTANCE_BUMP_AMOUNT);
+    };
+    const _: () = {
         assert!(MAX_SIGNERS >= 1);
     };
 }
 
 // ---------------------------------------------------------------------------
-// SafeAdd / SafeSub / SafeMul / SafeDiv traits (checked safety)
+// Telemetry helpers
 // ---------------------------------------------------------------------------
 
+use crate::telemetry::{estimate_gas, is_near_gas_limit, ExecutionCost, TransactionSummary};
+
 #[test]
-fn safe_add_checked_overflow() {
-    use crate::math::SafeAdd;
-    assert_eq!(i128::MAX.safe_add(1), Err(Error::Overflow));
-    assert_eq!(i128::MAX.safe_add(i128::MAX), Err(Error::Overflow));
-    assert_eq!(5i128.safe_add(7), Ok(12));
-    assert_eq!((-5i128).safe_add(5), Ok(0));
+fn telemetry_estimate_gas_transfer() {
+    // Transfer operations have a base cost of 100 gas.
+    assert_eq!(estimate_gas("transfer", 0), 100);
+    assert_eq!(estimate_gas("transfer", 1024), 110);
+    assert_eq!(estimate_gas("transfer", 10240), 200);
 }
 
 #[test]
-fn safe_sub_checked_underflow() {
-    use crate::math::SafeSub;
-    assert_eq!((i128::MIN).safe_sub(1), Err(Error::Overflow));
-    assert_eq!((10i128).safe_sub(3), Ok(7));
-    assert_eq!((10i128).safe_sub(10), Ok(0));
-    assert_eq!((i128::MIN).safe_sub(0), Ok(i128::MIN));
+fn telemetry_estimate_gas_mint() {
+    // Mint operations share the same base cost as transfer.
+    assert_eq!(estimate_gas("mint", 0), 100);
+    assert_eq!(estimate_gas("mint", 2048), 120);
 }
 
 #[test]
-fn safe_mul_checked_overflow() {
-    use crate::math::SafeMul;
-    assert_eq!(i128::MAX.safe_mul(2), Err(Error::Overflow));
-    assert_eq!(i128::MIN.safe_mul(-1), Err(Error::Overflow));
-    assert_eq!((2i128).safe_mul(3), Ok(6));
-    assert_eq!((0i128).safe_mul(i128::MAX), Ok(0));
+fn telemetry_estimate_gas_balance() {
+    // Read-only operations are cheaper.
+    assert_eq!(estimate_gas("balance", 0), 60);
+    assert_eq!(estimate_gas("balance_of", 0), 60);
 }
 
 #[test]
-fn safe_div_checked_zero_and_overflow() {
-    use crate::math::SafeDiv;
-    assert_eq!((1i128).safe_div(0), Err(Error::InvalidInput));
-    assert_eq!((0i128).safe_div(0), Err(Error::InvalidInput));
-    assert_eq!(i128::MIN.safe_div(-1), Err(Error::Overflow));
-    assert_eq!((20i128).safe_div(5), Ok(4));
-    assert_eq!((-20i128).safe_div(5), Ok(-4));
+fn telemetry_estimate_gas_approve() {
+    // Approve operations have a base cost of 80 gas.
+    assert_eq!(estimate_gas("approve", 0), 80);
+    assert_eq!(estimate_gas("allowance", 0), 80);
+}
+
+#[test]
+fn telemetry_estimate_gas_unknown_operation() {
+    // Unknown operations default to 100 gas.
+    assert_eq!(estimate_gas("unknown_op", 0), 100);
+    assert_eq!(estimate_gas("some_custom_fn", 512), 100);
+}
+
+#[test]
+fn telemetry_is_near_gas_limit() {
+    // Below 90% is not near limit.
+    assert!(!is_near_gas_limit(0));
+    assert!(!is_near_gas_limit(50_000_000));
+    assert!(!is_near_gas_limit(89_999_999));
+
+    // At or above 90% is near limit.
+    assert!(is_near_gas_limit(90_000_000));
+    assert!(is_near_gas_limit(100_000_000));
+    assert!(is_near_gas_limit(150_000_000));
+}
+
+#[test]
+fn execution_cost_struct_fields() {
+    let env = Env::default();
+    let cost = ExecutionCost {
+        operation: soroban_sdk::Symbol::new(&env, "transfer"),
+        gas_used: 150,
+        cpu_instructions: 0,
+        storage_bytes: 1024,
+        timestamp: 1_000_000,
+    };
+
+    assert_eq!(cost.operation, soroban_sdk::Symbol::new(&env, "transfer"));
+    assert_eq!(cost.gas_used, 150);
+    assert_eq!(cost.cpu_instructions, 0);
+    assert_eq!(cost.storage_bytes, 1024);
+    assert_eq!(cost.timestamp, 1_000_000);
+}
+
+#[test]
+fn transaction_summary_struct_fields() {
+    let summary = TransactionSummary {
+        total_gas: 500,
+        total_cpu: 10_000,
+        total_storage: 4096,
+        operation_count: 3,
+        near_limit: false,
+    };
+
+    assert_eq!(summary.total_gas, 500);
+    assert_eq!(summary.total_cpu, 10_000);
+    assert_eq!(summary.total_storage, 4096);
+    assert_eq!(summary.operation_count, 3);
+    assert!(!summary.near_limit);
+}
+
+#[test]
+fn telemetry_event_emission() {
+    use crate::telemetry::log_execution_cost;
+
+    let env = Env::default();
+
+    // Publish a telemetry event — should not panic.
+    log_execution_cost(&env, "transfer", 150, 1024);
+}
+
+#[test]
+fn telemetry_full_event_emission() {
+    use crate::telemetry::log_execution_cost_full;
+
+    let env = Env::default();
+
+    // Publish a full telemetry event — should not panic.
+    log_execution_cost_full(&env, "transfer", 150, 500, 1024);
+}
+
+#[test]
+fn telemetry_summary_event_emission() {
+    use crate::telemetry::log_transaction_summary;
+
+    let env = Env::default();
+
+    // Publish a transaction summary event — should not panic.
+    log_transaction_summary(&env, 500, 10_000, 4096, 3, false);
+}
+
+#[test]
+fn contract_event_gas_telemetry_variant() {
+    use crate::events::{publish, ContractEvent};
+    use soroban_sdk::Symbol;
+
+    let env = Env::default();
+
+    let event = ContractEvent::GasTelemetry {
+        operation: Symbol::new(&env, "transfer"),
+        gas_used: 150,
+        storage_bytes: 1024,
+    };
+
+    publish(&env, event);
+}
+
+#[test]
+fn contract_event_transaction_summary_variant() {
+    use crate::events::{publish, ContractEvent};
+
+    let env = Env::default();
+
+    let event = ContractEvent::TransactionSummary {
+        total_gas: 500,
+        total_cpu: 10_000,
+        total_storage: 4096,
+        operation_count: 3,
+    };
+
+    publish(&env, event);
 }

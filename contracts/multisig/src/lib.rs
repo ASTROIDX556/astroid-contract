@@ -62,10 +62,9 @@
 use astroid_shared::constants::{
     GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS,
     MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_THRESHOLD, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
+    PERSISTENT_LIFETIME_THRESHOLD, THRESHOLD_CHANGE_DELAY_LEDGERS,
 };
 use astroid_shared::errors::Error;
-use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::validation::require_time_reached;
 use soroban_sdk::{
@@ -84,16 +83,10 @@ enum DataKey {
     EmergencyLock,
     /// State: monotonic proposal id counter (instance).
     ProposalCount,
-    /// Config: ordered quorum tier by index (instance).
-    Tier(u32),
-    /// Config: number of configured tiers (instance).
-    TierCount,
     /// State: proposal record by id (persistent).
     Proposal(u64),
     /// Relationship: whether a signer approved a proposal (persistent).
     Approval(u64, Address),
-    /// Threshold value attached to a threshold-update proposal (persistent).
-    ProposalThreshold(u64),
     /// State: last used batch nonce (instance); batches must use a greater one.
     LastBatchNonce,
     /// Config: timelock delay applied to governance changes (instance, seconds).
@@ -102,6 +95,8 @@ enum DataKey {
     ChangeCount,
     /// State: pending governance change by id (persistent).
     Change(u64),
+    /// Pending threshold change awaiting finalization.
+    PendingThreshold,
 }
 
 /// A registered signer and its positive voting weight.
@@ -112,18 +107,20 @@ pub struct SignerWeight {
     pub weight: u32,
 }
 
+/// A pending threshold change that must wait a delay before finalization.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingThresholdChange {
+    pub new_threshold: u32,
+    /// Ledger sequence when the change was submitted.
+    pub effective_from: u32,
+}
+
 /// Internal multisig proposal. `action`/`payload` describe the intended change
 /// or call; the multisig only records weighted approvals and marks it executed
 /// once the accumulated weight meets the threshold. Actual value movement is
 /// delegated to the calling context (e.g. the Treasury) which checks
 /// `is_executed`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuorumTier {
-    pub max_amount: i128,
-    pub required_weight: u32,
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MsProposal {
@@ -132,8 +129,8 @@ pub struct MsProposal {
     pub action: Symbol,
     /// Opaque payload (e.g. serialized transfer intent / hash).
     pub payload: Bytes,
-    pub amount: i128,
-    pub approvals: u32,
+    /// Accumulated approval weight (sum of approver weights).
+    pub approval_weight: u32,
     pub executed: bool,
     /// Earliest timestamp at which execution is allowed (time lock; 0 = none).
     pub unlock_at: u64,
@@ -255,7 +252,6 @@ impl MultiSigContract {
         Self::assert_unique(&signers)?;
 
         env.storage().instance().set(&DataKey::Signers, &signers);
-        env.storage().instance().set(&DataKey::TierCount, &0u32);
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -270,6 +266,117 @@ impl MultiSigContract {
         env.storage()
             .instance()
             .set(&DataKey::TimelockDelay, &MIN_TIMELOCK_DELAY);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Add a signer. Signer-gated. Rejects duplicates, zero weights, and
+    /// over-capacity signer sets.
+    pub fn add_signer(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        weight: u32,
+    ) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        if weight == 0 {
+            return Err(Error::InvalidSignerWeight);
+        }
+        let mut signers = Self::signers(&env)?;
+        if signers.iter().any(|s| s.address == signer) {
+            return Err(Error::AlreadyExists);
+        }
+        if signers.len() >= MAX_SIGNERS {
+            return Err(Error::TooManySigners);
+        }
+        signers.push_back(SignerWeight {
+            address: signer.clone(),
+            weight,
+        });
+        env.storage().instance().set(&DataKey::Signers, &signers);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("signer"), symbol_short!("added")),
+            (signer, weight),
+        );
+        Ok(())
+    }
+
+    /// Remove a signer. Signer-gated. Refuses to drop below the threshold or to
+    /// empty the set, so the multisig can never become unusable.
+    pub fn remove_signer(env: Env, caller: Address, signer: Address) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        let mut signers = Self::signers(&env)?;
+        let threshold = Self::threshold(&env)?;
+        let idx = Self::index_of(&signers, &signer)?;
+        let remaining_total = Self::total_weight(&signers)? - signers.get(idx).unwrap().weight;
+        if remaining_total < threshold {
+            return Err(Error::InvalidThreshold);
+        }
+        signers.remove(idx);
+        env.storage().instance().set(&DataKey::Signers, &signers);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("signer"), symbol_short!("removed")), signer);
+        Ok(())
+    }
+
+    /// Propose a pending threshold change. Signer-gated. Must stay within
+    /// `[MIN_THRESHOLD, signers.len()]`. The change is stored but not applied
+    /// until [`finalize_threshold`] is called after the grace period.
+    pub fn set_threshold(env: Env, caller: Address, threshold: u32) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        let signers = Self::signers(&env)?;
+        Self::validate_threshold(threshold, Self::total_weight(&signers)?)?;
+
+        let current = Self::threshold(&env)?;
+        if current == threshold {
+            return Err(Error::InvalidThreshold);
+        }
+
+        let pending = PendingThresholdChange {
+            new_threshold: threshold,
+            effective_from: env.ledger().sequence(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingThreshold, &pending);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("threshold"), symbol_short!("pending")),
+            (threshold, env.ledger().sequence()),
+        );
+        Ok(())
+    }
+
+    /// Finalize a pending threshold change. The change only takes effect after
+    /// at least [`THRESHOLD_CHANGE_DELAY_LEDGERS`] ledgers have passed since
+    /// the change was submitted via [`set_threshold`].
+    pub fn finalize_threshold(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+
+        let pending: PendingThresholdChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingThreshold)
+            .ok_or(Error::NotFound)?;
+
+        let current_sequence = env.ledger().sequence();
+        let elapsed = current_sequence
+            .checked_sub(pending.effective_from)
+            .ok_or(Error::TimelockNotExpired)?;
+        if elapsed < THRESHOLD_CHANGE_DELAY_LEDGERS {
+            return Err(Error::TimelockNotExpired);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &pending.new_threshold);
+        env.storage().instance().remove(&DataKey::PendingThreshold);
+        env.events().publish(
+            (symbol_short!("threshold"), symbol_short!("changed")),
+            pending.new_threshold,
+        );
         Self::bump_instance(&env);
         Ok(())
     }
@@ -381,7 +488,10 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Change(proposal_id), &pending);
         Self::bump_change(&env, proposal_id);
-        events::multisig_govchange_executed(&env, proposal_id, &caller, kind);
+        env.events().publish(
+            (symbol_short!("govchange"), symbol_short!("executed")),
+            (proposal_id, caller, kind),
+        );
         Ok(())
     }
 
@@ -405,113 +515,9 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Change(proposal_id), &pending);
         Self::bump_change(&env, proposal_id);
-        events::multisig_govchange_cancelled(&env, proposal_id, &caller, kind);
-        Ok(())
-    }
-
-    /// Propose a threshold update through the collective approval flow. Only a
-    /// signer may propose. The `new_threshold` is validated against the current
-    /// signer set and persisted alongside the proposal so that
-    /// [`execute_threshold_update`] can apply it once quorum is reached.
-    pub fn propose_threshold_update(
-        env: Env,
-        proposer: Address,
-        new_threshold: u32,
-        unlock_at: u64,
-    ) -> Result<u64, Error> {
-        Self::require_not_locked(&env)?;
-        Self::require_signer(&env, &proposer)?;
-        let signers = Self::signers(&env)?;
-        let total = Self::total_weight(&signers)?;
-        if new_threshold == 0 || new_threshold > total {
-            return Err(Error::InvalidThreshold);
-        }
-
-        let mut count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProposalCount)
-            .ok_or(Error::NotInitialized)?;
-        count = checked_add(count as i128, 1)? as u64;
-        let id = count;
-
-        let proposer_weight = Self::weight_of(&env, &proposer)?;
-        let proposal = MsProposal {
-            proposer: proposer.clone(),
-            action: symbol_short!("threshupd"),
-            payload: Bytes::new(&env),
-            approval_weight: proposer_weight,
-            executed: false,
-            unlock_at,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(id), &proposal);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Approval(id, proposer.clone()), &true);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProposalThreshold(id), &new_threshold);
-        Self::bump_proposal(&env, id);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProposalCount, &count);
-        Self::bump_instance(&env);
-
         env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("created")),
-            (id, proposer),
-        );
-        Ok(id)
-    }
-
-    /// Execute an approved threshold-update proposal. Any signer may call once
-    /// the proposal has accumulated sufficient approval weight. The stored
-    /// `new_threshold` is validated, the threshold is persisted, and a
-    /// `ThresholdUpdated` event is emitted.
-    pub fn execute_threshold_update(
-        env: Env,
-        caller: Address,
-        proposal_id: u64,
-    ) -> Result<(), Error> {
-        Self::require_not_locked(&env)?;
-        Self::require_signer(&env, &caller)?;
-        let mut proposal = Self::load_proposal(&env, proposal_id)?;
-        if proposal.executed {
-            return Err(Error::InvalidProposalState);
-        }
-        let threshold = Self::threshold(&env)?;
-        if proposal.approval_weight < threshold {
-            return Err(Error::InsufficientWeight);
-        }
-        if proposal.unlock_at != 0 {
-            require_time_reached(&env, proposal.unlock_at)?;
-        }
-
-        let new_threshold: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ProposalThreshold(proposal_id))
-            .ok_or(Error::NotFound)?;
-        let signers = Self::signers(&env)?;
-        Self::validate_threshold(new_threshold, Self::total_weight(&signers)?)?;
-
-        let old_threshold = threshold;
-        env.storage()
-            .instance()
-            .set(&DataKey::Threshold, &new_threshold);
-
-        proposal.executed = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-
-        Self::bump_proposal(&env, proposal_id);
-        Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("threshold"), symbol_short!("updated")),
-            (old_threshold, new_threshold),
+            (symbol_short!("govchange"), symbol_short!("cancelled")),
+            (proposal_id, caller, kind),
         );
         Ok(())
     }
@@ -529,59 +535,6 @@ impl MultiSigContract {
         Ok(())
     }
 
-    /// Configure ascending amount tiers. The final tier must use `i128::MAX`.
-    pub fn set_quorum_tiers(
-        env: Env,
-        caller: Address,
-        tiers: Vec<QuorumTier>,
-    ) -> Result<(), Error> {
-        Self::require_signer(&env, &caller)?;
-        if tiers.is_empty() || tiers.get(tiers.len() - 1).unwrap().max_amount != i128::MAX {
-            return Err(Error::InvalidInput);
-        }
-        let signer_count = Self::signers(&env)?.len();
-        let mut previous = None;
-        let mut i = 0;
-        while i < tiers.len() {
-            let tier = tiers.get(i).unwrap();
-            if tier.max_amount < 0
-                || tier.required_weight == 0
-                || tier.required_weight > signer_count
-                || previous.map(|max| tier.max_amount <= max).unwrap_or(false)
-            {
-                return Err(Error::InvalidInput);
-            }
-            env.storage().instance().set(&DataKey::Tier(i), &tier);
-            previous = Some(tier.max_amount);
-            i += 1;
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::TierCount, &tiers.len());
-        Self::bump_instance(&env);
-        Ok(())
-    }
-
-    pub fn get_quorum_tiers(env: Env) -> Result<Vec<QuorumTier>, Error> {
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TierCount)
-            .unwrap_or(0);
-        let mut tiers = Vec::new(&env);
-        let mut i = 0;
-        while i < count {
-            tiers.push_back(
-                env.storage()
-                    .instance()
-                    .get(&DataKey::Tier(i))
-                    .ok_or(Error::NotInitialized)?,
-            );
-            i += 1;
-        }
-        Ok(tiers)
-    }
-
     /// Create a proposal. Only a signer may propose. `unlock_at` sets an optional
     /// time lock (0 = immediately executable once threshold met). The proposer's
     /// weight is counted automatically.
@@ -590,14 +543,10 @@ impl MultiSigContract {
         proposer: Address,
         action: Symbol,
         payload: Bytes,
-        amount: i128,
         unlock_at: u64,
     ) -> Result<u64, Error> {
         Self::require_not_locked(&env)?;
         Self::require_signer(&env, &proposer)?;
-        if amount < 0 {
-            return Err(Error::InvalidAmount);
-        }
 
         let mut count: u64 = env
             .storage()
@@ -612,8 +561,7 @@ impl MultiSigContract {
             proposer: proposer.clone(),
             action,
             payload,
-            amount,
-            approvals: 1,
+            approval_weight: proposer_weight,
             executed: false,
             unlock_at,
         };
@@ -629,7 +577,10 @@ impl MultiSigContract {
             .set(&DataKey::ProposalCount, &count);
         Self::bump_instance(&env);
 
-        astroid_shared::events::proposal_created(&env, id, &proposer);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("created")),
+            (id, proposer),
+        );
         Ok(id)
     }
 
@@ -655,11 +606,9 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         Self::bump_proposal(&env, proposal_id);
-        astroid_shared::events::proposal_approved(
-            &env,
-            proposal_id,
-            &caller,
-            proposal.approval_weight,
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("approved")),
+            (proposal_id, caller, proposal.approval_weight),
         );
         Ok(proposal.approval_weight)
     }
@@ -675,16 +624,9 @@ impl MultiSigContract {
         if proposal.executed {
             return Err(Error::InvalidProposalState);
         }
-        let threshold = if let Some(tier) = Self::tier_for_amount(&env, proposal.amount)? {
-            tier.required_weight
-        } else {
-            Self::threshold(&env)?
-        };
-        if proposal.approvals < threshold {
-            if Self::has_tiers(&env) {
-                return Err(Error::InsufficientTierWeight);
-            }
-            return Err(Error::ThresholdNotMet);
+        let threshold = Self::threshold(&env)?;
+        if proposal.approval_weight < threshold {
+            return Err(Error::InsufficientWeight);
         }
         if proposal.unlock_at != 0 {
             require_time_reached(&env, proposal.unlock_at)?;
@@ -694,7 +636,10 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         Self::bump_proposal(&env, proposal_id);
-        events::multisig_proposal_executed(&env, proposal_id);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("executed")),
+            proposal_id,
+        );
         Ok(())
     }
 
@@ -776,7 +721,10 @@ impl MultiSigContract {
         }
 
         Self::bump_instance(&env);
-        events::multisig_batch_executed(&env, nonce, &caller, calls.len());
+        env.events().publish(
+            (symbol_short!("batch"), symbol_short!("executed")),
+            (nonce, caller, calls.len()),
+        );
         Ok(())
     }
 
@@ -853,6 +801,13 @@ impl MultiSigContract {
         Self::threshold(&env)
     }
 
+    pub fn get_pending_threshold(env: Env) -> Result<PendingThresholdChange, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingThreshold)
+            .ok_or(Error::NotFound)
+    }
+
     pub fn is_signer(env: Env, who: Address) -> bool {
         Self::signers(&env)
             .map(|s| s.iter().any(|sw| sw.address == who))
@@ -894,33 +849,33 @@ impl MultiSigContract {
             .ok_or(Error::NotInitialized)
     }
 
-    fn has_tiers(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get::<_, u32>(&DataKey::TierCount)
-            .unwrap_or(0)
-            > 0
-    }
-
-    fn tier_for_amount(env: &Env, amount: i128) -> Result<Option<QuorumTier>, Error> {
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TierCount)
-            .unwrap_or(0);
+    fn total_weight(signers: &Vec<SignerWeight>) -> Result<u32, Error> {
+        let mut total: i128 = 0;
+        let len = signers.len();
         let mut i = 0;
-        while i < count {
-            let tier: QuorumTier = env
-                .storage()
-                .instance()
-                .get(&DataKey::Tier(i))
-                .ok_or(Error::NotInitialized)?;
-            if amount <= tier.max_amount {
-                return Ok(Some(tier));
-            }
+        while i < len {
+            let w = signers.get(i).unwrap().weight;
+            total = checked_add(total, w as i128)?;
             i += 1;
         }
-        Ok(None)
+        Self::to_weight(total)
+    }
+
+    /// Narrow an accumulated `i128` weight back to `u32`, refusing to truncate.
+    fn to_weight(total: i128) -> Result<u32, Error> {
+        if total > u32::MAX as i128 {
+            return Err(Error::Overflow);
+        }
+        Ok(total as u32)
+    }
+
+    fn weight_of(env: &Env, who: &Address) -> Result<u32, Error> {
+        let signers = Self::signers(env)?;
+        signers
+            .iter()
+            .find(|s| &s.address == who)
+            .map(|s| s.weight)
+            .ok_or(Error::NotASigner)
     }
 
     fn threshold(env: &Env) -> Result<u32, Error> {
@@ -1064,7 +1019,10 @@ impl MultiSigContract {
         env.storage().instance().set(&DataKey::ChangeCount, &count);
         Self::bump_instance(env);
 
-        events::multisig_govchange_proposed(&env, id, &caller, kind, eta);
+        env.events().publish(
+            (symbol_short!("govchange"), symbol_short!("proposed")),
+            (id, caller.clone(), kind, eta),
+        );
         Ok(id)
     }
 
@@ -1129,7 +1087,10 @@ impl MultiSigContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::Threshold, new_threshold);
-                events::multisig_threshold_changed(&env, *new_threshold);
+                env.events().publish(
+                    (symbol_short!("threshold"), symbol_short!("changed")),
+                    *new_threshold,
+                );
             }
             GovernanceChange::SignerWeight(signer, weight) => {
                 let mut signers = Self::signers(env)?;
@@ -1138,7 +1099,10 @@ impl MultiSigContract {
                 updated.weight = *weight;
                 signers.set(idx, updated);
                 env.storage().instance().set(&DataKey::Signers, &signers);
-                events::multisig_signer_weight(&env, &signer, *weight);
+                env.events().publish(
+                    (symbol_short!("signer"), symbol_short!("weight")),
+                    (signer.clone(), *weight),
+                );
             }
             GovernanceChange::AddSigner(signer, weight) => {
                 let mut signers = Self::signers(env)?;
@@ -1147,18 +1111,27 @@ impl MultiSigContract {
                     weight: *weight,
                 });
                 env.storage().instance().set(&DataKey::Signers, &signers);
-                events::multisig_signer_added(&env, &signer, *weight);
+                env.events().publish(
+                    (symbol_short!("signer"), symbol_short!("added")),
+                    (signer.clone(), *weight),
+                );
             }
             GovernanceChange::RemoveSigner(signer) => {
                 let mut signers = Self::signers(env)?;
                 let idx = Self::index_of(&signers, signer)?;
                 signers.remove(idx);
                 env.storage().instance().set(&DataKey::Signers, &signers);
-                events::multisig_signer_removed(&env, &signer);
+                env.events().publish(
+                    (symbol_short!("signer"), symbol_short!("removed")),
+                    signer.clone(),
+                );
             }
             GovernanceChange::TimelockDelay(delay) => {
                 env.storage().instance().set(&DataKey::TimelockDelay, delay);
-                events::multisig_timelock_changed(&env, *delay);
+                env.events().publish(
+                    (symbol_short!("timelock"), symbol_short!("changed")),
+                    *delay,
+                );
             }
         }
         Self::bump_instance(env);
