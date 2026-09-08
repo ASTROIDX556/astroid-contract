@@ -24,7 +24,7 @@ pub enum Error {
     Overflow = 11,
     InvalidAmount = 12,
 
-    // --- Policy (20-27) ---
+    // --- Policy (20-23, 25) ---
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
@@ -34,7 +34,7 @@ pub enum Error {
     /// A proposed spend would breach a per-asset spending allowance.
     PolicyAllowanceExceeded = 26,
 
-    // --- Registry (30-39) ---
+    // --- Registry (30-31) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
 
@@ -87,6 +87,8 @@ pub enum Error {
     EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
+    EscrowNotExpired = 85,
+    EscrowAlreadySettled = 86,
 
     // --- Treasury allowances (83-84) ---
     AllowanceExceeded = 83,

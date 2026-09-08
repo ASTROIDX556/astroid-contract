@@ -4,7 +4,25 @@
     "nonce": 0
   },
   "auth": [
-    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "function_name": "initialize",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
@@ -30,7 +48,15 @@
                   }
                 },
                 "void",
-                "void",
+                {
+                  "vec": []
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "u64": 0
+                },
                 {
                   "u64": 0
                 }
@@ -202,6 +228,39 @@
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "key": {
               "ledger_key_nonce": {
+                "nonce": 2032731177588607455
+              }
+            },
+            "durability": "temporary"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "ledger_key_nonce": {
+                    "nonce": 2032731177588607455
+                  }
+                },
+                "durability": "temporary",
+                "val": "void"
+              }
+            },
+            "ext": "v0"
+          },
+          6311999
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "ledger_key_nonce": {
                 "nonce": 4837995959683129791
               }
             },
@@ -301,9 +360,11 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "allowed_asset"
+                        "symbol": "allowed_assets"
                       },
-                      "val": "void"
+                      "val": {
+                        "vec": []
+                      }
                     },
                     {
                       "key": {
@@ -352,6 +413,22 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "time_window_end"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "time_window_start"
+                      },
+                      "val": {
+                        "u64": 0
                       }
                     },
                     {
@@ -488,12 +565,36 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Admin"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Count"
                             }
                           ]
                         },
                         "val": {
                           "u32": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Pause"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
                         }
                       }
                     ]
@@ -548,7 +649,9 @@
                 "symbol": "initialize"
               }
             ],
-            "data": "void"
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+            }
           }
         }
       },
@@ -611,7 +714,15 @@
                   }
                 },
                 "void",
-                "void",
+                {
+                  "vec": []
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "u64": 0
+                },
                 {
                   "u64": 0
                 }
@@ -1129,6 +1240,33 @@
       "event": {
         "ext": "v0",
         "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "PolicyViolation"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "wl"
+                },
+                {
+                  "symbol": "not_whitelisted"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
         "type_": "diagnostic",
         "body": {
           "v0": {
@@ -1142,7 +1280,7 @@
             ],
             "data": {
               "error": {
-                "contract": 23
+                "contract": 22
               }
             }
           }
@@ -1163,7 +1301,7 @@
               },
               {
                 "error": {
-                  "contract": 23
+                  "contract": 22
                 }
               }
             ],
@@ -1188,7 +1326,7 @@
               },
               {
                 "error": {
-                  "contract": 23
+                  "contract": 22
                 }
               }
             ],
