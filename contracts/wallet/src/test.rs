@@ -2,11 +2,11 @@
 extern crate std;
 
 use crate::access::Role;
-use crate::{WalletContract, WalletContractClient};
+use crate::{ContractCall, WalletContract, WalletContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val, Vec};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -25,6 +25,7 @@ struct Harness {
     client: WalletContractClient<'static>,
     admin: Address,
     token: Address,
+    contract_id: Address,
 }
 
 fn setup() -> Harness {
@@ -47,6 +48,7 @@ fn setup() -> Harness {
         client,
         admin,
         token,
+        contract_id,
     }
 }
 

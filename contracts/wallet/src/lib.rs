@@ -31,8 +31,8 @@
 //! resuming operations requires a threshold of signers.
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
-//! `emergency_unpause`, `set_guardian`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `batch_execute`,
+//! `emergency_pause`, `emergency_unpause`, `set_guardian`.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
 //! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
@@ -66,7 +66,7 @@ use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use astroid_shared::{constants, events};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Val,
 };
 
 pub mod access;
