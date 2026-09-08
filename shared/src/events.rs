@@ -83,6 +83,19 @@ pub enum ContractEvent {
         recipient: Address,
         assets: Vec<AssetAmount>,
     },
+    /// Gas usage telemetry for a single operation execution.
+    GasTelemetry {
+        operation: Symbol,
+        gas_used: u64,
+        storage_bytes: u64,
+    },
+    /// Cumulative resource usage summary for an entire transaction.
+    TransactionSummary {
+        total_gas: u64,
+        total_cpu: u64,
+        total_storage: u64,
+        operation_count: u32,
+    },
 }
 
 /// Publish a [`ContractEvent`] using the canonical schema.
@@ -172,6 +185,27 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "EscrowReleased"),),
                 (escrow_id, recipient, assets),
+            );
+        }
+        ContractEvent::GasTelemetry {
+            operation,
+            gas_used,
+            storage_bytes,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "GasTelemetry"),),
+                (operation, gas_used, storage_bytes),
+            );
+        }
+        ContractEvent::TransactionSummary {
+            total_gas,
+            total_cpu,
+            total_storage,
+            operation_count,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TransactionSummary"),),
+                (total_gas, total_cpu, total_storage, operation_count),
             );
         }
     }
