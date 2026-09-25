@@ -6,7 +6,9 @@ use crate::{WalletContract, WalletContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{testutils::Events, token, Address, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{
+    contract, contractimpl, testutils::Events, token, Address, Env, IntoVal, String, Symbol, Val,
+};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -662,4 +664,166 @@ fn granting_on_an_archived_wallet_is_refused() {
     // Revocation still works so stale grants can be cleaned up.
     h.client.revoke_role(&owner, &id, &agent);
     assert_eq!(h.client.get_role(&id, &agent), None);
+}
+
+// --- Pre-execution policy check hook (Issue #207) ---
+
+/// A minimal standalone policy contract used to exercise the wallet's
+/// pre-execution hook against a real cross-contract callee. It allows any
+/// transfer of at most 1_000 and denies everything else.
+#[contract]
+pub struct StubPolicyContract;
+
+#[contractimpl]
+impl StubPolicyContract {
+    pub fn check_transfer(
+        env: Env,
+        _policy_id: String,
+        _asset: Address,
+        _recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if amount > 1_000 {
+            return Err(Error::PolicyDenied);
+        }
+        env.events()
+            .publish((Symbol::new(&env, "stub_ok"),), amount);
+        Ok(())
+    }
+}
+
+fn register_stub(h: &Harness) -> Address {
+    let id = h.env.register_contract(None, StubPolicyContract);
+    StubPolicyContractClient::new(&h.env, &id).address
+}
+
+/// Fund a fresh wallet owned by a fresh owner and grant `agent` the Agent
+/// role, returning (wallet_id, owner, agent).
+fn funded_agent_wallet(h: &Harness, deposit: i128) -> (u64, Address, Address) {
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let agent = Address::generate(&h.env);
+    h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+    mint(h, &owner, deposit);
+    h.client.deposit(&id, &owner, &h.token, &deposit);
+    (id, owner, agent)
+}
+
+#[test]
+fn transfer_passes_when_policy_allows() {
+    let h = setup();
+    let policy_id = register_stub(&h);
+    h.client.set_policy(&h.admin, &policy_id.clone());
+    assert_eq!(h.client.get_policy(), Some(policy_id));
+
+    let (id, _owner, agent) = funded_agent_wallet(&h, 5_000);
+
+    // At the cap the stub allows the spend.
+    let to = Address::generate(&h.env);
+    h.client.transfer(&agent, &id, &to, &h.token, &1_000);
+    assert_eq!(token_balance(&h, &to), 1_000);
+    assert_eq!(h.client.balance(&id, &h.token), 4_000);
+}
+
+#[test]
+fn transfer_rejected_when_policy_denies_and_nothing_moves() {
+    let h = setup();
+    h.client.set_policy(&h.admin, &register_stub(&h));
+
+    let (id, _owner, agent) = funded_agent_wallet(&h, 5_000);
+
+    // Above the stub's cap: the policy veto propagates out of the wallet.
+    let to = Address::generate(&h.env);
+    let res = h.client.try_transfer(&agent, &id, &to, &h.token, &2_000);
+    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
+    // No debit and no token movement — the hook fired before the ledger was
+    // touched.
+    assert_eq!(h.client.balance(&id, &h.token), 5_000);
+    assert_eq!(token_balance(&h, &to), 0);
+}
+
+#[test]
+fn withdraw_is_policy_gated_and_bypass_excuses_a_wallet() {
+    let h = setup();
+    h.client.set_policy(&h.admin, &register_stub(&h));
+
+    let (id, owner, _agent) = funded_agent_wallet(&h, 3_000);
+
+    // Withdrawals are outbound movements, so they are gated too; 2_000
+    // breaches the stub cap.
+    let res = h.client.try_withdraw(&owner, &id, &h.token, &2_000);
+    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
+    assert_eq!(h.client.balance(&id, &h.token), 3_000);
+
+    // Excusing the wallet removes the gate for that wallet only.
+    h.client.set_policy_bypass(&h.admin, &id, &true);
+    assert!(h.client.get_policy_bypass(&id));
+    h.client.withdraw(&owner, &id, &h.token, &2_000);
+    assert_eq!(token_balance(&h, &owner), 2_000);
+    assert_eq!(h.client.balance(&id, &h.token), 1_000);
+
+    // A different wallet stays gated.
+    let other = h.client.create_wallet(&Address::generate(&h.env));
+    assert!(!h.client.get_policy_bypass(&other));
+}
+
+#[test]
+fn no_policy_wired_means_ungated_spending() {
+    let h = setup();
+    assert_eq!(h.client.get_policy(), None);
+
+    let (id, _owner, agent) = funded_agent_wallet(&h, 5_000);
+
+    // Without a wired policy, amounts above any cap still move.
+    let to = Address::generate(&h.env);
+    h.client.transfer(&agent, &id, &to, &h.token, &4_000);
+    assert_eq!(token_balance(&h, &to), 4_000);
+    assert_eq!(h.client.balance(&id, &h.token), 1_000);
+}
+
+#[test]
+fn clear_policy_removes_the_gate() {
+    let h = setup();
+    h.client.set_policy(&h.admin, &register_stub(&h));
+
+    let (id, owner, agent) = funded_agent_wallet(&h, 5_000);
+
+    let to = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_transfer(&agent, &id, &to, &h.token, &2_000),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Clearing the gate needs the admin; afterwards the same spend passes.
+    let res = h.client.try_clear_policy(&owner);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    h.client.clear_policy(&h.admin);
+    assert_eq!(h.client.get_policy(), None);
+
+    h.client.transfer(&agent, &id, &to, &h.token, &2_000);
+    assert_eq!(token_balance(&h, &to), 2_000);
+}
+
+#[test]
+fn set_policy_requires_admin_and_existing_wallets_for_bypass() {
+    let h = setup();
+    let policy_id = register_stub(&h);
+
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_set_policy(&stranger, &policy_id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+    h.client.set_policy(&h.admin, &policy_id);
+
+    // Bypass can only be configured for wallets that exist.
+    let res = h.client.try_set_policy_bypass(&h.admin, &999u64, &true);
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    h.client.set_policy_bypass(&h.admin, &id, &true);
+    assert!(h.client.get_policy_bypass(&id));
+    // Clearing a bypass that is set just flips the flag off.
+    h.client.set_policy_bypass(&h.admin, &id, &false);
+    assert!(!h.client.get_policy_bypass(&id));
 }
