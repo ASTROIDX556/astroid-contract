@@ -471,7 +471,7 @@ fn escrow_constraints_are_enforced_end_to_end() {
     assert_eq!(h.escrow.get(&escrow_id).state, EscrowState::Funded);
 
     // 3. The sender claws the funds back after the deadline + grace.
-    h.escrow.refund(&h.wallet.address, &escrow_id);
+    h.escrow.refund(&h.treasury.address, &escrow_id);
     assert_eq!(h.escrow.get(&escrow_id).state, EscrowState::Refunded);
     assert_eq!(token_balance(&h, &h.escrow.address), 0);
     assert_eq!(h.wallet.balance(&wallet_id, &h.asset), 20_000);
