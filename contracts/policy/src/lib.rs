@@ -17,7 +17,9 @@
 //! right now?" with a deterministic [`Error`] when it may not.
 //!
 //! Functions: `initialize`, `register_policy`, `rotate_policy`, `set_allowance`,
-//! `get_allowance`, `check_allowance`, `update_allowance`, `check_transfer`.
+//! `set_recurring_allowance`, `get_allowance`, `check_allowance`,
+//! `update_allowance`, `check_transfer`, `check_multi_asset_transfer`,
+//! `record_multi_asset_spend`.
 //!
 //! ## Multi-token allowances
 //!
@@ -25,6 +27,38 @@
 //! Stellar asset type (native XLM or a Soroban SAC token) is tracked under its
 //! own `(policy_id, asset)` key, so evaluation is safe against overflow and
 //! cheap (single persistent read/write).
+//!
+//! ## Recurring (rate-limited) allowances
+//!
+//! An allowance configured with `window_seconds > 0` (see
+//! `set_recurring_allowance`) is a rate limit: at most `limit` may be spent
+//! per fixed window of `window_seconds`. Windows are anchored at
+//! `window_start` (the ledger time the window was configured) and the period
+//! containing `now` is
+//!
+//! ```text
+//! k      = (now - window_start) / window_seconds      (integer division)
+//! period = [window_start + k*window_seconds, window_start + (k+1)*window_seconds)
+//! ```
+//!
+//! so a request at exactly `window_start + window_seconds` belongs to the
+//! NEW period. Transitions are settled lazily on every read and spend: when
+//! `k >= 1`, `spent` resets to zero and `window_start` re-anchors to the
+//! boundary (not to `now`), so windows never drift and an allowance left idle
+//! for many periods settles every missed reset at once. Time always comes
+//! from `env.ledger().timestamp()`; no caller-supplied time is accepted.
+//! `window_seconds == 0` keeps the allowance cumulative (one-shot).
+//!
+//! ## Multi-asset spending requests
+//!
+//! `check_multi_asset_transfer` and `record_multi_asset_spend` evaluate one
+//! request that moves several assets to a single recipient. Entries for the
+//! same asset are summed (checked) before any gate runs, so an over-limit
+//! spend cannot be split into several under-limit entries. Each asset is then
+//! evaluated against its own gates and allowance only; raw amounts of
+//! different assets are never compared or summed, since their decimals
+//! differ. Evaluation is all-or-nothing: every asset is validated before any
+//! spend is recorded.
 //!
 //! ## Asset deny list
 //!
@@ -45,14 +79,22 @@ use astroid_interfaces::PolicyInterface;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::math::{checked_add, checked_sub};
-use astroid_shared::validation::{require_non_empty, require_non_negative_amount};
+use astroid_shared::types::AssetAmount;
+use astroid_shared::validation::{
+    require_non_empty, require_non_negative_amount, require_positive_amount,
+};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Map, String, Vec,
 };
 
 /// Maximum recursion depth for composite rule evaluation to prevent stack
 /// overflows and excessive gas consumption on-chain.
 const MAX_RULE_DEPTH: u32 = 10;
+
+/// Maximum number of entries in one multi-asset spending request. Every
+/// distinct asset costs a few storage reads, so this bounds the worst-case
+/// cost of a single evaluation.
+const MAX_SPEND_ENTRIES: u32 = 10;
 
 /// A transaction payload submitted for policy evaluation.
 ///
@@ -241,6 +283,37 @@ pub struct AssetAllowance {
     pub spent: i128,
     /// Unix timestamp the allowance expires at (`0` = never).
     pub expires_at: u64,
+    /// Rate-limit window length in seconds. `0` = cumulative (never resets).
+    pub window_seconds: u64,
+    /// Start of the current window (unix seconds). Sits on a window boundary
+    /// once the allowance has rolled over at least once.
+    pub window_start: u64,
+}
+
+/// Settle every rate-limit window boundary that has passed by `now`.
+///
+/// With `k = (now - window_start) / window_seconds` whole windows elapsed
+/// (integer division, rounding down), `k >= 1` resets `spent` and moves
+/// `window_start` forward by exactly `k * window_seconds`. A ledger time
+/// earlier than `window_start` settles nothing, so the current usage stays in
+/// force (the conservative outcome). Cumulative allowances are untouched.
+fn settle_window(allowance: &mut AssetAllowance, now: u64) -> Result<(), Error> {
+    if allowance.window_seconds == 0 || now < allowance.window_start {
+        return Ok(());
+    }
+    let periods = (now - allowance.window_start) / allowance.window_seconds;
+    if periods == 0 {
+        return Ok(());
+    }
+    let advance = periods
+        .checked_mul(allowance.window_seconds)
+        .ok_or(Error::Overflow)?;
+    allowance.window_start = allowance
+        .window_start
+        .checked_add(advance)
+        .ok_or(Error::Overflow)?;
+    allowance.spent = 0;
+    Ok(())
 }
 
 #[contract]
@@ -729,6 +802,7 @@ impl PolicyContract {
 
     /// Create or update the spending allowance for `(policy_id, asset)`.
     /// `owner` only. Rejects a negative limit. `expires_at == 0` means never.
+    /// An existing rate-limit window is kept; a new allowance is cumulative.
     pub fn set_allowance(
         env: Env,
         caller: Address,
@@ -737,15 +811,63 @@ impl PolicyContract {
         limit: i128,
         expires_at: u64,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::store_allowance(&env, &caller, policy_id, asset, limit, None, expires_at)
+    }
+
+    /// Create or update a recurring (rate-limited) allowance: at most `limit`
+    /// of `asset` per fixed window of `window_seconds`. `owner` only.
+    /// `window_seconds == 0` makes the allowance cumulative. Changing the
+    /// window length re-anchors the window at the current ledger time; spend
+    /// already recorded in the current window is kept either way.
+    pub fn set_recurring_allowance(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        asset: Address,
+        limit: i128,
+        window_seconds: u64,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::store_allowance(
+            &env,
+            &caller,
+            policy_id,
+            asset,
+            limit,
+            Some(window_seconds),
+            expires_at,
+        )
+    }
+
+    fn store_allowance(
+        env: &Env,
+        caller: &Address,
+        policy_id: String,
+        asset: Address,
+        limit: i128,
+        window_seconds: Option<u64>,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(env, caller, &policy_id)?;
         require_non_negative_amount(limit)?;
         // Updating an allowance keeps existing spend so limits are enforced
-        // cumulatively across updates.
+        // cumulatively across updates. Settling first means a reset that is
+        // already due is neither lost nor deferred by the update.
+        let now = env.ledger().timestamp();
         let mut allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Allowance(policy_id.clone(), asset.clone()))
+        {
+            allowance.window_start = now;
+        }
+        if let Some(window) = window_seconds {
+            if window != allowance.window_seconds {
+                allowance.window_seconds = window;
+                allowance.window_start = now;
+            }
+        }
         allowance.limit = limit;
         allowance.expires_at = expires_at;
         allowance.policy_id = policy_id.clone();
@@ -787,9 +909,12 @@ impl PolicyContract {
 
     /// Read the current allowance for `(policy_id, asset)`. Returns the stored
     /// record, or a zeroed record when none has been configured (so callers can
-    /// treat an unset allowance as "unrestricted").
+    /// treat an unset allowance as "unrestricted"). A recurring allowance is
+    /// reported as of the current window: a window boundary that has passed
+    /// shows `spent == 0` even before the next spend persists the reset.
     pub fn get_allowance(env: Env, policy_id: String, asset: Address) -> AssetAllowance {
-        env.storage()
+        let mut allowance = env
+            .storage()
             .persistent()
             .get(&DataKey::Allowance(policy_id.clone(), asset.clone()))
             .unwrap_or(AssetAllowance {
@@ -798,7 +923,16 @@ impl PolicyContract {
                 limit: 0,
                 spent: 0,
                 expires_at: 0,
-            })
+                window_seconds: 0,
+                window_start: 0,
+            });
+        // `window_start + k * window_seconds <= now` always holds, so settling
+        // cannot overflow; keep the stored record if it somehow would.
+        let mut settled = allowance.clone();
+        if settle_window(&mut settled, env.ledger().timestamp()).is_ok() {
+            allowance = settled;
+        }
+        allowance
     }
 
     /// Check whether spending `amount` of `asset` under `policy_id` is within
@@ -814,25 +948,16 @@ impl PolicyContract {
         amount: i128,
     ) -> Result<i128, Error> {
         require_non_negative_amount(amount)?;
-        let allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
-        // No configured allowance => unrestricted for this asset.
-        if allowance.limit == 0 {
-            return Ok(i128::MAX);
+        match Self::consume_allowance(&env, &policy_id, &asset, amount)? {
+            // No configured allowance => unrestricted for this asset.
+            None => Ok(i128::MAX),
+            Some(allowance) => checked_sub(allowance.limit, allowance.spent),
         }
-        if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
-            events_policy_violation(&env, &policy_id, "allowance_expired");
-            return Err(Error::PolicyDenied);
-        }
-        let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
-        if amount > headroom_after_spend {
-            events_policy_violation(&env, &policy_id, "allowance_exceeded");
-            return Err(Error::PolicyAllowanceExceeded);
-        }
-        checked_sub(headroom_after_spend, amount)
     }
 
     /// Atomically consume `amount` against the `(policy_id, asset)` allowance.
-    /// Returns `Ok(())` when the allowance was decremented, or
+    /// Policy `owner` only; `amount` must be strictly positive. Returns
+    /// `Ok(())` when the allowance was decremented (or none is configured), or
     /// [`Error::PolicyAllowanceExceeded`] when it would be breached.
     pub fn update_allowance(
         env: Env,
@@ -841,29 +966,48 @@ impl PolicyContract {
         asset: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        require_non_negative_amount(amount)?;
-        let mut allowance = Self::get_allowance(env.clone(), policy_id.clone(), asset.clone());
-        // No configured allowance => nothing to enforce.
-        if allowance.limit == 0 {
-            return Ok(());
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        require_positive_amount(amount)?;
+        if let Some(allowance) = Self::consume_allowance(&env, &policy_id, &asset, amount)? {
+            Self::persist_spend(&env, &allowance, amount);
         }
-        if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
-            return Err(Error::PolicyDenied);
+        Ok(())
+    }
+
+    // --- multi-asset spending requests ---
+
+    /// Evaluate a request that moves several assets to `recipient`, without
+    /// recording it. Entries for the same asset are summed before any gate
+    /// runs, then every asset must pass the same gates as `check_transfer`
+    /// against its own allowance. Every amount must be strictly positive and
+    /// the request must hold between 1 and `MAX_SPEND_ENTRIES` entries.
+    pub fn check_multi_asset_transfer(
+        env: Env,
+        policy_id: String,
+        recipient: Address,
+        amounts: Vec<AssetAmount>,
+    ) -> Result<(), Error> {
+        Self::evaluate_spend(&env, &policy_id, &recipient, &amounts)?;
+        Ok(())
+    }
+
+    /// Evaluate a multi-asset request exactly as `check_multi_asset_transfer`
+    /// and, only if every asset passes, record the spend against each asset's
+    /// allowance. Policy `owner` only. A request with one failing asset
+    /// records nothing for any asset.
+    pub fn record_multi_asset_spend(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        recipient: Address,
+        amounts: Vec<AssetAmount>,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let (totals, updated) = Self::evaluate_spend(&env, &policy_id, &recipient, &amounts)?;
+        for allowance in updated.iter() {
+            let amount = totals.get(allowance.asset.clone()).ok_or(Error::NotFound)?;
+            Self::persist_spend(&env, &allowance, amount);
         }
-        let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
-        if amount > headroom_after_spend {
-            return Err(Error::PolicyAllowanceExceeded);
-        }
-        allowance.spent = checked_add(allowance.spent, amount)?;
-        env.storage().persistent().set(
-            &DataKey::Allowance(policy_id.clone(), asset.clone()),
-            &allowance,
-        );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("allow_use")),
-            (policy_id, asset, amount, allowance.spent),
-        );
         Ok(())
     }
 
@@ -971,6 +1115,198 @@ impl PolicyContract {
         }
         Ok(())
     }
+
+    /// Return the `(policy_id, asset)` allowance with `amount` consumed in the
+    /// current window, or the error that denies the spend. Nothing is
+    /// persisted. `None` means no allowance is configured (limit `0`), so there
+    /// is nothing to enforce or record. `amount == headroom` is permitted.
+    fn consume_allowance(
+        env: &Env,
+        policy_id: &String,
+        asset: &Address,
+        amount: i128,
+    ) -> Result<Option<AssetAllowance>, Error> {
+        let mut allowance: AssetAllowance = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(policy_id.clone(), asset.clone()))
+        {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        if allowance.limit == 0 {
+            return Ok(None);
+        }
+        let now = env.ledger().timestamp();
+        if allowance.expires_at != 0 && now >= allowance.expires_at {
+            events_policy_violation(env, policy_id, "allowance_expired");
+            return Err(Error::PolicyDenied);
+        }
+        settle_window(&mut allowance, now)?;
+        // Negative when the limit was lowered below what is already spent, in
+        // which case every positive amount is rejected.
+        let headroom = checked_sub(allowance.limit, allowance.spent)?;
+        if amount > headroom {
+            events_policy_violation(env, policy_id, "allowance_exceeded");
+            return Err(Error::PolicyAllowanceExceeded);
+        }
+        allowance.spent = checked_add(allowance.spent, amount)?;
+        Ok(Some(allowance))
+    }
+
+    /// Store an allowance returned by [`Self::consume_allowance`] and emit the
+    /// `allow_use` event.
+    fn persist_spend(env: &Env, allowance: &AssetAllowance, amount: i128) {
+        env.storage().persistent().set(
+            &DataKey::Allowance(allowance.policy_id.clone(), allowance.asset.clone()),
+            allowance,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("allow_use")),
+            (
+                allowance.policy_id.clone(),
+                allowance.asset.clone(),
+                amount,
+                allowance.spent,
+            ),
+        );
+    }
+
+    /// Sum a multi-asset request per asset. Rejects an empty or oversized
+    /// request with [`Error::InvalidInput`], a non-positive entry with
+    /// [`Error::InvalidAmount`] and a per-asset total that does not fit an
+    /// `i128` with [`Error::Overflow`].
+    fn aggregate_amounts(
+        env: &Env,
+        amounts: &Vec<AssetAmount>,
+    ) -> Result<Map<Address, i128>, Error> {
+        if amounts.is_empty() || amounts.len() > MAX_SPEND_ENTRIES {
+            return Err(Error::InvalidInput);
+        }
+        let mut totals: Map<Address, i128> = Map::new(env);
+        for entry in amounts.iter() {
+            require_positive_amount(entry.amount)?;
+            let total = checked_add(totals.get(entry.asset.clone()).unwrap_or(0), entry.amount)?;
+            totals.set(entry.asset, total);
+        }
+        Ok(totals)
+    }
+
+    /// Validate a whole multi-asset request. Returns the per-asset totals and
+    /// the allowance records as they would be after the spend (only for
+    /// assets with a configured allowance). Persists nothing.
+    fn evaluate_spend(
+        env: &Env,
+        policy_id: &String,
+        recipient: &Address,
+        amounts: &Vec<AssetAmount>,
+    ) -> Result<(Map<Address, i128>, Vec<AssetAllowance>), Error> {
+        let totals = Self::aggregate_amounts(env, amounts)?;
+        let policy = Self::check_policy_gates(env, policy_id, recipient)?;
+        let mut updated = Vec::new(env);
+        for (asset, total) in totals.iter() {
+            if let Some(allowance) =
+                Self::check_asset_gates(env, &policy, policy_id, &asset, recipient, total)?
+            {
+                updated.push_back(allowance);
+            }
+        }
+        Ok((totals, updated))
+    }
+
+    /// Asset-independent gates: the policy exists, is enabled, the recipient
+    /// is not blocked and the policy has not expired. Blocklist checks run
+    /// before any allowance, asset or amount evaluation (Issue #32).
+    fn check_policy_gates(
+        env: &Env,
+        policy_id: &String,
+        recipient: &Address,
+    ) -> Result<Policy, Error> {
+        let policy = Self::load(env, policy_id)?;
+        // Disabled policies deny every spend.
+        if !policy.enabled {
+            events_policy_violation(env, policy_id, "disabled");
+            return Err(Error::PolicyDenied);
+        }
+        // --- Blocklist checks (Issue #32) — evaluated first ---
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(recipient.clone()))
+        {
+            events_policy_violation(env, policy_id, "blacklisted");
+            return Err(Error::PolicyRecipientRestricted);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()))
+        {
+            events_policy_violation(env, policy_id, "merchant_blocked");
+            return Err(Error::PolicyMerchantBlocked);
+        }
+        if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
+            events_policy_violation(env, policy_id, "expired");
+            return Err(Error::PolicyDenied);
+        }
+        Ok(policy)
+    }
+
+    /// Per-asset gates for `amount` of `asset`, evaluated against that asset's
+    /// own rules only. Returns the allowance record as it would be after the
+    /// spend (see [`Self::consume_allowance`]).
+    fn check_asset_gates(
+        env: &Env,
+        policy: &Policy,
+        policy_id: &String,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Result<Option<AssetAllowance>, Error> {
+        if policy.max_amount != 0 && amount > policy.max_amount {
+            events_policy_violation(env, policy_id, "above_max");
+            return Err(Error::PolicyDenied);
+        }
+        if let Some(allow_recip) = &policy.allowed_recipient {
+            if allow_recip != recipient {
+                events_policy_violation(env, policy_id, "bad_recipient");
+                return Err(Error::PolicyDenied);
+            }
+        }
+        if let Some(allow_asset) = &policy.allowed_asset {
+            if allow_asset != asset {
+                events_policy_violation(env, policy_id, "bad_asset");
+                return Err(Error::PolicyDenied);
+            }
+        }
+        // The asset deny list wins over every allow gate, so blacklisting an
+        // allow-listed or whitelisted asset takes effect immediately.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::AssetBlacklist(policy_id.clone(), asset.clone()))
+        {
+            events_policy_violation(env, policy_id, "asset_blacklisted");
+            return Err(Error::PolicyDenied);
+        }
+        // Check asset whitelist (Issue #37)
+        Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
+        // Multi-token allowance gate: reject a spend that would breach the
+        // per-(policy, asset) allowance. An unset allowance is unrestricted.
+        let allowance = Self::consume_allowance(env, policy_id, asset, amount)?;
+        // --- Composite rule evaluation ---
+        let payload = TransactionPayload {
+            asset: asset.clone(),
+            recipient: recipient.clone(),
+            amount,
+        };
+        let rule_result = Self::evaluate_composite_rule(env.clone(), policy_id.clone(), payload)?;
+        if !rule_result {
+            events_policy_violation(env, policy_id, "rule_denied");
+            return Err(Error::PolicyDenied);
+        }
+        Ok(allowance)
+    }
 }
 
 /// Allow the interface trait to call `check_transfer` on this contract.
@@ -988,76 +1324,11 @@ impl PolicyInterface for PolicyContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        let policy = Self::load(&env, &policy_id)?;
-        // Disabled policies deny every spend.
-        if !policy.enabled {
-            events_policy_violation(&env, &policy_id, "disabled");
-            return Err(Error::PolicyDenied);
-        }
-        // --- Blocklist checks (Issue #32) — evaluated first ---
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Blacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "blacklisted");
-            return Err(Error::PolicyRecipientRestricted);
-        }
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
-        }
-        // --- Allowance / amount gates ---
-        if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
-            events_policy_violation(&env, &policy_id, "expired");
-            return Err(Error::PolicyDenied);
-        }
-        if policy.max_amount != 0 && amount > policy.max_amount {
-            events_policy_violation(&env, &policy_id, "above_max");
-            return Err(Error::PolicyDenied);
-        }
-        if let Some(allow_recip) = &policy.allowed_recipient {
-            if allow_recip.clone() != recipient {
-                events_policy_violation(&env, &policy_id, "bad_recipient");
-                return Err(Error::PolicyDenied);
-            }
-        }
-        if let Some(allow_asset) = &policy.allowed_asset {
-            if allow_asset.clone() != asset {
-                events_policy_violation(&env, &policy_id, "bad_asset");
-                return Err(Error::PolicyDenied);
-            }
-        }
-        // The asset deny list wins over every allow gate, so blacklisting an
-        // allow-listed or whitelisted asset takes effect immediately.
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::AssetBlacklist(policy_id.clone(), asset.clone()))
-        {
-            events_policy_violation(&env, &policy_id, "asset_blacklisted");
-            return Err(Error::PolicyDenied);
-        }
-        // Check asset whitelist (Issue #37)
-        Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
-        // Multi-token allowance gate: reject a spend that would breach the
-        // per-(policy, asset) allowance. An unset allowance is unrestricted.
-        Self::check_allowance(env.clone(), policy_id.clone(), asset.clone(), amount)?;
-        // --- Composite rule evaluation ---
-        let payload = TransactionPayload {
-            asset: asset.clone(),
-            recipient: recipient.clone(),
-            amount,
-        };
-        let rule_result = Self::evaluate_composite_rule(env.clone(), policy_id.clone(), payload)?;
-        if !rule_result {
-            events_policy_violation(&env, &policy_id, "rule_denied");
-            return Err(Error::PolicyDenied);
-        }
+        // A transfer moves a strictly positive amount; zero and negative
+        // requests are malformed and never reach the policy gates.
+        require_positive_amount(amount)?;
+        let policy = Self::check_policy_gates(&env, &policy_id, &recipient)?;
+        Self::check_asset_gates(&env, &policy, &policy_id, &asset, &recipient, amount)?;
         Ok(())
     }
 }
