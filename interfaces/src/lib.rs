@@ -21,6 +21,9 @@ pub mod upgrade;
 use crate::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::{contractclient, Address, Env, String};
+use astroid_shared::errors::Error;
+use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
+use soroban_sdk::{contractclient, Address, Env, String, Vec};
 
 /// Registry lookup surface. The registry is the protocol's source of truth for
 /// where each module/contract lives and who owns it (PRD Doc 7 §Registry).
@@ -31,6 +34,16 @@ pub trait RegistryInterface {
 
     /// Verify that `owner` is the recorded owner of `org`.
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error>;
+
+    /// Resolve several module registrations in one call.
+    ///
+    /// `result[i]` answers `ids[i]`: the output has the input's length and
+    /// order, duplicates included. An unregistered id yields `None` rather than
+    /// failing the batch; a deprecated one is reported with `deprecated: true`.
+    /// At most `MAX_REGISTRY_BATCH` ids may be requested; a longer list fails
+    /// with `InvalidInput` before any record is read. An empty list returns an
+    /// empty list.
+    fn get_modules_batch(env: Env, ids: Vec<ModuleId>) -> Result<Vec<Option<ModuleInfo>>, Error>;
 }
 
 /// Policy verification surface. Contracts call `check_transfer` to have a spend

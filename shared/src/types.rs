@@ -41,6 +41,27 @@ pub enum ModuleKind {
     Organization = 7,
 }
 
+/// Identifies one module registration in the Registry: the organization it
+/// belongs to and the kind of module. The same `(org, kind)` pair the single
+/// lookups take, bundled so a batch can carry a list of them.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleId {
+    pub org: String,
+    pub kind: ModuleKind,
+}
+
+/// A registered module as reported by a Registry batch lookup: its address and
+/// whether it is deprecated. A deprecated module is still reported (rather than
+/// failing the whole batch) so callers can see its status; the single-address
+/// routing lookup is what refuses to route to it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleInfo {
+    pub address: Address,
+    pub deprecated: bool,
+}
+
 /// An organization-scoped identifier. Astroid is multi-tenant, so most records
 /// are keyed by the organization they belong to.
 #[contracttype]

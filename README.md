@@ -51,6 +51,7 @@ Registry ──► Wallet ──► Treasury
 | `set_admin(caller, new_admin)` | Admin | Rotate the admin address. |
 | `lookup(org, kind)` | — | Interface method: resolve a module address for an org. |
 | `verify_owner(org, owner)` | — | Interface method: check if an address is the org owner. |
+| `get_modules_batch(ids)` | — | Interface method: resolve up to `MAX_REGISTRY_BATCH` (10) `(org, kind)` modules in one call. `result[i]` answers `ids[i]`; missing modules are `None`, deprecated ones are flagged. Oversized batches fail with `InvalidInput`. |
 
 ## Tech Stack
 
