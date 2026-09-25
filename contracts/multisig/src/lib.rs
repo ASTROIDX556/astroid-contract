@@ -59,6 +59,7 @@
 //! [`Error::TimelockNotExpired`]; governance calls from a non-signer with
 //! [`Error::UnauthorizedModification`].
 
+use astroid_interfaces::{MultisigInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS,
     MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_THRESHOLD, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
@@ -193,44 +194,6 @@ pub struct MultiSigContract;
 
 #[contractimpl]
 impl MultiSigContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Multisig`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Multisig,
-            wasm_hash,
-        )
-    }
     /// Initialize with an initial weighted signer set and a weight threshold.
     /// `threshold` must be within `[MIN_THRESHOLD, total_weight]` and the signer
     /// set within `MAX_SIGNERS`, with all weights positive and addresses unique.
@@ -728,52 +691,7 @@ impl MultiSigContract {
         Ok(())
     }
 
-    /// Verify that a collection of signatures over `payload` carries at least
-    /// the configured approval weight threshold.
-    ///
-    /// `caller` and every entry in `signatories` must be a registered signer and
-    /// must have authorized this exact payload — the Soroban host performs the
-    /// cryptographic signature verification via
-    /// [`Address::require_auth_for_args`], and binding the check to `payload`
-    /// means a signature collected for one operation can never be replayed
-    /// against another. Repeated signatories count once, so a single key can
-    /// never stack its own weight to reach the threshold alone.
-    ///
-    /// This exposes the same check `execute_batch` performs internally, so a
-    /// caller can verify a signature set against the threshold without asking
-    /// the multisig to execute anything.
-    ///
-    /// Returns the accumulated weight on success, [`Error::NotASigner`] when an
-    /// unregistered address is presented, and [`Error::ThresholdNotMet`] when
-    /// the verified weight falls short.
-    pub fn verify_threshold(
-        env: Env,
-        caller: Address,
-        signatories: Vec<Address>,
-        payload: Bytes,
-    ) -> Result<u32, Error> {
-        Self::require_not_locked(&env)?;
-        // A list longer than the maximum signer set can only hold duplicates or
-        // non-signers; reject it up front (gas safety).
-        if signatories.len() > MAX_SIGNERS {
-            return Err(Error::InvalidInput);
-        }
-        let signers = Self::signers(&env)?;
-        let threshold = Self::threshold(&env)?;
-        let args = vec![&env, payload.to_val()];
-        let weight = Self::accumulate_weight(&env, &signers, &caller, &signatories, &args)?;
-        if weight < threshold {
-            return Err(Error::ThresholdNotMet);
-        }
-        Ok(weight)
-    }
-
     // --- views ---
-
-    /// Voting weight of `who`, or 0 when it is not a registered signer.
-    pub fn get_signer_weight(env: Env, who: Address) -> u32 {
-        Self::weight_of(&env, &who).unwrap_or(0)
-    }
 
     /// Aggregate voting weight of the whole signer set.
     pub fn get_total_weight(env: Env) -> Result<u32, Error> {
@@ -797,21 +715,11 @@ impl MultiSigContract {
         Self::signers(&env).unwrap_or_else(|_| Vec::new(&env))
     }
 
-    pub fn get_threshold(env: Env) -> Result<u32, Error> {
-        Self::threshold(&env)
-    }
-
     pub fn get_pending_threshold(env: Env) -> Result<PendingThresholdChange, Error> {
         env.storage()
             .instance()
             .get(&DataKey::PendingThreshold)
             .ok_or(Error::NotFound)
-    }
-
-    pub fn is_signer(env: Env, who: Address) -> bool {
-        Self::signers(&env)
-            .map(|s| s.iter().any(|sw| sw.address == who))
-            .unwrap_or(false)
     }
 
     pub fn is_locked(env: Env) -> bool {
@@ -1236,6 +1144,106 @@ impl MultiSigContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quorum verification surface, exposed through `MultisigInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl MultisigInterface for MultiSigContract {
+    /// Verify that a collection of signatures over `payload` carries at least
+    /// the configured approval weight threshold.
+    ///
+    /// `caller` and every entry in `signatories` must be a registered signer and
+    /// must have authorized this exact payload — the Soroban host performs the
+    /// cryptographic signature verification via
+    /// [`Address::require_auth_for_args`], and binding the check to `payload`
+    /// means a signature collected for one operation can never be replayed
+    /// against another. Repeated signatories count once, so a single key can
+    /// never stack its own weight to reach the threshold alone.
+    ///
+    /// This exposes the same check `execute_batch` performs internally, so a
+    /// caller can verify a signature set against the threshold without asking
+    /// the multisig to execute anything.
+    ///
+    /// Returns the accumulated weight on success, [`Error::NotASigner`] when an
+    /// unregistered address is presented, and [`Error::ThresholdNotMet`] when
+    /// the verified weight falls short.
+    fn verify_threshold(
+        env: Env,
+        caller: Address,
+        signatories: Vec<Address>,
+        payload: Bytes,
+    ) -> Result<u32, Error> {
+        Self::require_not_locked(&env)?;
+        // A list longer than the maximum signer set can only hold duplicates or
+        // non-signers; reject it up front (gas safety).
+        if signatories.len() > MAX_SIGNERS {
+            return Err(Error::InvalidInput);
+        }
+        let signers = Self::signers(&env)?;
+        let threshold = Self::threshold(&env)?;
+        let args = vec![&env, payload.to_val()];
+        let weight = Self::accumulate_weight(&env, &signers, &caller, &signatories, &args)?;
+        if weight < threshold {
+            return Err(Error::ThresholdNotMet);
+        }
+        Ok(weight)
+    }
+
+    fn is_signer(env: Env, who: Address) -> bool {
+        Self::signers(&env)
+            .map(|s| s.iter().any(|sw| sw.address == who))
+            .unwrap_or(false)
+    }
+
+    /// Voting weight of `who`, or 0 when it is not a registered signer.
+    fn get_signer_weight(env: Env, who: Address) -> u32 {
+        Self::weight_of(&env, &who).unwrap_or(0)
+    }
+
+    fn get_threshold(env: Env) -> Result<u32, Error> {
+        Self::threshold(&env)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for MultiSigContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Multisig` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Multisig,
+            wasm_hash,
+        )
     }
 }
 

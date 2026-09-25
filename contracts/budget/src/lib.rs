@@ -40,7 +40,7 @@
 //! Functions: `allocate`, `set_recurrence`, `consume`, `reset`, `rollover`,
 //! `freeze`, `unfreeze`, `archive`, `transfer_allocation`.
 
-use astroid_interfaces::BudgetInterface;
+use astroid_interfaces::{BudgetInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
@@ -123,44 +123,6 @@ enum DataKey {
 pub struct BudgetContract;
 #[contractimpl]
 impl BudgetContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Budget`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Budget,
-            wasm_hash,
-        )
-    }
     /// Initialize with an admin (used only for protocol-level bookkeeping; all
     /// budget operations are owner-gated).
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
@@ -817,7 +779,8 @@ impl BudgetInterface for BudgetContract {
         );
         Ok(remaining)
     }
-    /// Read remaining allocation, accounting for a pending period transition.
+    /// Credit `amount` back to the budget. Fails with [`Error::InvalidAmount`]
+    /// when more is released than has been spent.
     fn release(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
@@ -831,6 +794,8 @@ impl BudgetInterface for BudgetContract {
         let capacity = astroid_shared::math::checked_add(budget.limit, budget.rollover_credit)?;
         astroid_shared::math::checked_sub(capacity, budget.spent)
     }
+
+    /// Read remaining allocation, accounting for a pending period transition.
     fn remaining(env: Env, budget_id: String) -> Result<i128, Error> {
         let mut budget = Self::load(&env, &budget_id)?;
         // Don't emit events from a read-only view, but persist the period
@@ -851,5 +816,45 @@ impl BudgetInterface for BudgetContract {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for BudgetContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Budget` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Budget,
+            wasm_hash,
+        )
+    }
+}
+
 #[cfg(test)]
 mod test;
