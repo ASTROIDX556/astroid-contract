@@ -17,6 +17,7 @@ doctest = false
 [dependencies]
 soroban-sdk = { workspace = true }
 astroid-shared = { workspace = true }
+astroid-interfaces = { workspace = true }
 
 # Integration tests deploy every workspace contract into a shared Env, so all
 # eight contracts are compiled in as dev-dependencies.
