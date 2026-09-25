@@ -20,7 +20,30 @@ fn setup(num_approvers: u32) -> Harness {
     env.ledger().set_timestamp(1_000);
     let contract_id = env.register_contract(None, ProposalContract);
     let client = ProposalContractClient::new(&env, &contract_id);
-    client.initialize();
+    client.initialize(&0);
+
+    let proposer = Address::generate(&env);
+    let mut approvers = std::vec::Vec::new();
+    for _ in 0..num_approvers {
+        approvers.push(Address::generate(&env));
+    }
+    Harness {
+        env,
+        client,
+        proposer,
+        approvers,
+    }
+}
+
+/// Like [`setup`], but with a mandatory non-zero timelock configured at
+/// initialization.
+fn setup_timelocked(num_approvers: u32, timelock: u64) -> Harness {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let contract_id = env.register_contract(None, ProposalContract);
+    let client = ProposalContractClient::new(&env, &contract_id);
+    client.initialize(&timelock);
 
     let proposer = Address::generate(&env);
     let mut approvers = std::vec::Vec::new();
@@ -189,7 +212,8 @@ fn expired_proposal_cannot_be_approved() {
 fn explicit_expire_transition() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);
-    // Cannot expire before deadline.
+    // Cannot expire before the deadline: the proposal has not entered the
+    // Expired state, so the transition does not apply yet.
     let early = h.client.try_expire(&id);
     assert_eq!(early, Err(Ok(Error::InvalidProposalState)));
     h.env.ledger().set_timestamp(6_000);
@@ -488,4 +512,334 @@ fn test_cancellation_grace_window() {
     h.client.cancel(&h.proposer, &id2); // works since 160 < 151 + 50 (created at 151)
 
     assert_eq!(h.client.state(&id2), crate::ProposalState::Cancelled);
+}
+
+// ---------------------------------------------------------------------------
+// Expiration gating
+//
+// The deadline is read from `env.ledger().timestamp()` at the moment of each
+// call, so the tests drive the deterministic ledger forward with
+// `env.ledger().with_mut` — sequence and timestamp together, exactly as the
+// host fixes them for a real invocation — and assert that every transition of
+// a stale proposal fails with the dedicated `ProposalExpired` code.
+// ---------------------------------------------------------------------------
+
+/// Advance the mock ledger to `sequence` / `timestamp`.
+fn advance(h: &Harness, sequence: u32, timestamp: u64) {
+    h.env.ledger().with_mut(|l| {
+        l.sequence_number = sequence;
+        l.timestamp = timestamp;
+    });
+}
+
+#[test]
+fn expired_proposal_cannot_be_rejected() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    advance(&h, 6, 6_000);
+    let res = h.client.try_reject(&h.approvers[0], &id);
+    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn expired_proposal_cannot_be_cancelled() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    advance(&h, 6, 6_000);
+    let res = h.client.try_cancel(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn expired_proposal_cannot_be_executed() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    advance(&h, 6, 6_000);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
+    // The stale approval never turned into an execution.
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn expired_proposal_cannot_be_failed() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+
+    advance(&h, 6, 6_000);
+    // The deadline, not the proposer, is what ended it: `expire` settles it.
+    let res = h.client.try_fail(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn expiry_boundary_is_inclusive() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+
+    advance(&h, 5, 4_999);
+    h.client.approve(&h.approvers[0], &id);
+
+    // One second later the deadline has been reached, so it counts as stale.
+    advance(&h, 6, 5_000);
+    assert_eq!(
+        h.client.try_approve(&h.approvers[1], &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert!(h.client.is_expired(&id));
+    h.client.expire(&id);
+    assert_eq!(h.client.state(&id), ProposalState::Expired);
+}
+
+#[test]
+fn ledger_timeline_blocks_every_stale_transition() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000); // created on sequence 1 at t = 1_000
+
+    // Milestone 1 — ledger 2, well before the deadline: approvals flow.
+    advance(&h, 2, 2_000);
+    h.client.approve(&h.approvers[0], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+
+    // Milestone 2 — ledger 6, past the deadline: every live transition is
+    // refused with the dedicated expired code, whatever the caller's rights.
+    advance(&h, 6, 5_001);
+    assert_eq!(
+        h.client.try_approve(&h.approvers[1], &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.approvers[1], &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(
+        h.client.try_cancel(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(
+        h.client.try_fail(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    // Nothing mutated: the proposal is still exactly where milestone 1 left it.
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+    assert_eq!(h.client.get(&id).approvals, 1);
+
+    // Milestone 3 — the permissionless transition records the terminal state.
+    h.client.expire(&id);
+    assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert_eq!(
+        h.client.try_expire(&id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+}
+
+#[test]
+fn proposal_without_deadline_never_expires() {
+    let h = setup(3);
+    let id = create(&h, 2, 0); // no deadline
+    advance(&h, 99, 4_000_000_000);
+    assert!(!h.client.is_expired(&id));
+    assert_eq!(
+        h.client.try_expire(&id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    // Still fully live: an approval lands normally.
+    h.client.approve(&h.approvers[0], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn is_expired_view_tracks_ledger_deadline() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    assert!(!h.client.is_expired(&id));
+    advance(&h, 5, 4_999);
+    assert!(!h.client.is_expired(&id));
+    advance(&h, 6, 5_000);
+    assert!(h.client.is_expired(&id));
+}
+
+#[test]
+fn cleanup_requires_a_passed_deadline() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    assert_eq!(
+        h.client.try_cleanup_expired(&id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    // A proposal without a deadline can never be purged either.
+    let never = create(&h, 2, 0);
+    assert_eq!(
+        h.client.try_cleanup_expired(&never),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn cleanup_waits_for_the_deposit_returning_transition() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    advance(&h, 6, 6_000);
+    // Stale, but the record still holds a live proposal (and its deposit):
+    // purging now would strand it, so the caller must expire it first.
+    assert_eq!(
+        h.client.try_cleanup_expired(&id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    h.client.expire(&id);
+    h.client.cleanup_expired(&id);
+    assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn cleanup_purges_the_record_and_its_approval_flags() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    advance(&h, 6, 6_000);
+    h.client.expire(&id);
+    h.client.cleanup_expired(&id);
+
+    assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+    // With the record gone, the approval flag can no longer be consulted.
+    assert_eq!(
+        h.client.try_approve(&h.approvers[1], &id),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn stale_prerequisite_blocks_the_dependent_chain() {
+    let h = setup(3);
+    let first = create(&h, 2, 5_000);
+    // The dependent proposal carries no deadline of its own, so only the
+    // prerequisite's expiry is under test.
+    let second = create_with_deps(&h, 2, 0, &[first]);
+
+    advance(&h, 6, 6_000);
+    // The prerequisite is stale: it can neither execute nor be approved, so
+    // the dependent proposal stays blocked rather than inheriting a stale step.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &first),
+        Err(Ok(Error::ProposalExpired))
+    );
+    h.client.expire(&first);
+    assert_eq!(h.client.state(&first), ProposalState::Expired);
+
+    // Approving the dependent is unaffected by its prerequisite's expiry ...
+    h.client.approve(&h.approvers[0], &second);
+    h.client.approve(&h.approvers[1], &second);
+    // ... but execution is still gated on the prerequisite having executed.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &second),
+        Err(Ok(Error::PrerequisiteNotMet))
+    );
+}
+
+// ------------------------------------------------------------- timelock ----
+
+/// Full approval, then a `get` view handy for timelock assertions.
+fn approve_to_threshold(h: &Harness, id: u64) {
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn approval_records_timestamp_used_by_the_timelock() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    assert_eq!(h.client.get(&id).approved_at, 0);
+
+    // Ledger time is 1_000 from setup: approval stamps exactly that moment.
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+
+    // Execution is refused well inside the 100s window.
+    h.env.ledger().set_timestamp(1_050);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // approved_at survives execution, recorded in the executed state too.
+    h.env.ledger().set_timestamp(1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+}
+
+#[test]
+fn execute_within_timelock_window_is_refused() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // One second before the delay elapses the proposal is still locked.
+    h.env.ledger().set_timestamp(1_099);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Exactly at release time execution is allowed (gate is `< release_at`).
+    h.env.ledger().set_timestamp(1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execute_after_timelock_window_succeeds() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // Long past the window, execution proceeds normally and emits "executed".
+    h.env.ledger().set_timestamp(5_000);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+
+    // Close still works from the executed state (timelock is behind us).
+    h.client.close(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Closed);
+}
+
+#[test]
+fn zero_timelock_allows_immediate_execution() {
+    let h = setup(3); // timelock 0 — the historical behaviour.
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn timelock_only_gates_execution_not_state_transitions() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // The timelock does not affect dependency queries.
+    assert!(h.client.dependencies_met(&id));
+
+    // Marking the proposal failed inside the window is still permitted.
+    h.env.ledger().set_timestamp(1_050);
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
 }

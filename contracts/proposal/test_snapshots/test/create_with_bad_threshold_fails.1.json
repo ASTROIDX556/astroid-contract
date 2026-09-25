@@ -51,6 +51,18 @@
                         "val": {
                           "u64": 0
                         }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Timelock"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
                       }
                     ]
                   }
@@ -104,7 +116,9 @@
                 "symbol": "initialize"
               }
             ],
-            "data": "void"
+            "data": {
+              "u64": 0
+            }
           }
         }
       },

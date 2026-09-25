@@ -75,6 +75,11 @@
 //!   from start_time to end_time with optional cliff_time.
 //! - Partial and multiple gradual withdrawals by the beneficiary.
 //! - Deterministic `Error::TimeLockActive` when withdrawing before maturity or cliff.
+//!
+//! The time lock is enforced on every value-leaving path, including the
+//! arbiter's `release`: a scheduled escrow cannot be released ahead of its
+//! vesting schedule no matter how much settlement time remains (see
+//! [`EscrowContract::release`]).
 
 pub mod storage;
 
@@ -747,6 +752,12 @@ impl EscrowContract {
     /// Release the escrowed assets to the recipient. Only the arbiter may call,
     /// and only before the deadline — afterward the sender reclaims via `refund`.
     ///
+    /// Time-locked escrows additionally gate on the release schedule: a `Cliff`
+    /// schedule refuses any release before its `cliff_time`, and a `Linear`
+    /// schedule refuses a release before the cliff or beyond the amount vested
+    /// at the current ledger timestamp, both with the deterministic
+    /// [`Error::TimeLockActive`] error.
+    ///
     /// `release_amount` is the amount to release this call. Partial releases are
     /// supported: the cumulative `released_amount` is tracked on the escrow and
     /// must not exceed `funded_amount`. A full release transitions the escrow to
@@ -764,7 +775,34 @@ impl EscrowContract {
         if env.storage().persistent().has(&DataKey::Milestones(id)) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() >= escrow.deadline + escrow.grace_period {
+        // Issue #238 — time-lock validation. A schedule-backed escrow can only
+        // be released once its own release schedule has matured, regardless of
+        // how much time is left on the settlement deadline:
+        //
+        // - `Cliff` schedules unlock everything at `cliff_time` (= `end_time`),
+        //   so a release before maturity is premature by definition.
+        // - `Linear` schedules vest continuously between `start_time` and
+        //   `end_time`; nothing has vested before `cliff_time` and any partial
+        //   release may not exceed the amount vested at the current ledger
+        //   timestamp.
+        //
+        // Deterministic error: [`Error::TimeLockActive`] while the lock holds.
+        // Both checks read the ledger clock via `env.ledger().timestamp()`.
+        let now = env.ledger().timestamp();
+        if matches!(escrow.schedule.release_type, ReleaseType::Cliff) {
+            if now < escrow.schedule.cliff_time {
+                return Err(Error::TimeLockActive);
+            }
+        } else if matches!(escrow.schedule.release_type, ReleaseType::Linear) {
+            if now < escrow.schedule.cliff_time {
+                return Err(Error::TimeLockActive);
+            }
+            let vested = calculate_vested_amount(escrow.funded_amount, &escrow.schedule, now)?;
+            if release_amount > vested {
+                return Err(Error::TimeLockActive);
+            }
+        }
+        if now >= escrow.deadline + escrow.grace_period {
             // Past the grace window the arbiter can no longer release. We do NOT
             // persist an `Expired` transition here: returning `Err` rolls back every
             // storage write, so the marker is set through the permissionless `expire`
@@ -900,16 +938,26 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Refund remaining funds back to the sender after the deadline.
+    /// Refund remaining funds back to the sender once the escrow has timed out.
+    ///
+    /// Only the stored `sender` may refund. Timing uses the ledger clock:
+    /// before `deadline` the call fails with [`Error::TimeLockActive`], during
+    /// `[deadline, deadline + grace_period)` with [`Error::GraceActive`]; from
+    /// `deadline + grace_period` onward (inclusive) the refund is permitted —
+    /// the same instant at which `release` starts failing with
+    /// [`Error::EscrowExpired`], so the two paths never overlap.
     pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
         if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
             return Err(Error::InvalidState);
         }
         if env.ledger().timestamp() < escrow.deadline {
             // Before the fulfillment deadline the escrow is still live.
-            return Err(Error::InvalidState);
+            return Err(Error::TimeLockActive);
         }
         if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
             // During the grace window the counterparty may still fulfill, so funds
@@ -1030,6 +1078,10 @@ impl EscrowContract {
         }
         if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
             return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            // Before the fulfillment deadline the escrow is still live.
+            return Err(Error::TimeLockActive);
         }
         // The grace window must have fully elapsed without fulfillment.
         let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
