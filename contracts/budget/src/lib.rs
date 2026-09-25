@@ -39,8 +39,23 @@
 //!
 //! Functions: `allocate`, `set_recurrence`, `consume`, `reset`, `rollover`,
 //! `freeze`, `unfreeze`, `archive`, `transfer_allocation`.
+//!
+//! ## Error codes
+//!
+//! Every handler validates its inputs before touching storage and fails with a
+//! stable code from the shared [`Error`] table rather than panicking:
+//!
+//! | Condition                                                   | Error                     |
+//! |-------------------------------------------------------------|---------------------------|
+//! | Spend / release / transfer amount `<= 0`                    | [`Error::InvalidAmount`]  |
+//! | Negative limit or rollover cap                              | [`Error::InvalidAmount`]  |
+//! | Limit below spent, expiry already passed, malformed period  | [`Error::InvalidInput`]   |
+//! | Spend would exceed the effective ceiling                    | [`Error::BudgetExceeded`] |
+//! | Checked arithmetic would overflow `i128`                    | [`Error::Overflow`]       |
+//! | Caller is not the budget owner                              | [`Error::Unauthorized`]   |
+//! | Budget is frozen / archived / expired                       | [`Error::BudgetFrozen`] / [`Error::BudgetArchived`] / [`Error::BudgetExpired`] |
 
-use astroid_interfaces::BudgetInterface;
+use astroid_interfaces::{BudgetInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
@@ -49,9 +64,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::math::{checked_add, checked_mul, checked_sub};
 use astroid_shared::types::ResourceState;
-use astroid_shared::validation::{
-    require_non_empty, require_non_negative_amount, require_positive_amount,
-};
+use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use astroid_shared::{constants, events};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
@@ -123,44 +136,6 @@ enum DataKey {
 pub struct BudgetContract;
 #[contractimpl]
 impl BudgetContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Budget`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Budget,
-            wasm_hash,
-        )
-    }
     /// Initialize with an admin (used only for protocol-level bookkeeping; all
     /// budget operations are owner-gated).
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
@@ -213,7 +188,11 @@ impl BudgetContract {
     ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&budget_id)?;
-        require_non_negative_amount(limit)?;
+        Self::require_valid_limit(limit)?;
+        // A budget that is already expired at creation could never be spent.
+        if expires_at != 0 && expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidInput);
+        }
         // Deficit carryforward only makes sense with a recurring period.
         if allow_deficit && period == Period::None {
             return Err(Error::InvalidInput);
@@ -269,7 +248,7 @@ impl BudgetContract {
         rollover_enabled: bool,
         rollover_cap: i128,
     ) -> Result<(), Error> {
-        require_non_negative_amount(rollover_cap)?;
+        Self::require_valid_limit(rollover_cap)?;
         if period == Period::Custom && period_seconds == 0 {
             return Err(Error::InvalidInput);
         }
@@ -304,6 +283,7 @@ impl BudgetContract {
     /// Rejects expired budgets.
     pub fn reset(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_not_archived(&budget)?;
         Self::require_not_expired(&env, &budget)?;
         budget.spent = 0;
         budget.rollover_credit = 0;
@@ -320,6 +300,7 @@ impl BudgetContract {
     /// so on its own.
     pub fn rollover(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_not_archived(&budget)?;
         Self::window_transition(&env, &mut budget, &budget_id, true)?;
         Self::store(&env, &budget_id, &budget);
         Ok(())
@@ -332,8 +313,9 @@ impl BudgetContract {
         budget_id: String,
         new_limit: i128,
     ) -> Result<(), Error> {
-        require_non_negative_amount(new_limit)?;
+        Self::require_valid_limit(new_limit)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_not_archived(&budget)?;
         Self::window_transition(&env, &mut budget, &budget_id, true)?;
         if new_limit < budget.spent {
             return Err(Error::InvalidInput);
@@ -406,6 +388,8 @@ impl BudgetContract {
         }
         Self::require_active(&from)?;
         Self::require_active(&to)?;
+        Self::require_not_expired(&env, &from)?;
+        Self::require_not_expired(&env, &to)?;
         // Only the unspent portion of `from` may be reallocated.
         let available = checked_sub(from.limit, from.spent)?;
         if amount > available {
@@ -435,9 +419,10 @@ impl BudgetContract {
         limit: i128,
         window_seconds: u64,
     ) -> Result<(), Error> {
+        Self::require_valid_limit(limit)?;
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
-        require_non_negative_amount(limit)?;
+        Self::require_not_expired(&env, &budget)?;
         let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
         let asset_budget = AssetBudget {
             limit,
@@ -464,6 +449,7 @@ impl BudgetContract {
         require_positive_amount(amount)?;
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
+        Self::require_not_expired(&env, &budget)?;
         let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
         let mut asset_budget: AssetBudget = env
             .storage()
@@ -546,6 +532,31 @@ impl BudgetContract {
             return Err(Error::Unauthorized);
         }
         Ok(budget)
+    }
+    /// Limits and rollover caps are non-negative (0 is a valid, closed budget).
+    fn require_valid_limit(limit: i128) -> Result<(), Error> {
+        if limit < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(())
+    }
+    /// Archiving is terminal: no administrative change may revive a budget.
+    fn require_not_archived(budget: &Budget) -> Result<(), Error> {
+        if budget.state == ResourceState::Archived {
+            return Err(Error::BudgetArchived);
+        }
+        Ok(())
+    }
+    /// Remaining allowance in the current period: base limit plus rollover
+    /// credit, less any carried-forward deficit and what has been spent.
+    fn effective_remaining(budget: &Budget) -> Result<i128, Error> {
+        let capacity = checked_add(budget.limit, budget.rollover_credit)?;
+        if budget.allow_deficit && budget.deficit_amount > 0 {
+            let net = checked_sub(capacity, budget.deficit_amount)?;
+            checked_sub(net, budget.spent)
+        } else {
+            checked_sub(capacity, budget.spent)
+        }
     }
     fn require_active(budget: &Budget) -> Result<(), Error> {
         match budget.state {
@@ -817,20 +828,25 @@ impl BudgetInterface for BudgetContract {
         );
         Ok(remaining)
     }
-    /// Read remaining allocation, accounting for a pending period transition.
+    /// Credit `amount` back to the budget (a refunded or cancelled spend).
+    /// Applies any pending period transition first, so an expired budget
+    /// fails with [`Error::BudgetExpired`] instead of silently accepting the
+    /// credit. Releasing more than has been spent in the current period fails
+    /// with [`Error::InvalidAmount`]. Returns the new remaining allocation.
     fn release(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
-        let _ = Self::window_transition(&env, &mut budget, &budget_id, true);
+        Self::window_transition(&env, &mut budget, &budget_id, true)?;
         if amount > budget.spent {
             return Err(Error::InvalidAmount);
         }
-        budget.spent = astroid_shared::math::checked_sub(budget.spent, amount)?;
+        budget.spent = checked_sub(budget.spent, amount)?;
         Self::store(&env, &budget_id, &budget);
-        let capacity = astroid_shared::math::checked_add(budget.limit, budget.rollover_credit)?;
-        astroid_shared::math::checked_sub(capacity, budget.spent)
+        Self::effective_remaining(&budget)
     }
+
+    /// Read remaining allocation, accounting for a pending period transition.
     fn remaining(env: Env, budget_id: String) -> Result<i128, Error> {
         let mut budget = Self::load(&env, &budget_id)?;
         // Don't emit events from a read-only view, but persist the period
@@ -840,16 +856,50 @@ impl BudgetInterface for BudgetContract {
         } else {
             return Ok(0);
         }
-        let capacity = checked_add(budget.limit, budget.rollover_credit)?;
-        if budget.allow_deficit && budget.deficit_amount > 0 {
-            // Remaining is reduced by the carried-forward deficit. Checked at
-            // every step: overflow returns [`Error::Overflow`], never wraps.
-            let net = checked_sub(capacity, budget.deficit_amount)?;
-            checked_sub(net, budget.spent)
-        } else {
-            checked_sub(capacity, budget.spent)
-        }
+        // Remaining is reduced by any carried-forward deficit. Checked at
+        // every step: overflow returns [`Error::Overflow`], never wraps.
+        Self::effective_remaining(&budget)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for BudgetContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Budget` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Budget,
+            wasm_hash,
+        )
+    }
+}
+
 #[cfg(test)]
 mod test;
