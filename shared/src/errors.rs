@@ -30,7 +30,9 @@ pub enum Error {
     PolicyRecipientRestricted = 22,
     PolicyMerchantBlocked = 23,
     PolicyCategoryRestricted = 24,
-    AssetNotWhitelisted = 25,
+    // 25 (`AssetNotWhitelisted`) retired: it meant the same thing as
+    // `AssetNotAuthorized` (43) and was consolidated into it, freeing a slot
+    // for `TreasuryPaused`. The value is never reused.
     /// A proposed spend would breach a per-asset spending allowance.
     PolicyAllowanceExceeded = 26,
 
@@ -42,6 +44,11 @@ pub enum Error {
     BudgetExceeded = 40,
     BudgetFrozen = 41,
     BudgetArchived = 42,
+    /// The named token contract is not on the organization's approved-asset
+    /// list. The canonical "asset not approved" code: consulted by the
+    /// treasury whitelist, the budget's asset registry and the policy
+    /// contract's per-policy asset whitelist alike (it also covers the value
+    /// formerly reported as `AssetNotWhitelisted`).
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
 
@@ -90,7 +97,12 @@ pub enum Error {
     EscrowNotExpired = 85,
     EscrowAlreadySettled = 86,
 
-    // --- Treasury allowances (83-84) ---
+    // --- Treasury (83-85) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
+    /// The treasury's emergency circuit breaker is engaged
+    /// (TREASURY_PAUSED): every outbound disbursement or transfer is refused
+    /// with this code until the guardian or multisig unpauses it. Inbound
+    /// deposits deliberately stay open so recovery funding can still arrive.
+    TreasuryPaused = 85,
 }

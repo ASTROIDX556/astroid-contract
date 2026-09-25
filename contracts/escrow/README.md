@@ -27,8 +27,12 @@ funder ──► create(sender, recipient, arbiter, assets[], deadline, memo,
   deadline. It is permissionless — the signatures are the authorization, so
   any relayer may submit them. Pass an empty signer set (and threshold `0`)
   at `create` time to disable this path for an escrow.
-- `refund` is permissionless after the deadline — a beneficiary that never
-  claims and an absent arbiter default back to the funder.
+- `refund` requires the recorded sender and opens once the escrow has timed
+  out: before `deadline` it fails with `TimeLockActive` (81), during the
+  grace period with `GraceActive` (82), and from `deadline + grace_period`
+  (inclusive, by ledger timestamp) it returns the funds to the sender. That is
+  the same instant `release` starts failing with `EscrowExpired` (80), so the
+  release and refund windows never overlap.
 - `close` (terminal) requires one of the three roles once the escrow is final.
 
 ## Invariants
