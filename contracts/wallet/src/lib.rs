@@ -378,7 +378,10 @@ impl WalletContract {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
-        Self::require_active(&wallet)?;
+        Self::require_active_for_transfer(&wallet)?;
+        // Pre-execution validation: reject invalid recipients before any policy
+        // or balance checks.
+        Self::validate_transfer_recipient(&env, &to)?;
         // Pre-execution policy check: the configured Policy contract gets a
         // veto over the spend before any value moves. A rejection aborts the
         // whole invocation with the policy's own deterministic error.
@@ -408,7 +411,7 @@ impl WalletContract {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
-        Self::require_active(&wallet)?;
+        Self::require_active_for_transfer(&wallet)?;
         // Pre-execution policy check — withdrawals are outbound movements too.
         Self::require_policy_allows(&env, wallet_id, &asset, &wallet.owner, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
@@ -718,6 +721,7 @@ impl WalletContract {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn require_active(wallet: &WalletData) -> Result<(), Error> {
         ensure!(wallet.state != ResourceState::Frozen, Error::WalletFrozen);
         ensure!(wallet.state != ResourceState::Paused, Error::WalletPaused);
@@ -725,6 +729,35 @@ impl WalletContract {
             wallet.state != ResourceState::Archived,
             Error::WalletArchived
         );
+        Ok(())
+    }
+
+    /// Like `require_active` but returns wallet-state-specific errors for
+    /// non-Active states to give transfer-specific error codes.
+    fn require_active_for_transfer(wallet: &WalletData) -> Result<(), Error> {
+        match wallet.state {
+            ResourceState::Frozen => Err(Error::WalletFrozen),
+            ResourceState::Paused => Err(Error::WalletPaused),
+            ResourceState::Archived => Err(Error::WalletArchived),
+            ResourceState::Active => Ok(()),
+        }
+    }
+
+    /// Validate that the transfer recipient is a valid address (not zero address
+    /// and not the contract itself).
+    fn validate_transfer_recipient(env: &Env, recipient: &Address) -> Result<(), Error> {
+        // Reject zero address (all zeros)
+        let zero_addr = Address::from_string(&String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if recipient == &zero_addr {
+            return Err(Error::InvalidInput);
+        }
+        // Reject self-transfer to the wallet contract
+        if recipient == &env.current_contract_address() {
+            return Err(Error::InvalidInput);
+        }
         Ok(())
     }
 
