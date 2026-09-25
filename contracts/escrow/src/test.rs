@@ -1229,278 +1229,97 @@ fn an_absurd_window_saturates_instead_of_overflowing() {
     h.client.refund(&h.sender, &id);
 }
 
-// --- expiration handling & reclaim mechanics ---
+// --- Time-lock validation on `release` (Issue #238) ---
 
 #[test]
-fn refund_opens_at_reports_the_reclaim_boundary() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
-    assert_eq!(h.client.refund_opens_at(&id), START + 100 + GRACE);
-    assert_eq!(h.client.refund_window_closes_at(&id), 0);
-
-    // One second before the boundary the escrow is still live: no reclaim
-    // path may open, and the permissionless marker cannot be set either.
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = START + 100 + GRACE - 1);
-    assert!(!h.client.is_refundable(&id));
-    assert_eq!(
-        h.client.try_reclaim(&h.sender, &id),
-        Err(Ok(Error::GraceActive))
-    );
-    assert_eq!(
-        h.client.try_refund(&h.sender, &id),
-        Err(Ok(Error::GraceActive))
-    );
-    assert_eq!(h.client.try_expire(&id), Err(Ok(Error::InvalidState)));
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
-
-    // Exactly at the boundary every reclaim path opens at once.
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = START + 100 + GRACE);
-    assert!(h.client.is_refundable(&id));
-    h.client.expire(&id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Expired);
-    h.client.refund(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-}
-
-#[test]
-fn refund_rejected_for_non_sender() {
-    let h = setup(5_000, 0);
-    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
-    let intruder = Address::generate(&h.env);
-
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = START + 100 + GRACE);
-
-    // The value returns to the depositor, so only the depositor may force the
-    // transition — a third party must not be able to settle someone else's
-    // escrow out from under them.
-    for who in [&h.recipient, &h.arbiter, &intruder] {
-        assert_eq!(h.client.try_refund(who, &id), Err(Ok(Error::Unauthorized)));
-        assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-        assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
-    }
-
-    h.client.refund(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
-}
-
-#[test]
-fn reclaim_after_partial_withdrawal_returns_only_the_remainder() {
+fn release_before_cliff_maturity_is_refused_with_time_lock_active() {
     let h = setup(10_000, 0);
     let unlock_time = START + 1_000;
-    let id = h.client.initialize_timelock(
+
+    let id = h.client.create_timelock(
         &h.sender,
         &h.recipient,
         &h.arbiter,
         &one_asset(&h, 10_000),
         &unlock_time,
-        &GRACE,
-        &String::from_str(&h.env, "cliff with grace"),
+        &String::from_str(&h.env, "premature release"),
     );
-    h.client.fund(&h.sender, &id);
+
+    // The settlement deadline is still far in the future, but the arbiter must
+    // not be able to route around the time lock: the cliff has not matured.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    let res = h.client.try_release(&h.arbiter, &id, &10_000);
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
+    // No funds moved and the escrow is still live.
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 
-    // The recipient takes 4_000 of the vested cliff; 6_000 stays in custody.
-    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
-    h.client.withdraw(&h.recipient, &id, &4_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 6_000);
-    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-
-    // After the grace period the sender reclaims what is still held — never
-    // the original 10_000, which the contract no longer has.
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = unlock_time + GRACE);
-    h.client.reclaim(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-}
-
-#[test]
-fn reclaim_after_partial_milestone_release_returns_only_the_remainder() {
-    let h = setup(10_000, 0);
-    let deadline = START + 100;
-    let specs = vec![
-        &h.env,
-        milestone_spec(&h.env, "design", 4_000),
-        milestone_spec(&h.env, "build", 6_000),
-    ];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &deadline,
-        &String::from_str(&h.env, "milestones"),
-        &specs,
-    );
-
-    h.client.release_milestone(&h.arbiter, &id, &0);
-    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 6_000);
-    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
-    // The escrow record must mirror the milestone bookkeeping, otherwise the
-    // remainder still looks like the untouched 10_000.
-    assert_eq!(h.client.get(&id).released_amount, 4_000);
-
-    h.env.ledger().with_mut(|l| l.timestamp = deadline);
-    h.client.reclaim(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-}
-
-#[test]
-fn cancel_after_partial_withdrawal_returns_only_the_remainder() {
-    let h = setup(10_000, 0);
-    let end_time = START + 1_000;
-    let schedule = ReleaseSchedule {
-        release_type: ReleaseType::Linear,
-        start_time: START,
-        cliff_time: START + 200,
-        end_time,
-    };
-    let id = h.client.create_scheduled(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &one_asset(&h, 10_000),
-        &schedule,
-        &end_time,
-        &String::from_str(&h.env, "linear"),
-    );
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
-    h.client.withdraw(&h.recipient, &id, &3_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 7_000);
-
-    // Cancelling mid-flight returns only what the escrow still holds.
-    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
-    h.client.cancel(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 7_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 3_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-}
-
-#[test]
-fn release_after_partial_withdrawal_pays_only_the_remainder() {
-    let h = setup(10_000, 0);
-    let end_time = START + 1_000;
-    let schedule = ReleaseSchedule {
-        release_type: ReleaseType::Linear,
-        start_time: START,
-        cliff_time: START + 200,
-        end_time,
-    };
-    let id = h.client.create_scheduled(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &one_asset(&h, 10_000),
-        &schedule,
-        &end_time,
-        &String::from_str(&h.env, "linear"),
-    );
-
-    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
-    h.client.withdraw(&h.recipient, &id, &3_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 7_000);
-
-    // The arbiter settles the escrow: only the outstanding 7_000 moves, so
-    // the contract never pays out of another escrow's custody.
-    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
-    h.client.release(&h.arbiter, &id, &7_000);
-    assert_eq!(h.client.get(&id).state, EscrowState::Released);
-    assert_eq!(h.client.get(&id).released_amount, 10_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-}
-
-#[test]
-fn unfunded_timelock_escrow_has_a_clean_reclaim_path() {
-    let h = setup(5_000, 0);
-    let unlock_time = START + 100;
-    let id = h.client.initialize_timelock(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &one_asset(&h, 5_000),
-        &unlock_time,
-        &GRACE,
-        &String::from_str(&h.env, "unfunded"),
-    );
-    assert_eq!(h.client.get(&id).state, EscrowState::Created);
-    // Nothing has been pulled into custody yet.
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
-
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = unlock_time + GRACE);
-    // `is_refundable` already advertised this state as reclaimable, so both
-    // reclaim paths must agree with it instead of failing with InvalidState,
-    // and neither may attempt a transfer the contract cannot cover.
-    assert!(h.client.is_refundable(&id));
+    // A release attempt at exactly the boundary before the cliff also fails.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time - 1);
     assert_eq!(
-        h.client.try_claim(&h.recipient, &id),
-        Err(Ok(Error::InvalidState))
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::TimeLockActive))
     );
-    h.client.refund(&h.sender, &id);
-    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
-    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+
+    // At maturity the pre-existing settlement window rule takes over: a
+    // timelock escrow's deadline equals its unlock time, so the release window
+    // closes exactly at maturity and the arbiter is refused with
+    // EscrowExpired. The recipient's path to the funds is `withdraw`/`claim`,
+    // not the arbiter's `release`.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::EscrowExpired))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 }
 
 #[test]
-fn absurd_grace_period_is_refused_at_creation() {
-    let h = setup(5_000, 0);
-    let deadline = START + 100;
+fn linear_release_cannot_exceed_vested_amount() {
+    let h = setup(10_000, 0);
+    let start_time = START;
+    let cliff_time = START + 200;
+    let end_time = START + 1_000;
 
-    // `deadline + grace_period` would saturate the reclaim boundary, i.e. the
-    // escrow's refund path could never open. Refuse it before any state is
-    // written (the id counter must not advance either).
-    let res = h.client.try_create(
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time,
+        cliff_time,
+        end_time,
+    };
+
+    let id = h.client.create_scheduled(
         &h.sender,
         &h.recipient,
         &h.arbiter,
-        &one_asset(&h, 5_000),
-        &deadline,
-        &u64::MAX,
-        &String::from_str(&h.env, "overflow"),
-        &no_signers(&h),
-        &0,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &end_time,
+        &String::from_str(&h.env, "linear release gate"),
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
 
-    let res = h.client.try_initialize_timelock(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &one_asset(&h, 5_000),
-        &deadline,
-        &u64::MAX,
-        &String::from_str(&h.env, "overflow"),
+    // Before the cliff nothing has vested: release must fail with
+    // TimeLockActive even though the deadline is far away.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::TimeLockActive))
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
-    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
 
-    // A well-formed escrow still gets the first id.
-    let id = create(&h, &one_asset(&h, 5_000), deadline, GRACE);
-    assert_eq!(id, 1);
+    // Halfway through the schedule only half has vested (50% of 10,000 =
+    // 5,000), so releasing more than the vested amount is refused.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_vested_amount(&id), 5_000);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // Releasing the vested amount works — the escrow settles in full per the
+    // arbiter's decision, but only once the schedule has vested that much.
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
 }

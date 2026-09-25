@@ -55,6 +55,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "astroid-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "astroid-budget",
+ "astroid-escrow",
+ "astroid-multisig",
+ "astroid-policy",
+ "astroid-proposal",
+ "astroid-registry",
+ "astroid-shared",
+ "astroid-treasury",
+ "astroid-wallet",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "astroid-interfaces"
 version = "0.1.0"
 dependencies = [
