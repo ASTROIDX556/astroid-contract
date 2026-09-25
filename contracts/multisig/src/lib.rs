@@ -289,6 +289,12 @@ impl MultiSigContract {
         if signers.len() >= MAX_SIGNERS {
             return Err(Error::TooManySigners);
         }
+        // The aggregate weight must stay representable, or every later
+        // threshold check would fail with `Overflow` and brick the multisig.
+        Self::to_weight(checked_add(
+            Self::total_weight(&signers)? as i128,
+            weight as i128,
+        )?)?;
         signers.push_back(SignerWeight {
             address: signer.clone(),
             weight,
@@ -309,8 +315,11 @@ impl MultiSigContract {
         let mut signers = Self::signers(&env)?;
         let threshold = Self::threshold(&env)?;
         let idx = Self::index_of(&signers, &signer)?;
-        let remaining_total = Self::total_weight(&signers)? - signers.get(idx).unwrap().weight;
-        if remaining_total < threshold {
+        let remaining_total = checked_sub(
+            Self::total_weight(&signers)? as i128,
+            signers.get(idx).unwrap().weight as i128,
+        )?;
+        if remaining_total < threshold as i128 {
             return Err(Error::InvalidThreshold);
         }
         signers.remove(idx);
@@ -368,6 +377,12 @@ impl MultiSigContract {
         if elapsed < THRESHOLD_CHANGE_DELAY_LEDGERS {
             return Err(Error::TimelockNotExpired);
         }
+        // The signer set may have shrunk while the change was pending; never
+        // install a threshold the remaining signers can no longer reach.
+        Self::validate_threshold(
+            pending.new_threshold,
+            Self::total_weight(&Self::signers(&env)?)?,
+        )?;
 
         env.storage()
             .instance()
@@ -571,6 +586,7 @@ impl MultiSigContract {
         env.storage()
             .persistent()
             .set(&DataKey::Approval(id, proposer.clone()), &true);
+        Self::bump_approval(&env, id, &proposer);
         Self::bump_proposal(&env, id);
         env.storage()
             .instance()
@@ -600,6 +616,7 @@ impl MultiSigContract {
         }
         let weight = Self::weight_of(&env, &caller)?;
         env.storage().persistent().set(&akey, &true);
+        Self::bump_approval(&env, proposal_id, &caller);
         proposal.approval_weight =
             checked_add(proposal.approval_weight as i128, weight as i128)? as u32;
         env.storage()
@@ -617,6 +634,11 @@ impl MultiSigContract {
     /// threshold and any time lock has elapsed. Marks it executed and emits
     /// `ProposalExecuted`. Rejects with [`Error::InsufficientWeight`] when the
     /// accumulated weight is below the threshold.
+    ///
+    /// Quorum is verified against the **live** signer set, not the running
+    /// total recorded at approval time: an approval from a signer who has since
+    /// been removed no longer counts, and a re-weighted signer counts at their
+    /// current weight. The recorded `approval_weight` is refreshed to match.
     pub fn execute(env: Env, caller: Address, proposal_id: u64) -> Result<(), Error> {
         Self::require_not_locked(&env)?;
         Self::require_signer(&env, &caller)?;
@@ -625,7 +647,9 @@ impl MultiSigContract {
             return Err(Error::InvalidProposalState);
         }
         let threshold = Self::threshold(&env)?;
-        if proposal.approval_weight < threshold {
+        let weight = Self::live_approval_weight(&env, proposal_id)?;
+        proposal.approval_weight = weight;
+        if weight < threshold {
             return Err(Error::InsufficientWeight);
         }
         if proposal.unlock_at != 0 {
@@ -876,6 +900,24 @@ impl MultiSigContract {
             .find(|s| &s.address == who)
             .map(|s| s.weight)
             .ok_or(Error::NotASigner)
+    }
+
+    /// Sum the current weight of every current signer that approved
+    /// `proposal_id`. One instance read for the signer set plus one approval
+    /// lookup per signer (bounded by `MAX_SIGNERS`).
+    fn live_approval_weight(env: &Env, proposal_id: u64) -> Result<u32, Error> {
+        let mut total: i128 = 0;
+        for s in Self::signers(env)?.iter() {
+            let approved: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Approval(proposal_id, s.address.clone()))
+                .unwrap_or(false);
+            if approved {
+                total = checked_add(total, s.weight as i128)?;
+            }
+        }
+        Self::to_weight(total)
     }
 
     fn threshold(env: &Env) -> Result<u32, Error> {
@@ -1227,6 +1269,16 @@ impl MultiSigContract {
     fn bump_proposal(env: &Env, id: u64) {
         env.storage().persistent().extend_ttl(
             &DataKey::Proposal(id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Approvals are re-read when the proposal executes, so they must live at
+    /// least as long as the proposal record itself.
+    fn bump_approval(env: &Env, id: u64, who: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(id, who.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );

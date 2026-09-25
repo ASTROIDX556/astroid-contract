@@ -560,7 +560,6 @@ fn non_signer_cannot_set_or_finalize_threshold() {
 fn non_signer_cannot_change_config() {
     let h = setup(&[1, 1, 1], 2);
     let stranger = Address::generate(&h.env);
-    let extra = Address::generate(&h.env);
     assert_eq!(
         h.client.try_set_threshold(&stranger, &3),
         Err(Ok(Error::NotASigner))
@@ -1138,4 +1137,136 @@ fn weight_views_report_the_configured_weights() {
     assert_eq!(h.client.get_signer_weight(&h.signers[2]), 1);
     assert_eq!(h.client.get_signer_weight(&Address::generate(&h.env)), 0);
     assert_eq!(h.client.get_total_weight(), 6);
+}
+
+// ---------------------------------------------------------------------------
+// Threshold verification against the live signer set (issue #326)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quorum_met_executes_and_one_short_fails() {
+    let h = setup(&[2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    // Proposer's weight (2) alone is one short of the threshold.
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 3);
+    h.client.execute(&h.signers[0], &id);
+    let p = h.client.get_proposal(&id);
+    assert!(p.executed);
+    assert_eq!(p.approval_weight, 3);
+}
+
+#[test]
+fn approval_from_removed_signer_no_longer_counts() {
+    let h = setup(&[2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 3);
+
+    // Signer 1 leaves after approving: the remaining set can still reach the
+    // threshold, but signer 1's approval must not.
+    h.client.remove_signer(&h.signers[0], &h.signers[1]);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // A current signer tops it back up to quorum.
+    h.client.approve(&h.signers[2], &id);
+    h.client.execute(&h.signers[0], &id);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 3);
+}
+
+#[test]
+fn reduced_signer_weight_is_applied_at_execution() {
+    let h = setup(&[1, 2, 1], 2);
+    let id = h.client.propose(
+        &h.signers[1],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 2);
+
+    let change = h
+        .client
+        .propose_weight_change(&h.signers[0], &h.signers[1], &1);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &change);
+    assert_eq!(h.client.get_signer_weight(&h.signers[1]), 1);
+
+    assert_eq!(
+        h.client.try_execute(&h.signers[1], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+}
+
+#[test]
+fn pending_threshold_is_revalidated_on_finalize() {
+    let h = setup(&[1, 1, 1], 1);
+    h.env.ledger().set_sequence_number(100);
+    h.client.set_threshold(&h.signers[0], &3);
+    // The signer set shrinks while the change is pending (current threshold 1
+    // is still satisfiable, so the removal itself is allowed).
+    h.client.remove_signer(&h.signers[0], &h.signers[2]);
+
+    h.env
+        .ledger()
+        .set_sequence_number(100 + THRESHOLD_CHANGE_DELAY_LEDGERS);
+    assert_eq!(
+        h.client.try_finalize_threshold(&h.signers[0]),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    assert_eq!(h.client.get_threshold(), 1);
+}
+
+#[test]
+fn adding_signer_that_overflows_total_weight_is_rejected() {
+    let h = setup(&[u32::MAX - 1], 1);
+    let newcomer = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_add_signer(&h.signers[0], &newcomer, &2),
+        Err(Ok(Error::Overflow))
+    );
+    assert!(!h.client.is_signer(&newcomer));
+    // Threshold checks keep working afterwards.
+    assert_eq!(h.client.get_total_weight(), u32::MAX - 1);
+}
+
+#[test]
+fn signer_set_with_invalid_weights_or_duplicates_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, MultiSigContract);
+    let client = MultiSigContractClient::new(&env, &id);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    assert_eq!(
+        client.try_initialize(&vec![&env, sw(&a, 1), sw(&a, 1)], &1),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        client.try_initialize(&vec![&env, sw(&a, 1), sw(&b, 0)], &1),
+        Err(Ok(Error::InsufficientWeight))
+    );
+    assert_eq!(
+        client.try_initialize(&vec![&env, sw(&a, u32::MAX), sw(&b, 1)], &1),
+        Err(Ok(Error::Overflow))
+    );
+    // Nothing was stored by the rejected attempts.
+    client.initialize(&vec![&env, sw(&a, 1), sw(&b, 1)], &2);
+    assert_eq!(client.get_threshold(), 2);
 }
