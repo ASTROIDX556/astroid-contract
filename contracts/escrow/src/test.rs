@@ -207,7 +207,7 @@ fn refund_before_deadline_rejected() {
     let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
 
     let res = h.client.try_refund(&h.sender, &id);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
 }
 
