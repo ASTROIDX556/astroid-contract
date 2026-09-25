@@ -1228,3 +1228,98 @@ fn an_absurd_window_saturates_instead_of_overflowing() {
     assert!(h.client.is_refundable(&id));
     h.client.refund(&h.sender, &id);
 }
+
+// --- Time-lock validation on `release` (Issue #238) ---
+
+#[test]
+fn release_before_cliff_maturity_is_refused_with_time_lock_active() {
+    let h = setup(10_000, 0);
+    let unlock_time = START + 1_000;
+
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &unlock_time,
+        &String::from_str(&h.env, "premature release"),
+    );
+
+    // The settlement deadline is still far in the future, but the arbiter must
+    // not be able to route around the time lock: the cliff has not matured.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    let res = h.client.try_release(&h.arbiter, &id, &10_000);
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
+    // No funds moved and the escrow is still live.
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+
+    // A release attempt at exactly the boundary before the cliff also fails.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time - 1);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // At maturity the pre-existing settlement window rule takes over: a
+    // timelock escrow's deadline equals its unlock time, so the release window
+    // closes exactly at maturity and the arbiter is refused with
+    // EscrowExpired. The recipient's path to the funds is `withdraw`/`claim`,
+    // not the arbiter's `release`.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::EscrowExpired))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
+
+#[test]
+fn linear_release_cannot_exceed_vested_amount() {
+    let h = setup(10_000, 0);
+    let start_time = START;
+    let cliff_time = START + 200;
+    let end_time = START + 1_000;
+
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time,
+        cliff_time,
+        end_time,
+    };
+
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &end_time,
+        &String::from_str(&h.env, "linear release gate"),
+    );
+
+    // Before the cliff nothing has vested: release must fail with
+    // TimeLockActive even though the deadline is far away.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // Halfway through the schedule only half has vested (50% of 10,000 =
+    // 5,000), so releasing more than the vested amount is refused.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_vested_amount(&id), 5_000);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // Releasing the vested amount works — the escrow settles in full per the
+    // arbiter's decision, but only once the schedule has vested that much.
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+}

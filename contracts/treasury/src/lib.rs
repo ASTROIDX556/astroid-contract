@@ -82,9 +82,9 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
 
-/// Stored treasury record. Held in contract instance storage under
-/// [`DataKey::Treasury`] (this crate keeps its storage definitions inline,
-/// unlike `contracts/escrow`, which splits them into `storage.rs`).
+const MAX_BALANCE_ASSETS: u32 = 32;
+
+/// Stored treasury record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Treasury {
@@ -130,6 +130,13 @@ pub struct Holding {
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetBalance {
+    pub asset: Address,
+    pub balance: i128,
 }
 
 /// Composite key identifying a withdrawal allowance scoped to a specific agent
@@ -923,12 +930,34 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
+    pub fn balance(env: Env, asset: Address) -> Result<i128, Error> {
+        Self::read_token_balance(&env, &asset)
+    }
+
+    pub fn balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error> {
+        if assets.len() > MAX_BALANCE_ASSETS {
+            return Err(Error::InvalidInput);
+        }
+        for i in 0..assets.len() {
+            let asset = assets.get_unchecked(i);
+            for j in (i + 1)..assets.len() {
+                if assets.get_unchecked(j) == asset {
+                    return Err(Error::InvalidInput);
+                }
+            }
+        }
+
+        let mut report = Vec::new(&env);
+        for asset in assets.iter() {
+            let balance = Self::read_token_balance(&env, &asset)?;
+            report.push_back(AssetBalance { asset, balance });
+        }
+        Ok(report)
+    }
+
     /// Whether `asset` is currently approved for routing.
     pub fn is_approved_asset(env: Env, asset: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ApprovedAsset(asset))
-            .unwrap_or(false)
+        Self::is_asset_approved(&env, &asset)
     }
 
     /// Number of token contracts currently on the whitelist.
@@ -961,16 +990,25 @@ impl TreasuryContract {
         Ok(t)
     }
 
+    fn is_asset_approved(env: &Env, asset: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovedAsset(asset.clone()))
+            .unwrap_or(false)
+    }
+
+    fn read_token_balance(env: &Env, asset: &Address) -> Result<i128, Error> {
+        if !Self::is_asset_approved(env, asset) {
+            return Err(Error::AssetNotAuthorized);
+        }
+        Ok(token::TokenClient::new(env, asset).balance(&env.current_contract_address()))
+    }
+
     /// Reject any routing through a token contract that governance has not
     /// approved. The whitelist starts empty, so a freshly initialized treasury
     /// moves nothing until an asset is explicitly approved.
     fn require_approved_asset(env: &Env, asset: &Address) -> Result<(), Error> {
-        if !env
-            .storage()
-            .persistent()
-            .get(&DataKey::ApprovedAsset(asset.clone()))
-            .unwrap_or(false)
-        {
+        if !Self::is_asset_approved(env, asset) {
             return Err(Error::AssetNotAuthorized);
         }
         env.storage().persistent().extend_ttl(
