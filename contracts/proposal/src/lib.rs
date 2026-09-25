@@ -19,6 +19,16 @@
 //! be `Executed` (marked done) and finally `Closed`. An approved proposal whose
 //! off-chain action did not go through is marked `Failed`, a terminal state.
 //!
+//! ## Timelock
+//!
+//! Executing an approved proposal immediately lets a sudden takeover spend the
+//! mandate before it is even visible. The contract therefore enforces a
+//! mandatory minimum delay — the configured `timelock` (seconds) stored at
+//! [`ProposalContract::initialize`] — between approval and execution. The
+//! approval timestamp is recorded the moment the proposal reaches `Approved`,
+//! and `execute` refuses with [`Error::TimelockNotExpired`] until
+//! `approved_at + timelock` has passed.
+//!
 //! ## Dependency chaining
 //!
 //! A proposal may declare prerequisite proposals it depends on. `execute` then
@@ -66,7 +76,9 @@
 //! ```
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
-//! `fail`, `close`, `cleanup_expired`.
+//! `fail`, `close`, `cleanup_expired`, plus the `get`, `state`, `is_expired`,
+//! `dependencies` and `dependencies_met` views. `initialize` also stores the
+//! mandatory per-proposal timelock.
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
@@ -75,7 +87,7 @@ use astroid_shared::constants::{
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::types::AssetAmount;
-use astroid_shared::validation::require_non_empty;
+use astroid_shared::validation::{require_non_empty, require_time_reached};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
     Vec,
@@ -150,6 +162,11 @@ pub struct Proposal {
     pub approvals: u32,
     pub state: ProposalState,
     pub created_at: u64,
+    /// Ledger timestamp at which the proposal reached `Approved`; `0` until
+    /// then. `execute` refuses to run until `approved_at + timelock` has
+    /// passed, so an approved proposal cannot be executed the moment it is
+    /// approved.
+    pub approved_at: u64,
     pub deposit: Vec<AssetAmount>,
     pub expires_at: u64,
     pub grace_period: u64,
@@ -183,6 +200,9 @@ impl Proposal {
 #[derive(Clone)]
 enum DataKey {
     ProposalCount,
+    /// Mandatory minimum delay in seconds between approval and execution,
+    /// applied to every proposal (configured once at [initialize]).
+    Timelock,
     Proposal(u64),
     Approval(u64, Address),
 }
@@ -230,12 +250,17 @@ impl ProposalContract {
             wasm_hash,
         )
     }
-    /// Initialize the id counter. Idempotent-guarded.
-    pub fn initialize(env: Env) -> Result<(), Error> {
+
+    /// Initialize the id counter and the mandatory per-proposal timelock.
+    /// Idempotent-guarded. `timelock` is the minimum number of seconds that
+    /// must pass between a proposal's approval and its execution; `0` disables
+    /// the delay.
+    pub fn initialize(env: Env, timelock: u64) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::ProposalCount) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
+        env.storage().instance().set(&DataKey::Timelock, &timelock);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -337,6 +362,7 @@ impl ProposalContract {
             deposit,
             state: ProposalState::Pending,
             created_at: env.ledger().timestamp(),
+            approved_at: 0,
             expires_at,
             grace_period,
         };
@@ -382,6 +408,10 @@ impl ProposalContract {
         proposal.approvals = checked_add(proposal.approvals as i128, 1)? as u32;
         if proposal.approvals >= proposal.threshold {
             proposal.state = ProposalState::Approved;
+            // Record the moment of approval: the timelock only starts counting
+            // once, when the threshold is reached, and is re-applied verbatim
+            // (approval signatures cannot be retracted).
+            proposal.approved_at = env.ledger().timestamp();
         }
         Self::store(&env, id, &proposal);
         env.events().publish(
@@ -531,12 +561,17 @@ impl ProposalContract {
     ///
     /// Every declared prerequisite must have executed first, otherwise the call
     /// fails with [`Error::PrerequisiteNotMet`] and nothing changes. This is
-    /// checked after approval and expiry so that a proposal blocked only by its
-    /// chain reports the dependency rather than a less specific error.
+    /// checked after the timelock so that a proposal blocked only by its chain
+    /// reports the dependency rather than a less specific error.
     ///
     /// The expiry gate runs first: an approved proposal whose deadline passed
     /// before it was executed may not fire, and reports
     /// [`Error::ProposalExpired`] rather than appearing merely un-executable.
+    /// Then the mandatory timelock applies — execution is refused with
+    /// [`Error::TimelockNotExpired`] until `timelock` seconds have passed
+    /// since approval — and only then is the dependency chain resolved. The
+    /// ordering means a premature attempt is reported as a scheduling error
+    /// rather than a (still accurate) dependency failure.
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
@@ -546,6 +581,21 @@ impl ProposalContract {
         }
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
+        }
+        // Mandatory timelock: an approved proposal may not be executed until
+        // `timelock` seconds have elapsed since it was approved. Guards against
+        // a sudden takeover executing freshly-approved proposals before honest
+        // members can withdraw support, reporting the protocol-wide
+        // [`Error::TimelockNotExpired`] constant for premature attempts. A `0`
+        // timelock (disabled) has no effect.
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Timelock)
+            .unwrap_or(0);
+        if timelock != 0 && proposal.approved_at != 0 {
+            let release_at = checked_add(proposal.approved_at as i128, timelock as i128)? as u64;
+            require_time_reached(&env, release_at)?;
         }
         Self::ensure_dependencies_met(&env, &proposal)?;
         proposal.state = ProposalState::Executed;
