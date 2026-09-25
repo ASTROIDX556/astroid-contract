@@ -1,7 +1,8 @@
 use astroid_shared::errors::Error;
+use astroid_shared::types::AssetAmount;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    Address, BytesN, Env, IntoVal, String, Symbol, Val,
+    vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use crate::{PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload};
@@ -1798,5 +1799,693 @@ fn only_the_owner_can_manage_the_blacklist() {
     assert_eq!(
         p.try_remove_asset_blacklist(&stranger, &pid, &asset),
         Err(Ok(Error::Unauthorized))
+    );
+}
+
+// --- Multi-asset spending requests (Issue #237) ---
+
+fn entry(asset: &Address, amount: i128) -> AssetAmount {
+    AssetAmount {
+        asset: asset.clone(),
+        amount,
+    }
+}
+
+fn spent(env: &Env, p: &PolicyContractClient, asset: &Address) -> i128 {
+    p.get_allowance(&String::from_str(env, "mt"), asset).spent
+}
+
+#[test]
+fn multi_asset_amount_at_limit_passes_and_one_over_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (a, b) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &a, &1_000, &0);
+    p.set_allowance(&owner, &pid, &b, &1_000, &0);
+
+    // limit + 1 is rejected and records nothing.
+    assert_eq!(
+        p.try_record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&b, 1_001)]),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    assert_eq!(spent(&env, &p, &b), 0);
+
+    // Exactly the limit is permitted and consumes the allowance fully.
+    p.record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&a, 1_000)]);
+    assert_eq!(spent(&env, &p, &a), 1_000);
+    assert_eq!(p.try_check_allowance(&pid, &a, &0), Ok(Ok(0)));
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&a, 1)]),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+}
+
+#[test]
+fn zero_and_negative_amounts_are_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
+
+    for bad in [0i128, -1, i128::MIN] {
+        assert_eq!(
+            p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&asset, bad)]),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            p.try_record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&asset, bad)]),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            p.try_check_transfer(&pid, &asset, &recip, &bad),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            p.try_update_allowance(&owner, &pid, &asset, &bad),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+    // A negative entry cannot offset a positive one for the same asset.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 1_500), entry(&asset, -600)]
+        ),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(spent(&env, &p, &asset), 0);
+}
+
+#[test]
+fn multi_asset_unlisted_asset_is_rejected_and_nothing_recorded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (known, unknown) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_asset_whitelist_enabled(&owner, &pid, &true);
+    p.add_asset_to_whitelist(&owner, &pid, &known);
+    p.set_allowance(&owner, &pid, &known, &1_000, &0);
+
+    assert_eq!(
+        p.try_record_multi_asset_spend(
+            &owner,
+            &pid,
+            &recip,
+            &vec![&env, entry(&known, 100), entry(&unknown, 1)]
+        ),
+        Err(Ok(Error::AssetNotWhitelisted))
+    );
+    assert_eq!(spent(&env, &p, &known), 0);
+}
+
+#[test]
+fn multi_asset_both_within_limits_records_both() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (xlm, usdc) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &xlm, &1_000, &0);
+    p.set_allowance(&owner, &pid, &usdc, &500, &0);
+
+    let req = vec![&env, entry(&xlm, 700), entry(&usdc, 500)];
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &req),
+        Ok(Ok(()))
+    );
+    // Checking is read-only.
+    assert_eq!(spent(&env, &p, &xlm), 0);
+    p.record_multi_asset_spend(&owner, &pid, &recip, &req);
+    assert_eq!(spent(&env, &p, &xlm), 700);
+    assert_eq!(spent(&env, &p, &usdc), 500);
+}
+
+#[test]
+fn multi_asset_one_over_limit_rejects_whole_request() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (xlm, usdc) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &xlm, &1_000, &0);
+    p.set_allowance(&owner, &pid, &usdc, &500, &0);
+
+    // The passing asset comes first in the request and still records nothing.
+    for req in [
+        vec![&env, entry(&xlm, 700), entry(&usdc, 501)],
+        vec![&env, entry(&usdc, 501), entry(&xlm, 700)],
+    ] {
+        assert_eq!(
+            p.try_record_multi_asset_spend(&owner, &pid, &recip, &req),
+            Err(Ok(Error::PolicyAllowanceExceeded))
+        );
+        assert_eq!(spent(&env, &p, &xlm), 0);
+        assert_eq!(spent(&env, &p, &usdc), 0);
+    }
+}
+
+#[test]
+fn duplicate_entries_are_aggregated_before_checking() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
+
+    // 600 + 500 = 1_100 > 1_000, although each entry fits on its own.
+    assert_eq!(
+        p.try_record_multi_asset_spend(
+            &owner,
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 600), entry(&asset, 500)]
+        ),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    assert_eq!(spent(&env, &p, &asset), 0);
+
+    // Within the limit the entries are recorded once, as their sum.
+    p.record_multi_asset_spend(
+        &owner,
+        &pid,
+        &recip,
+        &vec![&env, entry(&asset, 300), entry(&asset, 200)],
+    );
+    assert_eq!(spent(&env, &p, &asset), 500);
+}
+
+#[test]
+fn duplicate_entries_cannot_split_past_the_per_transfer_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    // `setup` registers "max_txn" with max_amount = 1_000_000.
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 600_000), entry(&asset, 400_001)]
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 600_000), entry(&asset, 400_000)]
+        ),
+        Ok(Ok(()))
+    );
+}
+
+#[test]
+fn amounts_near_i128_max_fail_without_panicking() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (a, b) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+
+    // Per-asset totals that do not fit an i128.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&a, i128::MAX), entry(&a, 1)]
+        ),
+        Err(Ok(Error::Overflow))
+    );
+    // i128::MAX of two *different* assets is fine: amounts are never summed
+    // across assets.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&a, i128::MAX), entry(&b, i128::MAX)]
+        ),
+        Ok(Ok(()))
+    );
+
+    // Cumulative spend right up to an i128::MAX limit, then one more unit.
+    p.set_allowance(&owner, &pid, &a, &i128::MAX, &0);
+    p.record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&a, i128::MAX - 1)]);
+    p.update_allowance(&owner, &pid, &a, &1);
+    assert_eq!(spent(&env, &p, &a), i128::MAX);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &a, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    assert_eq!(
+        p.try_check_transfer(&pid, &a, &recip, &i128::MAX),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+
+    // Lowering a limit below what was spent leaves negative headroom, which
+    // rejects every positive amount.
+    p.set_allowance(&owner, &pid, &a, &10, &0);
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&a, 1)]),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+}
+
+#[test]
+fn assets_with_different_decimals_keep_independent_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    // 1 XLM (7 decimals) and 5 USDC (6 decimals), in base units.
+    let (xlm, usdc) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &xlm, &10_000_000, &0);
+    p.set_allowance(&owner, &pid, &usdc, &5_000_000, &0);
+
+    // 9 USDC exceeds the USDC limit even though it is below the XLM limit.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&usdc, 9_000_000)]),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    // Both limits fully used in one request: the combined 15_000_000 base
+    // units are never compared with either limit.
+    p.record_multi_asset_spend(
+        &owner,
+        &pid,
+        &recip,
+        &vec![&env, entry(&xlm, 10_000_000), entry(&usdc, 5_000_000)],
+    );
+    assert_eq!(spent(&env, &p, &xlm), 10_000_000);
+    assert_eq!(spent(&env, &p, &usdc), 5_000_000);
+    for asset in [&xlm, &usdc] {
+        assert_eq!(
+            p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(asset, 1)]),
+            Err(Ok(Error::PolicyAllowanceExceeded))
+        );
+    }
+}
+
+#[test]
+fn empty_or_oversized_requests_are_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &Vec::new(&env)),
+        Err(Ok(Error::InvalidInput))
+    );
+    let mut ten = Vec::new(&env);
+    for _ in 0..10 {
+        ten.push_back(entry(&asset, 1));
+    }
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &ten),
+        Ok(Ok(()))
+    );
+    ten.push_back(entry(&asset, 1));
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &ten),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_asset_request_runs_the_policy_gates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let only = Address::generate(&env);
+    let other = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let p = PolicyContractClient::new(&env, &id);
+    p.initialize();
+    let pid = String::from_str(&env, "single");
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[3; 32]),
+        &0,
+        &None,
+        &Some(only.clone()),
+        &0,
+    );
+
+    // An asset outside `allowed_asset` sinks the whole request.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&only, 1), entry(&other, 1)]
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Recipient blocklist is evaluated before any asset.
+    p.add_to_blocklist(&owner, &pid, &recip);
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&only, 1)]),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+    // Unknown policy.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &String::from_str(&env, "nope"),
+            &recip,
+            &vec![&env, entry(&only, 1)]
+        ),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn only_the_owner_can_record_spend() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
+
+    // A non-owner cannot burn the owner's allowance through either path.
+    assert_eq!(
+        p.try_record_multi_asset_spend(&stranger, &pid, &recip, &vec![&env, entry(&asset, 1_000)]),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_update_allowance(&stranger, &pid, &asset, &1_000),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(spent(&env, &p, &asset), 0);
+    assert_eq!(
+        p.try_set_recurring_allowance(&stranger, &pid, &asset, &1, &60, &0),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn recording_spend_requires_the_callers_signature() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    // Drop the blanket auth mock: the owner has not signed this call.
+    env.set_auths(&[]);
+    let r = p.try_record_multi_asset_spend(
+        &owner,
+        &String::from_str(&env, "mt"),
+        &Address::generate(&env),
+        &vec![&env, entry(&asset, 1)],
+    );
+    // A host auth failure, not a contract error code.
+    assert!(matches!(r, Err(Err(_))));
+}
+
+// --- Rate-limited (recurring) allowances (Issue #237) ---
+
+const START: u64 = 1_000;
+const WINDOW: u64 = 100;
+
+/// A policy with a 1_000-per-100s rate limit on `asset`, configured at
+/// ledger time `START`.
+fn rate_setup<'a>(env: &'a Env, owner: &Address, asset: &Address) -> PolicyContractClient<'a> {
+    env.ledger().set_timestamp(START);
+    let p = allowance_setup(env, owner);
+    p.set_recurring_allowance(
+        owner,
+        &String::from_str(env, "mt"),
+        asset,
+        &1_000,
+        &WINDOW,
+        &0,
+    );
+    p
+}
+
+#[test]
+fn rate_limit_first_spend_and_accumulation_within_a_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!(
+        (a.spent, a.window_seconds, a.window_start),
+        (0, WINDOW, START)
+    );
+    // First-ever spend.
+    p.update_allowance(&owner, &pid, &asset, &400);
+    env.ledger().set_timestamp(START + 50);
+    p.update_allowance(&owner, &pid, &asset, &600);
+    assert_eq!(spent(&env, &p, &asset), 1_000);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+}
+
+#[test]
+fn rate_limit_spend_at_period_end_minus_one_counts_in_current_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(START + WINDOW - 1);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (1_000, START));
+}
+
+#[test]
+fn rate_limit_spend_exactly_at_period_end_opens_a_new_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(START + WINDOW);
+    assert_eq!(p.try_check_allowance(&pid, &asset, &1_000), Ok(Ok(0)));
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1_000).is_ok());
+    p.record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&asset, 250)]);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (250, START + WINDOW));
+}
+
+#[test]
+fn rate_limit_resets_after_several_periods_without_carry_over() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    // Five whole periods and part of a sixth.
+    env.ledger().set_timestamp(START + 5 * WINDOW + 37);
+    // The view already reflects the current window, anchored on a boundary.
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (0, START + 5 * WINDOW));
+    // Idle periods do not accrue: the limit is still 1_000, not 5_000.
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1_001),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    // The persisted window stays on the boundary schedule (no drift to `now`).
+    env.ledger().set_timestamp(START + 6 * WINDOW);
+    p.update_allowance(&owner, &pid, &asset, &1);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (1, START + 6 * WINDOW));
+}
+
+#[test]
+fn zero_window_allowance_never_resets() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &0, &0);
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(u64::MAX);
+    assert_eq!(spent(&env, &p, &asset), 1_000);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+}
+
+#[test]
+fn ledger_time_before_window_start_keeps_current_usage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(START - 1);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (1_000, START));
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+}
+
+#[test]
+fn rate_limit_window_far_in_the_future_does_not_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    env.ledger().set_timestamp(START);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &(u64::MAX / 2), &0);
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(u64::MAX);
+    // (u64::MAX - START) / (u64::MAX / 2) = 1 whole window elapsed.
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (0, START + u64::MAX / 2));
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+}
+
+#[test]
+fn reconfiguring_the_window_keeps_spend_and_reanchors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &700);
+    env.ledger().set_timestamp(START + 50);
+    // Changing the window re-anchors it at "now"; the 700 already spent stays.
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &200, &0);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!(
+        (a.spent, a.window_seconds, a.window_start),
+        (700, 200, START + 50)
+    );
+    env.ledger().set_timestamp(START + 50 + 199);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &301),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    // set_allowance only touches the limit and expiry: the window survives.
+    p.set_allowance(&owner, &pid, &asset, &2_000, &0);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!(
+        (a.limit, a.window_seconds, a.window_start),
+        (2_000, 200, START + 50)
+    );
+    env.ledger().set_timestamp(START + 50 + 200);
+    assert_eq!(spent(&env, &p, &asset), 0);
+}
+
+#[test]
+fn multi_asset_request_resets_each_asset_on_its_own_schedule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (hourly, cumulative) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &hourly);
+    let pid = String::from_str(&env, "mt");
+    p.set_allowance(&owner, &pid, &cumulative, &1_000, &0);
+
+    let both = vec![&env, entry(&hourly, 1_000), entry(&cumulative, 600)];
+    p.record_multi_asset_spend(&owner, &pid, &recip, &both);
+    env.ledger().set_timestamp(START + WINDOW);
+    // The rate-limited asset reset; the cumulative one did not, so the whole
+    // request is refused and the reset is not persisted by a failed request.
+    assert_eq!(
+        p.try_record_multi_asset_spend(&owner, &pid, &recip, &both),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    assert_eq!(spent(&env, &p, &cumulative), 600);
+    p.record_multi_asset_spend(
+        &owner,
+        &pid,
+        &recip,
+        &vec![&env, entry(&hourly, 1_000), entry(&cumulative, 400)],
+    );
+    assert_eq!(spent(&env, &p, &hourly), 1_000);
+    assert_eq!(spent(&env, &p, &cumulative), 1_000);
+}
+
+#[test]
+fn expired_rate_limit_stays_denied_after_a_reset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &WINDOW, &(START + 150));
+
+    env.ledger().set_timestamp(START + 150);
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&asset, 1)]),
+        Err(Ok(Error::PolicyDenied))
     );
 }
