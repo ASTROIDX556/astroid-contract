@@ -597,7 +597,7 @@ impl ProposalContract {
             let release_at = checked_add(proposal.approved_at as i128, timelock as i128)? as u64;
             require_time_reached(&env, release_at)?;
         }
-        Self::ensure_dependencies_met(&env, &proposal)?;
+        Self::ensure_dependencies_met(&env, id, &proposal)?;
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -681,6 +681,14 @@ impl ProposalContract {
     /// The prerequisite proposal ids this proposal declares.
     pub fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
         Ok(Self::load(&env, id)?.dependencies)
+    }
+
+    /// Whether the proposal has completed its action — `Executed` or `Closed`
+    /// (the only terminal states reachable from a successful run). This is the
+    /// completion check downstream contracts should read before chaining onto a
+    /// proposal, so dependency resolution needs no private state.
+    pub fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
+        Ok(Self::load(&env, id)?.state.has_executed())
     }
 
     /// Whether every prerequisite has executed — the same question `execute`

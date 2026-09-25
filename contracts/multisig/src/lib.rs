@@ -287,7 +287,7 @@ impl MultiSigContract {
             return Err(Error::AlreadyExists);
         }
         if signers.len() >= MAX_SIGNERS {
-            return Err(Error::InvalidThreshold);
+            return Err(Error::TooManySigners);
         }
         signers.push_back(SignerWeight {
             address: signer.clone(),
@@ -1056,7 +1056,7 @@ impl MultiSigContract {
                     return Err(Error::AlreadyExists);
                 }
                 if signers.len() >= MAX_SIGNERS {
-                    return Err(Error::InvalidThreshold);
+                    return Err(Error::TooManySigners);
                 }
                 // Total weight only grows here, so the threshold stays
                 // satisfiable; the check is purely an overflow guard.

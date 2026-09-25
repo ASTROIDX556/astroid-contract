@@ -101,10 +101,6 @@ enum DataKey {
     Paused,
     /// Monotonic wallet id counter (instance).
     WalletCount,
-    /// Policy contract consulted when validating batch actions (instance).
-    Policy,
-    /// Budget contract consulted when consuming batch action value (instance).
-    Budget,
     /// Wallet record: id -> WalletData.
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.

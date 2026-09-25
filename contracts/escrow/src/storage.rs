@@ -49,7 +49,6 @@ pub enum EscrowState {
     Refunded = 3,
     Expired = 4,
     Closed = 5,
-    Cancelled = 6,
 }
 
 #[contracttype]
