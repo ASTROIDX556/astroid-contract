@@ -46,15 +46,39 @@
 //! and a dependency that would close a cycle is rejected at creation time with
 //! [`Error::CircularDependencyDetected`].
 //!
-//! Every time a chain is validated, the contract publishes a structured event
-//! so watchers can follow dependency resolution: `("proposal", "dep_ok")` when
-//! all prerequisites have executed, or `("proposal", "dep_fail")` with the id
-//! of the first unmet prerequisite when the chain is blocked.
+//! ## Expiration gating
+//!
+//! A proposal may declare `expires_at`, a deadline after which its approval
+//! window is closed. The deadline is compared against the deterministic ledger
+//! clock (`env.ledger().timestamp()`), so every node evaluating the same ledger
+//! agrees on whether the proposal is stale. `expires_at == 0` means the
+//! proposal never expires.
+//!
+//! Every entrypoint that would move a live proposal forward or sideways —
+//! `approve`, `reject`, `cancel`, `execute`, `fail` — re-checks the deadline
+//! against the *current* ledger immediately before mutating state, and refuses
+//! the call with [`Error::ProposalExpired`] when it has passed. The check is
+//! deliberately re-evaluated per call rather than cached on the record: a
+//! proposal created with a future deadline can still go stale before it is ever
+//! touched, and a stale proposal must not be able to change state, move its
+//! deposit or satisfy a dependent proposal's prerequisite.
+//!
+//! The deadline itself does not rewrite state — nothing runs unattended. The
+//! terminal `Expired` transition is recorded explicitly through the
+//! permissionless [`ProposalContract::expire`] (which fails with
+//! [`Error::InvalidProposalState`] until the deadline has actually passed) and
+//! the record can afterwards be purged by [`ProposalContract::cleanup_expired`].
+//!
+//! ```text
+//! live (timestamp < expires_at) ──approve/execute/…──▶ normal transition
+//! stale (timestamp >= expires_at) ──any transition────▶ Error::ProposalExpired
+//! stale ──expire()──▶ Expired (deposit refunded) ──cleanup_expired()──▶ purged
+//! ```
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
-//! `fail`, `close`, `cleanup_expired`, and views `get`, `state`,
-//! `dependencies`, `dependencies_met`, `is_executed`. `initialize` also stores
-//! the mandatory per-proposal timelock.
+//! `fail`, `close`, `cleanup_expired`, plus the `get`, `state`, `is_expired`,
+//! `dependencies` and `dependencies_met` views. `initialize` also stores the
+//! mandatory per-proposal timelock.
 
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
@@ -96,6 +120,27 @@ impl ProposalState {
     pub fn has_executed(self) -> bool {
         matches!(self, ProposalState::Executed | ProposalState::Closed)
     }
+
+    /// Whether a proposal in this state has already returned its deposit (or
+    /// never held one), and so may be purged from storage by
+    /// [`ProposalContract::cleanup_expired`].
+    ///
+    /// `Pending` and `Approved` are excluded: a stale proposal in either state
+    /// still holds the proposer's deposit, and deleting the record would
+    /// strand it. Those states must first pass through
+    /// [`ProposalContract::expire`], which refunds the deposit as it records
+    /// the transition. `Failed` is excluded for the same custody reason — its
+    /// deposit has not been returned by any transition, so the record is kept.
+    pub fn deposit_settled(self) -> bool {
+        matches!(
+            self,
+            ProposalState::Expired
+                | ProposalState::Rejected
+                | ProposalState::Cancelled
+                | ProposalState::Executed
+                | ProposalState::Closed
+        )
+    }
 }
 
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
@@ -128,10 +173,19 @@ pub struct Proposal {
 }
 
 impl Proposal {
+    /// Whether the proposal's deadline has been reached on the current ledger.
+    ///
+    /// Evaluated against `env.ledger().timestamp()` — the deterministic clock
+    /// the host fixes for the whole invocation — so the answer is identical for
+    /// every read of the same ledger. `expires_at == 0` encodes "no deadline"
+    /// and never expires. The boundary is inclusive: `now == expires_at` is
+    /// already expired.
     pub fn is_expired(&self, env: &Env) -> bool {
         self.expires_at != 0 && env.ledger().timestamp() >= self.expires_at
     }
 
+    /// Whether the proposal may still change state: it has not gone stale and
+    /// sits in one of the two live states.
     pub fn is_active(&self, env: &Env) -> bool {
         !self.is_expired(env)
             && matches!(self.state, ProposalState::Pending | ProposalState::Approved)
@@ -196,8 +250,12 @@ impl ProposalContract {
             wasm_hash,
         )
     }
-    /// Initialize the id counter. Idempotent-guarded.
-    pub fn initialize(env: Env) -> Result<(), Error> {
+
+    /// Initialize the id counter and the mandatory per-proposal timelock.
+    /// Idempotent-guarded. `timelock` is the minimum number of seconds that
+    /// must pass between a proposal's approval and its execution; `0` disables
+    /// the delay.
+    pub fn initialize(env: Env, timelock: u64) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::ProposalCount) {
             return Err(Error::AlreadyInitialized);
         }
@@ -328,12 +386,14 @@ impl ProposalContract {
 
     /// Approve a proposal. Caller must be on the approver allow-list and may
     /// approve only once. Reaching `threshold` transitions to `Approved`.
+    ///
+    /// Refused with [`Error::ProposalExpired`] when the proposal's deadline
+    /// has passed on the current ledger, so a stale proposal can never reach
+    /// `Approved`.
     pub fn approve(env: Env, caller: Address, id: u64) -> Result<u32, Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        if proposal.is_expired(&env) {
-            return Err(Error::ProposalExpired);
-        }
+        Self::require_not_expired(&env, &proposal)?;
         if proposal.state != ProposalState::Pending {
             return Err(Error::InvalidProposalState);
         }
@@ -362,10 +422,15 @@ impl ProposalContract {
     }
 
     /// Reject a proposal. Any approver may reject a pending proposal, which
-    /// moves it to the terminal `Rejected` state.
+    /// moves it to the terminal `Rejected` state and refunds the deposit.
+    ///
+    /// A stale proposal may not be rejected — it has left the approval window,
+    /// so it is settled through [`ProposalContract::expire`] instead; the
+    /// deposit is returned on either path.
     pub fn reject(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
+        Self::require_not_expired(&env, &proposal)?;
         if proposal.state != ProposalState::Pending {
             return Err(Error::InvalidProposalState);
         }
@@ -390,9 +455,15 @@ impl ProposalContract {
 
     /// Cancel a proposal. Only the original proposer may cancel, and only before
     /// it is executed/closed.
+    ///
+    /// A proposal that has already gone stale is out of the cancellation
+    /// window regardless of the grace period: cancelling is a live-proposal
+    /// action and fails with [`Error::ProposalExpired`], leaving the deposit
+    /// to be returned by [`ProposalContract::expire`].
     pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
+        Self::require_not_expired(&env, &proposal)?;
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
@@ -423,6 +494,14 @@ impl ProposalContract {
 
     /// Mark a proposal expired if its deadline has passed. Permissionless
     /// (anyone may trigger the transition; state gate protects correctness).
+    ///
+    /// This is the only transition a stale proposal may undergo. The deadline
+    /// is re-read from `env.ledger().timestamp()` here rather than trusted
+    /// from the caller: calling it before the deadline has passed fails with
+    /// [`Error::InvalidProposalState`], because the proposal has not entered
+    /// the `Expired` state and the transition does not apply. Recording the
+    /// transition refunds the proposer's deposit and closes the proposal
+    /// permanently, so it must never fire early.
     pub fn expire(env: Env, id: u64) -> Result<(), Error> {
         let mut proposal = Self::load(&env, id)?;
         if !matches!(
@@ -449,12 +528,29 @@ impl ProposalContract {
     }
 
     /// Purge an expired proposal from storage to reclaim space.
+    ///
+    /// Two gates, both re-read from the ledger, and both reported as
+    /// [`Error::InvalidProposalState`]: the deadline must have passed (a
+    /// proposal with no deadline at all can never be purged), and the proposal
+    /// must be in a state that has already settled its deposit. Purging a
+    /// still-live proposal would delete the record while the contract still
+    /// holds the proposer's funds, so the caller must drive it to `Expired`
+    /// (or another deposit-returning terminal state) first. The proposal's
+    /// approval flags are purged along with it.
     pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
         let proposal = Self::load(&env, id)?;
-        if proposal.expires_at == 0 || env.ledger().timestamp() < proposal.expires_at {
+        if !proposal.is_expired(&env) {
+            return Err(Error::InvalidProposalState);
+        }
+        if !proposal.state.deposit_settled() {
             return Err(Error::InvalidProposalState);
         }
         env.storage().persistent().remove(&DataKey::Proposal(id));
+        for approver in proposal.approvers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Approval(id, approver));
+        }
         env.events()
             .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
         Ok(())
@@ -463,18 +559,23 @@ impl ProposalContract {
     /// Execute an approved proposal. Only the proposer may execute (the actual
     /// value movement happens in the wallet/treasury; this records completion).
     ///
-    /// Two gates apply after the state check: the mandatory timelock —
-    /// execution is refused with [`Error::TimelockNotExpired`] until `timelock`
-    /// seconds have passed since approval — and the dependency chain. The
-    /// timelock is checked before the chain, so a premature attempt is
-    /// reported as a scheduling error rather than a (still accurate)
-    /// dependency failure.
+    /// Every declared prerequisite must have executed first, otherwise the call
+    /// fails with [`Error::PrerequisiteNotMet`] and nothing changes. This is
+    /// checked after the timelock so that a proposal blocked only by its chain
+    /// reports the dependency rather than a less specific error.
+    ///
+    /// The expiry gate runs first: an approved proposal whose deadline passed
+    /// before it was executed may not fire, and reports
+    /// [`Error::ProposalExpired`] rather than appearing merely un-executable.
+    /// Then the mandatory timelock applies — execution is refused with
+    /// [`Error::TimelockNotExpired`] until `timelock` seconds have passed
+    /// since approval — and only then is the dependency chain resolved. The
+    /// ordering means a premature attempt is reported as a scheduling error
+    /// rather than a (still accurate) dependency failure.
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        if proposal.is_expired(&env) {
-            return Err(Error::ProposalExpired);
-        }
+        Self::require_not_expired(&env, &proposal)?;
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
@@ -496,7 +597,7 @@ impl ProposalContract {
             let release_at = checked_add(proposal.approved_at as i128, timelock as i128)? as u64;
             require_time_reached(&env, release_at)?;
         }
-        Self::ensure_dependencies_met(&env, id, &proposal)?;
+        Self::ensure_dependencies_met(&env, &proposal)?;
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -515,9 +616,15 @@ impl ProposalContract {
     /// do so. Recording the failure explicitly keeps a broken step visible to
     /// anything that depends on it: a `Failed` prerequisite never satisfies a
     /// dependent proposal, so the chain stops instead of silently continuing.
+    ///
+    /// A proposal that has gone stale before being executed or failed is
+    /// reported as [`Error::ProposalExpired`], not `Failed`: the deadline, not
+    /// the action, is what ended it, and the deposit is returned by
+    /// [`ProposalContract::expire`].
     pub fn fail(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
+        Self::require_not_expired(&env, &proposal)?;
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
@@ -532,6 +639,12 @@ impl ProposalContract {
     }
 
     /// Close an executed proposal (terminal). Only the proposer may close.
+    ///
+    /// Deliberately *not* gated on the deadline: by the time this runs the
+    /// proposal has already executed, so the approval window is moot and
+    /// refusing the tidy-up after `expires_at` would only strand the record in
+    /// `Executed`. The expiry gates guard transitions that still let a stale
+    /// proposal influence the outcome.
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
@@ -558,12 +671,11 @@ impl ProposalContract {
         Ok(Self::load(&env, id)?.state)
     }
 
-    /// Whether the proposal has completed its action — `Executed` or `Closed`
-    /// (the only terminal states reachable from a successful run). This is the
-    /// completion check downstream contracts should read before chaining onto a
-    /// proposal, so dependency resolution needs no private state.
-    pub fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
-        Ok(Self::load(&env, id)?.state.has_executed())
+    /// Whether the proposal's deadline has been reached on the current ledger
+    /// (and it therefore has a deadline at all). Lets a client check before
+    /// spending a transaction on a stale proposal.
+    pub fn is_expired(env: Env, id: u64) -> Result<bool, Error> {
+        Ok(Self::load(&env, id)?.is_expired(&env))
     }
 
     /// The prerequisite proposal ids this proposal declares.
@@ -579,6 +691,23 @@ impl ProposalContract {
     }
 
     // --- internal helpers ---
+
+    /// Refuse any interaction with a proposal whose deadline has passed on the
+    /// current ledger.
+    ///
+    /// Called at the top of every entrypoint that mutates a live proposal, so
+    /// the check always runs against `env.ledger().timestamp()` at the moment
+    /// of the call — never against a value cached when the proposal was
+    /// created or last read. Returns the dedicated
+    /// [`Error::ProposalExpired`] code, which is distinct from the generic
+    /// [`Error::InvalidProposalState`]: callers can tell "you were too late"
+    /// from "that transition is not available in this state".
+    fn require_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
+        if proposal.is_expired(env) {
+            return Err(Error::ProposalExpired);
+        }
+        Ok(())
+    }
 
     fn load(env: &Env, id: u64) -> Result<Proposal, Error> {
         env.storage()

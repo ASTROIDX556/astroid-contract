@@ -31,9 +31,22 @@
 //! resuming operations requires a threshold of signers.
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`, `batch_execute`,
-//! `batch_execute_validated`, `set_policy`, `set_budget`,
-//! `emergency_pause`, `emergency_unpause`, `set_guardian`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
+//! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
+//! `set_policy_bypass`.
+//!
+//! ## Pre-execution policy hook
+//!
+//! Per the architecture, the wallet "holds funds and enforces policy before
+//! executing transactions". Every outbound movement — `transfer` and
+//! `withdraw` — therefore consults the org's Policy contract (wired with
+//! [`WalletContract::set_policy`]) *before* any balance is debited or any
+//! token moves. The policy is invoked through the generated [`PolicyClient`]
+//! with the same canonical `"active"` policy id the treasury uses; a
+//! rejection propagates as a deterministic policy error and aborts the
+//! invocation, so the wallet is never left debited without the spend having
+//! been approved. Individual wallets can be excused from the org-wide gate
+//! with [`WalletContract::set_policy_bypass`] (admin only).
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
 //! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
@@ -59,16 +72,20 @@
 //! plus wallet-scoped state-change and role-administration events.
 
 use crate::access::Role;
-use astroid_interfaces::{BudgetClient, PolicyClient};
-use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
+use astroid_interfaces::PolicyClient;
+use astroid_shared::constants;
+use astroid_shared::constants::{
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD,
+};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::math::{SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
-use astroid_shared::{constants, events};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol,
 };
 
 pub mod access;
@@ -92,6 +109,12 @@ enum DataKey {
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
+    /// Org-wide Policy contract consulted before every outbound movement
+    /// (instance).
+    Policy,
+    /// Per-wallet opt-out from the policy gate: wallet id -> bool (persistent).
+    /// Present + `true` means the wallet spends without policy evaluation.
+    PolicyBypass(u64),
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -235,6 +258,84 @@ impl WalletContract {
         Ok(id)
     }
 
+    /// Wire the org's Policy contract consulted before every outbound
+    /// movement (admin only). Pass an address previously registered to enable
+    /// the gate; `clear_policy` removes it. The policy is invoked through the
+    /// generated [`PolicyClient`] so a rejection propagates as a deterministic
+    /// error and the spend never executes.
+    pub fn set_policy(env: Env, caller: Address, policy: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Policy, &policy);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("policy")),
+            (caller, policy),
+        );
+        Ok(())
+    }
+
+    /// Remove the policy gate (admin only). Subsequent spends run ungated.
+    pub fn clear_policy(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&DataKey::Policy) {
+            return Err(Error::NotFound);
+        }
+        env.storage().instance().remove(&DataKey::Policy);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("policy")),
+            (caller, "cleared"),
+        );
+        Ok(())
+    }
+
+    /// Read the wired policy contract, if any.
+    pub fn get_policy(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Policy)
+    }
+
+    /// Excuse a single wallet from the org-wide policy gate (admin only).
+    ///
+    /// The gate is org-wide by design; this escape hatch exists for wallets
+    /// whose outflows are governed by a stricter contract-level control (a
+    /// multisig-guarded payroll wallet, for example). The flag persists so the
+    /// opt-out survives TTL expiry of the wallet record.
+    pub fn set_policy_bypass(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        bypass: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        // Only existing wallets can be configured.
+        Self::load_wallet(&env, wallet_id)?;
+        let key = DataKey::PolicyBypass(wallet_id);
+        if bypass {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("pol_byp")),
+            (wallet_id, bypass),
+        );
+        Ok(())
+    }
+
+    /// Whether a wallet is excused from the policy gate.
+    pub fn get_policy_bypass(env: Env, wallet_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PolicyBypass(wallet_id))
+            .unwrap_or(false)
+    }
+
     /// Fund a wallet: pulls `amount` of `asset` from `from` into custody and
     /// credits the wallet's internal balance. Requires `from` authorization.
     pub fn deposit(
@@ -282,6 +383,10 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
+        // Pre-execution policy check: the configured Policy contract gets a
+        // veto over the spend before any value moves. A rejection aborts the
+        // whole invocation with the policy's own deterministic error.
+        Self::require_policy_allows(&env, wallet_id, &asset, &to, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -308,6 +413,8 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
+        // Pre-execution policy check — withdrawals are outbound movements too.
+        Self::require_policy_allows(&env, wallet_id, &asset, &wallet.owner, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -494,6 +601,36 @@ impl WalletContract {
     }
 
     // --- internal helpers ---
+
+    /// Pre-execution policy hook, applied to every outbound movement.
+    ///
+    /// When an org-wide policy contract is configured and the wallet has not
+    /// been excused, the spend is submitted to `check_transfer` under the
+    /// canonical "active" policy id (the same id the treasury uses). The
+    /// generated [`PolicyClient`] maps the remote error straight through, so a
+    /// policy rejection surfaces deterministically and no value moves.
+    /// With no policy wired the hook is a no-op.
+    fn require_policy_allows(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if Self::get_policy_bypass(env.clone(), wallet_id) {
+            return Ok(());
+        }
+        let policy = Self::get_policy(env.clone());
+        if let Some(policy_addr) = policy {
+            PolicyClient::new(env, &policy_addr).check_transfer(
+                &String::from_str(env, "active"),
+                asset,
+                recipient,
+                &amount,
+            );
+        }
+        Ok(())
+    }
 
     fn load_wallet(env: &Env, id: u64) -> Result<WalletData, Error> {
         env.storage()

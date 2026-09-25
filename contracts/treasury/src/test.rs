@@ -432,6 +432,70 @@ fn multiple_approved_assets_route_independently() {
 }
 
 #[test]
+fn balance_reports_actual_custody_across_assets() {
+    let h = setup("vault", 1_000);
+    let second = unapproved_token(&h, 250);
+    h.client.add_approved_asset(&h.admin, &second);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &second, &250);
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.client.address, &7);
+
+    assert_eq!(h.client.balance(&h.asset), 1_007);
+    assert_eq!(h.client.balance(&second), 250);
+
+    let assets: Vec<Address> = vec![&h.env, second.clone(), h.asset.clone()];
+    let report = h.client.balances(&assets);
+    assert_eq!(report.len(), 2);
+    assert_eq!(report.get(0).unwrap().asset, second);
+    assert_eq!(report.get(0).unwrap().balance, 250);
+    assert_eq!(report.get(1).unwrap().asset, h.asset);
+    assert_eq!(report.get(1).unwrap().balance, 1_007);
+}
+
+#[test]
+fn balance_queries_require_approved_assets() {
+    let h = setup("vault", 0);
+    let rogue = unapproved_token(&h, 100);
+
+    assert_eq!(
+        h.client.try_balance(&rogue),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    let assets: Vec<Address> = vec![&h.env, rogue];
+    assert_eq!(
+        h.client.try_balances(&assets),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+}
+
+#[test]
+fn balance_report_rejects_duplicate_assets() {
+    let h = setup("vault", 0);
+    let assets: Vec<Address> = vec![&h.env, h.asset.clone(), h.asset.clone()];
+
+    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn balance_report_rejects_oversized_asset_lists() {
+    let h = setup("vault", 0);
+    let mut assets: Vec<Address> = Vec::new(&h.env);
+    for _ in 0..33 {
+        assets.push_back(Address::generate(&h.env));
+    }
+
+    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn balance_report_is_empty_for_no_assets() {
+    let h = setup("vault", 0);
+    let assets: Vec<Address> = Vec::new(&h.env);
+
+    assert!(h.client.balances(&assets).is_empty());
+}
+
+#[test]
 fn whitelist_changes_emit_events() {
     let h = setup("vault", 0);
     let other = unapproved_token(&h, 0);
@@ -713,4 +777,177 @@ fn freeze_without_multisig_configured_fails() {
     // Try to freeze without setting multisig - should fail
     let res = client.try_freeze(&admin);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+// ---------------------------------------------------------------------------
+// Emergency circuit breaker (pause / unpause)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unauthorized_pause_attempts_are_rejected() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let intruder = Address::generate(&h.env);
+
+    // Neither direction is open to a stranger, and neither call mutates the
+    // pause flag.
+    assert_eq!(h.client.try_pause(&intruder), Err(Ok(Error::Unauthorized)));
+    assert_eq!(
+        h.client.try_unpause(&intruder),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(!h.client.is_paused());
+
+    // Outflows still work, because the breaker never engaged.
+    let recipient = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+}
+
+#[test]
+fn guardian_can_pause_and_unpause() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // Bootstrap: the admin is recorded as the initial guardian, and a fresh
+    // treasury starts with the breaker disengaged.
+    assert_eq!(h.client.guardian(), h.admin);
+    assert!(!h.client.is_paused());
+
+    h.client.pause(&h.admin);
+    assert!(h.client.is_paused());
+    assert_event(&h.env, "TreasuryConfigUpdated");
+
+    h.client.unpause(&h.admin);
+    assert!(!h.client.is_paused());
+    assert_event(&h.env, "TreasuryConfigUpdated");
+}
+
+#[test]
+fn multisig_can_pause_and_unpause() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // The organization's multisig holds the authority independently of the
+    // guardian slot.
+    h.client.pause(&h.multisig);
+    assert!(h.client.is_paused());
+    h.client.unpause(&h.multisig);
+    assert!(!h.client.is_paused());
+}
+
+#[test]
+fn pause_blocks_outflows_and_keeps_inflows_open() {
+    // 1_500 minted so 1_000 can be deposited now and 500 more during the pause.
+    let h = setup("vault", 1_500);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.pause(&h.admin);
+
+    let recipient = Address::generate(&h.env);
+
+    // Single withdrawal refused with the dedicated code; nothing moved.
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+    assert_eq!(token_balance(&h, &recipient), 0);
+
+    // Batch payout refused with the same code; no leg is paid.
+    let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 50)];
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+    assert_eq!(token_balance(&h, &recipient), 0);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+
+    // Inbound deposits stay open during a pause, so recovery funding arrives.
+    h.client.deposit(&h.admin, &h.asset, &500);
+    assert_eq!(token_balance(&h, &h.client.address), 1_500);
+    assert_eq!(h.client.holding(&h.asset).total_in, 1_500);
+
+    // Releasing the breaker restores every outflow.
+    h.client.unpause(&h.admin);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+    assert_eq!(token_balance(&h, &h.client.address), 1_400);
+}
+
+#[test]
+fn pause_blocks_milestone_disbursement() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let to = Address::generate(&h.env);
+    let mid = h
+        .client
+        .init_milestone_disbursement(&h.admin, &h.asset, &to, &1_000, &3);
+
+    h.client.pause(&h.admin);
+    let res = h.client.try_release_next_milestone(&h.admin, &mid);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+    assert_eq!(token_balance(&h, &to), 0);
+
+    h.client.unpause(&h.admin);
+    h.client.release_next_milestone(&h.admin, &mid);
+    assert_eq!(token_balance(&h, &to), 333);
+}
+
+#[test]
+fn pause_toggle_is_idempotency_checked() {
+    let h = setup("vault", 0);
+    // Unpausing a treasury that was never paused is rejected.
+    assert_eq!(h.client.try_unpause(&h.admin), Err(Ok(Error::InvalidState)));
+    h.client.pause(&h.admin);
+    // Pausing twice is rejected rather than silently accepted.
+    assert_eq!(h.client.try_pause(&h.admin), Err(Ok(Error::InvalidState)));
+    assert!(h.client.is_paused());
+}
+
+#[test]
+fn pause_and_freeze_report_distinct_codes() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let recipient = Address::generate(&h.env);
+
+    // The multisig freeze is the structural stop and reports InvalidState.
+    h.client.freeze(&h.multisig);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &10),
+        Err(Ok(Error::InvalidState))
+    );
+    h.client.unfreeze(&h.multisig);
+
+    // The guardian pause is the circuit breaker and reports TreasuryPaused.
+    h.client.pause(&h.admin);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &10),
+        Err(Ok(Error::TreasuryPaused))
+    );
+    assert_eq!(
+        h.client
+            .try_batch_transfer(&h.admin, &h.asset, &vec![&h.env, payment(&recipient, 10)]),
+        Err(Ok(Error::TreasuryPaused))
+    );
+}
+
+#[test]
+fn set_guardian_rotates_pause_authority() {
+    let h = setup("vault", 1_000);
+    let new_guardian = Address::generate(&h.env);
+
+    // Only the admin may rotate the guardian.
+    let intruder = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_set_guardian(&intruder, &new_guardian),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.guardian(), h.admin);
+
+    h.client.set_guardian(&h.admin, &new_guardian);
+    assert_eq!(h.client.guardian(), new_guardian);
+
+    // The superseded guardian has lost the authority; the new one holds it.
+    assert_eq!(h.client.try_pause(&h.admin), Err(Ok(Error::Unauthorized)));
+    h.client.pause(&new_guardian);
+    assert!(h.client.is_paused());
+
+    // The multisig keeps its own, independent authority throughout.
+    h.client.unpause(&h.multisig);
+    assert!(!h.client.is_paused());
 }

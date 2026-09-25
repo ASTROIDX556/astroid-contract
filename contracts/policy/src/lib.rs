@@ -499,7 +499,7 @@ impl PolicyContract {
     }
 
     /// Check whether an asset is whitelisted for a given policy.
-    /// Returns Ok(()) if allowed, or AssetNotWhitelisted if the whitelist is
+    /// Returns Ok(()) if allowed, or AssetNotAuthorized if the whitelist is
     /// enabled and the asset is not present.
     pub fn validate_asset(env: Env, policy_id: String, asset: Address) -> Result<(), Error> {
         let enabled_key = DataKey::AssetWhitelistEnabled(policy_id.clone());
@@ -514,7 +514,7 @@ impl PolicyContract {
         let key = DataKey::AssetWhitelist(policy_id.clone(), asset.clone());
         if !env.storage().persistent().has(&key) {
             events_policy_violation(&env, &policy_id, "asset_not_whitelisted");
-            return Err(Error::AssetNotWhitelisted);
+            return Err(Error::AssetNotAuthorized);
         }
         Ok(())
     }
