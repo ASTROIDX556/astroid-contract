@@ -68,6 +68,24 @@ pub enum ContractEvent {
     TreasuryFrozen { org: String },
     /// A treasury was unfrozen by the multisig.
     TreasuryUnfrozen { org: String },
+    /// Value was deposited into a treasury. `balance` is the treasury's
+    /// recorded balance of `asset` after the deposit.
+    TreasuryDeposited {
+        org: String,
+        from: Address,
+        asset: Address,
+        amount: i128,
+        balance: i128,
+    },
+    /// Value was withdrawn from a treasury. `balance` is the treasury's
+    /// recorded balance of `asset` after the withdrawal.
+    TreasuryWithdrawn {
+        org: String,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        balance: i128,
+    },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -176,6 +194,30 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::TreasuryUnfrozen { org } => {
             env.events()
                 .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
+        }
+        ContractEvent::TreasuryDeposited {
+            org,
+            from,
+            asset,
+            amount,
+            balance,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryDeposited"),),
+                (org, from, asset, amount, balance),
+            );
+        }
+        ContractEvent::TreasuryWithdrawn {
+            org,
+            to,
+            asset,
+            amount,
+            balance,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryWithdrawn"),),
+                (org, to, asset, amount, balance),
+            );
         }
         ContractEvent::EscrowReleased {
             escrow_id,

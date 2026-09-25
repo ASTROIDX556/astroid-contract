@@ -714,3 +714,223 @@ fn freeze_without_multisig_configured_fails() {
     let res = client.try_freeze(&admin);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
+
+// --- Multi-asset balance tracking + deposit/withdrawal events (Issue #210) ---
+
+/// A second SAC token registered and approved for routing.
+fn second_asset(h: &Harness) -> Address {
+    let token_admin = Address::generate(&h.env);
+    let asset = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    h.client.add_approved_asset(&h.admin, &asset);
+    asset
+}
+
+fn balance_of(h: &Harness, asset: &Address, who: &Address) -> i128 {
+    token::TokenClient::new(&h.env, asset).balance(who)
+}
+
+/// Assert that a structured single-topic event was published and that its
+/// payload renders to the expected XDR-serializable field list (used to pin
+/// the TreasuryDeposited / TreasuryWithdrawn schema: org, counterparty,
+/// asset, amount, balance).
+fn assert_event_payload(env: &Env, variant: &str, want: Vec<Val>) {
+    use soroban_sdk::xdr::ToXdr;
+
+    let want_topic: Val = Symbol::new(env, variant).into_val(env);
+    let want_scval = want.to_xdr(env);
+    let found = env.events().all().iter().any(|(_id, topics, payload)| {
+        if !topics.contains(want_topic.clone()) {
+            return false;
+        }
+        // Both sides are converted to their XDR form in the same host env,
+        // so identical structures produce identical bytes.
+        payload.to_xdr(env) == want_scval
+    });
+    assert!(
+        found,
+        "expected {} event with the given payload to be emitted",
+        variant
+    );
+}
+
+#[test]
+fn multi_asset_deposits_track_independent_balances() {
+    let h = setup("vault", 0);
+    let asset_b = second_asset(&h);
+
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &1_000);
+    token::StellarAssetClient::new(&h.env, &asset_b).mint(&h.admin, &2_000);
+
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &asset_b, &2_000);
+
+    // Each asset keeps its own balance and flow totals.
+    assert_eq!(h.client.asset_balance(&h.asset), 1_000);
+    assert_eq!(h.client.asset_balance(&asset_b), 2_000);
+    assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
+    assert_eq!(h.client.holding(&asset_b).total_in, 2_000);
+
+    // Real custody agrees per asset.
+    assert_eq!(balance_of(&h, &h.asset, &h.client.address), 1_000);
+    assert_eq!(balance_of(&h, &asset_b, &h.client.address), 2_000);
+
+    // An asset that never moved reads as zero.
+    let untouched = Address::generate(&h.env);
+    assert_eq!(h.client.asset_balance(&untouched), 0);
+}
+
+#[test]
+fn multi_asset_withdrawals_debit_only_the_named_asset() {
+    let h = setup("vault", 0);
+    let asset_b = second_asset(&h);
+
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &1_000);
+    token::StellarAssetClient::new(&h.env, &asset_b).mint(&h.admin, &1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &asset_b, &1_000);
+
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &r1, &400);
+    h.client.withdraw(&h.admin, &asset_b, &r2, &100);
+
+    // Balances and flow totals move independently per asset.
+    assert_eq!(h.client.asset_balance(&h.asset), 600);
+    assert_eq!(h.client.asset_balance(&asset_b), 900);
+    assert_eq!(h.client.holding(&h.asset).total_out, 400);
+    assert_eq!(h.client.holding(&asset_b).total_out, 100);
+    assert_eq!(balance_of(&h, &h.asset, &r1), 400);
+    assert_eq!(balance_of(&h, &asset_b, &r2), 100);
+}
+
+#[test]
+fn assets_lists_every_asset_that_has_ever_moved() {
+    let h = setup("vault", 0);
+    let asset_b = second_asset(&h);
+    let asset_c = second_asset(&h);
+
+    // Before anything moves, no asset is tracked.
+    assert_eq!(h.client.assets().len(), 0);
+
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &300);
+    token::StellarAssetClient::new(&h.env, &asset_b).mint(&h.admin, &300);
+    h.client.deposit(&h.admin, &h.asset, &300);
+    h.client.deposit(&h.admin, &asset_b, &300);
+
+    let tracked = h.client.assets();
+    assert_eq!(tracked.len(), 2);
+    assert!(tracked.contains(&h.asset));
+    assert!(tracked.contains(&asset_b));
+    assert!(!tracked.contains(&asset_c));
+
+    // A withdrawal does not remove the asset from the index.
+    h.client
+        .withdraw(&h.admin, &asset_b, &Address::generate(&h.env), &300);
+    let tracked = h.client.assets();
+    assert_eq!(tracked.len(), 2);
+    assert_eq!(h.client.asset_balance(&asset_b), 0);
+}
+
+#[test]
+fn balance_never_going_negative_on_overdraw() {
+    let h = setup("vault", 0);
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &100);
+    h.client.deposit(&h.admin, &h.asset, &100);
+
+    let res = h
+        .client
+        .try_withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &1_000);
+    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+
+    // A failed withdrawal leaves the recorded balance untouched.
+    assert_eq!(h.client.asset_balance(&h.asset), 100);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+}
+
+#[test]
+fn deposit_and_withdraw_emit_structured_events_with_balance() {
+    let h = setup("vault", 0);
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &1_000);
+
+    // The structured payload carries org, counterparty, asset, amount and
+    // the treasury's resulting balance of the asset.
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    assert_event_payload(
+        &h.env,
+        "TreasuryDeposited",
+        vec![
+            &h.env,
+            String::from_str(&h.env, "vault").into_val(&h.env),
+            h.admin.to_val(),
+            h.asset.to_val(),
+            1_000i128.into_val(&h.env),
+            1_000i128.into_val(&h.env),
+        ],
+    );
+
+    let recipient = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
+    assert_event_payload(
+        &h.env,
+        "TreasuryWithdrawn",
+        vec![
+            &h.env,
+            String::from_str(&h.env, "vault").into_val(&h.env),
+            recipient.to_val(),
+            h.asset.to_val(),
+            400i128.into_val(&h.env),
+            600i128.into_val(&h.env),
+        ],
+    );
+
+    // The legacy `(treasury, deposited)` tuple topic is still emitted for
+    // existing consumers; withdrawals keep their long-standing
+    // `(transfer, executed)` legacy topic.
+    let deposited: Val = Symbol::new(&h.env, "deposited").into_val(&h.env);
+    let executed: Val = Symbol::new(&h.env, "executed").into_val(&h.env);
+    let all = h.env.events().all();
+    assert!(all
+        .iter()
+        .any(|(_, topics, _)| topics.contains(deposited.clone())));
+    assert!(all
+        .iter()
+        .any(|(_, topics, _)| topics.contains(executed.clone())));
+
+    // Successive events carry the updated balance, so indexers can rebuild
+    // per-asset balances from the log alone.
+    let recipient2 = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient2, &100);
+    assert_event_payload(
+        &h.env,
+        "TreasuryWithdrawn",
+        vec![
+            &h.env,
+            String::from_str(&h.env, "vault").into_val(&h.env),
+            recipient2.to_val(),
+            h.asset.to_val(),
+            100i128.into_val(&h.env),
+            500i128.into_val(&h.env),
+        ],
+    );
+}
+
+#[test]
+fn unapproved_asset_cannot_enter_multi_asset_tracking() {
+    let h = setup("vault", 0);
+
+    // An unapproved token contract is refused before any bookkeeping happens.
+    let token_admin = Address::generate(&h.env);
+    let rogue = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&h.env, &rogue).mint(&h.admin, &1_000);
+
+    let res = h.client.try_deposit(&h.admin, &rogue, &1_000);
+    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
+    assert_eq!(h.client.asset_balance(&rogue), 0);
+    assert!(!h.client.assets().contains(&rogue));
+}

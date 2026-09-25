@@ -46,8 +46,28 @@
 //! `add_approved_asset`, `remove_approved_asset`, `freeze`, `unfreeze`,
 //! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `set_allowance`,
 //! `remove_allowance`, `allowance`, `init_milestone_disbursement`,
-//! `release_next_milestone`, `get`, `holding`, `is_approved_asset`,
-//! `approved_asset_count`.
+//! `release_next_milestone`, `get`, `holding`, `asset_balance`, `assets`,
+//! `is_approved_asset`, `approved_asset_count`.
+//!
+//! ## Multi-asset balance tracking
+//!
+//! A treasury routinely holds more than one token (a payment asset plus a
+//! reserve asset, for example). Beyond the cumulative flow totals in
+//! [`Holding`], every asset gets its own persistent [`DataKey::AssetBalance`]
+//! recording the net units currently held (`total_in - total_out`), exposed
+//! through [`TreasuryContract::asset_balance`]. Assets are registered in an
+//! instance-storage index the first time they move, so
+//! [`TreasuryContract::assets`] can enumerate everything the treasury has
+//! ever routed without scanning storage.
+//!
+//! ## Deposit and withdrawal event logging
+//!
+//! Inflows and outflows each emit a structured, single-topic event —
+//! `TreasuryDeposited` / `TreasuryWithdrawn` (see [`events::ContractEvent`])
+//! — carrying the organization, counterparty, asset, amount and the
+//! treasury's resulting balance of that asset, so indexers can rebuild
+//! per-asset balances from the log alone. The legacy `(treasury, deposited)`
+//! tuple topic is still published for existing consumers.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -96,7 +116,9 @@ pub struct MilestoneDisbursement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holding {
     pub asset: Address,
+    /// Cumulative amount deposited for this asset.
     pub total_in: i128,
+    /// Cumulative amount withdrawn for this asset.
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
@@ -137,6 +159,14 @@ enum DataKey {
     ApprovedAsset(Address),
     /// Number of currently approved assets (instance).
     ApprovedAssetCount,
+    /// Current balance per asset: token contract address -> net units held
+    /// for the organization (persistent). `balance = total_in - total_out`.
+    AssetBalance(Address),
+    /// Position -> tracked asset address (instance). Paired with
+    /// [`DataKey::AssetCount`] it bounds multi-asset iteration for `assets`.
+    AssetIndex(u32),
+    /// Number of assets that have ever been deposited or withdrawn (instance).
+    AssetCount,
     ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
@@ -351,6 +381,11 @@ impl TreasuryContract {
     /// Deposit assets into the treasury (any funder may authorize). Moves real
     /// SAC tokens from `from` into the treasury's custody, then credits the
     /// internal per-asset accounting.
+    ///
+    /// Multi-asset bookkeeping: every asset keeps its own [`AssetBalance`] on
+    /// top of the cumulative [`Holding`] flow totals, so a treasury holding
+    /// several tokens reports an accurate per-asset balance. Emits the
+    /// structured `TreasuryDeposited` event alongside the legacy tuple topic.
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
@@ -363,6 +398,8 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, amount)?;
         Self::store_holding(&env, &asset, &h);
+        let balance = checked_add(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
             (asset.clone(), amount),
@@ -372,6 +409,16 @@ impl TreasuryContract {
             &from,
             &env.current_contract_address(),
             &amount,
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryDeposited {
+                org: t.org.clone(),
+                from: from.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
+            },
         );
         Self::unlock(&env);
         Self::unlock(&env);
@@ -482,6 +529,10 @@ impl TreasuryContract {
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
     /// must clear policy and budget gates before the ledger is debited.
+    ///
+    /// Multi-asset bookkeeping: the per-asset [`AssetBalance`] is debited
+    /// alongside the cumulative [`Holding`] totals, and the structured
+    /// `TreasuryWithdrawn` event is emitted alongside the legacy tuple topic.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -556,6 +607,8 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        let balance = checked_sub(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -570,6 +623,16 @@ impl TreasuryContract {
                 to: to.clone(),
                 asset: asset.clone(),
                 amount,
+            },
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryWithdrawn {
+                org: t.org.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
             },
         );
         Self::unlock(&env);
@@ -784,6 +847,32 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
+    /// Current internal balance of `asset`: net units recorded for the
+    /// organization (deposits minus withdrawals), independent of the
+    /// cumulative flow totals in [`Self::holding`]. Starts at 0 for assets
+    /// that have never moved.
+    pub fn asset_balance(env: Env, asset: Address) -> i128 {
+        Self::asset_balance_internal(&env, &asset)
+    }
+
+    /// The list of assets the treasury has ever moved (deposited or
+    /// withdrawn). Multi-asset iteration is bounded because an asset is
+    /// registered only through `deposit`/`withdraw`, and every routed asset
+    /// must first have been approved by governance.
+    pub fn assets(env: Env) -> Result<Vec<Address>, Error> {
+        let mut out: Vec<Address> = Vec::new(&env);
+        let count = Self::asset_count(&env);
+        for i in 0..count {
+            let asset: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::AssetIndex(i))
+                .ok_or(Error::NotFound)?;
+            out.push_back(asset);
+        }
+        Ok(out)
+    }
+
     /// Whether `asset` is currently approved for routing.
     pub fn is_approved_asset(env: Env, asset: Address) -> bool {
         env.storage()
@@ -846,6 +935,46 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .get(&DataKey::ApprovedAssetCount)
+            .unwrap_or(0)
+    }
+
+    /// Current recorded balance for `asset` (0 when the asset never moved).
+    fn asset_balance_internal(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBalance(asset.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Persist `balance` for `asset`, registering the asset in the tracked
+    /// index the first time it moves.
+    fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
+        let key = DataKey::AssetBalance(asset.clone());
+        let first_movement = !env.storage().persistent().has(&key);
+        env.storage().persistent().set(&key, &balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        if first_movement {
+            let count = Self::asset_count(env);
+            env.storage()
+                .instance()
+                .set(&DataKey::AssetIndex(count), asset);
+            let next = count.saturating_add(1);
+            env.storage().instance().set(&DataKey::AssetCount, &next);
+            env.storage()
+                .instance()
+                .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        }
+    }
+
+    /// Number of assets that have ever been deposited or withdrawn.
+    fn asset_count(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AssetCount)
             .unwrap_or(0)
     }
 
