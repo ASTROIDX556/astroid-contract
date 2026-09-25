@@ -42,33 +42,31 @@
 //! the fee of one transaction. If any leg fails, the host reverts the entire
 //! invocation and no recipient is paid.
 //!
+//! ## Emergency circuit breaker (pause)
+//!
+//! Alongside the multisig-only `freeze`, the treasury carries a dedicated
+//! `paused: bool` flag and an authorized `guardian: Address` in its instance
+//! storage. `pause` / `unpause` may only be called by that guardian or by the
+//! organization's multisig, and they flip nothing but the flag - structural
+//! ownership and configuration stay untouched:
+//!
+//! ```text
+//! paused ── withdraw / batch_transfer / release_next_milestone ──▶ Error::TreasuryPaused
+//! paused ── deposit ─────────────────────────────────────────────▶ still accepted
+//! ```
+//!
+//! Inbound deposits are deliberately left open while the breaker is engaged,
+//! so an organization can keep receiving recovery funding during an incident;
+//! only value leaving the treasury is refused, with the dedicated
+//! [`Error::TreasuryPaused`] code so off-chain monitors can distinguish "we
+//! paused on purpose" from a generic state failure.
+//!
 //! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`,
-//! `add_approved_asset`, `remove_approved_asset`, `freeze`, `unfreeze`,
-//! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `set_allowance`,
-//! `remove_allowance`, `allowance`, `init_milestone_disbursement`,
-//! `release_next_milestone`, `get`, `holding`, `balance`, `balances`,
-//! `is_approved_asset`, `approved_asset_count`.
-//!
-//! ## Multi-asset balance tracking
-//!
-//! A treasury routinely holds more than one token (a payment asset plus a
-//! reserve asset, for example). Beyond the cumulative flow totals in
-//! [`Holding`], the treasury reports its per-asset position directly from
-//! custody: [`TreasuryContract::balance`] reads one asset's balance and
-//! [`TreasuryContract::balances`] aggregates a whole list of assets into a
-//! single [`AssetBalance`] report, so clients can price every token the
-//! treasury routes without one cross-contract call each. Both refuse
-//! unapproved token contracts with [`Error::AssetNotAuthorized`], keeping the
-//! whitelist as the single routing gate.
-//!
-//! ## Deposit and withdrawal event logging
-//!
-//! Inflows and outflows each emit a structured, single-topic event —
-//! `TreasuryDeposited` / `TreasuryWithdrawn` (see [`events::ContractEvent`])
-//! — carrying the organization, counterparty, asset, amount and the
-//! treasury's resulting balance of that asset, so indexers can rebuild
-//! per-asset balances from the log alone. The legacy `(treasury, deposited)`
-//! tuple topic is still published for existing consumers.
+//! `set_guardian`, `add_approved_asset`, `remove_approved_asset`, `freeze`,
+//! `unfreeze`, `pause`, `unpause`, `deposit`, `withdraw`, `batch_transfer`,
+//! `allocate_budget`, `set_allowance`, `remove_allowance`, `allowance`,
+//! `init_milestone_disbursement`, `release_next_milestone`, `get`, `holding`,
+//! `is_paused`, `guardian`, `is_approved_asset`, `approved_asset_count`.
 
 use astroid_interfaces::PolicyClient;
 use astroid_shared::constants::{
@@ -100,6 +98,15 @@ pub struct Treasury {
     pub budget: Option<Address>,
     /// Lifecycle state shared with wallets.
     pub state: ResourceState,
+    /// Emergency circuit-breaker guardian: may engage or release the pause
+    /// alongside the multisig. Bootstrapped to `admin` at `initialize` and
+    /// rotated through [`TreasuryContract::set_guardian`].
+    pub guardian: Address,
+    /// Whether the emergency circuit breaker is currently engaged. While
+    /// `true`, every outbound disbursement or transfer is refused with
+    /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
+    /// funding can still arrive.
+    pub paused: bool,
 }
 
 /// Per-asset accounting within the treasury.
@@ -224,6 +231,11 @@ impl TreasuryContract {
         )
     }
     /// Create a treasury for `org`, gated on the admin's signature.
+    ///
+    /// The circuit breaker starts disengaged (`paused == false`) and the
+    /// deployer admin is recorded as the initial guardian, so a freshly
+    /// created treasury always has at least one account that can pause it;
+    /// rotate the guardian afterwards with [`Self::set_guardian`].
     pub fn initialize(env: Env, org: String, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Treasury) {
             return Err(Error::AlreadyInitialized);
@@ -238,6 +250,8 @@ impl TreasuryContract {
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
+                guardian: admin.clone(),
+                paused: false,
             },
         );
         env.storage()
@@ -379,6 +393,84 @@ impl TreasuryContract {
         );
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("unfrozen")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Rotate the emergency circuit-breaker guardian (admin-gated).
+    ///
+    /// The guardian is a dedicated key whose only powers are
+    /// [`Self::pause`] / [`Self::unpause`]; pointing it at a hot
+    /// monitoring key (or at another multisig) lets an organization decouple
+    /// "who can stop the treasury" from "who can spend from it".
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), Error> {
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.guardian = guardian;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("guardian"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("guardian")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Engage the emergency circuit breaker.
+    ///
+    /// Restricted to the recorded guardian or the organization's multisig
+    /// (both checked against instance storage, then authorized with
+    /// `require_auth`). While engaged, every outbound value movement
+    /// ([`Self::withdraw`], [`Self::batch_transfer`],
+    /// [`Self::release_next_milestone`]) short-circuits with
+    /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
+    /// funding can still arrive. Unlike [`Self::freeze`] this does not change
+    /// any structural ownership or configuration - only the pause flag moves.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        let mut t = Self::require_guardian(&env, &caller)?;
+        if t.paused {
+            return Err(Error::InvalidState);
+        }
+        t.paused = true;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("pause"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("paused")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Release the emergency circuit breaker and restore outbound transfers.
+    ///
+    /// Same guardian/multisig gate as [`Self::pause`], and symmetric: an
+    /// attempt to unpause a treasury that is not paused fails with
+    /// [`Error::InvalidState`] rather than silently doing nothing.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        let mut t = Self::require_guardian(&env, &caller)?;
+        if !t.paused {
+            return Err(Error::InvalidState);
+        }
+        t.paused = false;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("unpause"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("unpaused")), ());
         Self::unlock(&env);
         Ok(())
     }
@@ -535,9 +627,8 @@ impl TreasuryContract {
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
     /// must clear policy and budget gates before the ledger is debited.
     ///
-    /// Multi-asset bookkeeping: the per-asset [`AssetBalance`] is debited
-    /// alongside the cumulative [`Holding`] totals, and the structured
-    /// `TreasuryWithdrawn` event is emitted alongside the legacy tuple topic.
+    /// While the circuit breaker is engaged this short-circuits with
+    /// [`Error::TreasuryPaused`] before any other gate is consulted.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -546,6 +637,7 @@ impl TreasuryContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
@@ -656,6 +748,10 @@ impl TreasuryContract {
     /// sub-call, such as a policy denial or a token transfer) rolls back every
     /// storage write and every transfer made earlier in the invocation, so a
     /// batch either pays every recipient or none of them.
+    ///
+    /// Like every other outflow it is refused with [`Error::TreasuryPaused`]
+    /// while the emergency circuit breaker is engaged - a batch payout is a
+    /// disbursement like any other.
     pub fn batch_transfer(
         env: Env,
         caller: Address,
@@ -665,6 +761,7 @@ impl TreasuryContract {
         if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
             return Err(Error::InvalidInput);
         }
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         let t = Self::load(&env);
         Self::require_active(&t)?;
@@ -739,6 +836,17 @@ impl TreasuryContract {
 
     // --- views ---
 
+    /// Whether the emergency circuit breaker is currently engaged.
+    pub fn is_paused(env: Env) -> bool {
+        Self::load(&env).paused
+    }
+
+    /// The address currently authorized to pause / unpause this treasury
+    /// (alongside the multisig).
+    pub fn guardian(env: Env) -> Address {
+        Self::load(&env).guardian
+    }
+
     /// Initialize a milestone-based disbursement.
     pub fn init_milestone_disbursement(
         env: Env,
@@ -786,11 +894,15 @@ impl TreasuryContract {
     }
 
     /// Release the next milestone payout.
+    ///
+    /// An outflow like any other: refused with [`Error::TreasuryPaused`] while
+    /// the emergency circuit breaker is engaged.
     pub fn release_next_milestone(
         env: Env,
         caller: Address,
         milestone_id: u64,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         let t = Self::require_admin(&env, &caller)?;
         let key = DataKey::Milestone(milestone_id);
         let mut d: MilestoneDisbursement = env
@@ -1001,6 +1113,32 @@ impl TreasuryContract {
             }
             _ => Err(Error::Unauthorized),
         }
+    }
+
+    /// Authorize a circuit-breaker operation: the caller must be either the
+    /// recorded guardian or the organization's multisig, verified against
+    /// instance storage before `require_auth` is demanded.
+    fn require_guardian(env: &Env, caller: &Address) -> Result<Treasury, Error> {
+        let t = Self::load(env);
+        let is_multisig = matches!(&t.multisig, Some(multisig) if multisig == caller);
+        if t.guardian != *caller && !is_multisig {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        Ok(t)
+    }
+
+    /// Short-circuit an outbound value movement while the emergency circuit
+    /// breaker is engaged, with the dedicated [`Error::TreasuryPaused`] code.
+    ///
+    /// Reads the flag from instance storage on every call rather than caching
+    /// it, and is never called on inbound paths: deposits must keep working
+    /// during a pause so recovery funding can arrive.
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::load(env).paused {
+            return Err(Error::TreasuryPaused);
+        }
+        Ok(())
     }
 
     fn check_frozen(env: &Env) -> Result<(), Error> {

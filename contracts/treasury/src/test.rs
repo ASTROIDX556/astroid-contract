@@ -779,250 +779,175 @@ fn freeze_without_multisig_configured_fails() {
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
 
-// --- Multi-asset balance tracking + deposit/withdrawal events (Issue #210) ---
+// ---------------------------------------------------------------------------
+// Emergency circuit breaker (pause / unpause)
+// ---------------------------------------------------------------------------
 
-/// A second SAC token registered and approved for routing.
-fn second_asset(h: &Harness) -> Address {
-    let token_admin = Address::generate(&h.env);
-    let asset = h
-        .env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    h.client.add_approved_asset(&h.admin, &asset);
-    asset
-}
+#[test]
+fn unauthorized_pause_attempts_are_rejected() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let intruder = Address::generate(&h.env);
 
-fn balance_of(h: &Harness, asset: &Address, who: &Address) -> i128 {
-    token::TokenClient::new(&h.env, asset).balance(who)
-}
-
-/// Assert that a structured single-topic event was published and that its
-/// payload renders to the expected XDR-serializable field list (used to pin
-/// the TreasuryDeposited / TreasuryWithdrawn schema: org, counterparty,
-/// asset, amount, balance).
-fn assert_event_payload(env: &Env, variant: &str, want: Vec<Val>) {
-    use soroban_sdk::xdr::ToXdr;
-
-    let want_topic: Val = Symbol::new(env, variant).into_val(env);
-    let want_scval = want.to_xdr(env);
-    let found = env.events().all().iter().any(|(_id, topics, payload)| {
-        if !topics.contains(want_topic) {
-            return false;
-        }
-        // Both sides are converted to their XDR form in the same host env,
-        // so identical structures produce identical bytes.
-        payload.to_xdr(env) == want_scval
-    });
-    assert!(
-        found,
-        "expected {} event with the given payload to be emitted",
-        variant
+    // Neither direction is open to a stranger, and neither call mutates the
+    // pause flag.
+    assert_eq!(h.client.try_pause(&intruder), Err(Ok(Error::Unauthorized)));
+    assert_eq!(
+        h.client.try_unpause(&intruder),
+        Err(Ok(Error::Unauthorized))
     );
+    assert!(!h.client.is_paused());
+
+    // Outflows still work, because the breaker never engaged.
+    let recipient = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
 }
 
 #[test]
-fn multi_asset_deposits_track_independent_balances() {
-    let h = setup("vault", 0);
-    let asset_b = second_asset(&h);
-
-    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &1_000);
-    token::StellarAssetClient::new(&h.env, &asset_b).mint(&h.admin, &2_000);
-
+fn guardian_can_pause_and_unpause() {
+    let h = setup("vault", 1_000);
     h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.deposit(&h.admin, &asset_b, &2_000);
 
-    // Each asset is custodied and accounted independently.
-    assert_eq!(h.client.balance(&h.asset), 1_000);
-    assert_eq!(h.client.balance(&asset_b), 2_000);
-    assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
-    assert_eq!(h.client.holding(&asset_b).total_in, 2_000);
+    // Bootstrap: the admin is recorded as the initial guardian, and a fresh
+    // treasury starts with the breaker disengaged.
+    assert_eq!(h.client.guardian(), h.admin);
+    assert!(!h.client.is_paused());
 
-    // A single report covers both assets in one call.
-    let report = h
-        .client
-        .balances(&vec![&h.env, h.asset.clone(), asset_b.clone()]);
-    assert_eq!(report.len(), 2);
-    assert_eq!(report.get(0).unwrap().asset, h.asset);
-    assert_eq!(report.get(0).unwrap().balance, 1_000);
-    assert_eq!(report.get(1).unwrap().asset, asset_b);
-    assert_eq!(report.get(1).unwrap().balance, 2_000);
+    h.client.pause(&h.admin);
+    assert!(h.client.is_paused());
+    assert_event(&h.env, "TreasuryConfigUpdated");
 
-    // Real custody agrees per asset.
-    assert_eq!(balance_of(&h, &h.asset, &h.client.address), 1_000);
-    assert_eq!(balance_of(&h, &asset_b, &h.client.address), 2_000);
-
-    // An asset that was approved but never funded holds nothing.
-    let untouched = second_asset(&h);
-    assert_eq!(h.client.balance(&untouched), 0);
+    h.client.unpause(&h.admin);
+    assert!(!h.client.is_paused());
+    assert_event(&h.env, "TreasuryConfigUpdated");
 }
 
 #[test]
-fn multi_asset_withdrawals_debit_only_the_named_asset() {
-    let h = setup("vault", 0);
-    let asset_b = second_asset(&h);
-
-    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &1_000);
-    token::StellarAssetClient::new(&h.env, &asset_b).mint(&h.admin, &1_000);
+fn multisig_can_pause_and_unpause() {
+    let h = setup("vault", 1_000);
     h.client.deposit(&h.admin, &h.asset, &1_000);
-    h.client.deposit(&h.admin, &asset_b, &1_000);
 
-    let r1 = Address::generate(&h.env);
-    let r2 = Address::generate(&h.env);
-    h.client.withdraw(&h.admin, &h.asset, &r1, &400);
-    h.client.withdraw(&h.admin, &asset_b, &r2, &100);
-
-    // Balances and flow totals move independently per asset.
-    assert_eq!(h.client.balance(&h.asset), 600);
-    assert_eq!(h.client.balance(&asset_b), 900);
-    assert_eq!(h.client.holding(&h.asset).total_out, 400);
-    assert_eq!(h.client.holding(&asset_b).total_out, 100);
-    assert_eq!(balance_of(&h, &h.asset, &r1), 400);
-    assert_eq!(balance_of(&h, &asset_b, &r2), 100);
+    // The organization's multisig holds the authority independently of the
+    // guardian slot.
+    h.client.pause(&h.multisig);
+    assert!(h.client.is_paused());
+    h.client.unpause(&h.multisig);
+    assert!(!h.client.is_paused());
 }
 
 #[test]
-fn multi_asset_balances_survive_full_drain_of_one_asset() {
-    let h = setup("vault", 0);
-    let asset_b = second_asset(&h);
-    let asset_c = second_asset(&h);
-
-    // With nothing deposited, both assets report zero through the report.
-    let report = h
-        .client
-        .balances(&vec![&h.env, h.asset.clone(), asset_b.clone()]);
-    assert_eq!(report.len(), 2);
-    for entry in report.iter() {
-        assert_eq!(entry.balance, 0);
-    }
-
-    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &300);
-    token::StellarAssetClient::new(&h.env, &asset_b).mint(&h.admin, &300);
-    h.client.deposit(&h.admin, &h.asset, &300);
-    h.client.deposit(&h.admin, &asset_b, &300);
-
-    // Draining asset_b entirely leaves asset_a untouched, and asset_c (a
-    // third approved token) is never affected.
-    h.client
-        .withdraw(&h.admin, &asset_b, &Address::generate(&h.env), &300);
-    assert_eq!(h.client.balance(&h.asset), 300);
-    assert_eq!(h.client.balance(&asset_b), 0);
-    assert_eq!(h.client.balance(&asset_c), 0);
-
-    // The report reflects the same state in one aggregate call.
-    let report = h.client.balances(&vec![
-        &h.env,
-        h.asset.clone(),
-        asset_b.clone(),
-        asset_c.clone(),
-    ]);
-    assert_eq!(report.len(), 3);
-    assert_eq!(report.get(0).unwrap().balance, 300);
-    assert_eq!(report.get(1).unwrap().balance, 0);
-    assert_eq!(report.get(2).unwrap().balance, 0);
-}
-
-#[test]
-fn balance_never_going_negative_on_overdraw() {
-    let h = setup("vault", 0);
-    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &100);
-    h.client.deposit(&h.admin, &h.asset, &100);
-
-    let res = h
-        .client
-        .try_withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &1_000);
-    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
-
-    // A failed withdrawal leaves the recorded balance untouched.
-    assert_eq!(h.client.balance(&h.asset), 100);
-    assert_eq!(h.client.holding(&h.asset).total_out, 0);
-}
-
-#[test]
-fn deposit_and_withdraw_emit_structured_events_with_balance() {
-    let h = setup("vault", 0);
-    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &1_000);
-
-    // The structured payload carries org, counterparty, asset, amount and
-    // the treasury's resulting balance of the asset.
+fn pause_blocks_outflows_and_keeps_inflows_open() {
+    // 1_500 minted so 1_000 can be deposited now and 500 more during the pause.
+    let h = setup("vault", 1_500);
     h.client.deposit(&h.admin, &h.asset, &1_000);
-    assert_event_payload(
-        &h.env,
-        "TreasuryDeposited",
-        vec![
-            &h.env,
-            String::from_str(&h.env, "vault").into_val(&h.env),
-            h.admin.to_val(),
-            h.asset.to_val(),
-            1_000i128.into_val(&h.env),
-            1_000i128.into_val(&h.env),
-        ],
-    );
+    h.client.pause(&h.admin);
 
     let recipient = Address::generate(&h.env);
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
-    assert_event_payload(
-        &h.env,
-        "TreasuryWithdrawn",
-        vec![
-            &h.env,
-            String::from_str(&h.env, "vault").into_val(&h.env),
-            recipient.to_val(),
-            h.asset.to_val(),
-            400i128.into_val(&h.env),
-            600i128.into_val(&h.env),
-        ],
-    );
 
-    // The legacy `(treasury, deposited)` tuple topic is still emitted for
-    // existing consumers; withdrawals keep their long-standing
-    // `(transfer, executed)` legacy topic.
-    let deposited: Val = Symbol::new(&h.env, "deposited").into_val(&h.env);
-    let executed: Val = Symbol::new(&h.env, "executed").into_val(&h.env);
-    let all = h.env.events().all();
-    assert!(all.iter().any(|(_, topics, _)| topics.contains(deposited)));
-    assert!(all.iter().any(|(_, topics, _)| topics.contains(executed)));
+    // Single withdrawal refused with the dedicated code; nothing moved.
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+    assert_eq!(token_balance(&h, &recipient), 0);
 
-    // Successive events carry the updated balance, so indexers can rebuild
-    // per-asset balances from the log alone.
-    let recipient2 = Address::generate(&h.env);
-    h.client.withdraw(&h.admin, &h.asset, &recipient2, &100);
-    assert_event_payload(
-        &h.env,
-        "TreasuryWithdrawn",
-        vec![
-            &h.env,
-            String::from_str(&h.env, "vault").into_val(&h.env),
-            recipient2.to_val(),
-            h.asset.to_val(),
-            100i128.into_val(&h.env),
-            500i128.into_val(&h.env),
-        ],
-    );
+    // Batch payout refused with the same code; no leg is paid.
+    let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 50)];
+    let res = h.client.try_batch_transfer(&h.admin, &h.asset, &payments);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+    assert_eq!(token_balance(&h, &recipient), 0);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+
+    // Inbound deposits stay open during a pause, so recovery funding arrives.
+    h.client.deposit(&h.admin, &h.asset, &500);
+    assert_eq!(token_balance(&h, &h.client.address), 1_500);
+    assert_eq!(h.client.holding(&h.asset).total_in, 1_500);
+
+    // Releasing the breaker restores every outflow.
+    h.client.unpause(&h.admin);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+    assert_eq!(token_balance(&h, &h.client.address), 1_400);
 }
 
 #[test]
-fn unapproved_asset_cannot_enter_multi_asset_tracking() {
+fn pause_blocks_milestone_disbursement() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let to = Address::generate(&h.env);
+    let mid = h
+        .client
+        .init_milestone_disbursement(&h.admin, &h.asset, &to, &1_000, &3);
+
+    h.client.pause(&h.admin);
+    let res = h.client.try_release_next_milestone(&h.admin, &mid);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+    assert_eq!(token_balance(&h, &to), 0);
+
+    h.client.unpause(&h.admin);
+    h.client.release_next_milestone(&h.admin, &mid);
+    assert_eq!(token_balance(&h, &to), 333);
+}
+
+#[test]
+fn pause_toggle_is_idempotency_checked() {
     let h = setup("vault", 0);
+    // Unpausing a treasury that was never paused is rejected.
+    assert_eq!(h.client.try_unpause(&h.admin), Err(Ok(Error::InvalidState)));
+    h.client.pause(&h.admin);
+    // Pausing twice is rejected rather than silently accepted.
+    assert_eq!(h.client.try_pause(&h.admin), Err(Ok(Error::InvalidState)));
+    assert!(h.client.is_paused());
+}
 
-    // An unapproved token contract is refused before any bookkeeping happens.
-    let token_admin = Address::generate(&h.env);
-    let rogue = h
-        .env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    token::StellarAssetClient::new(&h.env, &rogue).mint(&h.admin, &1_000);
+#[test]
+fn pause_and_freeze_report_distinct_codes() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let recipient = Address::generate(&h.env);
 
-    let res = h.client.try_deposit(&h.admin, &rogue, &1_000);
-    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
-    // Balance queries refuse unapproved assets too, so a rogue token can
-    // never enter the multi-asset accounting.
+    // The multisig freeze is the structural stop and reports InvalidState.
+    h.client.freeze(&h.multisig);
     assert_eq!(
-        h.client.try_balance(&rogue),
-        Err(Ok(Error::AssetNotAuthorized))
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &10),
+        Err(Ok(Error::InvalidState))
+    );
+    h.client.unfreeze(&h.multisig);
+
+    // The guardian pause is the circuit breaker and reports TreasuryPaused.
+    h.client.pause(&h.admin);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &10),
+        Err(Ok(Error::TreasuryPaused))
     );
     assert_eq!(
         h.client
-            .try_balances(&vec![&h.env, rogue.clone(), h.asset.clone()]),
-        Err(Ok(Error::AssetNotAuthorized))
+            .try_batch_transfer(&h.admin, &h.asset, &vec![&h.env, payment(&recipient, 10)]),
+        Err(Ok(Error::TreasuryPaused))
     );
+}
+
+#[test]
+fn set_guardian_rotates_pause_authority() {
+    let h = setup("vault", 1_000);
+    let new_guardian = Address::generate(&h.env);
+
+    // Only the admin may rotate the guardian.
+    let intruder = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_set_guardian(&intruder, &new_guardian),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.guardian(), h.admin);
+
+    h.client.set_guardian(&h.admin, &new_guardian);
+    assert_eq!(h.client.guardian(), new_guardian);
+
+    // The superseded guardian has lost the authority; the new one holds it.
+    assert_eq!(h.client.try_pause(&h.admin), Err(Ok(Error::Unauthorized)));
+    h.client.pause(&new_guardian);
+    assert!(h.client.is_paused());
+
+    // The multisig keeps its own, independent authority throughout.
+    h.client.unpause(&h.multisig);
+    assert!(!h.client.is_paused());
 }

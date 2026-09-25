@@ -628,6 +628,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "guardian"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "multisig"
                               },
                               "val": {
@@ -640,6 +648,14 @@
                               },
                               "val": {
                                 "string": "vault"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "paused"
+                              },
+                              "val": {
+                                "bool": false
                               }
                             },
                             {

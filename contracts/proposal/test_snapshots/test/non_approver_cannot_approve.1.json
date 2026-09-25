@@ -120,6 +120,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "approved_at"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "approvers"
                       },
                       "val": {
@@ -267,6 +275,18 @@
                         "val": {
                           "u64": 1
                         }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Timelock"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
                       }
                     ]
                   }
@@ -353,7 +373,9 @@
                 "symbol": "initialize"
               }
             ],
-            "data": "void"
+            "data": {
+              "u64": 0
+            }
           }
         }
       },

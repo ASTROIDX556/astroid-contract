@@ -1,11 +1,12 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{RegistryContract, RegistryContractClient, RegistryRole};
+use crate::{DataKey, RegistryContract, RegistryContractClient, RegistryRole};
+use astroid_shared::constants::{MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT};
 use astroid_shared::errors::Error;
-use astroid_shared::types::ModuleKind;
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{testutils::Events, Address, Env, IntoVal, String, Symbol, Val};
+use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
+use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger};
+use soroban_sdk::{testutils::Events, vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -728,4 +729,278 @@ fn only_the_current_admin_can_rotate_the_authority() {
     h.member
         .set_upgrade_authority(&h.admin, &stranger, &h.registry_id);
     assert_eq!(h.member.get_upgrade_authority().admin, stranger);
+}
+
+// --- Batch lookup (Issue #228) ---
+
+fn module_id(env: &Env, org: &str, kind: ModuleKind) -> ModuleId {
+    ModuleId {
+        org: String::from_str(env, org),
+        kind,
+    }
+}
+
+fn live(address: &Address) -> Option<ModuleInfo> {
+    Some(ModuleInfo {
+        address: address.clone(),
+        deprecated: false,
+    })
+}
+
+/// Register org "acme" with Wallet, Treasury and Policy modules; returns the
+/// three module addresses in that order.
+fn setup_acme(env: &Env, client: &RegistryContractClient, admin: &Address) -> [Address; 3] {
+    let org = String::from_str(env, "acme");
+    let owner = Address::generate(env);
+    client.register_org(admin, &org, &owner);
+    let modules = [
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+    ];
+    let kinds = [ModuleKind::Wallet, ModuleKind::Treasury, ModuleKind::Policy];
+    for (kind, address) in kinds.iter().zip(modules.iter()) {
+        client.register_module(&owner, &org, kind, address);
+    }
+    modules
+}
+
+#[test]
+fn batch_returns_every_registered_module_in_request_order() {
+    let (env, client, admin) = setup();
+    let [wallet, treasury, policy] = setup_acme(&env, &client, &admin);
+
+    // Deliberately not in registration order.
+    let ids = vec![
+        &env,
+        module_id(&env, "acme", ModuleKind::Policy),
+        module_id(&env, "acme", ModuleKind::Wallet),
+        module_id(&env, "acme", ModuleKind::Treasury),
+    ];
+    assert_eq!(
+        client.get_modules_batch(&ids),
+        vec![&env, live(&policy), live(&wallet), live(&treasury)]
+    );
+}
+
+#[test]
+fn batch_reports_missing_modules_as_none_in_place() {
+    let (env, client, admin) = setup();
+    let [wallet, _treasury, policy] = setup_acme(&env, &client, &admin);
+
+    let ids = vec![
+        &env,
+        module_id(&env, "acme", ModuleKind::Escrow), // kind never registered
+        module_id(&env, "acme", ModuleKind::Wallet),
+        module_id(&env, "ghost", ModuleKind::Wallet), // org never registered
+        module_id(&env, "acme", ModuleKind::Policy),
+    ];
+    assert_eq!(
+        client.get_modules_batch(&ids),
+        vec![&env, None, live(&wallet), None, live(&policy)]
+    );
+}
+
+#[test]
+fn batch_of_only_missing_modules_is_all_none() {
+    let (env, client, _admin) = setup();
+    let ids = vec![
+        &env,
+        module_id(&env, "ghost", ModuleKind::Wallet),
+        module_id(&env, "ghost", ModuleKind::Budget),
+    ];
+    assert_eq!(client.get_modules_batch(&ids), vec![&env, None, None]);
+}
+
+#[test]
+fn empty_batch_returns_empty_list() {
+    let (env, client, _admin) = setup();
+    assert_eq!(client.get_modules_batch(&Vec::new(&env)), Vec::new(&env));
+}
+
+#[test]
+fn batch_at_the_size_limit_succeeds() {
+    let (env, client, admin) = setup();
+    let [wallet, _treasury, _policy] = setup_acme(&env, &client, &admin);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        ids.push_back(module_id(&env, "acme", ModuleKind::Wallet));
+    }
+    let result = client.get_modules_batch(&ids);
+    assert_eq!(result.len(), MAX_REGISTRY_BATCH);
+    assert!(result.iter().all(|m| m == live(&wallet)));
+}
+
+#[test]
+fn batch_over_the_size_limit_is_rejected() {
+    let (env, client, admin) = setup();
+    setup_acme(&env, &client, &admin);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..=MAX_REGISTRY_BATCH {
+        ids.push_back(module_id(&env, "acme", ModuleKind::Wallet));
+    }
+    assert_eq!(
+        client.try_get_modules_batch(&ids),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn batch_size_is_checked_before_any_storage_read() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    client.register_org(&admin, &org, &Address::generate(&env));
+    client.freeze(&admin, &org);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..=MAX_REGISTRY_BATCH {
+        ids.push_back(module_id(&env, "acme", ModuleKind::Wallet));
+    }
+    // The freeze flag is itself a storage read; an oversized batch is refused
+    // on its length alone, before the freeze flag is consulted.
+    assert_eq!(
+        client.try_get_modules_batch(&ids),
+        Err(Ok(Error::InvalidInput))
+    );
+    let one = vec![&env, module_id(&env, "acme", ModuleKind::Wallet)];
+    assert_eq!(
+        client.try_get_modules_batch(&one),
+        Err(Ok(Error::RegistryFrozen))
+    );
+}
+
+#[test]
+fn batch_answers_duplicate_ids_at_every_position() {
+    let (env, client, admin) = setup();
+    let [wallet, treasury, _policy] = setup_acme(&env, &client, &admin);
+
+    let ids = vec![
+        &env,
+        module_id(&env, "acme", ModuleKind::Wallet),
+        module_id(&env, "acme", ModuleKind::Treasury),
+        module_id(&env, "acme", ModuleKind::Wallet),
+        module_id(&env, "ghost", ModuleKind::Wallet),
+        module_id(&env, "ghost", ModuleKind::Wallet),
+    ];
+    assert_eq!(
+        client.get_modules_batch(&ids),
+        vec![
+            &env,
+            live(&wallet),
+            live(&treasury),
+            live(&wallet),
+            None,
+            None
+        ]
+    );
+}
+
+#[test]
+fn batch_agrees_with_the_single_lookups() {
+    let (env, client, admin) = setup();
+    setup_acme(&env, &client, &admin);
+    let org = String::from_str(&env, "acme");
+    client.deprecate_module(&admin, &org, &ModuleKind::Treasury);
+
+    let kinds = [
+        ModuleKind::Wallet,
+        ModuleKind::Treasury, // deprecated
+        ModuleKind::Policy,
+        ModuleKind::Escrow, // missing
+    ];
+    let mut ids = Vec::new(&env);
+    for kind in kinds {
+        ids.push_back(ModuleId {
+            org: org.clone(),
+            kind,
+        });
+    }
+    let batch = client.get_modules_batch(&ids);
+    assert_eq!(batch.len(), ids.len());
+
+    for (id, entry) in ids.iter().zip(batch.iter()) {
+        let raw = client.try_get_module_address(&id.org, &id.kind);
+        let routed = client.try_lookup(&id.org, &id.kind);
+        match entry {
+            None => {
+                assert_eq!(raw, Err(Ok(Error::NotFound)));
+                assert_eq!(routed, Err(Ok(Error::NotFound)));
+            }
+            Some(info) => {
+                assert_eq!(raw, Ok(Ok(info.address.clone())));
+                assert_eq!(
+                    info.deprecated,
+                    client.is_module_deprecated(&id.org, &id.kind)
+                );
+                if info.deprecated {
+                    assert_eq!(routed, Err(Ok(Error::ModuleDeprecated)));
+                } else {
+                    assert_eq!(routed, Ok(Ok(info.address)));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_reports_deprecated_modules_without_failing() {
+    let (env, client, admin) = setup();
+    let [wallet, treasury, _policy] = setup_acme(&env, &client, &admin);
+    let org = String::from_str(&env, "acme");
+    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
+
+    let ids = vec![
+        &env,
+        module_id(&env, "acme", ModuleKind::Wallet),
+        module_id(&env, "acme", ModuleKind::Treasury),
+    ];
+    assert_eq!(
+        client.get_modules_batch(&ids),
+        vec![
+            &env,
+            Some(ModuleInfo {
+                address: wallet,
+                deprecated: true,
+            }),
+            live(&treasury),
+        ]
+    );
+}
+
+#[test]
+fn batch_extends_ttl_exactly_like_lookup() {
+    let (env, client, admin) = setup();
+    setup_acme(&env, &client, &admin);
+    let org = String::from_str(&env, "acme");
+    client.deprecate_module(&admin, &org, &ModuleKind::Treasury);
+
+    let ttl = |kind: ModuleKind| {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Module(org.clone(), kind))
+        })
+    };
+    // Age the records past the bump threshold so a read would extend them.
+    env.ledger().with_mut(|l| l.sequence_number += 2 * 17_280);
+    let aged = ttl(ModuleKind::Wallet);
+    assert!(aged < PERSISTENT_BUMP_AMOUNT);
+    assert_eq!(ttl(ModuleKind::Treasury), aged);
+
+    let ids = vec![
+        &env,
+        module_id(&env, "acme", ModuleKind::Wallet),
+        module_id(&env, "acme", ModuleKind::Treasury),
+    ];
+    client.get_modules_batch(&ids);
+    // A live record is extended, as a successful `lookup` extends it; a
+    // deprecated one is left alone, as `lookup` (which refuses it) does.
+    assert_eq!(ttl(ModuleKind::Wallet), PERSISTENT_BUMP_AMOUNT);
+    assert_eq!(ttl(ModuleKind::Treasury), aged);
+
+    // `lookup` on the policy record produces the same extension.
+    client.lookup(&org, &ModuleKind::Policy);
+    assert_eq!(ttl(ModuleKind::Policy), PERSISTENT_BUMP_AMOUNT);
 }
