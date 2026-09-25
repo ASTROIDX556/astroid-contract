@@ -21,8 +21,9 @@
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
-//! deadline passes); funds stay in custody until `refund` returns them to the
-//! sender, so no escrow can be `Closed` with money still locked.
+//! deadline *and* grace period have passed, i.e. from `refund_opens_at`
+//! onwards); funds stay in custody until `refund` or `reclaim` returns them to
+//! the sender, so no escrow can be `Closed` with money still locked.
 //!
 //! ## Bounded refund window
 //!
@@ -40,6 +41,29 @@
 //! [`EscrowContract::refund_window_closes_at`] and
 //! [`EscrowContract::is_refundable`] expose the rule so clients need not
 //! recompute it off-chain.
+//!
+//! ## Reclaim rules
+//!
+//! The reclaim boundary is computed in exactly one place — the internal
+//! `grace_end` helper, exposed to clients as
+//! [`EscrowContract::refund_opens_at`] — i.e. `deadline.saturating_add(grace_period)`.
+//! Every entrypoint that settles an escrow reads it from there instead of
+//! re-deriving `deadline + grace_period` inline. Because the helper saturates,
+//! creation rejects a `grace_period` that would push the boundary past the
+//! largest representable instant with [`Error::InvalidInput`]; such an escrow
+//! could otherwise saturate into a state whose reclaim path never opens
+//! (permanent lockup).
+//!
+//! Every reclaim path is gated on the escrow's own parties: [`EscrowContract::refund`],
+//! [`EscrowContract::refund_timelock`] and [`EscrowContract::reclaim`] are
+//! sender-only (the sender is the only party whose funds are being returned),
+//! while a pre-deadline [`EscrowContract::cancel`] may be triggered by either
+//! the sender or the arbiter. All four — and the recipient-facing settlement
+//! paths [`EscrowContract::release`] and [`EscrowContract::override_release`]
+//! — move **only the un-released remainder**, pro-rated per asset as
+//! `(funded_amount - released_amount) / funded_amount`. A recipient that has
+//! already withdrawn part of a vested escrow keeps what it took, and a reclaim
+//! can never reach into another escrow's custody.
 //!
 //! ## Signature-based release override
 //!
@@ -329,6 +353,12 @@ impl EscrowContract {
         if deadline <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
         }
+        // The reclaim boundary must be a representable instant. `grace_end`
+        // saturates, so a grace period that overflows it would create an escrow
+        // whose reclaim path never opens — permanent lockup. Refuse it here.
+        deadline
+            .checked_add(grace_period)
+            .ok_or(Error::InvalidInput)?;
         Self::validate_assets(&assets)?;
         Self::validate_override_config(&release_signers, release_threshold)?;
 
@@ -547,6 +577,12 @@ impl EscrowContract {
         if unlock_time <= now {
             return Err(Error::InvalidInput);
         }
+        // Same representability guard as `create_with_refund_window`: a grace
+        // period that saturates the reclaim boundary would leave an escrow
+        // whose refund/reclaim path can never open.
+        unlock_time
+            .checked_add(grace_period)
+            .ok_or(Error::InvalidInput)?;
         Self::validate_assets(&assets)?;
 
         let id = increment_count(&env)?;
@@ -684,7 +720,7 @@ impl EscrowContract {
             ) {
                 calculate_claimable_amount(&escrow, now)?
             } else {
-                if now < escrow.deadline + escrow.grace_period {
+                if now < Self::grace_end(&escrow) {
                     return Err(Error::TimeLockActive);
                 }
                 checked_sub(escrow.funded_amount, escrow.released_amount)?
@@ -724,21 +760,19 @@ impl EscrowContract {
             );
             Ok(claimable)
         } else if matches!(escrow.state, EscrowState::Created) {
-            if now < escrow.deadline + escrow.grace_period {
+            if now < Self::grace_end(&escrow) {
                 return Err(Error::TimeLockActive);
             }
-            escrow.state = EscrowState::Released;
-            store_escrow(&env, id, &escrow);
-            Self::transfer_all(&env, &escrow, &escrow.recipient);
-            for a in escrow.assets.iter() {
-                events::transfer_executed(
-                    &env,
-                    &escrow.sender,
-                    &escrow.recipient,
-                    &a.asset,
-                    a.amount,
-                );
+            // A `Created` escrow that was never funded holds nothing: there is
+            // nothing to claim, and attempting a transfer the contract cannot
+            // cover would trap. Refuse cleanly instead.
+            if escrow.funded_amount <= 0 {
+                return Err(Error::InvalidState);
             }
+            escrow.state = EscrowState::Released;
+            Self::disburse_remainder(&env, &escrow, &escrow.recipient)?;
+            escrow.released_amount = escrow.funded_amount;
+            store_escrow(&env, id, &escrow);
             env.events().publish(
                 (symbol_short!("escrow"), symbol_short!("claimed")),
                 (id, caller, escrow.funded_amount),
@@ -750,7 +784,8 @@ impl EscrowContract {
     }
 
     /// Release the escrowed assets to the recipient. Only the arbiter may call,
-    /// and only before the deadline — afterward the sender reclaims via `refund`.
+    /// and only until the reclaim boundary ([`Self::refund_opens_at`]) is
+    /// reached — afterward the sender reclaims via `refund`.
     ///
     /// Time-locked escrows additionally gate on the release schedule: a `Cliff`
     /// schedule refuses any release before its `cliff_time`, and a `Linear`
@@ -817,14 +852,15 @@ impl EscrowContract {
             return Err(Error::InvalidAmount);
         }
 
-        escrow.released_amount = escrow.funded_amount;
         escrow.state = EscrowState::Released;
+        // Move the real tokens out of custody to the recipient — only what
+        // this escrow still holds. Anything the recipient already withdrew
+        // stays with it, and no other escrow's custody is touched. The
+        // remainder must be computed against the *pre-release*
+        // `released_amount`, so the record is updated afterwards.
+        Self::disburse_remainder(&env, &escrow, &escrow.recipient)?;
+        escrow.released_amount = escrow.funded_amount;
         store_escrow(&env, id, &escrow);
-        // Move the real tokens out of custody to the recipient.
-        Self::transfer_all(&env, &escrow, &escrow.recipient);
-        for a in escrow.assets.iter() {
-            events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &a.asset, a.amount);
-        }
         events::publish(
             &env,
             ContractEvent::EscrowReleased {
@@ -900,11 +936,13 @@ impl EscrowContract {
 
         escrow.override_nonce = nonce;
         escrow.state = EscrowState::Released;
+        // Same remainder rule as `release`: pay out only what this escrow
+        // still holds — computed against the pre-release `released_amount` —
+        // then record it as fully released so the accounting field never goes
+        // stale on a `Released` record.
+        Self::disburse_remainder(&env, &escrow, &escrow.recipient)?;
+        escrow.released_amount = escrow.funded_amount;
         store_escrow(&env, id, &escrow);
-        Self::transfer_all(&env, &escrow, &escrow.recipient);
-        for a in escrow.assets.iter() {
-            events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &a.asset, a.amount);
-        }
         events::publish(
             &env,
             ContractEvent::EscrowReleased {
@@ -926,7 +964,7 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow) {
             // The grace window is still open — the arbiter may still release, so the
             // escrow cannot be marked expired yet.
             return Err(Error::InvalidState);
@@ -938,41 +976,41 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Refund remaining funds back to the sender after the deadline.
+    /// Refund the un-released remainder back to the sender once the reclaim
+    /// boundary ([`Self::refund_opens_at`]) has been reached.
+    ///
+    /// Sender-only: the value returns to the escrow's depositor, so only that
+    /// depositor may force the transition — a third party (recipient, arbiter
+    /// or stranger) is refused with [`Error::Unauthorized`], exactly like
+    /// [`Self::refund_timelock`] and [`Self::reclaim`]. Only the remainder is
+    /// returned, so anything the recipient already withdrew stays with it.
     pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
-        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(
+            escrow.state,
+            EscrowState::Created | EscrowState::Funded | EscrowState::Expired
+        ) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline {
+        let now = env.ledger().timestamp();
+        if now < escrow.deadline {
             // Before the fulfillment deadline the escrow is still live.
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if now < Self::grace_end(&escrow) {
             // During the grace window the counterparty may still fulfill, so funds
             // may not yet be reclaimed via refund. Use `reclaim` after grace expiry.
             return Err(Error::GraceActive);
         }
         Self::require_refund_window_open(&env, &escrow)?;
 
-        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
-
-        if remaining > 0 {
-            for a in escrow.assets.iter() {
-                let return_amount =
-                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
-                if return_amount > 0 {
-                    token::TokenClient::new(&env, &a.asset).transfer(
-                        &env.current_contract_address(),
-                        &escrow.sender,
-                        &return_amount,
-                    );
-                }
-            }
-        }
+        Self::disburse_remainder(&env, &escrow, &escrow.sender)?;
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("refunded")),
             (id, caller),
@@ -993,28 +1031,14 @@ impl EscrowContract {
         ) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow) {
             return Err(Error::TimeLockActive);
         }
         Self::require_refund_window_open(&env, &escrow)?;
 
-        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
-
-        if remaining > 0 {
-            for a in escrow.assets.iter() {
-                let return_amount =
-                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
-                if return_amount > 0 {
-                    token::TokenClient::new(&env, &a.asset).transfer(
-                        &env.current_contract_address(),
-                        &escrow.sender,
-                        &return_amount,
-                    );
-                }
-            }
-        }
+        Self::disburse_remainder(&env, &escrow, &escrow.sender)?;
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("ref_tl")),
             (id, caller),
@@ -1022,11 +1046,15 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Close a settled escrow (terminal).
-    /// Cancel an escrow before its fulfillment `deadline` and return any held
-    /// funds to the sender. Either the `sender` or the `arbiter` may cancel, but
-    /// only while the escrow is still `Funded`/`Created` and before the deadline
-    /// has been reached — this is the pre-fulfillment dispute exit.
+    /// Cancel an escrow before its fulfillment `deadline` and return the
+    /// un-released remainder to the sender. Either the `sender` or the
+    /// `arbiter` may cancel, but only while the escrow is still
+    /// `Funded`/`Created` and before the deadline has been reached — this is
+    /// the pre-fulfillment dispute exit.
+    ///
+    /// Only the remainder moves: a recipient that already withdrew part of a
+    /// vested escrow keeps it, and an unfunded `Created` escrow (nothing in
+    /// custody) transitions without attempting a transfer it cannot cover.
     pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -1041,12 +1069,9 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
-        Self::transfer_all(&env, &escrow, &escrow.sender);
-        for a in escrow.assets.iter() {
-            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
-        }
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
+        Self::disburse_remainder(&env, &escrow, &escrow.sender)?;
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("cancelled")),
             (id, caller),
@@ -1056,9 +1081,13 @@ impl EscrowContract {
 
     /// Reclaim the escrowed funds to the sender after the grace period has fully
     /// elapsed without counterparty fulfillment. Only the `sender` may reclaim,
-    /// and only once `now >= deadline + grace_period`. This is the post-dispute
+    /// and only once `now >= refund_opens_at` (the shared
+    /// `deadline + grace_period` boundary). This is the post-dispute
     /// safe-settlement path that guarantees funds cannot be stranded or
-    /// double-spent while a dispute is unresolved.
+    /// double-spent while a dispute is unresolved: only the un-released
+    /// remainder is returned, so a recipient that already withdrew part of the
+    /// escrow keeps it and the contract is never asked to move more than this
+    /// escrow still holds.
     pub fn reclaim(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -1066,22 +1095,21 @@ impl EscrowContract {
         if escrow.sender != caller {
             return Err(Error::Unauthorized);
         }
-        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+        if !matches!(
+            escrow.state,
+            EscrowState::Created | EscrowState::Funded | EscrowState::Expired
+        ) {
             return Err(Error::InvalidState);
         }
         // The grace window must have fully elapsed without fulfillment.
-        let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
-        if env.ledger().timestamp() < grace_end {
+        if env.ledger().timestamp() < Self::grace_end(&escrow) {
             return Err(Error::GraceActive);
         }
         Self::require_refund_window_open(&env, &escrow)?;
 
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
-        Self::transfer_all(&env, &escrow, &escrow.sender);
-        for a in escrow.assets.iter() {
-            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
-        }
+        Self::disburse_remainder(&env, &escrow, &escrow.sender)?;
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("reclaimed")),
             (id, caller),
@@ -1089,6 +1117,9 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Close a settled escrow (terminal). Only the three parties may do it, and
+    /// only from a terminal settlement state (`Released` or `Refunded`), so an
+    /// escrow is never closed while funds are still in custody.
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -1278,11 +1309,18 @@ impl EscrowContract {
             .persistent()
             .set(&DataKey::Milestones(id), &set);
 
+        // Mirror the milestone bookkeeping onto the escrow record so
+        // `funded_amount - released_amount` keeps meaning "what this escrow
+        // still holds" for every later reclaim (`reclaim`, `refund`, `cancel`).
+        // Without this a partially released milestone escrow would look
+        // untouched and a reclaim could ask the contract for more than this
+        // escrow still has in custody.
+        escrow.released_amount = set.released_amount;
         let all_released = set.milestones.iter().all(|m| m.released);
         if all_released {
             escrow.state = EscrowState::Released;
-            store_escrow(&env, id, &escrow);
         }
+        store_escrow(&env, id, &escrow);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("ms_rel")),
@@ -1305,6 +1343,17 @@ impl EscrowContract {
         load_escrow(&env, id)
     }
 
+    /// Timestamp at which the sender's refund and reclaim paths open for `id`:
+    /// the escrow's `deadline + grace_period`, saturating at `u64::MAX`.
+    ///
+    /// This is the one boundary every settlement entrypoint reads, so clients
+    /// can render a countdown without recomputing the rule off-chain. For a
+    /// bounded window it is always `<=` [`Self::refund_window_closes_at`]
+    /// (which measures the window from here); an unbounded window reports `0`.
+    pub fn refund_opens_at(env: Env, id: u64) -> Result<u64, Error> {
+        Ok(Self::grace_end(&load_escrow(&env, id)?))
+    }
+
     /// Timestamp at which the escrow's refund window closes, or `0` when the
     /// window has no upper bound. Lets clients show a countdown without
     /// recomputing the window rule off-chain.
@@ -1324,7 +1373,7 @@ impl EscrowContract {
             return Ok(false);
         }
         let now = env.ledger().timestamp();
-        if now < escrow.deadline + escrow.grace_period {
+        if now < Self::grace_end(&escrow) {
             return Ok(false);
         }
         Ok(Self::require_refund_window_open(&env, &escrow).is_ok())
@@ -1349,17 +1398,6 @@ impl EscrowContract {
         Ok(escrow.schedule)
     }
 
-    /// Move every listed asset amount out of the contract's custody to `to`.
-    fn transfer_all(env: &Env, escrow: &Escrow, to: &Address) {
-        for a in escrow.assets.iter() {
-            token::TokenClient::new(env, &a.asset).transfer(
-                &env.current_contract_address(),
-                to,
-                &a.amount,
-            );
-        }
-    }
-
     /// Sum the amounts across every listed asset (single-asset milestone
     /// escrows simply return that asset's amount).
     fn total_amount(assets: &Vec<AssetAmount>) -> i128 {
@@ -1370,20 +1408,59 @@ impl EscrowContract {
         total
     }
 
-    /// Validate a multi-asset list: non-empty, within the size cap, every
-    /// amount strictly positive, and no asset listed more than once.
     /// Timestamp the refund window closes at (`0` = never). Refunds open at
-    /// `deadline + grace_period`, so the window is measured from there.
+    /// [`Self::grace_end`], so the window is measured from there.
     /// `saturating_add` keeps an absurd `refund_window` from wrapping around
     /// into an already-closed window.
     fn closes_at(escrow: &Escrow) -> u64 {
         if escrow.refund_window == 0 {
             return 0;
         }
-        escrow
-            .deadline
-            .saturating_add(escrow.grace_period)
-            .saturating_add(escrow.refund_window)
+        Self::grace_end(escrow).saturating_add(escrow.refund_window)
+    }
+
+    /// The single reclaim boundary: the instant at which the sender's `refund`,
+    /// `refund_timelock` and `reclaim` paths open, i.e. `deadline +
+    /// grace_period`.
+    ///
+    /// Saturating on purpose. `grace_period` is caller-supplied, so a raw `+`
+    /// would panic on an overflowing sum and a truncating cast would wrap it
+    /// back to a past instant (letting a reclaim fire while the arbiter could
+    /// still release). Saturation pushes the boundary as late as possible, and
+    /// `create_with_refund_window` / `initialize_timelock` reject such inputs
+    /// up front, so no escrow can end up with a boundary that never opens.
+    fn grace_end(escrow: &Escrow) -> u64 {
+        escrow.deadline.saturating_add(escrow.grace_period)
+    }
+
+    /// Move this escrow's un-released remainder out of custody to `to`,
+    /// pro-rating each listed asset as `amount * remaining / funded_amount`
+    /// and emitting the shared `transfer`/`executed` event for every amount
+    /// actually moved.
+    ///
+    /// Every path that empties an escrow goes through here, which is what
+    /// guarantees the two invariants the reclaim paths rely on: an escrow
+    /// never moves more than `funded_amount - released_amount` (so a partially
+    /// released escrow can never reach into another escrow's balance), and an
+    /// unfunded record (`funded_amount == 0`) moves nothing instead of
+    /// dividing by zero or transferring tokens the contract does not hold.
+    fn disburse_remainder(env: &Env, escrow: &Escrow, to: &Address) -> Result<(), Error> {
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        if remaining <= 0 {
+            return Ok(());
+        }
+        for a in escrow.assets.iter() {
+            let amount = checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+            if amount > 0 {
+                token::TokenClient::new(env, &a.asset).transfer(
+                    &env.current_contract_address(),
+                    to,
+                    &amount,
+                );
+                events::transfer_executed(env, &escrow.sender, to, &a.asset, amount);
+            }
+        }
+        Ok(())
     }
 
     /// Refuse a reclaim once a bounded refund window has elapsed, so an
@@ -1397,6 +1474,8 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Validate a multi-asset list: non-empty, within the size cap, every
+    /// amount strictly positive, and no asset listed more than once.
     fn validate_assets(assets: &Vec<AssetAmount>) -> Result<(), Error> {
         if assets.is_empty() || assets.len() > MAX_ESCROW_ASSETS {
             return Err(Error::InvalidInput);
