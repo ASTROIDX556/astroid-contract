@@ -60,6 +60,7 @@ version = "0.1.0"
 dependencies = [
  "astroid-budget",
  "astroid-escrow",
+ "astroid-interfaces",
  "astroid-multisig",
  "astroid-policy",
  "astroid-proposal",

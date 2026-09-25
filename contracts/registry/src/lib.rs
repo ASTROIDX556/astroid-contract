@@ -39,14 +39,16 @@
 //! escalate into ownership or to widen its own reach.
 
 use astroid_interfaces::RegistryInterface;
-use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
+use astroid_shared::constants::{
+    MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
-use astroid_shared::types::ModuleKind;
+use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Vec,
 };
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
@@ -723,6 +725,28 @@ impl RegistryContract {
         }
     }
 
+    /// Read one module record together with its deprecation flag, or `None`
+    /// when `(org, kind)` is not registered. Shared by [`Self::lookup`] and
+    /// [`Self::get_modules_batch`] so both read a record identically: the TTL is
+    /// extended only for a live (non-deprecated) record, as routing has always
+    /// done.
+    fn read_module(env: &Env, org: String, kind: ModuleKind) -> Option<ModuleInfo> {
+        let key = DataKey::Module(org.clone(), kind);
+        let address: Address = env.storage().persistent().get(&key)?;
+        let deprecated = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ModuleDeprecated(org, kind))
+            .unwrap_or(false);
+        if !deprecated {
+            Self::bump(env, &key);
+        }
+        Some(ModuleInfo {
+            address,
+            deprecated,
+        })
+    }
+
     fn bump(env: &Env, key: &DataKey) {
         env.storage().persistent().extend_ttl(
             key,
@@ -740,23 +764,12 @@ impl RegistryContract {
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
-        let key = DataKey::Module(org.clone(), kind);
-        let val = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotFound)?;
+        let module = Self::read_module(&env, org, kind).ok_or(Error::NotFound)?;
         // Routing guard: reject new interactions targeting deprecated modules.
-        if env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::ModuleDeprecated(org, kind))
-            .unwrap_or(false)
-        {
+        if module.deprecated {
             return Err(Error::ModuleDeprecated);
         }
-        Self::bump(&env, &key);
-        Ok(val)
+        Ok(module.address)
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
@@ -769,6 +782,31 @@ impl RegistryInterface for RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(recorded == owner)
+    }
+
+    /// Batch counterpart of [`Self::lookup`]: resolve up to
+    /// [`MAX_REGISTRY_BATCH`] module registrations in a single invocation.
+    ///
+    /// - `result[i]` answers `ids[i]`; length and order are preserved and
+    ///   duplicate ids are answered at every position.
+    /// - An unregistered id yields `None` instead of failing the batch, so one
+    ///   missing module does not hide the others.
+    /// - A deprecated module is returned with `deprecated: true` rather than
+    ///   [`Error::ModuleDeprecated`]; callers routing to it should refuse it.
+    /// - An empty `ids` returns an empty list.
+    ///
+    /// Errors: [`Error::InvalidInput`] when more than [`MAX_REGISTRY_BATCH`] ids
+    /// are requested (checked before any storage is read), and
+    /// [`Error::RegistryFrozen`] while the registry is frozen, like every
+    /// other lookup on this interface. Read-only: no auth is required.
+    fn get_modules_batch(env: Env, ids: Vec<ModuleId>) -> Result<Vec<Option<ModuleInfo>>, Error> {
+        ensure!(ids.len() <= MAX_REGISTRY_BATCH, Error::InvalidInput);
+        Self::check_frozen(&env)?;
+        let mut modules = Vec::new(&env);
+        for id in ids.iter() {
+            modules.push_back(Self::read_module(&env, id.org, id.kind));
+        }
+        Ok(modules)
     }
 }
 
