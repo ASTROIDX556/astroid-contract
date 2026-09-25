@@ -10,18 +10,14 @@
 //! list of `(asset, amount)` pairs rather than a single token/amount.
 //!
 //! On `create` the sender's funds are pulled into the contract's own custody and
-//! only leave through one of the settlement paths below.
-//!
-//! ## Settlement paths
+//! only leave through one of three settlement paths:
 //!
 //! ```text
 //! Funded ──(arbiter, before deadline+grace)─────▶ Released ─▶ recipient ─▶ Closed
 //! Funded ──(signature override, before deadline)▶ Released ─▶ recipient ─▶ Closed
-//! Funded ──(sender/arbiter cancel, before deadline)──▶ Refunded ─▶ sender ─▶ Closed
-//! Funded ──(after deadline+grace, refund)───────▶ Refunded ─▶ sender   ─▶ Closed
-//! Funded ──(after deadline+grace, reclaim)──────▶ Refunded ─▶ sender   ─▶ Closed
-//! Funded ──(after deadline+grace, cancel)───────▶ Cancelled ─▶sender   ─▶ Closed
-//! Funded ──(post-deadline, expire marker)───────▶ Expired  ──(refund/cancel)──▶ Closed
+//! Funded ──(cancel, before deadline)────────────▶ Refunded ─▶ sender    ─▶ Closed
+//! Funded ──(after deadline+grace, no release)───▶ reclaim  ─▶ sender    ─▶ Closed
+//!    └────(after deadline+grace, marker)────────▶ Expired ──(refund)──▶ Refunded
 //! ```
 //!
 //! `Expired` is a permissionless status marker (a keeper/UI may set it once the
@@ -671,31 +667,15 @@ impl EscrowContract {
         Ok(escrow.released_amount)
     }
 
-    /// Claim all currently available funds from a time-locked or scheduled
-    /// escrow. Only the recipient may claim and only what is already vested.
+    /// Claim all currently available funds from time-locked or scheduled escrow.
     pub fn claim(env: Env, caller: Address, id: u64) -> Result<i128, Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
         if escrow.recipient != caller {
             return Err(Error::Unauthorized);
         }
-        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Created) {
-            return Err(Error::InvalidState);
-        }
-        if !matches!(
-            escrow.schedule.release_type,
-            ReleaseType::Cliff | ReleaseType::Linear
-        ) {
-            // Plain escrows settle through `release`, `refund`, `cancel` or
-            // `reclaim`, never through a recipient-side `claim`.
-            return Err(Error::InvalidState);
-        }
 
         let now = env.ledger().timestamp();
-        let claimable = calculate_claimable_amount(&escrow, now)?;
-        if claimable <= 0 {
-            return Err(Error::TimeLockActive);
-        }
 
         if matches!(escrow.state, EscrowState::Funded) {
             let claimable = if matches!(
@@ -748,36 +728,29 @@ impl EscrowContract {
                 return Err(Error::TimeLockActive);
             }
             escrow.state = EscrowState::Released;
-        }
-        store_escrow(&env, id, &escrow);
-
-        for a in escrow.assets.iter() {
-            let send_amount = checked_div(checked_mul(a.amount, claimable)?, escrow.funded_amount)?;
-            if send_amount > 0 {
-                token::TokenClient::new(&env, &a.asset).transfer(
-                    &env.current_contract_address(),
-                    &escrow.recipient,
-                    &send_amount,
-                );
+            store_escrow(&env, id, &escrow);
+            Self::transfer_all(&env, &escrow, &escrow.recipient);
+            for a in escrow.assets.iter() {
                 events::transfer_executed(
                     &env,
                     &escrow.sender,
                     &escrow.recipient,
                     &a.asset,
-                    send_amount,
+                    a.amount,
                 );
             }
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("claimed")),
+                (id, caller, escrow.funded_amount),
+            );
+            Ok(escrow.funded_amount)
+        } else {
+            Err(Error::InvalidState)
         }
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("claimed")),
-            (id, caller, claimable),
-        );
-        Ok(claimable)
     }
 
     /// Release the escrowed assets to the recipient. Only the arbiter may call,
-    /// and only before the deadline (plus any grace window) — afterward the
-    /// sender reclaims via `refund` / `reclaim` / `cancel`.
+    /// and only before the deadline — afterward the sender reclaims via `refund`.
     ///
     /// Time-locked escrows additionally gate on the release schedule: a `Cliff`
     /// schedule refuses any release before its `cliff_time`, and a `Linear`
@@ -836,7 +809,10 @@ impl EscrowContract {
             // entrypoint and the funds are reclaimed via `refund` / `reclaim`.
             return Err(Error::EscrowExpired);
         }
-        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        let remaining = escrow
+            .funded_amount
+            .checked_sub(escrow.released_amount)
+            .ok_or(Error::Overflow)?;
         if release_amount > remaining {
             return Err(Error::InvalidAmount);
         }
@@ -944,8 +920,7 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Mark a timed-out escrow `Expired` once its deadline (plus any grace
-    /// window) has passed. Permissionless so a keeper/UI may set the marker.
+    /// Mark a timed-out escrow `Expired` once its deadline has passed.
     pub fn expire(env: Env, id: u64) -> Result<(), Error> {
         let mut escrow = load_escrow(&env, id)?;
         if !matches!(escrow.state, EscrowState::Funded) {
@@ -1015,8 +990,7 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Refund a time-locked escrow after `unlock_time` / deadline (plus any
-    /// grace window) has elapsed. Sender only.
+    /// Refund time-locked escrow after unlock_time / deadline has elapsed.
     pub fn refund_timelock(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -1077,29 +1051,14 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
-        // Return the remaining locked assets exclusively to the depositor.
-        if remaining > 0 {
-            for a in escrow.assets.iter() {
-                let return_amount =
-                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
-                if return_amount > 0 {
-                    token::TokenClient::new(&env, &a.asset).transfer(
-                        &env.current_contract_address(),
-                        &escrow.sender,
-                        &return_amount,
-                    );
-                    events::transfer_executed(
-                        &env,
-                        &env.current_contract_address(),
-                        &escrow.sender,
-                        &a.asset,
-                        return_amount,
-                    );
-                }
-            }
+        Self::transfer_all(&env, &escrow, &escrow.sender);
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
         }
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("canceled")),
+            (symbol_short!("escrow"), symbol_short!("cancelled")),
             (id, caller),
         );
         Ok(())
@@ -1147,10 +1106,7 @@ impl EscrowContract {
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
-        if !matches!(
-            escrow.state,
-            EscrowState::Released | EscrowState::Refunded | EscrowState::Cancelled
-        ) {
+        if !matches!(escrow.state, EscrowState::Released | EscrowState::Refunded) {
             return Err(Error::InvalidState);
         }
         if caller != escrow.sender && caller != escrow.recipient && caller != escrow.arbiter {
@@ -1482,7 +1438,7 @@ impl EscrowContract {
             return Ok(());
         }
         if signers.len() > MAX_SIGNERS {
-            return Err(Error::InvalidThreshold);
+            return Err(Error::TooManySigners);
         }
         if threshold == 0 || threshold > signers.len() {
             return Err(Error::InvalidThreshold);

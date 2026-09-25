@@ -33,7 +33,7 @@
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
 //! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
-//! `set_policy_bypass`.
+//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`.
 //!
 //! ## Pre-execution policy hook
 //!
@@ -72,7 +72,7 @@
 //! plus wallet-scoped state-change and role-administration events.
 
 use crate::access::Role;
-use astroid_interfaces::PolicyClient;
+use astroid_interfaces::{BudgetClient, PolicyClient};
 use astroid_shared::constants;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
@@ -81,11 +81,11 @@ use astroid_shared::constants::{
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::{SafeAdd, SafeSub};
+use astroid_shared::math::{checked_add, SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
 };
 
 pub mod access;
@@ -101,8 +101,6 @@ enum DataKey {
     Paused,
     /// Monotonic wallet id counter (instance).
     WalletCount,
-    /// Policy contract consulted when validating batch actions (instance).
-    Policy,
     /// Budget contract consulted when consuming batch action value (instance).
     Budget,
     /// Wallet record: id -> WalletData.
@@ -123,6 +121,57 @@ enum DataKey {
 pub struct WalletData {
     pub owner: Address,
     pub state: ResourceState,
+}
+
+/// A single sub-call to be executed as part of a batch. `contract_addr` is the
+/// target contract, `fn_name` is the entry-point symbol, and `args` are the
+/// serialized arguments. The batch executor invokes each sub-call sequentially;
+/// if any fails the entire transaction is atomically reverted by the Soroban
+/// runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractCall {
+    pub contract_addr: Address,
+    pub fn_name: Symbol,
+    pub args: soroban_sdk::Vec<Val>,
+}
+
+/// One policy- and budget-gated action of a validated batch. Carries the raw
+/// [`ContractCall`] to execute plus the metadata the wallet needs to validate
+/// the action before any value moves: the policy envelope and asset/recipient
+/// the spend is checked against, and the budget envelope it is consumed from.
+///
+/// An empty `policy_id` skips the policy gate for that action; an empty
+/// `budget_id` skips budget consumption — mirrors how the treasury wires each
+/// holding to a specific envelope.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAction {
+    /// The external sub-call to execute.
+    pub call: ContractCall,
+    /// Policy envelope id validated against this action; empty = skip.
+    pub policy_id: String,
+    /// Budget envelope id consumed by this action; empty = skip.
+    pub budget_id: String,
+    /// Asset moved by this action, used by the policy check.
+    pub asset: Address,
+    /// Recipient of this action's value, used by the policy check.
+    pub recipient: Address,
+    /// Value moved by this action, checked against policy and budget.
+    pub amount: i128,
+}
+
+/// Aggregated outcome of a validated batch execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchReceipt {
+    /// Number of sub-calls executed.
+    pub executed: u32,
+    /// Cumulative value across the batch (checked-sum of all action amounts).
+    pub total_amount: i128,
+    /// Remaining allocation of the last budget envelope consumed; `0` when the
+    /// batch touched no budget.
+    pub budget_remaining: i128,
 }
 
 #[contract]
@@ -501,6 +550,110 @@ impl WalletContract {
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("archived"));
         Ok(())
+    }
+
+    /// Execute a batch of [`BatchAction`]s atomically, validating every action
+    /// against the contract's policy and budget gates before any sub-call
+    /// fires. Each action opts into the gates via `policy_id` / `budget_id`: a
+    /// non-empty id requires the corresponding contract to be wired up
+    /// ([`WalletContract::set_policy`] / [`WalletContract::set_budget`]) or the
+    /// batch is refused, while an empty id skips that gate for the action.
+    ///
+    /// Phase 1 verifies every action and aggregates its value with checked math
+    /// in a single pass (one budget consumption per envelope — no speculative
+    /// pre-flights), then Phase 2 executes the sub-calls sequentially. Any
+    /// failure — a policy denial, a budget overrun, a cumulative overflow, or a
+    /// failing sub-call — reverts the entire transaction, so validation and
+    /// execution are atomic. On success an aggregated [`BatchReceipt`] is
+    /// returned and `("wallet", "batch_validated")` is published.
+    pub fn batch_execute_validated(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        actions: soroban_sdk::Vec<BatchAction>,
+    ) -> Result<BatchReceipt, Error> {
+        Self::when_not_paused(&env)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
+        Self::require_active(&wallet)?;
+
+        if actions.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        if actions.len() > constants::MAX_BATCH_CALLS {
+            return Err(Error::InvalidInput);
+        }
+
+        let policy: Option<Address> = env.storage().instance().get(&DataKey::Policy);
+        let budget: Option<Address> = env.storage().instance().get(&DataKey::Budget);
+
+        // Phase 1 — verify every action and aggregate its value with checked
+        // math so a cumulative overflow is caught before any value moves.
+        let mut total_amount: i128 = 0;
+        let mut budget_remaining: i128 = 0;
+        for action in actions.iter() {
+            require_positive_amount(action.amount)?;
+            total_amount = checked_add(total_amount, action.amount)?;
+
+            if !action.policy_id.is_empty() {
+                let policy_addr = policy.as_ref().ok_or(Error::InvalidInput)?;
+                PolicyClient::new(&env, policy_addr).check_transfer(
+                    &action.policy_id,
+                    &action.asset,
+                    &action.recipient,
+                    &action.amount,
+                );
+            }
+
+            if !action.budget_id.is_empty() {
+                let budget_addr = budget.as_ref().ok_or(Error::InvalidInput)?;
+                budget_remaining = BudgetClient::new(&env, budget_addr).consume(
+                    &caller,
+                    &action.budget_id,
+                    &action.amount,
+                );
+            }
+        }
+
+        // Phase 2 — execute every action sequentially; the runtime rolls the
+        // whole batch back if any sub-call fails.
+        let mut executed: u32 = 0;
+        for action in actions.into_iter() {
+            Self::execute_call(&env, &action.call)?;
+            executed += 1;
+        }
+
+        events::wallet_batch_validated(&env, wallet_id, executed, total_amount, budget_remaining);
+        Ok(BatchReceipt {
+            executed,
+            total_amount,
+            budget_remaining,
+        })
+    }
+
+    /// Wire the budget contract batch actions consume from (contract admin
+    /// only). Mirrors [`WalletContract::set_policy`].
+    pub fn set_budget(env: Env, caller: Address, budget: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Budget, &budget);
+        Ok(())
+    }
+
+    /// Invoke a single batch call so a callee failure surfaces as its own
+    /// contract error, reverting the whole batch atomically; system-level
+    /// failures are reported as [`Error::BatchCallFailed`].
+    fn execute_call(env: &Env, call: &ContractCall) -> Result<(), Error> {
+        match env.try_invoke_contract::<Val, Error>(
+            &call.contract_addr,
+            &call.fn_name,
+            call.args.clone(),
+        ) {
+            Ok(_) => Ok(()),
+            // A raw `Val` always decodes, so this arm is unreachable in
+            // practice; kept for exhaustiveness.
+            Err(Ok(e)) => Err(e),
+            // System-level failure (panic / abort / unknown error code).
+            Err(Err(_)) => Err(Error::BatchCallFailed),
+        }
     }
 
     /// Delegate `role` on a wallet to `account`, replacing any role it already

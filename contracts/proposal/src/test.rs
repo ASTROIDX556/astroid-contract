@@ -4,8 +4,8 @@ extern crate std;
 use crate::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, String, Vec};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
+use soroban_sdk::{Address, Env, IntoVal, String, Symbol, Val, Vec};
 
 struct Harness {
     env: Env,
@@ -112,6 +112,15 @@ fn dep_vec(h: &Harness, deps: &[u64]) -> Vec<u64> {
         v.push_back(*d);
     }
     v
+}
+
+/// Whether any event carrying `symbol` in its topics has been emitted.
+fn emitted(env: &Env, symbol: &str) -> bool {
+    let want: Val = Symbol::new(env, symbol).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want))
 }
 
 /// Drive a proposal all the way to `Executed`.

@@ -265,14 +265,6 @@
                       "val": {
                         "u64": 100
                       }
-                    },
-                    {
-                      "key": {
-                        "symbol": "whitelist_enabled"
-                      },
-                      "val": {
-                        "bool": false
-                      }
                     }
                   ]
                 }
