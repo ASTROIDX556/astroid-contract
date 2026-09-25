@@ -856,3 +856,242 @@ fn deficit_surplus_rollover_combined() {
     assert_eq!(b.rollover_credit, 400);
     assert_eq!(b.spent, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #223: near-maximum boundary values. Every arithmetic path touching
+// token balances / budget limits must go through the shared checked helpers
+// and surface `Error::Overflow` instead of panicking or silently wrapping.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn allocate_accepts_maximum_limit() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &i128::MAX,
+        &Period::None,
+        &false,
+        &0,
+    );
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.limit, i128::MAX);
+    // remaining = (limit + 0 credit) - 0 spent: fits exactly, no overflow.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), i128::MAX);
+}
+
+#[test]
+fn consume_up_to_max_capacity_succeeds() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &i128::MAX,
+        &Period::None,
+        &false,
+        &0,
+    );
+    // spent = 0 + MAX and remaining = MAX - MAX: both fit exactly.
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &i128::MAX);
+    assert_eq!(rem, 0);
+}
+
+#[test]
+fn consume_beyond_max_capacity_returns_overflow() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &i128::MAX,
+        &Period::None,
+        &false,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &i128::MAX);
+    // spent + amount = MAX + 1 overflows i128: checked math returns the
+    // contract error instead of a panic or a wrapped value.
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+}
+
+#[test]
+fn release_refunds_the_full_maximum_spend() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &i128::MAX,
+        &Period::None,
+        &false,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &i128::MAX);
+    // Refund the whole period's spend: spent = MAX - MAX, remaining = MAX - 0.
+    let rem = h.client.release(&h.owner, &id(&h.env, "eng"), &i128::MAX);
+    assert_eq!(rem, i128::MAX);
+}
+
+#[test]
+fn uncapped_rollover_accrual_past_max_returns_overflow() {
+    let h = setup();
+    // Three whole idle periods accrue 3 * limit, which overflows i128 when
+    // limit is ~MAX/2. The uncapped path uses checked math on purpose.
+    let limit = i128::MAX / 2;
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &limit,
+        &Period::Weekly,
+        &true, // rollover_enabled, uncapped (cap = 0)
+        &0,
+    );
+    h.env.ledger().set_timestamp(1_000 + 3 * WEEK);
+    let res = h.client.try_rollover(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+}
+
+#[test]
+fn capped_rollover_accrual_saturates_instead_of_overflowing() {
+    let h = setup();
+    // Same near-max setup, but with a cap: the accrual saturates and the
+    // credit is clamped to the cap, so the budget stays usable.
+    let limit = i128::MAX / 2;
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &limit,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &limit, // rollover_cap
+    );
+    h.env.ledger().set_timestamp(1_000 + 3 * WEEK);
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, limit);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2 * limit);
+}
+
+#[test]
+fn rollover_accrual_of_second_idle_period_overflows() {
+    let h = setup();
+    // Two whole idle periods accrue credit + limit = 2 * (MAX - 5), which
+    // overflows i128 on the checked accrual path.
+    let limit = i128::MAX - 5;
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &limit,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    h.env.ledger().set_timestamp(1_000 + 2 * WEEK);
+    let res = h.client.try_rollover(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+}
+
+#[test]
+fn remaining_with_max_limit_and_credit_returns_overflow() {
+    let h = setup();
+    // Rollover itself succeeds (credit = MAX - 10 fits), but the next
+    // capacity computation limit + credit = MAX + (MAX - 10) overflows and
+    // must surface as the contract error, not a wrapped value.
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &i128::MAX,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &10);
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    let res = h.client.try_remaining(&id(&h.env, "eng"));
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+}
+
+#[test]
+fn deficit_remaining_near_max_stays_negative_and_checked() {
+    let h = setup();
+    let limit = i128::MAX - 1_000;
+    h.client.allocate_with_deficit(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &limit,
+        &Period::Weekly,
+        &true,
+        &true, // allow_deficit
+        &0,
+    );
+    // Overspend into a deficit: remaining = (MAX - 1_000) - MAX = -1_000.
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &i128::MAX);
+    assert_eq!(rem, -1_000);
+    // The transition carries the deficit; next period's remaining is
+    // (limit - deficit) - spent = (MAX - 1_000) - 1_000 - 0 = MAX - 2_000.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.deficit_amount, 1_000);
+    assert_eq!(b.spent, 0);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), i128::MAX - 2_000);
+}
+
+#[test]
+fn transfer_allocation_past_max_returns_overflow() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "src"),
+        &(i128::MAX - 10),
+        &Period::None,
+        &false,
+        &0,
+    );
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "dst"),
+        &(i128::MAX - 10),
+        &Period::None,
+        &false,
+        &0,
+    );
+    // First hop fills dst exactly to i128::MAX.
+    h.client
+        .transfer_allocation(&h.owner, &id(&h.env, "src"), &id(&h.env, "dst"), &10);
+    assert_eq!(h.client.remaining(&id(&h.env, "dst")), i128::MAX);
+    // A further increase of dst.limit would overflow: checked math rejects it.
+    let res =
+        h.client
+            .try_transfer_allocation(&h.owner, &id(&h.env, "src"), &id(&h.env, "dst"), &20);
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+    // Atomic: dst is untouched by the failed transfer.
+    assert_eq!(h.client.remaining(&id(&h.env, "dst")), i128::MAX);
+    assert_eq!(h.client.remaining(&id(&h.env, "src")), i128::MAX - 20);
+}
+
+#[test]
+fn per_asset_spend_past_max_returns_overflow() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::None, false);
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &i128::MAX, &0);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &i128::MAX);
+    // spent + amount = MAX + 1 overflows the i128 spent counter.
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+    // The spend was not recorded.
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 0);
+}
