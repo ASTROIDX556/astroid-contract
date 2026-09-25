@@ -68,7 +68,7 @@
 //! `init_milestone_disbursement`, `release_next_milestone`, `get`, `holding`,
 //! `is_paused`, `guardian`, `is_approved_asset`, `approved_asset_count`.
 
-use astroid_interfaces::PolicyClient;
+use astroid_interfaces::{PolicyClient, TreasuryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
@@ -187,44 +187,6 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Treasury`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Treasury,
-            wasm_hash,
-        )
-    }
     /// Create a treasury for `org`, gated on the admin's signature.
     ///
     /// The circuit breaker starts disengaged (`paused == false`) and the
@@ -802,11 +764,6 @@ impl TreasuryContract {
 
     // --- views ---
 
-    /// Whether the emergency circuit breaker is currently engaged.
-    pub fn is_paused(env: Env) -> bool {
-        Self::load(&env).paused
-    }
-
     /// The address currently authorized to pause / unpause this treasury
     /// (alongside the multisig).
     pub fn guardian(env: Env) -> Address {
@@ -930,10 +887,6 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
-    pub fn balance(env: Env, asset: Address) -> Result<i128, Error> {
-        Self::read_token_balance(&env, &asset)
-    }
-
     pub fn balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error> {
         if assets.len() > MAX_BALANCE_ASSETS {
             return Err(Error::InvalidInput);
@@ -953,11 +906,6 @@ impl TreasuryContract {
             report.push_back(AssetBalance { asset, balance });
         }
         Ok(report)
-    }
-
-    /// Whether `asset` is currently approved for routing.
-    pub fn is_approved_asset(env: Env, asset: Address) -> bool {
-        Self::is_asset_approved(&env, &asset)
     }
 
     /// Number of token contracts currently on the whitelist.
@@ -1157,6 +1105,65 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared read surface, exposed through `TreasuryInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl TreasuryInterface for TreasuryContract {
+    fn balance(env: Env, asset: Address) -> Result<i128, Error> {
+        Self::read_token_balance(&env, &asset)
+    }
+
+    /// Whether `asset` is currently approved for routing.
+    fn is_approved_asset(env: Env, asset: Address) -> bool {
+        Self::is_asset_approved(&env, &asset)
+    }
+
+    /// Whether the emergency circuit breaker is currently engaged.
+    fn is_paused(env: Env) -> bool {
+        Self::load(&env).paused
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for TreasuryContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Treasury` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Treasury,
+            wasm_hash,
+        )
     }
 }
 
