@@ -432,6 +432,70 @@ fn multiple_approved_assets_route_independently() {
 }
 
 #[test]
+fn balance_reports_actual_custody_across_assets() {
+    let h = setup("vault", 1_000);
+    let second = unapproved_token(&h, 250);
+    h.client.add_approved_asset(&h.admin, &second);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &second, &250);
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.client.address, &7);
+
+    assert_eq!(h.client.balance(&h.asset), 1_007);
+    assert_eq!(h.client.balance(&second), 250);
+
+    let assets: Vec<Address> = vec![&h.env, second.clone(), h.asset.clone()];
+    let report = h.client.balances(&assets);
+    assert_eq!(report.len(), 2);
+    assert_eq!(report.get(0).unwrap().asset, second);
+    assert_eq!(report.get(0).unwrap().balance, 250);
+    assert_eq!(report.get(1).unwrap().asset, h.asset);
+    assert_eq!(report.get(1).unwrap().balance, 1_007);
+}
+
+#[test]
+fn balance_queries_require_approved_assets() {
+    let h = setup("vault", 0);
+    let rogue = unapproved_token(&h, 100);
+
+    assert_eq!(
+        h.client.try_balance(&rogue),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    let assets: Vec<Address> = vec![&h.env, rogue];
+    assert_eq!(
+        h.client.try_balances(&assets),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+}
+
+#[test]
+fn balance_report_rejects_duplicate_assets() {
+    let h = setup("vault", 0);
+    let assets: Vec<Address> = vec![&h.env, h.asset.clone(), h.asset.clone()];
+
+    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn balance_report_rejects_oversized_asset_lists() {
+    let h = setup("vault", 0);
+    let mut assets: Vec<Address> = Vec::new(&h.env);
+    for _ in 0..33 {
+        assets.push_back(Address::generate(&h.env));
+    }
+
+    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn balance_report_is_empty_for_no_assets() {
+    let h = setup("vault", 0);
+    let assets: Vec<Address> = Vec::new(&h.env);
+
+    assert!(h.client.balances(&assets).is_empty());
+}
+
+#[test]
 fn whitelist_changes_emit_events() {
     let h = setup("vault", 0);
     let other = unapproved_token(&h, 0);
