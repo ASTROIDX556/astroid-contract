@@ -806,7 +806,7 @@ fn assert_event_payload(env: &Env, variant: &str, want: Vec<Val>) {
     let want_topic: Val = Symbol::new(env, variant).into_val(env);
     let want_scval = want.to_xdr(env);
     let found = env.events().all().iter().any(|(_id, topics, payload)| {
-        if !topics.contains(want_topic.clone()) {
+        if !topics.contains(want_topic) {
             return false;
         }
         // Both sides are converted to their XDR form in the same host env,
@@ -831,19 +831,29 @@ fn multi_asset_deposits_track_independent_balances() {
     h.client.deposit(&h.admin, &h.asset, &1_000);
     h.client.deposit(&h.admin, &asset_b, &2_000);
 
-    // Each asset keeps its own balance and flow totals.
-    assert_eq!(h.client.asset_balance(&h.asset), 1_000);
-    assert_eq!(h.client.asset_balance(&asset_b), 2_000);
+    // Each asset is custodied and accounted independently.
+    assert_eq!(h.client.balance(&h.asset), 1_000);
+    assert_eq!(h.client.balance(&asset_b), 2_000);
     assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
     assert_eq!(h.client.holding(&asset_b).total_in, 2_000);
+
+    // A single report covers both assets in one call.
+    let report = h
+        .client
+        .balances(&vec![&h.env, h.asset.clone(), asset_b.clone()]);
+    assert_eq!(report.len(), 2);
+    assert_eq!(report.get(0).unwrap().asset, h.asset);
+    assert_eq!(report.get(0).unwrap().balance, 1_000);
+    assert_eq!(report.get(1).unwrap().asset, asset_b);
+    assert_eq!(report.get(1).unwrap().balance, 2_000);
 
     // Real custody agrees per asset.
     assert_eq!(balance_of(&h, &h.asset, &h.client.address), 1_000);
     assert_eq!(balance_of(&h, &asset_b, &h.client.address), 2_000);
 
-    // An asset that never moved reads as zero.
-    let untouched = Address::generate(&h.env);
-    assert_eq!(h.client.asset_balance(&untouched), 0);
+    // An asset that was approved but never funded holds nothing.
+    let untouched = second_asset(&h);
+    assert_eq!(h.client.balance(&untouched), 0);
 }
 
 #[test]
@@ -862,8 +872,8 @@ fn multi_asset_withdrawals_debit_only_the_named_asset() {
     h.client.withdraw(&h.admin, &asset_b, &r2, &100);
 
     // Balances and flow totals move independently per asset.
-    assert_eq!(h.client.asset_balance(&h.asset), 600);
-    assert_eq!(h.client.asset_balance(&asset_b), 900);
+    assert_eq!(h.client.balance(&h.asset), 600);
+    assert_eq!(h.client.balance(&asset_b), 900);
     assert_eq!(h.client.holding(&h.asset).total_out, 400);
     assert_eq!(h.client.holding(&asset_b).total_out, 100);
     assert_eq!(balance_of(&h, &h.asset, &r1), 400);
@@ -871,31 +881,44 @@ fn multi_asset_withdrawals_debit_only_the_named_asset() {
 }
 
 #[test]
-fn assets_lists_every_asset_that_has_ever_moved() {
+fn multi_asset_balances_survive_full_drain_of_one_asset() {
     let h = setup("vault", 0);
     let asset_b = second_asset(&h);
     let asset_c = second_asset(&h);
 
-    // Before anything moves, no asset is tracked.
-    assert_eq!(h.client.assets().len(), 0);
+    // With nothing deposited, both assets report zero through the report.
+    let report = h
+        .client
+        .balances(&vec![&h.env, h.asset.clone(), asset_b.clone()]);
+    assert_eq!(report.len(), 2);
+    for entry in report.iter() {
+        assert_eq!(entry.balance, 0);
+    }
 
     token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.admin, &300);
     token::StellarAssetClient::new(&h.env, &asset_b).mint(&h.admin, &300);
     h.client.deposit(&h.admin, &h.asset, &300);
     h.client.deposit(&h.admin, &asset_b, &300);
 
-    let tracked = h.client.assets();
-    assert_eq!(tracked.len(), 2);
-    assert!(tracked.contains(&h.asset));
-    assert!(tracked.contains(&asset_b));
-    assert!(!tracked.contains(&asset_c));
-
-    // A withdrawal does not remove the asset from the index.
+    // Draining asset_b entirely leaves asset_a untouched, and asset_c (a
+    // third approved token) is never affected.
     h.client
         .withdraw(&h.admin, &asset_b, &Address::generate(&h.env), &300);
-    let tracked = h.client.assets();
-    assert_eq!(tracked.len(), 2);
-    assert_eq!(h.client.asset_balance(&asset_b), 0);
+    assert_eq!(h.client.balance(&h.asset), 300);
+    assert_eq!(h.client.balance(&asset_b), 0);
+    assert_eq!(h.client.balance(&asset_c), 0);
+
+    // The report reflects the same state in one aggregate call.
+    let report = h.client.balances(&vec![
+        &h.env,
+        h.asset.clone(),
+        asset_b.clone(),
+        asset_c.clone(),
+    ]);
+    assert_eq!(report.len(), 3);
+    assert_eq!(report.get(0).unwrap().balance, 300);
+    assert_eq!(report.get(1).unwrap().balance, 0);
+    assert_eq!(report.get(2).unwrap().balance, 0);
 }
 
 #[test]
@@ -910,7 +933,7 @@ fn balance_never_going_negative_on_overdraw() {
     assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
 
     // A failed withdrawal leaves the recorded balance untouched.
-    assert_eq!(h.client.asset_balance(&h.asset), 100);
+    assert_eq!(h.client.balance(&h.asset), 100);
     assert_eq!(h.client.holding(&h.asset).total_out, 0);
 }
 
@@ -956,12 +979,8 @@ fn deposit_and_withdraw_emit_structured_events_with_balance() {
     let deposited: Val = Symbol::new(&h.env, "deposited").into_val(&h.env);
     let executed: Val = Symbol::new(&h.env, "executed").into_val(&h.env);
     let all = h.env.events().all();
-    assert!(all
-        .iter()
-        .any(|(_, topics, _)| topics.contains(deposited.clone())));
-    assert!(all
-        .iter()
-        .any(|(_, topics, _)| topics.contains(executed.clone())));
+    assert!(all.iter().any(|(_, topics, _)| topics.contains(deposited)));
+    assert!(all.iter().any(|(_, topics, _)| topics.contains(executed)));
 
     // Successive events carry the updated balance, so indexers can rebuild
     // per-asset balances from the log alone.
@@ -995,6 +1014,15 @@ fn unapproved_asset_cannot_enter_multi_asset_tracking() {
 
     let res = h.client.try_deposit(&h.admin, &rogue, &1_000);
     assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
-    assert_eq!(h.client.asset_balance(&rogue), 0);
-    assert!(!h.client.assets().contains(&rogue));
+    // Balance queries refuse unapproved assets too, so a rogue token can
+    // never enter the multi-asset accounting.
+    assert_eq!(
+        h.client.try_balance(&rogue),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    assert_eq!(
+        h.client
+            .try_balances(&vec![&h.env, rogue.clone(), h.asset.clone()]),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
 }

@@ -46,19 +46,20 @@
 //! `add_approved_asset`, `remove_approved_asset`, `freeze`, `unfreeze`,
 //! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`, `set_allowance`,
 //! `remove_allowance`, `allowance`, `init_milestone_disbursement`,
-//! `release_next_milestone`, `get`, `holding`, `asset_balance`, `assets`,
+//! `release_next_milestone`, `get`, `holding`, `balance`, `balances`,
 //! `is_approved_asset`, `approved_asset_count`.
 //!
 //! ## Multi-asset balance tracking
 //!
 //! A treasury routinely holds more than one token (a payment asset plus a
 //! reserve asset, for example). Beyond the cumulative flow totals in
-//! [`Holding`], every asset gets its own persistent [`DataKey::AssetBalance`]
-//! recording the net units currently held (`total_in - total_out`), exposed
-//! through [`TreasuryContract::asset_balance`]. Assets are registered in an
-//! instance-storage index the first time they move, so
-//! [`TreasuryContract::assets`] can enumerate everything the treasury has
-//! ever routed without scanning storage.
+//! [`Holding`], the treasury reports its per-asset position directly from
+//! custody: [`TreasuryContract::balance`] reads one asset's balance and
+//! [`TreasuryContract::balances`] aggregates a whole list of assets into a
+//! single [`AssetBalance`] report, so clients can price every token the
+//! treasury routes without one cross-contract call each. Both refuse
+//! unapproved token contracts with [`Error::AssetNotAuthorized`], keeping the
+//! whitelist as the single routing gate.
 //!
 //! ## Deposit and withdrawal event logging
 //!
@@ -171,11 +172,6 @@ enum DataKey {
     /// Current balance per asset: token contract address -> net units held
     /// for the organization (persistent). `balance = total_in - total_out`.
     AssetBalance(Address),
-    /// Position -> tracked asset address (instance). Paired with
-    /// [`DataKey::AssetCount`] it bounds multi-asset iteration for `assets`.
-    AssetIndex(u32),
-    /// Number of assets that have ever been deposited or withdrawn (instance).
-    AssetCount,
     ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
@@ -960,36 +956,17 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
-    /// Persist `balance` for `asset`, registering the asset in the tracked
-    /// index the first time it moves.
+    /// Persist the per-asset balance used by the structured deposit and
+    /// withdrawal events so the resulting balance never has to be recomputed
+    /// from the flow totals at emission time.
     fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
         let key = DataKey::AssetBalance(asset.clone());
-        let first_movement = !env.storage().persistent().has(&key);
         env.storage().persistent().set(&key, &balance);
         env.storage().persistent().extend_ttl(
             &key,
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        if first_movement {
-            let count = Self::asset_count(env);
-            env.storage()
-                .instance()
-                .set(&DataKey::AssetIndex(count), asset);
-            let next = count.saturating_add(1);
-            env.storage().instance().set(&DataKey::AssetCount, &next);
-            env.storage()
-                .instance()
-                .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        }
-    }
-
-    /// Number of assets that have ever been deposited or withdrawn.
-    fn asset_count(env: &Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::AssetCount)
-            .unwrap_or(0)
     }
 
     fn store_approved_count(env: &Env, count: u32) {
