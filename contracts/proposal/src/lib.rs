@@ -597,7 +597,7 @@ impl ProposalContract {
             let release_at = checked_add(proposal.approved_at as i128, timelock as i128)? as u64;
             require_time_reached(&env, release_at)?;
         }
-        Self::ensure_dependencies_met(&env, &proposal)?;
+        Self::ensure_dependencies_met(&env, id, &proposal)?;
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -683,11 +683,19 @@ impl ProposalContract {
         Ok(Self::load(&env, id)?.dependencies)
     }
 
+    /// Whether the proposal has completed its action — `Executed` or `Closed`
+    /// (the only terminal states reachable from a successful run). This is the
+    /// completion check downstream contracts should read before chaining onto a
+    /// proposal, so dependency resolution needs no private state.
+    pub fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
+        Ok(Self::load(&env, id)?.state.has_executed())
+    }
+
     /// Whether every prerequisite has executed — the same question `execute`
     /// asks, exposed so callers can check before spending a transaction on it.
     pub fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
         let proposal = Self::load(&env, id)?;
-        Ok(Self::ensure_dependencies_met(&env, &proposal).is_ok())
+        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
     }
 
     // --- internal helpers ---
@@ -731,13 +739,26 @@ impl ProposalContract {
     /// prerequisite that has been cancelled, rejected, expired or explicitly
     /// marked `Failed` can never become executed, but it is reported the same
     /// way: the dependent proposal simply cannot run.
-    fn ensure_dependencies_met(env: &Env, proposal: &Proposal) -> Result<(), Error> {
+    ///
+    /// Dependency resolution is observable: validation publishes
+    /// `("proposal", "dep_ok")` when the whole chain is satisfied, or
+    /// `("proposal", "dep_fail")` carrying the id of the first unmet
+    /// prerequisite when it is not.
+    fn ensure_dependencies_met(env: &Env, id: u64, proposal: &Proposal) -> Result<(), Error> {
         for dep in proposal.dependencies.iter() {
             let prerequisite = Self::load(env, dep)?;
             if !prerequisite.state.has_executed() {
+                env.events().publish(
+                    (symbol_short!("proposal"), symbol_short!("dep_fail")),
+                    (id, dep),
+                );
                 return Err(Error::PrerequisiteNotMet);
             }
         }
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("dep_ok")),
+            (id, proposal.dependencies.clone()),
+        );
         Ok(())
     }
 
