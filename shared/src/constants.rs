@@ -51,6 +51,11 @@ pub const MAX_BATCH_CALLS: u32 = 16;
 /// invocation (and therefore the cost of the revert when a leg fails).
 pub const MAX_BATCH_PAYMENTS: u32 = 32;
 
+/// Upper bound on how many module records one registry batch lookup may read.
+/// Every id costs up to two persistent reads (record + deprecation flag), so
+/// this caps the footprint of a single `get_modules_batch` invocation.
+pub const MAX_REGISTRY_BATCH: u32 = 10;
+
 /// Upper bound on how many distinct assets a single escrow agreement may hold.
 pub const MAX_ESCROW_ASSETS: u32 = 10;
 

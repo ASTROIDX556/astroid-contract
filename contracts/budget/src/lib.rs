@@ -628,7 +628,8 @@ impl BudgetContract {
         if budget.rollover_enabled {
             let mut credit = checked_add(budget.rollover_credit, leftover)?;
             if periods > 1 {
-                credit = Self::accrue_idle_periods(credit, budget, periods - 1)?;
+                let idle = checked_sub(periods, 1)?;
+                credit = Self::accrue_idle_periods(credit, budget, idle)?;
             }
             budget.rollover_credit = Self::apply_cap(credit, budget.rollover_cap);
         } else {
@@ -794,7 +795,9 @@ impl BudgetInterface for BudgetContract {
             if budget.allow_deficit && budget.deficit_amount == 0 {
                 budget.spent = new_spent;
                 Self::store(&env, &budget_id, &budget);
-                let remaining = capacity - new_spent; // may be negative
+                // Checked: a genuine i128 overflow surfaces as [`Error::Overflow`]
+                // instead of a panic; a negative result (deficit) is expected.
+                let remaining = checked_sub(capacity, new_spent)?;
                 env.events().publish(
                     (symbol_short!("budget"), symbol_short!("consumed")),
                     (budget_id, amount, remaining),
@@ -839,8 +842,10 @@ impl BudgetInterface for BudgetContract {
         }
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         if budget.allow_deficit && budget.deficit_amount > 0 {
-            // Remaining is reduced by the carried-forward deficit.
-            Ok(capacity - budget.deficit_amount - budget.spent)
+            // Remaining is reduced by the carried-forward deficit. Checked at
+            // every step: overflow returns [`Error::Overflow`], never wraps.
+            let net = checked_sub(capacity, budget.deficit_amount)?;
+            checked_sub(net, budget.spent)
         } else {
             checked_sub(capacity, budget.spent)
         }

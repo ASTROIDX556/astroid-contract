@@ -938,16 +938,26 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Refund remaining funds back to the sender after the deadline.
+    /// Refund remaining funds back to the sender once the escrow has timed out.
+    ///
+    /// Only the stored `sender` may refund. Timing uses the ledger clock:
+    /// before `deadline` the call fails with [`Error::TimeLockActive`], during
+    /// `[deadline, deadline + grace_period)` with [`Error::GraceActive`]; from
+    /// `deadline + grace_period` onward (inclusive) the refund is permitted —
+    /// the same instant at which `release` starts failing with
+    /// [`Error::EscrowExpired`], so the two paths never overlap.
     pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
         if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
             return Err(Error::InvalidState);
         }
         if env.ledger().timestamp() < escrow.deadline {
             // Before the fulfillment deadline the escrow is still live.
-            return Err(Error::InvalidState);
+            return Err(Error::TimeLockActive);
         }
         if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
             // During the grace window the counterparty may still fulfill, so funds
@@ -1068,6 +1078,10 @@ impl EscrowContract {
         }
         if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
             return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            // Before the fulfillment deadline the escrow is still live.
+            return Err(Error::TimeLockActive);
         }
         // The grace window must have fully elapsed without fulfillment.
         let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
