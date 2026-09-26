@@ -37,6 +37,30 @@
 //! the emergency freeze, and administering roles themselves — stay with the
 //! recorded org owner and the protocol admin, so no grant can be used to
 //! escalate into ownership or to widen its own reach.
+//!
+//! ## Version upgrade validation (Issue #304)
+//!
+//! The registry is the single source of truth for contract version upgrades,
+//! so replacing deployed bytecode goes through a validated, two-step
+//! propose → commit flow ([`RegistryContract::propose_upgrade`],
+//! [`RegistryContract::commit_upgrade`], [`RegistryContract::reject_upgrade`])
+//! with every check re-applied at commit time:
+//!
+//! | Validation | Where | On failure |
+//! |------------|-------|------------|
+//! | Caller is protocol admin, org owner, or delegated `ModuleUpgrader` | propose | `Unauthorized` (`NotFound` for an unknown org) |
+//! | `version` non-zero and strictly greater than the kind's latest | propose + commit + `register_version` | `InvalidInput` / `InvalidState` (downgrade protection) |
+//! | `wasm_hash` well-formed (non-zero) via [`require_valid_wasm_hash`] | propose + commit + `add_approved_wasm` | `InvalidInput` |
+//! | Wasm hash not already approved for the kind | propose | `InvalidInput` (identical-WASM re-proposal) |
+//! | No other open proposal for the kind | propose | `InvalidState` |
+//! | Proposal not expired (1 week) | commit | `NotFound` |
+//! | Registry not frozen | every lifecycle entrypoint | `RegistryFrozen` |
+//!
+//! Successful lifecycle actions emit `UpgradeProposed` / `UpgradeCommitted` /
+//! `UpgradeRejected` (canonical and tuple-topic form) and are appended to the
+//! immutable audit log; refused attempts revert atomically with their error
+//! code. The admin-only [`RegistryContract::register_version`] escape hatch
+//! carries the same non-zero and downgrade guards as the flow.
 
 use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
 use astroid_shared::constants::{

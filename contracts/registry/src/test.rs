@@ -150,6 +150,32 @@ fn register_version_zero_fails() {
 }
 
 #[test]
+fn register_version_rejects_downgrades_and_repeats() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2);
+
+    // The version table is monotonic per kind: the admin escape hatch may
+    // never lower or repeat the latest version, mirroring the propose/commit
+    // flow's downgrade protection (Issue #304).
+    let addr = Address::generate(&env);
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &2, &addr),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr),
+        Err(Ok(Error::InvalidState))
+    );
+    // Strictly newer versions still land.
+    let v3 = Address::generate(&env);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3);
+    assert_eq!(client.get_latest(&ModuleKind::Wallet), v3);
+}
+
+#[test]
 fn remove_module_works_and_missing_fails() {
     let (env, client, admin) = setup();
     let org = String::from_str(&env, "acme");
