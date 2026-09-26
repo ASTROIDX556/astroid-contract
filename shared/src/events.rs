@@ -21,7 +21,7 @@
 //! existing nor new consumers break.
 
 use crate::types::{AssetAmount, ModuleKind};
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -37,6 +37,12 @@ pub enum ContractEvent {
         org: String,
         kind: ModuleKind,
         address: Address,
+    },
+    /// Registry WASM was updated after an approved, authorized request.
+    RegistryUpgraded {
+        sequence: u32,
+        caller: Address,
+        wasm_hash: BytesN<32>,
     },
     /// An organization's owner changed.
     OrgOwnerChanged { org: String, new_owner: Address },
@@ -109,6 +115,16 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "RegistryModuleUpdated"),),
                 (org, kind, address),
+            );
+        }
+        ContractEvent::RegistryUpgraded {
+            sequence,
+            caller,
+            wasm_hash,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryUpgraded"),),
+                (sequence, caller, wasm_hash),
             );
         }
         ContractEvent::OrgOwnerChanged { org, new_owner } => {
