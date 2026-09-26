@@ -73,6 +73,21 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
 
 /// Create a proposal that depends on `deps`.
 fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> u64 {
+    create_with_grace_and_deps(h, threshold, expires_at, 0, deps)
+}
+
+/// Create an independent proposal with an explicit cancellation grace window.
+fn create_with_grace(h: &Harness, threshold: u32, expires_at: u64, grace_period: u64) -> u64 {
+    create_with_grace_and_deps(h, threshold, expires_at, grace_period, &[])
+}
+
+fn create_with_grace_and_deps(
+    h: &Harness,
+    threshold: u32,
+    expires_at: u64,
+    grace_period: u64,
+    deps: &[u64],
+) -> u64 {
     h.client.create(
         &h.proposer,
         &String::from_str(&h.env, "acme"),
@@ -83,7 +98,7 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
         &threshold,
         &soroban_sdk::vec![&h.env],
         &expires_at,
-        &0,
+        &grace_period,
     )
 }
 
@@ -310,6 +325,8 @@ fn execution_blocked_until_prerequisite_executes() {
     h.client.approve(&h.approvers[1], &second);
     assert_eq!(h.client.state(&second), ProposalState::Approved);
     assert!(!h.client.dependencies_met(&second));
+    // The executability view agrees: an unmet prerequisite blocks it too.
+    assert!(!h.client.can_execute(&second));
 
     assert_eq!(
         h.client.try_execute(&h.proposer, &second),
@@ -319,6 +336,7 @@ fn execution_blocked_until_prerequisite_executes() {
     assert_eq!(h.client.state(&second), ProposalState::Approved);
 
     approve_and_execute(&h, first);
+    assert!(h.client.can_execute(&second));
     h.client.execute(&h.proposer, &second);
     assert_eq!(h.client.state(&second), ProposalState::Executed);
 }
@@ -913,4 +931,256 @@ fn timelock_only_gates_execution_not_state_transitions() {
     assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
     h.client.fail(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Failed);
+}
+
+// ------------------------------------------------------ quorum / majority ----
+//
+// `execute` re-validates the tally that earned `Approved`: the configured
+// threshold, the participation quorum (an integer-scaled percentage of the
+// allow-list) and a strict majority. The cases below pin the boundaries — an
+// exact tie, and tallies one vote short of a bar — where a threshold-only
+// check would let a barely-supported proposal fire.
+
+#[test]
+fn quorum_calculation_rounds_up_with_integer_scaling() {
+    // ceil(eligible * percent / 100) — exact shares stay exact ...
+    assert_eq!(ProposalContract::quorum_required(4, 50), 2);
+    assert_eq!(ProposalContract::quorum_required(2, 50), 1);
+    // ... partial shares round up so they can never slip under the bar.
+    assert_eq!(ProposalContract::quorum_required(5, 50), 3); // 2.5 -> 3
+    assert_eq!(ProposalContract::quorum_required(3, 60), 2); // 1.8 -> 2
+
+    // Degenerate bounds: the full allow-list, and no participation at all.
+    assert_eq!(ProposalContract::quorum_required(7, 100), 7);
+    assert_eq!(ProposalContract::quorum_required(0, 50), 0);
+    assert_eq!(ProposalContract::quorum_required(7, 0), 0);
+    // A percentage above 100 is clamped: never more than the allow-list.
+    assert_eq!(ProposalContract::quorum_required(4, 250), 4);
+}
+
+#[test]
+fn majority_check_never_accepts_a_tie() {
+    // The bar is always one past half of the allow-list ...
+    assert_eq!(ProposalContract::majority_required(4), 3);
+    assert_eq!(ProposalContract::majority_required(5), 3);
+    // ... an empty allow-list can never be reached by any tally ...
+    assert_eq!(ProposalContract::majority_required(0), 1);
+    // Exactly half of an even allow-list is a tie, not a majority ...
+    assert!(!ProposalContract::has_majority(2, 4));
+    assert!(ProposalContract::has_majority(3, 4));
+    // ... and one short of an odd one is still short.
+    assert!(!ProposalContract::has_majority(2, 5));
+    assert!(ProposalContract::has_majority(3, 5));
+    assert!(!ProposalContract::has_majority(1, 3));
+    assert!(ProposalContract::has_majority(2, 3));
+    // A sole voter is its own majority.
+    assert!(ProposalContract::has_majority(1, 1));
+}
+
+#[test]
+fn tied_vote_blocks_execution() {
+    let h = setup(4);
+    let id = create(&h, 2, 5_000); // threshold 2 — exactly half of 4
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // 2 in favour, 2 not voted: the configured threshold and the quorum (2 of
+    // 4) are both met, but a tie is not a majority, so execution is refused
+    // with the threshold code and nothing changes.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approvals, 2);
+}
+
+#[test]
+fn narrowly_missing_the_quorum_blocks_execution() {
+    let h = setup(5);
+    let id = create(&h, 2, 5_000); // clears its own threshold: 2 of 5
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Quorum for 5 voters at 50% is ceil(2.5) == 3, so two approvals fall
+    // exactly one vote short of the participation bar — the tally may not
+    // execute despite `Approved` (the protocol-wide threshold code covers
+    // every vote bar, quorum included).
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // The tally cannot be topped up either (the state gate owns approvals
+    // now), so the proposer's escape hatch is to fail the proposal.
+    assert_eq!(
+        h.client.try_approve(&h.approvers[2], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+}
+
+#[test]
+fn exact_quorum_and_majority_boundary_executes() {
+    let h = setup(5);
+    // 5 voters: quorum = 3 and majority = 3 — this tally sits exactly on
+    // both bars rather than clearing them with room to spare.
+    let id = create(&h, 3, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // One approval fewer would be refused; exactly three clears every bar.
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn narrowly_missing_the_threshold_never_approves_and_cannot_execute() {
+    let h = setup(4);
+    let id = create(&h, 3, 5_000); // needs 3 of 4
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id); // 2 of 3 — one vote short
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+
+    // Below the configured threshold the proposal never reached `Approved`,
+    // so the state gate refuses execution before quorum even applies.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalNotApproved))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+
+    // The missing approval completes the threshold and, with it, quorum and
+    // majority — the same proposal then executes normally.
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+// ------------------------------------------- timelock / expiry boundary ----
+
+#[test]
+fn execution_window_follows_the_ledger_sequence_and_timestamp() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+
+    // Sequence and timestamp move together, exactly as the host fixes them for
+    // a real invocation: still inside the 100s delay, so execution is refused
+    // with the dedicated premature-execution code.
+    advance(&h, 2, 1_050);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // One ledger later the release instant (approved_at + timelock = 1_100)
+    // has been reached.
+    advance(&h, 3, 1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn expiry_gate_wins_over_the_timelock_gate() {
+    // Timelock 1_000s from an approval at t = 1_000, but the deadline lands at
+    // t = 1_500 — the release instant (2_000) lies beyond the validity window,
+    // so a late attempt must report the deadline rather than the (still true)
+    // timelock: the proposal cannot wait out its own expiry.
+    let h = setup_timelocked(3, 1_000);
+    let id = create(&h, 2, 1_500);
+    approve_to_threshold(&h, id);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+
+    advance(&h, 2, 1_400); // live, but the delay has not elapsed
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    advance(&h, 3, 1_500); // deadline reached, delay still running
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn can_execute_tracks_timelock_and_expiry() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 5_000);
+
+    // Pending is never executable, however much time has passed.
+    assert!(!h.client.can_execute(&id));
+
+    approve_to_threshold(&h, id); // approved at t = 1_000
+    assert!(!h.client.can_execute(&id)); // delay still running
+
+    advance(&h, 2, 1_100); // exactly at approved_at + timelock
+    assert!(h.client.can_execute(&id));
+
+    advance(&h, 6, 5_000); // past the deadline
+    assert!(!h.client.can_execute(&id));
+}
+
+#[test]
+fn unrepresentable_timelock_fails_closed_instead_of_wrapping() {
+    // `approved_at + timelock` cannot be expressed as a ledger timestamp. The
+    // delay must fail closed with the deterministic `Overflow` code — if the
+    // sum were truncated into the past, execution would be allowed the moment
+    // the proposal is approved.
+    let h = setup_timelocked(3, u64::MAX);
+    let id = create(&h, 2, 0);
+    approve_to_threshold(&h, id);
+
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert!(!h.client.can_execute(&id));
+}
+
+// ------------------------------------------------- cancellation window ----
+
+#[test]
+fn cancellation_window_is_inclusive_and_then_closes() {
+    let h = setup(3);
+    h.env.ledger().set_timestamp(1_000);
+    // Both created at t = 1_000 with a 50s grace window: the window ends at
+    // t = 1_050 inclusive.
+    let inside = create_with_grace(&h, 2, 8_000, 50);
+    let outside = create_with_grace(&h, 2, 8_000, 50);
+
+    advance(&h, 2, 1_050);
+    h.client.cancel(&h.proposer, &inside);
+    assert_eq!(h.client.state(&inside), ProposalState::Cancelled);
+
+    // One second later the window has closed for the untouched twin.
+    advance(&h, 3, 1_051);
+    assert_eq!(
+        h.client.try_cancel(&h.proposer, &outside),
+        Err(Ok(Error::CancellationWindowClosed))
+    );
+    assert_eq!(h.client.state(&outside), ProposalState::Pending);
+}
+
+#[test]
+fn unrepresentable_grace_window_does_not_trap_cancellation() {
+    // `created_at + grace_period` overflows a ledger timestamp. The window is
+    // treated as never closing (the deadline still bounds the proposal) and
+    // the arithmetic must not trap the host.
+    let h = setup(3);
+    let id = create_with_grace(&h, 2, 0, u64::MAX);
+    h.client.cancel(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Cancelled);
 }

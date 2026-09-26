@@ -273,9 +273,10 @@ fn advance(h: &Harness, seconds: u64) {
 fn assert_event(env: &Env, category: Symbol, action: Symbol) {
     let want_category: Val = category.into_val(env);
     let want_action: Val = action.into_val(env);
-    let found = env.events().all().iter().any(|(_id, topics, _data)| {
-        topics.contains(&want_category) && topics.contains(&want_action)
-    });
+    let found =
+        env.events().all().iter().any(|(_id, topics, _data)| {
+            topics.contains(want_category) && topics.contains(want_action)
+        });
     assert!(found, "expected a matching event to be emitted");
 }
 
