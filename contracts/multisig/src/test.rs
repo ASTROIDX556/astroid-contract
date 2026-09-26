@@ -1270,3 +1270,89 @@ fn signer_set_with_invalid_weights_or_duplicates_is_rejected() {
     client.initialize(&vec![&env, sw(&a, 1), sw(&b, 1)], &2);
     assert_eq!(client.get_threshold(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #280: Threshold voting validation & duplicate vote prevention tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn threshold_voting_duplicate_ballot_rejected_for_multiple_signers() {
+    let h = setup(&[2, 3, 4], 7);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("action"),
+        &payload(&h.env),
+        &0,
+    );
+
+    // Proposer (signers[0]) weight = 2. Duplicate vote from proposer is rejected.
+    assert_eq!(
+        h.client.try_approve(&h.signers[0], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+
+    // signers[1] (weight = 3) approves -> total weight 5 < 7
+    let w1 = h.client.approve(&h.signers[1], &id);
+    assert_eq!(w1, 5);
+
+    // Duplicate vote from signers[1] is rejected
+    assert_eq!(
+        h.client.try_approve(&h.signers[1], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+
+    // Proposal cannot execute yet because weight 5 < threshold 7
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // signers[2] (weight = 4) approves -> total weight 9 >= 7
+    let w2 = h.client.approve(&h.signers[2], &id);
+    assert_eq!(w2, 9);
+
+    // Duplicate vote from signers[2] is also rejected
+    assert_eq!(
+        h.client.try_approve(&h.signers[2], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+
+    // Now proposal successfully executes and transitions state
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+
+    // Cannot approve an already executed proposal
+    assert_eq!(
+        h.client.try_approve(&h.signers[1], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+}
+
+#[test]
+fn threshold_voting_exact_boundary_transitions_state() {
+    // Exactly meeting threshold: 3 + 2 = 5, threshold = 5
+    let h = setup(&[3, 2, 1], 5);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("pay"),
+        &payload(&h.env),
+        &0,
+    );
+
+    // Total weight currently 3 (proposer only) < 5
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // signers[1] (weight 2) approves -> total weight is exactly 5 == threshold
+    let total = h.client.approve(&h.signers[1], &id);
+    assert_eq!(total, 5);
+
+    // Execution succeeds and proposal is marked executed
+    h.client.execute(&h.signers[2], &id);
+    let proposal = h.client.get_proposal(&id);
+    assert!(proposal.executed);
+    assert_eq!(proposal.approval_weight, 5);
+}
+
