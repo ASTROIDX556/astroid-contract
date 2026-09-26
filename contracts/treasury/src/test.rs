@@ -1073,6 +1073,23 @@ fn deposits_withdrawals_and_portfolio_across_tokens_with_different_decimals() {
 }
 
 #[test]
+fn get_all_balances_reports_every_approved_token() {
+    let h = setup("vault", 1_000);
+    let funded = mock_token(&h, 6, 0, 500);
+    let empty = mock_token(&h, 8, 0, 0);
+    h.client.add_approved_asset(&h.admin, &funded);
+    h.client.add_approved_asset(&h.admin, &empty);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &funded, &500);
+
+    let balances = h.client.get_all_balances();
+    assert_eq!(balances.len(), 3);
+    assert_eq!(balances.get(0).unwrap(), (h.asset.clone(), 1_000));
+    assert_eq!(balances.get(1).unwrap(), (funded, 500));
+    assert_eq!(balances.get(2).unwrap(), (empty, 0));
+}
+
+#[test]
 fn zero_balance_assets_are_reported_and_cannot_be_withdrawn() {
     let h = setup("vault", 0);
     let empty = mock_token(&h, 2, 0, 0);
