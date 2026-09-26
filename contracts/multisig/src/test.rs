@@ -273,9 +273,10 @@ fn advance(h: &Harness, seconds: u64) {
 fn assert_event(env: &Env, category: Symbol, action: Symbol) {
     let want_category: Val = category.into_val(env);
     let want_action: Val = action.into_val(env);
-    let found = env.events().all().iter().any(|(_id, topics, _data)| {
-        topics.contains(&want_category) && topics.contains(&want_action)
-    });
+    let found =
+        env.events().all().iter().any(|(_id, topics, _data)| {
+            topics.contains(want_category) && topics.contains(want_action)
+        });
     assert!(found, "expected a matching event to be emitted");
 }
 
@@ -1077,6 +1078,17 @@ fn verify_threshold_accumulates_weight_of_distinct_signers() {
 }
 
 #[test]
+fn verify_threshold_returns_weight_above_threshold() {
+    let h = setup(&[3, 2, 1], 5);
+    let weight = h.client.verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1, 2]),
+        &payload(&h.env),
+    );
+    assert_eq!(weight, 6);
+}
+
+#[test]
 fn verify_threshold_below_threshold_is_refused() {
     let h = setup(&[3, 2, 1], 5);
     let res = h.client.try_verify_threshold(
@@ -1211,6 +1223,31 @@ fn reduced_signer_weight_is_applied_at_execution() {
         h.client.try_execute(&h.signers[1], &id),
         Err(Ok(Error::InsufficientWeight))
     );
+}
+
+#[test]
+fn approval_weight_uses_current_signer_weights() {
+    let h = setup(&[u32::MAX - 2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), u32::MAX - 1);
+
+    let change = h
+        .client
+        .propose_weight_change(&h.signers[1], &h.signers[0], &1);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &change);
+
+    let newcomer = Address::generate(&h.env);
+    h.client.add_signer(&h.signers[0], &newcomer, &2);
+    // Historical weights would overflow u32; approvals are recomputed using
+    // the current weights of the signers who actually approved.
+    assert_eq!(h.client.approve(&newcomer, &id), 4);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 4);
 }
 
 #[test]

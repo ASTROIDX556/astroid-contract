@@ -4,7 +4,10 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, Val,
 };
 
-use crate::{PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload};
+use crate::{
+    PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload,
+    MAX_POLICY_RULES,
+};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -641,10 +644,10 @@ fn allowance_over_limit_rejected_with_exceeded() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &1_000, &0);
 
     let over = p.try_check_allowance(&String::from_str(&env, "mt"), &asset, &1_001);
-    assert_eq!(over, Err(Ok(Error::PolicyAllowanceExceeded)));
+    assert_eq!(over, Err(Ok(Error::AllowanceExceeded)));
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &1_001),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 }
 
@@ -670,7 +673,7 @@ fn allowance_cumulative_consumption_blocks_after_limit() {
     // 401 would exceed the cumulative limit.
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &401),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // A fresh 300 transfer still fits.
     assert!(p
@@ -697,7 +700,7 @@ fn multi_token_allowances_are_independent_per_asset() {
         .is_ok());
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &xlm, &recip, &101),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // An asset with no configured allowance is unrestricted.
     let eth = Address::generate(&env);
@@ -765,7 +768,7 @@ fn allowance_remove_restores_unlimited() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &100, &0);
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &200),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 
     p.remove_allowance(&owner, &String::from_str(&env, "mt"), &asset);
@@ -1801,116 +1804,538 @@ fn only_the_owner_can_manage_the_blacklist() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Issue #247: Enhanced Composite Rule Evaluation Tests
-// ---------------------------------------------------------------------------
+// --- Multi-rule composition (rule stack) tests ---
+//
+// A policy may stack several independent rule trees. All of them must pass for
+// `check_transfer` to authorize a transaction: the evaluation short-circuits on
+// the first failing rule with `Error::PolicyDenied`.
+
+/// A chain of 15 nested `Not` nodes — structurally valid (so registration
+/// accepts it) but deeper than `MAX_RULE_DEPTH`, so evaluating it fails with
+/// [`Error::InvalidInput`]. Used to prove the stack short-circuits before it
+/// reaches a later, un-evaluable rule.
+fn deep_chain_tree(env: &Env) -> RuleTree {
+    let mut tree = soroban_sdk::Vec::new(env);
+    for i in 0..15u32 {
+        tree.push_back(RuleNode {
+            op: RuleOp::Not,
+            value_i128: 0,
+            value_address: Address::generate(env),
+            children_start: i + 1,
+            children_end: i + 2,
+        });
+    }
+    tree.push_back(RuleNode {
+        op: RuleOp::MaxAmount,
+        value_i128: i128::MAX,
+        value_address: Address::generate(env),
+        children_start: 0,
+        children_end: 0,
+    });
+    tree
+}
 
 #[test]
-fn composite_multi_condition_rules_evaluation_and_denial_events() {
+fn multi_rule_recipient_and_amount_both_must_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // Compound policy: allow-listed recipient AND max amount 500.
+    assert_eq!(
+        p.add_policy_rule(
+            &owner,
+            &pid,
+            &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env)
+        ),
+        1
+    );
+    assert_eq!(
+        p.add_policy_rule(
+            &owner,
+            &pid,
+            &single_amount_tree(RuleOp::MaxAmount, 500, &env)
+        ),
+        2
+    );
+    assert_eq!(p.get_policy_rules(&pid).len(), 2);
+
+    // Recipient whitelisted and amount within the cap: authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &500).is_ok());
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &1).is_ok());
+}
+
+#[test]
+fn multi_rule_whitelisted_recipient_failure_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Amount is fine, but the recipient is not on the whitelist: one failing
+    // rule is enough to deny the whole evaluation.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_amount_limit_failure_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Recipient is whitelisted, but the amount breaches the cap.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &501),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_is_conjunctive_across_three_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // recipient + amount + asset: every rule must pass.
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedAsset, asset.clone(), &env),
+    );
+    assert_eq!(p.get_policy_rules(&pid).len(), 3);
+
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &500).is_ok());
+
+    let other_asset = Address::generate(&env);
+    assert_eq!(
+        p.try_check_transfer(&pid, &other_asset, &vendor, &500),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_empty_stack_is_permissive() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
     let asset = Address::generate(&env);
-    let allowed_recip = Address::generate(&env);
-    let blocked_recip = Address::generate(&env);
+    let recip = Address::generate(&env);
 
-    // Tree layout: AND(MaxAmount(500), AllowedRecipient(allowed_recip), AllowedAsset(asset))
-    // Root [0] AND (children 1..4)
-    // [1] MaxAmount(500)
-    // [2] AllowedRecipient(allowed_recip)
-    // [3] AllowedAsset(asset)
-    let mut tree = soroban_sdk::Vec::new(&env);
-    tree.push_back(RuleNode {
+    // No rules registered: nothing to enforce, every transfer is authorized.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recip, &1_000_000)
+        .is_ok());
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip,
+        amount: 1,
+    };
+    assert_eq!(p.try_evaluate_policy_rules(&pid, &payload), Ok(Ok(true)));
+}
+
+#[test]
+fn multi_rule_remove_retires_a_single_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Over the cap while both rules are active.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Retire the amount rule (index 1); the recipient rule stays in force.
+    p.remove_policy_rule(&owner, &pid, &1);
+    assert_eq!(p.get_policy_rules(&pid).len(), 1);
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &600).is_ok());
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_remove_bounds_and_missing_stack_fail() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    // No stack yet.
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &0),
+        Err(Ok(Error::NotFound))
+    );
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 1, &env),
+    );
+    // Out-of-range index is rejected instead of panicking.
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &5),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &u32::MAX),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    p.remove_policy_rule(&owner, &pid, &0);
+    // The key is dropped with its last rule.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &0),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        p.try_clear_policy_rules(&owner, &pid),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn multi_rule_only_the_owner_can_manage_the_stack() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+    assert_eq!(
+        p.try_add_policy_rule(&stranger, &pid, &tree),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_remove_policy_rule(&stranger, &pid, &0),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_clear_policy_rules(&stranger, &pid),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // The owner's own stack is untouched by the rejected attempts.
+    p.add_policy_rule(&owner, &pid, &tree);
+    assert_eq!(p.get_policy_rules(&pid).len(), 1);
+}
+
+#[test]
+fn multi_rule_rejects_empty_and_malformed_trees() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    // Empty tree.
+    let empty = soroban_sdk::Vec::new(&env);
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &empty),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // AND with an empty child range.
+    let mut no_children = soroban_sdk::Vec::new(&env);
+    no_children.push_back(RuleNode {
         op: RuleOp::And,
         value_i128: 0,
         value_address: Address::generate(&env),
         children_start: 1,
-        children_end: 4,
+        children_end: 1,
     });
-    tree.push_back(leaf_amount(RuleOp::MaxAmount, 500, &env));
-    tree.push_back(leaf_addr(
-        RuleOp::AllowedRecipient,
-        allowed_recip.clone(),
-        &env,
-    ));
-    tree.push_back(leaf_addr(RuleOp::AllowedAsset, asset.clone(), &env));
-
-    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
-
-    // 1. Passing transaction payload
-    let valid_payload = TransactionPayload {
-        asset: asset.clone(),
-        recipient: allowed_recip.clone(),
-        amount: 400,
-    };
     assert_eq!(
-        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &valid_payload),
-        Ok(Ok(true))
+        p.try_add_policy_rule(&owner, &pid, &no_children),
+        Err(Ok(Error::InvalidInput))
     );
-    assert!(p
-        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &allowed_recip, &400)
-        .is_ok());
 
-    // 2. Failing transaction payload (amount > 500)
-    let invalid_amount_payload = TransactionPayload {
-        asset: asset.clone(),
-        recipient: allowed_recip.clone(),
-        amount: 600,
-    };
+    // AND whose child range runs past the end of the tree.
+    let mut out_of_bounds = soroban_sdk::Vec::new(&env);
+    out_of_bounds.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 9,
+    });
+    out_of_bounds.push_back(leaf_amount(RuleOp::MaxAmount, 1, &env));
     assert_eq!(
-        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &invalid_amount_payload),
-        Ok(Ok(false))
+        p.try_add_policy_rule(&owner, &pid, &out_of_bounds),
+        Err(Ok(Error::InvalidInput))
     );
-    let res = p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &allowed_recip, &600);
-    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
-    assert_event(&env, "PolicyViolation");
 
-    // 3. Failing transaction payload (wrong recipient)
-    let invalid_recip_payload = TransactionPayload {
-        asset: asset.clone(),
-        recipient: blocked_recip.clone(),
-        amount: 200,
-    };
+    // NOT with more than one child.
+    let mut two_children = soroban_sdk::Vec::new(&env);
+    two_children.push_back(RuleNode {
+        op: RuleOp::Not,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    two_children.push_back(leaf_amount(RuleOp::MaxAmount, 1, &env));
+    two_children.push_back(leaf_amount(RuleOp::MaxAmount, 2, &env));
     assert_eq!(
-        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &invalid_recip_payload),
-        Ok(Ok(false))
+        p.try_add_policy_rule(&owner, &pid, &two_children),
+        Err(Ok(Error::InvalidInput))
     );
-    let res2 = p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &blocked_recip, &200);
-    assert_eq!(res2, Err(Ok(Error::PolicyDenied)));
+
+    // Nothing was stored by any of the rejected registrations.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
 }
 
 #[test]
-fn composite_fails_closed_on_invalid_tree_structure() {
+fn multi_rule_stack_is_bounded() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    for i in 0..MAX_POLICY_RULES {
+        let tree = single_amount_tree(RuleOp::MaxAmount, i as i128, &env);
+        assert_eq!(p.add_policy_rule(&owner, &pid, &tree), i + 1);
+    }
+    assert_eq!(p.get_policy_rules(&pid).len(), MAX_POLICY_RULES);
+
+    // The stack cannot grow past the gas-safety bound.
+    let overflow = single_amount_tree(RuleOp::MaxAmount, i128::MAX, &env);
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &overflow),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_rule_clear_restores_permissive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
 
-    // Out-of-bounds children indices fail closed
-    let mut tree = soroban_sdk::Vec::new(&env);
-    tree.push_back(RuleNode {
-        op: RuleOp::And,
-        value_i128: 0,
-        value_address: Address::generate(&env),
-        children_start: 5,
-        children_end: 10,
-    });
-    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
 
+    p.clear_policy_rules(&owner, &pid);
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &100).is_ok());
+}
+
+#[test]
+fn multi_rule_denial_emits_policy_violation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+
+    let _ = p.try_check_transfer(&pid, &asset, &recip, &100);
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn multi_rule_stacks_with_the_single_composite_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // The single composite tree caps the amount at 100 …
+    let tree = single_amount_tree(RuleOp::MaxAmount, 100, &env);
+    p.set_composite_rule(&owner, &pid, &tree);
+    // … while the stack additionally whitelists the vendor.
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+
+    // Composite tree denies the oversized transfer.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &200),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Stack denies the unlisted recipient.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &50),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Both layers pass for the whitelisted vendor inside the cap.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &50).is_ok());
+}
+
+#[test]
+fn multi_rule_short_circuits_on_first_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
     let payload = TransactionPayload {
         asset: asset.clone(),
         recipient: recip.clone(),
         amount: 100,
     };
+
+    // A rule deeper than the recursion guard cannot be evaluated at all.
+    let deep = deep_chain_tree(&env);
+    let deny = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+
+    // [failing rule, deep rule]: the first rule denies and the loop stops
+    // before it ever reaches the un-evaluable second rule.
+    p.add_policy_rule(&owner, &pid, &deny);
+    p.add_policy_rule(&owner, &pid, &deep);
+    assert_eq!(p.try_evaluate_policy_rules(&pid, &payload), Ok(Ok(false)));
     assert_eq!(
-        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &payload),
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // [deep rule, failing rule]: with the order swapped the depth guard trips
+    // first, proving evaluation really does run in stack order.
+    p.clear_policy_rules(&owner, &pid);
+    p.add_policy_rule(&owner, &pid, &deep);
+    p.add_policy_rule(&owner, &pid, &deny);
+    assert_eq!(
+        p.try_evaluate_policy_rules(&pid, &payload),
         Err(Ok(Error::InvalidInput))
     );
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_rule_stack_is_scoped_to_its_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let other = String::from_str(&env, "other");
+    p.register_policy(
+        &owner,
+        &other,
+        &BytesN::from_array(&env, &[7; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "cr"),
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+
+    // The strict rule is enforced only on its own policy; the sibling stays
+    // permissive.
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
-        Err(Ok(Error::InvalidInput))
+        Err(Ok(Error::PolicyDenied))
     );
+    assert_eq!(p.get_policy_rules(&other).len(), 0);
+    assert!(p.try_check_transfer(&other, &asset, &recip, &100).is_ok());
 }

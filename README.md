@@ -43,8 +43,11 @@ Registry ──► Wallet ──► Treasury
 | `set_org_owner(caller, org, new_owner)` | Org owner or admin | Transfer org ownership. |
 | `register_module(caller, org, kind, address)` | Org owner or admin | Record a module address for an org. |
 | `remove_module(caller, org, kind)` | Org owner or admin | Remove a module registration. |
-| `register_version(caller, kind, version, address)` | Admin | Record a contract version in the global upgrade map. |
+| `register_version(caller, kind, version, address, wasm_hash)` | Admin | Record a contract version in the global upgrade map, bound to the WASM hash it runs. `wasm_hash` must be approved for `kind` (`add_approved_wasm`), else `Unauthorized`. Versions are immutable: re-registering a `(kind, version)` fails with `AlreadyExists`. Blocked while frozen. Emits `RegistryVersionRegistered`. |
+| `add_approved_wasm(caller, kind, wasm_hash)` / `remove_approved_wasm(...)` | Admin | Approve or revoke implementation code for a module kind. |
 | `get_version(kind, version)` | — | Look up an implementation address by version. |
+| `get_version_wasm(kind, version)` | — | Read the WASM hash a version is bound to. `NotFound` for unknown keys. |
+| `verify_version(kind, version, wasm_hash)` | — | Return the version's address only if it is bound to `wasm_hash` (`InvalidInput` on mismatch) and that hash is still approved (`Unauthorized` once revoked). `NotFound` for unknown keys. |
 | `get_latest(kind)` | — | Look up the latest implementation address for a module kind. |
 | `get_org_owner(org)` | — | Read the owner of an organization. |
 | `get_admin()` | — | Read the current protocol admin. |
