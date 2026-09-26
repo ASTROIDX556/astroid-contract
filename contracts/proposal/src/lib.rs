@@ -65,7 +65,13 @@
 //!
 //! All three bars are re-derived from the stored record on every call rather
 //! than cached, so the verdict is a pure function of on-chain state and every
-//! node agrees on it.
+//! node agrees on it. The maths lives in [`VoteBars`] — the quorum
+//! calculation and majority check helpers ([`VoteBars::quorum_required`],
+//! [`VoteBars::majority_required`], [`VoteBars::has_majority`]) composed by
+//! [`VoteBars::for_proposal`] and applied by [`VoteBars::ensure_met`] — and
+//! the very same numbers are readable on-chain through the `vote_bars` view,
+//! so a client can report *which* bar a tally missed instead of only that
+//! execution was refused.
 //!
 //! ## Dependency chaining
 //!
@@ -108,8 +114,8 @@
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
 //! `fail`, `close`, `cleanup_expired`, plus the `get`, `state`, `is_expired`,
-//! `dependencies`, `dependencies_met` and `can_execute` views. `initialize`
-//! also stores the mandatory per-proposal timelock.
+//! `dependencies`, `dependencies_met`, `vote_bars` and `can_execute` views.
+//! `initialize` also stores the mandatory per-proposal timelock.
 
 use astroid_interfaces::{ProposalInterface, UpgradeableInterface};
 // The lifecycle vocabulary lives in the interfaces crate so the multisig, the
@@ -194,6 +200,86 @@ impl Proposal {
         self.is_active(env)
             && self.state == ProposalState::Approved
             && require_timelock_elapsed(env, self).is_ok()
+    }
+}
+
+/// The three vote bars a tally must clear before [`ProposalContract::execute`]
+/// may fire, derived from the proposal's allow-list, its configured
+/// `threshold` and the protocol quorum percentage — see the module-level
+/// *Quorum and majority* notes.
+///
+/// Every bar is recomputed from the stored record on each check rather than
+/// cached, so the verdict is a pure function of on-chain state and every node
+/// agrees on it. The struct is a [`contracttype`] so the same bars can be
+/// read back through the [`ProposalContract::vote_bars`] view, letting a
+/// client report *which* bar a tally missed instead of only that execution
+/// was refused.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoteBars {
+    /// The approval threshold the proposal declared at creation.
+    pub threshold: u32,
+    /// Participation quorum: [`PROPOSAL_QUORUM_PERCENT`]% of the approver
+    /// allow-list, rounded **up** so a partial vote can never round the bar
+    /// away.
+    pub quorum: u32,
+    /// Strict majority: one past half of the approver allow-list. An exact
+    /// tie never reaches it.
+    pub majority: u32,
+}
+
+impl VoteBars {
+    /// All three bars for `proposal`, re-derived from its allow-list size.
+    pub fn for_proposal(proposal: &Proposal) -> Self {
+        let eligible = proposal.approvers.len();
+        Self {
+            threshold: proposal.threshold,
+            quorum: Self::quorum_required(eligible, PROPOSAL_QUORUM_PERCENT),
+            majority: Self::majority_required(eligible),
+        }
+    }
+
+    /// Quorum calculation helper: the number of approvals that makes a vote
+    /// among `eligible` voters quorate — `percent`% of the approver
+    /// allow-list, rounded **up**.
+    ///
+    /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
+    /// [`u64::div_ceil`] — never floating point, so every node derives the
+    /// identical integer. `percent` is clamped to 100, so a misconfigured
+    /// percentage can never demand more than the whole allow-list.
+    pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
+        let percent = percent.min(100);
+        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
+    }
+
+    /// Majority check helper: the smallest number of approvals that exceeds
+    /// half the allow-list — a strict majority. An exact tie (exactly half)
+    /// never reaches it.
+    pub fn majority_required(eligible: u32) -> u32 {
+        eligible / 2 + 1
+    }
+
+    /// Whether `approvals` forms a strict majority of the `eligible` voters.
+    pub fn has_majority(approvals: u32, eligible: u32) -> bool {
+        approvals >= Self::majority_required(eligible)
+    }
+
+    /// Whether a tally of `approvals` clears *every* bar — the configured
+    /// threshold, the participation quorum and the strict majority.
+    pub fn met_by(&self, approvals: u32) -> bool {
+        approvals >= self.threshold && approvals >= self.quorum && approvals >= self.majority
+    }
+
+    /// Refuse a tally that misses any bar with the protocol-wide
+    /// [`Error::ThresholdNotMet`]; a missed quorum *is* a missed threshold,
+    /// and the shared error enum is at the Stellar spec's 50-case cap, so one
+    /// code covers all three bars.
+    pub fn ensure_met(&self, approvals: u32) -> Result<(), Error> {
+        if self.met_by(approvals) {
+            Ok(())
+        } else {
+            Err(Error::ThresholdNotMet)
+        }
     }
 }
 
@@ -639,6 +725,22 @@ impl ProposalContract {
         Ok(proposal)
     }
 
+    /// The vote bars this proposal's tally must clear before `execute` will
+    /// run: its configured `threshold`, the participation quorum
+    /// ([`PROPOSAL_QUORUM_PERCENT`]% of the approver allow-list, integer
+    /// scaled and rounded up) and a strict majority of that allow-list.
+    ///
+    /// The bars themselves never depend on the clock, but the record is read
+    /// through the same settle-first path as every other view, so the answer
+    /// is derived from exactly what `execute` would see: a client that only
+    /// gets [`Error::ThresholdNotMet`] back can use this view to tell the
+    /// caller *which* bar its tally missed.
+    pub fn vote_bars(env: Env, id: u64) -> Result<VoteBars, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(VoteBars::for_proposal(&proposal))
+    }
+
     // --- internal helpers ---
 
     /// Materialize expiry when an interaction observes a stale or already
@@ -684,34 +786,11 @@ impl ProposalContract {
         Self::bump(env, id);
     }
 
-    /// The number of approvals that makes a vote among `eligible` voters
-    /// quorate: `percent`% of the approver allow-list, rounded **up** so a
-    /// partial vote can never round the requirement away.
-    ///
-    /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
-    /// [`u64::div_ceil`] — never floating point, so every node derives the
-    /// identical integer. `percent` is clamped to 100, so a misconfigured
-    /// percentage can never demand more than the whole allow-list.
-    fn quorum_required(eligible: u32, percent: u32) -> u32 {
-        let percent = percent.min(100);
-        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
-    }
-
-    /// The smallest number of approvals that exceeds half the allow-list — a
-    /// strict majority. An exact tie (exactly half) never reaches it.
-    fn majority_required(eligible: u32) -> u32 {
-        eligible / 2 + 1
-    }
-
-    /// Whether `approvals` forms a strict majority of the `eligible` voters.
-    fn has_majority(approvals: u32, eligible: u32) -> bool {
-        approvals >= Self::majority_required(eligible)
-    }
-
     /// Refuse to execute a proposal whose tally does not clear every vote bar.
     ///
-    /// Re-derived from the stored record on each call — nothing is cached —
-    /// and checked in order of increasing strictness:
+    /// The bars are derived afresh from the stored record on each call —
+    /// nothing is cached — by [`VoteBars::for_proposal`], and checked in
+    /// order of increasing strictness:
     ///
     /// 1. the proposal's configured `threshold` (defence in depth: the
     ///    `Approved` state gate in `execute` already guarantees it);
@@ -720,22 +799,13 @@ impl ProposalContract {
     /// 3. a strict majority of the allow-list (an exact tie is not a
     ///    majority).
     ///
-    /// Every shortfall reports [`Error::ThresholdNotMet`] — a missed quorum
-    /// *is* a missed threshold, and the shared error enum is at the Stellar
-    /// spec's 50-case cap, so one protocol-wide code covers all three bars.
+    /// Every shortfall reports [`Error::ThresholdNotMet`] (see
+    /// [`VoteBars::ensure_met`]).
     ///
     /// Nothing is mutated: a refusal leaves the proposal `Approved` and free
     /// to be re-attempted, failed or cancelled.
     fn ensure_vote_valid(proposal: &Proposal) -> Result<(), Error> {
-        let eligible = proposal.approvers.len();
-        let quorum = Self::quorum_required(eligible, PROPOSAL_QUORUM_PERCENT);
-        if proposal.approvals < proposal.threshold
-            || proposal.approvals < quorum
-            || !Self::has_majority(proposal.approvals, eligible)
-        {
-            return Err(Error::ThresholdNotMet);
-        }
-        Ok(())
+        VoteBars::for_proposal(proposal).ensure_met(proposal.approvals)
     }
 
     /// Require that every prerequisite proposal has executed.
