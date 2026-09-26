@@ -219,6 +219,9 @@ enum DataKey {
     ApprovedAssetCount,
     /// Enumerable list of currently approved assets (instance).
     ApprovedAssetList,
+    /// Recorded per-asset custody balance backing the structured deposit and
+    /// withdrawal events (persistent).
+    AssetBalance(Address),
     ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
