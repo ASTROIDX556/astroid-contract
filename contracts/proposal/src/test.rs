@@ -73,6 +73,21 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
 
 /// Create a proposal that depends on `deps`.
 fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> u64 {
+    create_with_grace_and_deps(h, threshold, expires_at, 0, deps)
+}
+
+/// Create an independent proposal with an explicit cancellation grace window.
+fn create_with_grace(h: &Harness, threshold: u32, expires_at: u64, grace_period: u64) -> u64 {
+    create_with_grace_and_deps(h, threshold, expires_at, grace_period, &[])
+}
+
+fn create_with_grace_and_deps(
+    h: &Harness,
+    threshold: u32,
+    expires_at: u64,
+    grace_period: u64,
+    deps: &[u64],
+) -> u64 {
     h.client.create(
         &h.proposer,
         &String::from_str(&h.env, "acme"),
@@ -83,7 +98,7 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
         &threshold,
         &soroban_sdk::vec![&h.env],
         &expires_at,
-        &0,
+        &grace_period,
     )
 }
 
@@ -310,6 +325,8 @@ fn execution_blocked_until_prerequisite_executes() {
     h.client.approve(&h.approvers[1], &second);
     assert_eq!(h.client.state(&second), ProposalState::Approved);
     assert!(!h.client.dependencies_met(&second));
+    // The executability view agrees: an unmet prerequisite blocks it too.
+    assert!(!h.client.can_execute(&second));
 
     assert_eq!(
         h.client.try_execute(&h.proposer, &second),
@@ -319,6 +336,7 @@ fn execution_blocked_until_prerequisite_executes() {
     assert_eq!(h.client.state(&second), ProposalState::Approved);
 
     approve_and_execute(&h, first);
+    assert!(h.client.can_execute(&second));
     h.client.execute(&h.proposer, &second);
     assert_eq!(h.client.state(&second), ProposalState::Executed);
 }

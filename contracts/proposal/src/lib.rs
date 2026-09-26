@@ -27,7 +27,45 @@
 //! [`ProposalContract::initialize`] — between approval and execution. The
 //! approval timestamp is recorded the moment the proposal reaches `Approved`,
 //! and `execute` refuses with [`Error::TimelockNotExpired`] until
-//! `approved_at + timelock` has passed.
+//! `approved_at + timelock` has passed. The `can_execute` view evaluates that
+//! same gate, so it never advertises a proposal as executable while its delay
+//! is still running.
+//!
+//! ## Quorum and majority
+//!
+//! A bare approval threshold can be gamed — `threshold = 1` on a ten-person
+//! allow-list would execute on a single signature — so `execute` re-validates
+//! the tally against two further bars before anything fires:
+//!
+//! * **Quorum (participation).** At least [`PROPOSAL_QUORUM_PERCENT`]% of the
+//!   approver allow-list must have voted. The requirement is computed with
+//!   integer scaling only — `ceil(approvers * percent / 100)`, never
+//!   floating point — and rounded *up* so a partial vote can never round the
+//!   bar away.
+//! * **Majority (the vote itself).** The approvals must form a *strict*
+//!   majority of the allow-list: `approvals > approvers / 2`. An exact tie is
+//!   not a majority.
+//!
+//! The proposal's own configured `threshold` is re-checked as well — behind
+//! the `Approved` state gate, which already guarantees it — as defence in
+//! depth against a tally that somehow slipped below the bar it declared.
+//!
+//! Every shortfall reports the protocol-wide [`Error::ThresholdNotMet`]: a
+//! missed quorum *is* a missed threshold (the participation bar was not
+//! crossed), and the shared error enum already sits at the Stellar spec's
+//! 50-case cap for contract errors, so there is no room for a dedicated
+//! quorum code.
+//!
+//! ```text
+//! approvals < threshold              ──▶ ProposalNotApproved (state gate)
+//! approvals < quorum(allow-list)     ──▶ Error::ThresholdNotMet
+//! approvals <= allow-list / 2 (tie)  ──▶ Error::ThresholdNotMet
+//! otherwise                          ──▶ timelock / dependency gates, then run
+//! ```
+//!
+//! All three bars are re-derived from the stored record on every call rather
+//! than cached, so the verdict is a pure function of on-chain state and every
+//! node agrees on it.
 //!
 //! ## Quorum and majority
 //!
@@ -113,8 +151,8 @@
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
 //! `fail`, `close`, `cleanup_expired`, plus the `get`, `state`, `is_expired`,
-//! `dependencies` and `dependencies_met` views. `initialize` also stores the
-//! mandatory per-proposal timelock.
+//! `dependencies`, `dependencies_met` and `can_execute` views. `initialize`
+//! also stores the mandatory per-proposal timelock.
 
 use astroid_interfaces::UpgradeableInterface;
 use astroid_shared::constants::{
@@ -228,8 +266,22 @@ impl Proposal {
             && matches!(self.state, ProposalState::Pending | ProposalState::Approved)
     }
 
+    /// Whether `execute` would accept this proposal on the current ledger: it
+    /// is live, sits in `Approved`, and the mandatory delay between approval
+    /// and execution has elapsed.
+    ///
+    /// The last term is the same gate [`ProposalContract::execute`] applies,
+    /// evaluated through [`require_timelock_elapsed`], so a client that
+    /// pre-checks this view can never get an answer the entrypoint would then
+    /// contradict — in particular it never reports a prematurely executable
+    /// proposal while its timelock is still running. The check reads this
+    /// contract's instance storage (the configured timelock), so it must be
+    /// evaluated in the proposal contract's own context;
+    /// [`ProposalContract::can_execute`] is the entrypoint form of the question.
     pub fn can_execute(&self, env: &Env) -> bool {
-        self.is_active(env) && self.state == ProposalState::Approved
+        self.is_active(env)
+            && self.state == ProposalState::Approved
+            && require_timelock_elapsed(env, self).is_ok()
     }
 }
 
@@ -471,10 +523,15 @@ impl ProposalContract {
         ) {
             return Err(Error::InvalidProposalState);
         }
-        if proposal.grace_period != 0
-            && env.ledger().timestamp() > proposal.created_at + proposal.grace_period
-        {
-            return Err(Error::CancellationWindowClosed);
+        if proposal.grace_period != 0 {
+            // Saturating end-of-window: `created_at + grace_period` that does
+            // not fit a ledger timestamp describes a window so long it never
+            // closes, which must not wrap into the past (and trap) — the
+            // deadline above still bounds how long it can be relied on.
+            let grace_end = proposal.created_at.saturating_add(proposal.grace_period);
+            if env.ledger().timestamp() > grace_end {
+                return Err(Error::CancellationWindowClosed);
+            }
         }
         proposal.state = ProposalState::Cancelled;
         if let Some(dep) = proposal.deposit.first() {
@@ -596,16 +653,9 @@ impl ProposalContract {
         // a sudden takeover executing freshly-approved proposals before honest
         // members can withdraw support, reporting the protocol-wide
         // [`Error::TimelockNotExpired`] constant for premature attempts. A `0`
-        // timelock (disabled) has no effect.
-        let timelock: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Timelock)
-            .unwrap_or(0);
-        if timelock != 0 && proposal.approved_at != 0 {
-            let release_at = checked_add(proposal.approved_at as i128, timelock as i128)? as u64;
-            require_time_reached(&env, release_at)?;
-        }
+        // timelock (disabled) has no effect. The same gate backs
+        // [`Proposal::can_execute`], so the view and the entrypoint agree.
+        require_timelock_elapsed(&env, &proposal)?;
         Self::ensure_dependencies_met(&env, id, &proposal)?;
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
@@ -704,6 +754,24 @@ impl ProposalContract {
     /// asks, exposed so callers can check before spending a transaction on it.
     pub fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
         let proposal = Self::load(&env, id)?;
+        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
+    }
+
+    /// Whether `execute` would accept this proposal on the current ledger:
+    /// live (not past its deadline), `Approved`, the tally still clearing the
+    /// quorum / threshold / majority bars, the mandatory delay since approval
+    /// elapsed, and every prerequisite executed. The conjunction of exactly
+    /// the gates `execute` applies, in the order it applies them, so a client
+    /// can check before spending a transaction on it and never get an answer
+    /// the entrypoint would then contradict.
+    pub fn can_execute(env: Env, id: u64) -> Result<bool, Error> {
+        let proposal = Self::load(&env, id)?;
+        if !proposal.can_execute(&env) {
+            return Ok(false);
+        }
+        if Self::ensure_vote_valid(&proposal).is_err() {
+            return Ok(false);
+        }
         Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
     }
 
@@ -832,6 +900,31 @@ impl ProposalContract {
             PERSISTENT_BUMP_AMOUNT,
         );
     }
+}
+
+/// Refuse to release a proposal until the mandatory delay between approval and
+/// execution has elapsed on the current ledger.
+///
+/// The delay is the protocol-wide `timelock` (seconds) stored once by
+/// [`ProposalContract::initialize`]; `0` disables it, and a record stamped
+/// before any delay applied (`approved_at == 0`) has nothing to wait for.
+/// Otherwise the release instant `approved_at + timelock` is computed with the
+/// shared checked helpers and *must* be representable as a ledger timestamp:
+/// an unrepresentable instant fails closed with [`Error::Overflow`] instead of
+/// truncating into the past, which would otherwise let a proposal execute the
+/// moment it is approved. [`Proposal::can_execute`] runs the very same gate.
+fn require_timelock_elapsed(env: &Env, proposal: &Proposal) -> Result<(), Error> {
+    let timelock: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::Timelock)
+        .unwrap_or(0);
+    if timelock == 0 || proposal.approved_at == 0 {
+        return Ok(());
+    }
+    let release_at = checked_add(proposal.approved_at as i128, timelock as i128)?;
+    let release_at = u64::try_from(release_at).map_err(|_| Error::Overflow)?;
+    require_time_reached(env, release_at)
 }
 
 // ---------------------------------------------------------------------------
