@@ -94,3 +94,78 @@ pub fn checked_neg(a: i128) -> Result<i128, Error> {
 pub fn checked_abs(a: i128) -> Result<i128, Error> {
     a.checked_abs().ok_or(Error::Overflow)
 }
+
+// ---------------------------------------------------------------------------
+// Balance validation
+// ---------------------------------------------------------------------------
+//
+// Token balances are tracked as `i128`. Before invoking an external Soroban
+// token contract every transfer must prove that the tracked balance covers the
+// requested amount, otherwise a wrapping subtraction could silently mint value.
+// These helpers centralize that check so wallets, treasuries and escrows all
+// fail with the same deterministic error codes.
+
+/// Verify that `balance` is large enough to cover `amount`.
+///
+/// Negative balances or amounts are treated as malformed input and rejected
+/// with [`Error::InvalidAmount`], since neither is ever legitimate for a token
+/// transfer. A zero `amount` is allowed (a no-op transfer) and only succeeds
+/// when `balance` is also non-negative. When `balance < amount` the call fails
+/// with [`Error::InsufficientFunds`].
+///
+/// The comparison is pure — no arithmetic is performed — so it cannot overflow,
+/// even at the `i128` boundaries.
+pub fn validate_sufficient_balance(balance: i128, amount: i128) -> Result<(), Error> {
+    if balance < 0 || amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if balance < amount {
+        return Err(Error::InsufficientFunds);
+    }
+    Ok(())
+}
+
+/// Debit `amount` from `balance` after proving the balance is sufficient.
+///
+/// Returns the remaining balance. Fails with [`Error::InvalidAmount`] for
+/// negative operands and [`Error::InsufficientFunds`] when `balance < amount`,
+/// so the subtraction can never underflow.
+pub fn checked_balance_sub(balance: i128, amount: i128) -> Result<i128, Error> {
+    validate_sufficient_balance(balance, amount)?;
+    balance.checked_sub(amount).ok_or(Error::Overflow)
+}
+
+/// Credit `amount` onto `balance`, returning the new balance.
+///
+/// Fails with [`Error::InvalidAmount`] for negative operands and
+/// [`Error::Overflow`] when the sum cannot be represented as an `i128`.
+pub fn checked_balance_add(balance: i128, amount: i128) -> Result<i128, Error> {
+    if balance < 0 || amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    balance.checked_add(amount).ok_or(Error::Overflow)
+}
+
+/// Balance-aware arithmetic on `i128`.
+///
+/// Mirrors the [`SafeAdd`] family but models a ledger balance: debits verify
+/// sufficiency ([`Error::InsufficientFunds`]) instead of allowing an underflow,
+/// and credits reject overflow ([`Error::Overflow`]). Both reject negative
+/// operands with [`Error::InvalidAmount`].
+pub trait SafeBalance {
+    /// Subtract a transfer amount, verifying the balance is sufficient.
+    fn safe_debit(self, amount: i128) -> Result<i128, Error>;
+
+    /// Add a deposit amount, verifying the result does not overflow.
+    fn safe_credit(self, amount: i128) -> Result<i128, Error>;
+}
+
+impl SafeBalance for i128 {
+    fn safe_debit(self, amount: i128) -> Result<i128, Error> {
+        checked_balance_sub(self, amount)
+    }
+
+    fn safe_credit(self, amount: i128) -> Result<i128, Error> {
+        checked_balance_add(self, amount)
+    }
+}
