@@ -78,13 +78,15 @@
 //! | `withdraw`, `pause`, `unpause`, `archive`     | `Admin`      |
 //! | `grant_role`, `revoke_role`                   | `Admin`      |
 //! | `transfer`                                    | `Agent`      |
+//! | `batch_execute`                               | `Agent`      |
 //! | `freeze`, `unfreeze`                          | `Agent`, or the contract admin |
 //!
 //! A caller whose role is below the requirement — including an `Auditor`, who
 //! holds no mutating power at all — is rejected with [`Error::Unauthorized`].
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`, `grant_role`, `revoke_role`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `grant_role`, `revoke_role`,
+//! `batch_execute` (raw atomic batch of arbitrary contract calls, Issue #301).
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted` (shared schema)
 //! plus wallet-scoped state-change and role-administration events.
@@ -744,6 +746,56 @@ impl WalletContract {
             total_amount,
             budget_remaining,
         })
+    }
+    /// Execute a batch of up to [`MAX_BATCH_CALLS`] arbitrary contract calls
+    /// atomically in a single Soroban invocation (Issue #301). The agent
+    /// submits the calls it wants fired and the wallet is the sole authority
+    /// deciding whether they go — no per-call policy or budget metadata is
+    /// involved, which is what distinguishes this raw entrypoint from
+    /// [`Self::batch_execute_validated`].
+    ///
+    /// Gates, in order:
+    /// - the contract-wide circuit breaker must be untripped and the wallet
+    ///   `Active` (`Frozen` / `Paused` / `Archived` wallets spend nothing);
+    /// - `caller` must hold at least [`Role::Agent`] on the wallet, exactly as
+    ///   for a single [`Self::transfer`];
+    /// - `calls` must be non-empty (an empty batch is a mistake, not a no-op)
+    ///   and at most [`MAX_BATCH_CALLS`] long, so an oversized payload cannot
+    ///   exceed Soroban's per-invocation resource limits.
+    ///    /// Sub-calls run as the wallet contract — the custodian of record — so a
+    /// token move out of custody must name the wallet contract as its source;
+    /// Soroban resolves that authorization against this very invocation, and
+    /// its reentrancy protection prevents a callee from looping back into the
+    /// wallet. If any call fails the runtime reverts the whole batch, leaving
+    /// no partial state. On success `("wallet", "batch")` is published with
+    /// the executed count.
+    pub fn batch_execute(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        calls: soroban_sdk::Vec<ContractCall>,
+    ) -> Result<u32, Error> {
+        Self::when_not_paused(&env)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
+        Self::require_active(&wallet)?;
+
+        // Payload guards: an empty batch is refused rather than silently
+        // succeeding, and an oversized one is refused before any storage is
+        // read so it can never hit the invocation's resource limits.
+        ensure!(!calls.is_empty(), Error::InvalidInput);
+        ensure!(
+            calls.len() <= constants::MAX_BATCH_CALLS,
+            Error::InvalidInput
+        );
+
+        // Fire every sub-call sequentially; any failure propagates and reverts
+        // the entire transaction.
+        for call in calls.iter() {
+            Self::execute_call(&env, &call)?;
+        }
+
+        events::wallet_batch_executed(&env, wallet_id, calls.len());
+        Ok(calls.len())
     }
 
     /// Wire the budget contract batch actions consume from (contract admin
