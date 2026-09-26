@@ -1,10 +1,36 @@
-//! Overflow-safe `i128` arithmetic.
+//! Overflow-safe `i128` and `u64` arithmetic.
 //!
 //! Financial contracts must never rely on wrapping arithmetic. Every value
 //! computation routes through these helpers, which return a contract [`Error`]
 //! instead of panicking so callers can fail safely and deterministically.
 
 use crate::errors::Error;
+
+/// Map the `None` produced by a primitive `checked_*` operation onto the
+/// shared, deterministic [`Error`] table.
+///
+/// This is the single conversion point for arithmetic failures across the
+/// workspace: the checked `add`/`sub`/`mul` families return `None` on overflow
+/// (or underflow) and `checked_div` returns `None` on division by zero.
+/// Routing every `None` through this trait keeps each crate mapping the same
+/// failure to the same contract error code.
+pub trait CheckedOptionExt<T> {
+    /// Convert `None` into [`Error::Overflow`].
+    fn or_overflow(self) -> Result<T, Error>;
+
+    /// Convert `None` into [`Error::InvalidInput`].
+    fn or_invalid_input(self) -> Result<T, Error>;
+}
+
+impl<T> CheckedOptionExt<T> for Option<T> {
+    fn or_overflow(self) -> Result<T, Error> {
+        self.ok_or(Error::Overflow)
+    }
+
+    fn or_invalid_input(self) -> Result<T, Error> {
+        self.ok_or(Error::InvalidInput)
+    }
+}
 
 pub trait SafeAdd {
     fn safe_add(self, other: Self) -> Result<Self, Error>
@@ -32,19 +58,19 @@ pub trait SafeDiv {
 
 impl SafeAdd for i128 {
     fn safe_add(self, other: i128) -> Result<i128, Error> {
-        self.checked_add(other).ok_or(Error::Overflow)
+        self.checked_add(other).or_overflow()
     }
 }
 
 impl SafeSub for i128 {
     fn safe_sub(self, other: i128) -> Result<i128, Error> {
-        self.checked_sub(other).ok_or(Error::Overflow)
+        self.checked_sub(other).or_overflow()
     }
 }
 
 impl SafeMul for i128 {
     fn safe_mul(self, other: i128) -> Result<i128, Error> {
-        self.checked_mul(other).ok_or(Error::Overflow)
+        self.checked_mul(other).or_overflow()
     }
 }
 
@@ -53,14 +79,44 @@ impl SafeDiv for i128 {
         if other == 0 {
             return Err(Error::InvalidInput);
         }
-        self.checked_div(other).ok_or(Error::Overflow)
+        self.checked_div(other).or_overflow()
+    }
+}
+
+// `u64` is the type of ledger counters, timestamps and telemetry values. It
+// shares the exact same failure semantics as `i128` so a wrapping count or a
+// zero-denominator division can never panic the Wasm runtime.
+impl SafeAdd for u64 {
+    fn safe_add(self, other: u64) -> Result<u64, Error> {
+        self.checked_add(other).or_overflow()
+    }
+}
+
+impl SafeSub for u64 {
+    fn safe_sub(self, other: u64) -> Result<u64, Error> {
+        self.checked_sub(other).or_overflow()
+    }
+}
+
+impl SafeMul for u64 {
+    fn safe_mul(self, other: u64) -> Result<u64, Error> {
+        self.checked_mul(other).or_overflow()
+    }
+}
+
+impl SafeDiv for u64 {
+    fn safe_div(self, other: u64) -> Result<u64, Error> {
+        if other == 0 {
+            return Err(Error::InvalidInput);
+        }
+        self.checked_div(other).or_overflow()
     }
 }
 
 // Keep the old functions for backwards compatibility in other contracts,
 // but delegate to the traits
 pub fn checked_add(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_add(b).map_err(|_| Error::Overflow) // mapping back for old code
+    a.safe_add(b)
 }
 
 pub fn checked_sub(a: i128, b: i128) -> Result<i128, Error> {
@@ -68,7 +124,7 @@ pub fn checked_sub(a: i128, b: i128) -> Result<i128, Error> {
 }
 
 pub fn checked_mul(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_mul(b).map_err(|_| Error::Overflow)
+    a.safe_mul(b)
 }
 
 pub fn checked_div(a: i128, b: i128) -> Result<i128, Error> {
@@ -93,6 +149,34 @@ pub fn checked_neg(a: i128) -> Result<i128, Error> {
 /// cannot be represented (only `i128::MIN`).
 pub fn checked_abs(a: i128) -> Result<i128, Error> {
     a.checked_abs().ok_or(Error::Overflow)
+}
+
+// ---------------------------------------------------------------------------
+// `u64` checked helpers
+// ---------------------------------------------------------------------------
+//
+// Ledger counters, timestamps and telemetry values are `u64`. They go through
+// the same checked path as `i128` so an overflowing count or a zero-denominator
+// division surfaces as a contract error rather than a Wasm panic.
+
+/// Checked `u64` addition. Returns [`Error::Overflow`] on overflow.
+pub fn checked_add_u64(a: u64, b: u64) -> Result<u64, Error> {
+    a.safe_add(b)
+}
+
+/// Checked `u64` subtraction. Returns [`Error::Overflow`] on underflow.
+pub fn checked_sub_u64(a: u64, b: u64) -> Result<u64, Error> {
+    a.safe_sub(b)
+}
+
+/// Checked `u64` multiplication. Returns [`Error::Overflow`] on overflow.
+pub fn checked_mul_u64(a: u64, b: u64) -> Result<u64, Error> {
+    a.safe_mul(b)
+}
+
+/// Checked `u64` division. Returns [`Error::InvalidInput`] on division by zero.
+pub fn checked_div_u64(a: u64, b: u64) -> Result<u64, Error> {
+    a.safe_div(b)
 }
 
 // ---------------------------------------------------------------------------
