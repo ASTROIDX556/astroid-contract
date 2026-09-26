@@ -79,7 +79,15 @@ pub enum Error {
     InvalidSignerWeight = 69,
     /// Accumulated approval weight is below the configured threshold.
     InsufficientWeight = 90,
-    /// A timelocked governance change was executed before its delay elapsed.
+    /// A timelocked action was executed before its delay elapsed. Reported by
+    /// the multisig when a governance change runs ahead of its delay, and by
+    /// the escrow (Issue #332) when a release attempt fires before the
+    /// escrow's own release clock — the ledger timestamp is still short of the
+    /// `cliff_time`, or on a linear schedule the requested amount exceeds what
+    /// has vested so far. This is the distinct early-release code: the
+    /// beneficiary-facing `withdraw` / `claim` paths report
+    /// [`Error::TimeLockActive`] instead. (A dedicated new variant is not
+    /// possible: this table is already at the 50-case spec limit.)
     TimelockNotExpired = 91,
     /// A caller without governance rights attempted to modify signers,
     /// weights or the threshold.
