@@ -1318,8 +1318,12 @@ impl TreasuryInterface for TreasuryContract {
     }
 
     /// Whether the emergency circuit breaker is currently engaged.
+    ///
+    /// An uninitialized treasury has no breaker to engage, so this reports
+    /// `false` rather than failing. Use [`TreasuryContract::get`] when the
+    /// caller needs to distinguish "not paused" from "not initialized".
     fn is_paused(env: Env) -> bool {
-        Self::load(&env).paused
+        Self::load(&env).map(|t| t.paused).unwrap_or(false)
     }
 }
 

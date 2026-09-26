@@ -129,6 +129,85 @@ pub enum Error {
     TreasuryPaused = 85,
 }
 
+impl Error {
+    /// Every variant the protocol can report, in the order the enum declares
+    /// them. The audit walks this list, so a variant added to (or removed from)
+    /// the enum without a matching entry fails `error_code_table_is_frozen`.
+    pub const ALL: [Error; 50] = [
+        // --- Generic / lifecycle (1-6) ---
+        Error::NotFound,
+        Error::AlreadyExists,
+        Error::Unauthorized,
+        Error::InvalidInput,
+        Error::NotInitialized,
+        Error::AlreadyInitialized,
+        // --- Value / arithmetic (10-12) ---
+        Error::InsufficientFunds,
+        Error::Overflow,
+        Error::InvalidAmount,
+        // --- Policy (20-29) ---
+        Error::PolicyDenied,
+        Error::EmergencyLock,
+        Error::PolicyRecipientRestricted,
+        Error::PolicyMerchantBlocked,
+        Error::PolicyCategoryRestricted,
+        Error::VelocityLimitExceeded,
+        // --- Registry (30-39) ---
+        Error::RegistryFrozen,
+        Error::ModuleDeprecated,
+        // --- Budget (40-44) ---
+        Error::BudgetExceeded,
+        Error::BudgetFrozen,
+        Error::BudgetArchived,
+        Error::AssetNotAuthorized,
+        Error::BudgetExpired,
+        // --- Wallet (50-53) ---
+        Error::WalletFrozen,
+        Error::WalletArchived,
+        Error::WalletPaused,
+        Error::InvalidState,
+        // --- Multisig / approvals (61-69, 90-92) ---
+        Error::ThresholdNotMet,
+        Error::AlreadySigned,
+        Error::NotASigner,
+        Error::InvalidThreshold,
+        Error::TooManySigners,
+        Error::BatchCallFailed,
+        Error::InvalidNonce,
+        Error::InvalidSignerWeight,
+        Error::InsufficientWeight,
+        Error::TimelockNotExpired,
+        Error::UnauthorizedModification,
+        // --- Proposal (71-79) ---
+        Error::ProposalExpired,
+        Error::InvalidProposalState,
+        Error::ProposalNotApproved,
+        Error::NotAnApprover,
+        Error::CancellationWindowClosed,
+        Error::PrerequisiteNotMet,
+        Error::CircularDependencyDetected,
+        // --- Escrow (80-82) ---
+        Error::EscrowExpired,
+        Error::TimeLockActive,
+        Error::GraceActive,
+        // --- Treasury (83-85) ---
+        Error::AllowanceExceeded,
+        Error::AllowanceExpired,
+        Error::TreasuryPaused,
+    ];
+
+    /// The `u32` code this variant carries on the wire.
+    ///
+    /// Equivalent to the `#[repr(u32)]` discriminant and to the code embedded
+    /// in the [`soroban_sdk::Error`] produced by `From<Error>`, so this is the
+    /// exact value an off-chain consumer sees. Note that `0` is reserved: the
+    /// host reports a contract error of `0` as "no error", so no variant may
+    /// ever take that value.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Budget spend errors, kept separate from the protocol-wide error enum so
 /// budget-specific timing errors do not exceed Soroban's 50-variant limit.
 /// Existing codes match [`Error`] exactly; code 45 is the new scheduled-start

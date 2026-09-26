@@ -32,7 +32,7 @@ use astroid_wallet::WalletContract;
 const ALL_CODES: [u32; 50] = [
     1, 2, 3, 4, 5, 6, // generic / lifecycle
     10, 11, 12, // value / arithmetic
-    20, 21, 22, 23, 24, 26, // policy
+    20, 21, 22, 23, 24, 27, // policy
     30, 31, // registry
     40, 41, 42, 43, 44, // budget
     50, 51, 52, 53, // wallet
@@ -44,7 +44,7 @@ const ALL_CODES: [u32; 50] = [
 
 /// Codes that were part of an earlier revision and must never come back: a
 /// reissued slot would make two different historical failures decode the same.
-const RETIRED_CODES: [u32; 2] = [25, 65];
+const RETIRED_CODES: [u32; 3] = [25, 26, 65];
 
 /// The number an off-chain caller would read from a failed transaction, for
 /// either shape a generated `try_*` call can return.
@@ -122,7 +122,15 @@ fn a_budget_refusal_reaches_the_caller_as_its_canonical_code() {
     );
     let token = Address::generate(&env);
     let res = budget.try_check_and_record_spend(&admin, &live, &token, &1);
-    assert_eq!(code_of(res), Error::AssetNotAuthorized.code());
+    // The budget reports through its own `BudgetError` enum (so the budget's
+    // scheduled-start code can exist without crowding the shared 50). The
+    // codes it carries are the canonical ones, so decode it the way the host
+    // does and compare against the shared table.
+    let wire = match res {
+        Err(Ok(e)) => soroban_sdk::Error::from(e).get_code(),
+        other => panic!("expected a contract error, got {:?}", other),
+    };
+    assert_eq!(wire, Error::AssetNotAuthorized.code());
 }
 
 #[test]

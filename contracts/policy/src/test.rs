@@ -2504,9 +2504,11 @@ fn expired_rate_limit_stays_denied_after_a_reset() {
     p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &WINDOW, &(START + 150));
 
     env.ledger().set_timestamp(START + 150);
+    // A window reset must not resurrect a lapsed envelope: the refusal names
+    // the expiry rather than being passed off as a rule denial.
     assert_eq!(
         p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&asset, 1)]),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::AllowanceExpired))
     );
 }
 

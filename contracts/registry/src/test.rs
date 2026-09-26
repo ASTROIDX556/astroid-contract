@@ -1564,7 +1564,13 @@ fn unauthorized_callers_are_refused_by_the_protocol_admin() {
         Err(Ok(Error::Unauthorized))
     );
     assert_eq!(
-        client.try_register_version(&intruder, &ModuleKind::Wallet, &1, &Address::generate(&env)),
+        client.try_register_version(
+            &intruder,
+            &ModuleKind::Wallet,
+            &1,
+            &Address::generate(&env),
+            &hash(&env, 1)
+        ),
         Err(Ok(Error::Unauthorized))
     );
     // The admin is unchanged.

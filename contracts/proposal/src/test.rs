@@ -5,7 +5,7 @@ use crate::{ProposalContract, ProposalContractClient, ProposalState, VoteBars};
 use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
-use soroban_sdk::{Address, Env, IntoVal, String, Symbol, Val, Vec};
+use soroban_sdk::{vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
 
 struct Harness {
     env: Env,
