@@ -4,7 +4,10 @@
 use crate::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS};
 use crate::errors::Error;
 use crate::math::{
-    checked_abs, checked_add, checked_div, checked_mul, checked_neg, checked_rem, checked_sub,
+    checked_abs, checked_add, checked_add_u64, checked_balance_add, checked_balance_sub,
+    checked_div, checked_div_u64, checked_mul, checked_mul_u64, checked_neg, checked_rem,
+    checked_sub, checked_sub_u64, validate_sufficient_balance, CheckedOptionExt, SafeAdd,
+    SafeBalance, SafeDiv, SafeMul, SafeSub,
 };
 use crate::validation::{
     require_non_negative_amount, require_not_expired, require_positive_amount,
@@ -204,6 +207,233 @@ fn math_additional_edge_cases() {
     assert_eq!(checked_add(i128::MAX, 0), Ok(i128::MAX));
     assert_eq!(checked_mul(0, i128::MAX), Ok(0));
     assert_eq!(checked_div(i128::MIN, 1), Ok(i128::MIN));
+}
+
+// ---------------------------------------------------------------------------
+// u64 checked helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn u64_add_happy_path() {
+    assert_eq!(checked_add_u64(0, 0), Ok(0));
+    assert_eq!(checked_add_u64(2, 3), Ok(5));
+    assert_eq!(checked_add_u64(u64::MAX, 0), Ok(u64::MAX));
+    assert_eq!(checked_add_u64(0, u64::MAX), Ok(u64::MAX));
+}
+
+#[test]
+fn u64_add_overflow() {
+    assert_eq!(checked_add_u64(u64::MAX, 1), Err(Error::Overflow));
+    assert_eq!(checked_add_u64(1, u64::MAX), Err(Error::Overflow));
+    assert_eq!(checked_add_u64(u64::MAX, u64::MAX), Err(Error::Overflow));
+}
+
+#[test]
+fn u64_sub_happy_path() {
+    assert_eq!(checked_sub_u64(5, 3), Ok(2));
+    assert_eq!(checked_sub_u64(0, 0), Ok(0));
+    assert_eq!(checked_sub_u64(u64::MAX, u64::MAX), Ok(0));
+    assert_eq!(checked_sub_u64(u64::MAX, 1), Ok(u64::MAX - 1));
+}
+
+#[test]
+fn u64_sub_underflow() {
+    assert_eq!(checked_sub_u64(0, 1), Err(Error::Overflow));
+    assert_eq!(checked_sub_u64(3, 5), Err(Error::Overflow));
+    assert_eq!(checked_sub_u64(1, u64::MAX), Err(Error::Overflow));
+}
+
+#[test]
+fn u64_mul_happy_path() {
+    assert_eq!(checked_mul_u64(0, u64::MAX), Ok(0));
+    assert_eq!(checked_mul_u64(6, 7), Ok(42));
+    assert_eq!(checked_mul_u64(u64::MAX, 1), Ok(u64::MAX));
+}
+
+#[test]
+fn u64_mul_overflow() {
+    assert_eq!(checked_mul_u64(u64::MAX, 2), Err(Error::Overflow));
+    assert_eq!(checked_mul_u64(u64::MAX, u64::MAX), Err(Error::Overflow));
+    assert_eq!(
+        checked_mul_u64(1u64 << 32, 1u64 << 32),
+        Err(Error::Overflow)
+    );
+}
+
+#[test]
+fn u64_div_happy_path() {
+    assert_eq!(checked_div_u64(20, 5), Ok(4));
+    assert_eq!(checked_div_u64(0, 5), Ok(0));
+    assert_eq!(checked_div_u64(u64::MAX, 1), Ok(u64::MAX));
+}
+
+#[test]
+fn u64_div_by_zero() {
+    assert_eq!(checked_div_u64(0, 0), Err(Error::InvalidInput));
+    assert_eq!(checked_div_u64(42, 0), Err(Error::InvalidInput));
+    assert_eq!(checked_div_u64(u64::MAX, 0), Err(Error::InvalidInput));
+}
+
+#[test]
+fn u64_traits_match_free_functions() {
+    // The `Safe*` traits and the free helpers must agree on every edge case.
+    assert_eq!(2u64.safe_add(3), Ok(5));
+    assert_eq!(u64::MAX.safe_add(1), Err(Error::Overflow));
+    assert_eq!(5u64.safe_sub(3), Ok(2));
+    assert_eq!(0u64.safe_sub(1), Err(Error::Overflow));
+    assert_eq!(6u64.safe_mul(7), Ok(42));
+    assert_eq!(u64::MAX.safe_mul(2), Err(Error::Overflow));
+    assert_eq!(20u64.safe_div(5), Ok(4));
+    assert_eq!(1u64.safe_div(0), Err(Error::InvalidInput));
+}
+
+// ---------------------------------------------------------------------------
+// Unified error mapping
+// ---------------------------------------------------------------------------
+
+#[test]
+fn checked_option_maps_none_to_contract_errors() {
+    assert_eq!(Some(5i128).or_overflow(), Ok(5));
+    assert_eq!(None::<i128>.or_overflow(), Err(Error::Overflow));
+    assert_eq!(Some(5i128).or_invalid_input(), Ok(5));
+    assert_eq!(None::<i128>.or_invalid_input(), Err(Error::InvalidInput));
+
+    assert_eq!(Some(5u64).or_overflow(), Ok(5));
+    assert_eq!(None::<u64>.or_overflow(), Err(Error::Overflow));
+    assert_eq!(None::<u64>.or_invalid_input(), Err(Error::InvalidInput));
+}
+
+// ---------------------------------------------------------------------------
+// Balance validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sufficient_balance_happy_path() {
+    // A balance larger than the amount, and the exact-balance boundary, both pass.
+    assert_eq!(validate_sufficient_balance(100, 30), Ok(()));
+    assert_eq!(validate_sufficient_balance(30, 30), Ok(()));
+    assert_eq!(validate_sufficient_balance(i128::MAX, i128::MAX), Ok(()));
+    assert_eq!(validate_sufficient_balance(i128::MAX, 1), Ok(()));
+}
+
+#[test]
+fn sufficient_balance_zero_values() {
+    // Zero is a legal balance and a zero-amount transfer is a no-op.
+    assert_eq!(validate_sufficient_balance(0, 0), Ok(()));
+    assert_eq!(validate_sufficient_balance(1, 0), Ok(()));
+    assert_eq!(validate_sufficient_balance(i128::MAX, 0), Ok(()));
+    // An empty balance cannot fund any positive transfer.
+    assert_eq!(
+        validate_sufficient_balance(0, 1),
+        Err(Error::InsufficientFunds)
+    );
+    assert_eq!(
+        validate_sufficient_balance(0, i128::MAX),
+        Err(Error::InsufficientFunds)
+    );
+}
+
+#[test]
+fn sufficient_balance_insufficient() {
+    assert_eq!(
+        validate_sufficient_balance(29, 30),
+        Err(Error::InsufficientFunds)
+    );
+    assert_eq!(
+        validate_sufficient_balance(i128::MAX - 1, i128::MAX),
+        Err(Error::InsufficientFunds)
+    );
+}
+
+#[test]
+fn sufficient_balance_rejects_negatives() {
+    // Negative balances/amounts are malformed input, never a valid transfer.
+    assert_eq!(
+        validate_sufficient_balance(-1, 0),
+        Err(Error::InvalidAmount)
+    );
+    assert_eq!(
+        validate_sufficient_balance(0, -1),
+        Err(Error::InvalidAmount)
+    );
+    assert_eq!(
+        validate_sufficient_balance(-5, -5),
+        Err(Error::InvalidAmount)
+    );
+    assert_eq!(
+        validate_sufficient_balance(i128::MIN, 0),
+        Err(Error::InvalidAmount)
+    );
+    assert_eq!(
+        validate_sufficient_balance(i128::MIN, i128::MIN),
+        Err(Error::InvalidAmount)
+    );
+}
+
+#[test]
+fn balance_sub_happy_path() {
+    assert_eq!(checked_balance_sub(100, 30), Ok(70));
+    assert_eq!(checked_balance_sub(30, 30), Ok(0));
+    assert_eq!(checked_balance_sub(0, 0), Ok(0));
+    assert_eq!(checked_balance_sub(i128::MAX, i128::MAX), Ok(0));
+    assert_eq!(checked_balance_sub(i128::MAX, 0), Ok(i128::MAX));
+}
+
+#[test]
+fn balance_sub_insufficient() {
+    // The subtraction is guarded, so an over-draw returns a deterministic error
+    // instead of wrapping to a huge positive balance.
+    assert_eq!(checked_balance_sub(5, 6), Err(Error::InsufficientFunds));
+    assert_eq!(
+        checked_balance_sub(0, i128::MAX),
+        Err(Error::InsufficientFunds)
+    );
+}
+
+#[test]
+fn balance_sub_negative_operands() {
+    assert_eq!(checked_balance_sub(-5, 1), Err(Error::InvalidAmount));
+    assert_eq!(checked_balance_sub(10, -1), Err(Error::InvalidAmount));
+    assert_eq!(checked_balance_sub(i128::MIN, 1), Err(Error::InvalidAmount));
+}
+
+#[test]
+fn balance_add_happy_path() {
+    assert_eq!(checked_balance_add(0, 0), Ok(0));
+    assert_eq!(checked_balance_add(5, 5), Ok(10));
+    assert_eq!(checked_balance_add(i128::MAX, 0), Ok(i128::MAX));
+    assert_eq!(checked_balance_add(0, i128::MAX), Ok(i128::MAX));
+}
+
+#[test]
+fn balance_add_overflow() {
+    assert_eq!(checked_balance_add(i128::MAX, 1), Err(Error::Overflow));
+    assert_eq!(checked_balance_add(1, i128::MAX), Err(Error::Overflow));
+    assert_eq!(
+        checked_balance_add(i128::MAX, i128::MAX),
+        Err(Error::Overflow)
+    );
+}
+
+#[test]
+fn balance_add_negative_operands() {
+    assert_eq!(checked_balance_add(-1, 0), Err(Error::InvalidAmount));
+    assert_eq!(checked_balance_add(0, -1), Err(Error::InvalidAmount));
+    assert_eq!(checked_balance_add(-1, -1), Err(Error::InvalidAmount));
+}
+
+#[test]
+fn safe_balance_trait_delegates() {
+    // `safe_debit`/`safe_credit` mirror the free-function guarantees.
+    assert_eq!(100i128.safe_debit(30), Ok(70));
+    assert_eq!(30i128.safe_debit(30), Ok(0));
+    assert_eq!(30i128.safe_debit(100), Err(Error::InsufficientFunds));
+    assert_eq!(30i128.safe_debit(-1), Err(Error::InvalidAmount));
+
+    assert_eq!(100i128.safe_credit(30), Ok(130));
+    assert_eq!(i128::MAX.safe_credit(0), Ok(i128::MAX));
+    assert_eq!(i128::MAX.safe_credit(1), Err(Error::Overflow));
+    assert_eq!(1i128.safe_credit(-1), Err(Error::InvalidAmount));
 }
 
 #[test]
