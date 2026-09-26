@@ -27,6 +27,13 @@
 //! fails the whole batch reverts with [`Error::BatchCallFailed`] or the callee's
 //! error.
 //!
+//! [`MultiSigContract::verify_threshold`] exposes that same signature check on
+//! its own, without executing anything: it verifies a set of signatures over an
+//! exact payload, accumulates the weight of the distinct registered signers
+//! behind them, and returns the total or [`Error::ThresholdNotMet`]. Duplicated
+//! signatories are counted once, so a single key can never reach the threshold
+//! alone however often it is listed.
+//!
 //! ## Timelocked governance
 //!
 //! Changing who can sign, how much a signer's vote is worth, or the threshold
@@ -58,10 +65,11 @@
 //! [`Error::TimelockNotExpired`]; governance calls from a non-signer with
 //! [`Error::UnauthorizedModification`].
 
+use astroid_interfaces::{MultisigInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS,
     MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_THRESHOLD, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
+    PERSISTENT_LIFETIME_THRESHOLD, THRESHOLD_CHANGE_DELAY_LEDGERS,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::{checked_add, checked_sub};
@@ -94,6 +102,8 @@ enum DataKey {
     ChangeCount,
     /// State: pending governance change by id (persistent).
     Change(u64),
+    /// Pending threshold change awaiting finalization.
+    PendingThreshold,
 }
 
 /// A registered signer and its positive voting weight.
@@ -102,6 +112,15 @@ enum DataKey {
 pub struct SignerWeight {
     pub address: Address,
     pub weight: u32,
+}
+
+/// A pending threshold change that must wait a delay before finalization.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingThresholdChange {
+    pub new_threshold: u32,
+    /// Ledger sequence when the change was submitted.
+    pub effective_from: u32,
 }
 
 /// Internal multisig proposal. `action`/`payload` describe the intended change
@@ -218,6 +237,132 @@ impl MultiSigContract {
         env.storage()
             .instance()
             .set(&DataKey::TimelockDelay, &MIN_TIMELOCK_DELAY);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Add a signer. Signer-gated. Rejects duplicates, zero weights, and
+    /// over-capacity signer sets.
+    pub fn add_signer(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        weight: u32,
+    ) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        if weight == 0 {
+            return Err(Error::InvalidSignerWeight);
+        }
+        let mut signers = Self::signers(&env)?;
+        if signers.iter().any(|s| s.address == signer) {
+            return Err(Error::AlreadyExists);
+        }
+        if signers.len() >= MAX_SIGNERS {
+            return Err(Error::TooManySigners);
+        }
+        // The aggregate weight must stay representable, or every later
+        // threshold check would fail with `Overflow` and brick the multisig.
+        Self::to_weight(checked_add(
+            Self::total_weight(&signers)? as i128,
+            weight as i128,
+        )?)?;
+        signers.push_back(SignerWeight {
+            address: signer.clone(),
+            weight,
+        });
+        env.storage().instance().set(&DataKey::Signers, &signers);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("signer"), symbol_short!("added")),
+            (signer, weight),
+        );
+        Ok(())
+    }
+
+    /// Remove a signer. Signer-gated. Refuses to drop below the threshold or to
+    /// empty the set, so the multisig can never become unusable.
+    pub fn remove_signer(env: Env, caller: Address, signer: Address) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        let mut signers = Self::signers(&env)?;
+        let threshold = Self::threshold(&env)?;
+        let idx = Self::index_of(&signers, &signer)?;
+        let remaining_total = checked_sub(
+            Self::total_weight(&signers)? as i128,
+            signers.get(idx).unwrap().weight as i128,
+        )?;
+        if remaining_total < threshold as i128 {
+            return Err(Error::InvalidThreshold);
+        }
+        signers.remove(idx);
+        env.storage().instance().set(&DataKey::Signers, &signers);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("signer"), symbol_short!("removed")), signer);
+        Ok(())
+    }
+
+    /// Propose a pending threshold change. Signer-gated. Must stay within
+    /// `[MIN_THRESHOLD, signers.len()]`. The change is stored but not applied
+    /// until [`finalize_threshold`] is called after the grace period.
+    pub fn set_threshold(env: Env, caller: Address, threshold: u32) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        let signers = Self::signers(&env)?;
+        Self::validate_threshold(threshold, Self::total_weight(&signers)?)?;
+
+        let current = Self::threshold(&env)?;
+        if current == threshold {
+            return Err(Error::InvalidThreshold);
+        }
+
+        let pending = PendingThresholdChange {
+            new_threshold: threshold,
+            effective_from: env.ledger().sequence(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingThreshold, &pending);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("threshold"), symbol_short!("pending")),
+            (threshold, env.ledger().sequence()),
+        );
+        Ok(())
+    }
+
+    /// Finalize a pending threshold change. The change only takes effect after
+    /// at least [`THRESHOLD_CHANGE_DELAY_LEDGERS`] ledgers have passed since
+    /// the change was submitted via [`set_threshold`].
+    pub fn finalize_threshold(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+
+        let pending: PendingThresholdChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingThreshold)
+            .ok_or(Error::NotFound)?;
+
+        let current_sequence = env.ledger().sequence();
+        let elapsed = current_sequence
+            .checked_sub(pending.effective_from)
+            .ok_or(Error::TimelockNotExpired)?;
+        if elapsed < THRESHOLD_CHANGE_DELAY_LEDGERS {
+            return Err(Error::TimelockNotExpired);
+        }
+        // The signer set may have shrunk while the change was pending; never
+        // install a threshold the remaining signers can no longer reach.
+        Self::validate_threshold(
+            pending.new_threshold,
+            Self::total_weight(&Self::signers(&env)?)?,
+        )?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &pending.new_threshold);
+        env.storage().instance().remove(&DataKey::PendingThreshold);
+        env.events().publish(
+            (symbol_short!("threshold"), symbol_short!("changed")),
+            pending.new_threshold,
+        );
         Self::bump_instance(&env);
         Ok(())
     }
@@ -413,6 +558,7 @@ impl MultiSigContract {
         env.storage()
             .persistent()
             .set(&DataKey::Approval(id, proposer.clone()), &true);
+        Self::bump_approval(&env, id, &proposer);
         Self::bump_proposal(&env, id);
         env.storage()
             .instance()
@@ -446,11 +592,9 @@ impl MultiSigContract {
         if env.storage().persistent().get(&akey).unwrap_or(false) {
             return Err(Error::AlreadySigned);
         }
-        // Checked accumulation: a wrapping sum would truncate to a smaller
-        // value and could wrongly satisfy (or fail) the threshold.
-        let approval_weight = Self::add_weight(proposal.approval_weight, weight)?;
         env.storage().persistent().set(&akey, &true);
-        proposal.approval_weight = approval_weight;
+        Self::bump_approval(&env, proposal_id, &caller);
+        proposal.approval_weight = Self::live_approval_weight(&env, proposal_id)?;
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -466,6 +610,11 @@ impl MultiSigContract {
     /// threshold and any time lock has elapsed. Marks it executed and emits
     /// `ProposalExecuted`. Rejects with [`Error::InsufficientWeight`] when the
     /// accumulated weight is below the threshold.
+    ///
+    /// Quorum is verified against the **live** signer set, not the running
+    /// total recorded at approval time: an approval from a signer who has since
+    /// been removed no longer counts, and a re-weighted signer counts at their
+    /// current weight. The recorded `approval_weight` is refreshed to match.
     pub fn execute(env: Env, caller: Address, proposal_id: u64) -> Result<(), Error> {
         Self::require_not_locked(&env)?;
         Self::require_signer(&env, &caller)?;
@@ -474,12 +623,11 @@ impl MultiSigContract {
             return Err(Error::InvalidProposalState);
         }
         let threshold = Self::threshold(&env)?;
-        // Single quorum check, shared with the batch flow.
-        Self::verify_threshold(
-            proposal.approval_weight,
-            threshold,
-            Error::InsufficientWeight,
-        )?;
+        let weight = Self::live_approval_weight(&env, proposal_id)?;
+        proposal.approval_weight = weight;
+        if weight < threshold {
+            return Err(Error::InsufficientWeight);
+        }
         if proposal.unlock_at != 0 {
             require_time_reached(&env, proposal.unlock_at)?;
         }
@@ -511,8 +659,9 @@ impl MultiSigContract {
     ///   payload `(nonce, calls)`; the host cryptographically verifies each
     ///   signature and enforces replay prevention via
     ///   [`Address::require_auth_for_args`]. Duplicate entries (including the
-    ///   caller) only count once. Each signer carries weight 1, so the number
-    ///   of distinct signers — caller plus approvers — must meet the threshold.
+    ///   caller) only count once. Each distinct signer contributes its own
+    ///   voting weight, so the accumulated weight — caller plus approvers —
+    ///   must meet the threshold.
     ///
     /// Execution is atomic: each call runs inside a Soroban error-handling
     /// boundary ([`Env::try_invoke_contract`]); if any sub-call fails the whole
@@ -554,22 +703,12 @@ impl MultiSigContract {
 
         // Aggregate signature verification over the entire batch payload: the
         // caller plus every distinct approver must be a signer and must have
-        // authorized `(nonce, calls)`. Each signer carries weight 1.
+        // authorized `(nonce, calls)`. Each distinct signer contributes its own
+        // voting weight.
         let payload = Self::batch_payload(&env, nonce, &calls);
-        let mut weight: u32 = 1; // the caller's signature counts
-        let mut seen = Vec::new(&env);
-        seen.push_back(caller.clone());
-        caller.require_auth_for_args(payload.clone());
-        for approver in approvers.iter() {
-            if !signers.iter().any(|s| s.address == approver) {
-                return Err(Error::NotASigner);
-            }
-            if seen.contains(&approver) {
-                continue;
-            }
-            seen.push_back(approver.clone());
-            approver.require_auth_for_args(payload.clone());
-            weight = Self::add_weight(weight, 1)?;
+        let weight = Self::accumulate_weight(&env, &signers, &caller, &approvers, &payload)?;
+        if weight < threshold {
+            return Err(Error::ThresholdNotMet);
         }
         // Same threshold verification helper as the proposal flow; batches
         // report their dedicated shortfall code.
@@ -594,6 +733,11 @@ impl MultiSigContract {
 
     // --- views ---
 
+    /// Aggregate voting weight of the whole signer set.
+    pub fn get_total_weight(env: Env) -> Result<u32, Error> {
+        Self::total_weight(&Self::signers(&env)?)
+    }
+
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<MsProposal, Error> {
         Self::load_proposal(&env, proposal_id)
     }
@@ -611,14 +755,11 @@ impl MultiSigContract {
         Self::signers(&env).unwrap_or_else(|_| Vec::new(&env))
     }
 
-    pub fn get_threshold(env: Env) -> Result<u32, Error> {
-        Self::threshold(&env)
-    }
-
-    pub fn is_signer(env: Env, who: Address) -> bool {
-        Self::signers(&env)
-            .map(|s| s.iter().any(|sw| sw.address == who))
-            .unwrap_or(false)
+    pub fn get_pending_threshold(env: Env) -> Result<PendingThresholdChange, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingThreshold)
+            .ok_or(Error::NotFound)
     }
 
     pub fn is_locked(env: Env) -> bool {
@@ -687,37 +828,22 @@ impl MultiSigContract {
             .ok_or(Error::NotASigner)
     }
 
-    /// Authorize `caller` and resolve its voting weight from a *single* read
-    /// of the signer set. Fuses `require_signer` + `weight_of`, which each
-    /// performed their own instance-storage read of the same key.
-    fn require_signer_weight(env: &Env, caller: &Address) -> Result<u32, Error> {
-        caller.require_auth();
-        let signers = Self::signers(env)?;
-        Self::weight_in(&signers, caller)
-    }
-
-    /// Checked accumulation of a signer weight into a running approval total.
-    /// The sum is computed in `i128` and narrowed by [`Self::to_weight`], so an
-    /// overflowing weight sum surfaces as [`Error::Overflow`] instead of
-    /// truncating into a smaller value that could wrongly satisfy the
-    /// threshold.
-    fn add_weight(total: u32, weight: u32) -> Result<u32, Error> {
-        Self::to_weight(checked_add(total as i128, weight as i128)?)
-    }
-
-    /// Threshold verification helper: validate a signer weight sum against the
-    /// configured threshold.
-    ///
-    /// `sum` is built exclusively through [`Self::add_weight`], i.e. it is
-    /// wrap-free by construction; a sum below `threshold` is rejected with
-    /// `shortfall`, the caller's own shortfall code ([`Error::InsufficientWeight`]
-    /// for proposal approvals, [`Error::ThresholdNotMet`] for batches), so
-    /// every quorum decision in the contract is taken in exactly one place.
-    fn verify_threshold(sum: u32, threshold: u32, shortfall: Error) -> Result<(), Error> {
-        if sum < threshold {
-            return Err(shortfall);
+    /// Sum the current weight of every current signer that approved
+    /// `proposal_id`. One instance read for the signer set plus one approval
+    /// lookup per signer (bounded by `MAX_SIGNERS`).
+    fn live_approval_weight(env: &Env, proposal_id: u64) -> Result<u32, Error> {
+        let mut total: i128 = 0;
+        for s in Self::signers(env)?.iter() {
+            let approved: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Approval(proposal_id, s.address.clone()))
+                .unwrap_or(false);
+            if approved {
+                total = checked_add(total, s.weight as i128)?;
+            }
         }
-        Ok(())
+        Self::to_weight(total)
     }
 
     fn threshold(env: &Env) -> Result<u32, Error> {
@@ -762,6 +888,46 @@ impl MultiSigContract {
         let nonce_val: Val = nonce.into_val(env);
         let calls_val: Val = calls.to_val();
         vec![env, nonce_val, calls_val]
+    }
+
+    /// Verify `caller` plus every distinct `signatories` entry against `args`
+    /// and accumulate their voting weight.
+    ///
+    /// Each address must be a registered signer; the Soroban host performs the
+    /// cryptographic verification through [`Address::require_auth_for_args`],
+    /// binding every signature to the exact payload. Repeated entries — the
+    /// caller included — are verified and counted once, so one key can never
+    /// stack its own weight.
+    fn accumulate_weight(
+        env: &Env,
+        signers: &Vec<SignerWeight>,
+        caller: &Address,
+        signatories: &Vec<Address>,
+        args: &Vec<Val>,
+    ) -> Result<u32, Error> {
+        let caller_weight = signers
+            .iter()
+            .find(|s| &s.address == caller)
+            .map(|s| s.weight)
+            .ok_or(Error::NotASigner)?;
+        caller.require_auth_for_args(args.clone());
+        let mut total: i128 = caller_weight as i128;
+        let mut seen = Vec::new(env);
+        seen.push_back(caller.clone());
+        for who in signatories.iter() {
+            let weight = signers
+                .iter()
+                .find(|s| s.address == who)
+                .map(|s| s.weight)
+                .ok_or(Error::NotASigner)?;
+            if seen.contains(&who) {
+                continue;
+            }
+            seen.push_back(who.clone());
+            who.require_auth_for_args(args.clone());
+            total = checked_add(total, weight as i128)?;
+        }
+        Self::to_weight(total)
     }
 
     /// Invoke a single batch call inside a Soroban error-handling boundary so a
@@ -1035,10 +1201,120 @@ impl MultiSigContract {
         );
     }
 
+    /// Approvals are re-read when the proposal executes, so they must live at
+    /// least as long as the proposal record itself.
+    fn bump_approval(env: &Env, id: u64, who: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(id, who.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
     fn bump_instance(env: &Env) {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quorum verification surface, exposed through `MultisigInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl MultisigInterface for MultiSigContract {
+    /// Verify that a collection of signatures over `payload` carries at least
+    /// the configured approval weight threshold.
+    ///
+    /// `caller` and every entry in `signatories` must be a registered signer and
+    /// must have authorized this exact payload — the Soroban host performs the
+    /// cryptographic signature verification via
+    /// [`Address::require_auth_for_args`], and binding the check to `payload`
+    /// means a signature collected for one operation can never be replayed
+    /// against another. Repeated signatories count once, so a single key can
+    /// never stack its own weight to reach the threshold alone.
+    ///
+    /// This exposes the same check `execute_batch` performs internally, so a
+    /// caller can verify a signature set against the threshold without asking
+    /// the multisig to execute anything.
+    ///
+    /// Returns the accumulated weight on success, [`Error::NotASigner`] when an
+    /// unregistered address is presented, and [`Error::ThresholdNotMet`] when
+    /// the verified weight falls short.
+    fn verify_threshold(
+        env: Env,
+        caller: Address,
+        signatories: Vec<Address>,
+        payload: Bytes,
+    ) -> Result<u32, Error> {
+        Self::require_not_locked(&env)?;
+        // A list longer than the maximum signer set can only hold duplicates or
+        // non-signers; reject it up front (gas safety).
+        if signatories.len() > MAX_SIGNERS {
+            return Err(Error::InvalidInput);
+        }
+        let signers = Self::signers(&env)?;
+        let threshold = Self::threshold(&env)?;
+        let args = vec![&env, payload.to_val()];
+        let weight = Self::accumulate_weight(&env, &signers, &caller, &signatories, &args)?;
+        if weight < threshold {
+            return Err(Error::ThresholdNotMet);
+        }
+        Ok(weight)
+    }
+
+    fn is_signer(env: Env, who: Address) -> bool {
+        Self::signers(&env)
+            .map(|s| s.iter().any(|sw| sw.address == who))
+            .unwrap_or(false)
+    }
+
+    /// Voting weight of `who`, or 0 when it is not a registered signer.
+    fn get_signer_weight(env: Env, who: Address) -> u32 {
+        Self::weight_of(&env, &who).unwrap_or(0)
+    }
+
+    fn get_threshold(env: Env) -> Result<u32, Error> {
+        Self::threshold(&env)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for MultiSigContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Multisig` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Multisig,
+            wasm_hash,
+        )
     }
 }
 

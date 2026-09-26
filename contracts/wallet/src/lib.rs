@@ -32,7 +32,39 @@
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
-//! `emergency_unpause`, `set_guardian`.
+//! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
+//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`.
+//!
+//! ## Pre-execution policy hook
+//!
+//! Per the architecture, the wallet "holds funds and enforces policy before
+//! executing transactions". Every outbound movement — `transfer` and
+//! `withdraw` — therefore consults the org's Policy contract (wired with
+//! [`WalletContract::set_policy`]) *before* any balance is debited or any
+//! token moves. The policy is invoked through the generated [`PolicyClient`]
+//! with the same canonical `"active"` policy id the treasury uses; a
+//! rejection propagates as a deterministic policy error and aborts the
+//! invocation, so the wallet is never left debited without the spend having
+//! been approved. Individual wallets can be excused from the org-wide gate
+//! with [`WalletContract::set_policy_bypass`] (admin only).
+//!
+//! ## Velocity limits
+//!
+//! Absolute caps bound how much can be spent, not how fast: a compromised
+//! agent key could drain everything a policy allows within seconds. A wallet
+//! [`Role::Admin`] can therefore set a per-asset velocity ceiling
+//! ([`WalletContract::set_velocity_limit`]): at most `max_amount` may leave the
+//! wallet within a rolling window of `window_seconds`. The check runs in the
+//! same pre-execution path, right after the policy approves the spend and
+//! before any balance is debited, on `transfer`, `withdraw` and every
+//! validated batch action; a breach fails with
+//! [`Error::VelocityLimitExceeded`] and nothing moves.
+//!
+//! The window is tracked as [`VELOCITY_BUCKETS`] ledger-time buckets in one
+//! fixed-size record per (wallet, asset), overwritten in place. Rejected
+//! spends revert with the invocation, so they never consume allowance. The
+//! velocity ceiling is independent of the policy bypass: excusing a wallet
+//! from the org policy does not lift its own ceiling.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
 //! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
@@ -58,16 +90,20 @@
 //! plus wallet-scoped state-change and role-administration events.
 
 use crate::access::Role;
-use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
+use astroid_interfaces::{BudgetClient, PolicyClient, UpgradeableInterface};
+use astroid_shared::constants;
+use astroid_shared::constants::{
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD,
+};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
-use astroid_shared::math::{checked_add, checked_mul, checked_sub};
-use astroid_shared::math::{SafeAdd, SafeSub};
+use astroid_shared::events;
+use astroid_shared::math::{checked_add, SafeAdd, SafeSub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::require_positive_amount;
-use astroid_shared::{constants, events};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
 };
 
 pub mod access;
@@ -83,12 +119,53 @@ enum DataKey {
     Paused,
     /// Monotonic wallet id counter (instance).
     WalletCount,
+    /// Budget contract consulted when consuming batch action value (instance).
+    Budget,
     /// Wallet record: id -> WalletData.
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
     Balance(u64, Address),
-    /// Minimum collateral reserve ratio in basis points: (id, asset) -> u32.
-    MinReserve(u64, Address),
+    /// Org-wide Policy contract consulted before every outbound movement
+    /// (instance).
+    Policy,
+    /// Per-wallet opt-out from the policy gate: wallet id -> bool (persistent).
+    /// Present + `true` means the wallet spends without policy evaluation.
+    PolicyBypass(u64),
+    /// Velocity ceiling: (wallet id, asset) -> VelocityLimit (persistent).
+    VelocityLimit(u64, Address),
+    /// Rolling velocity usage: (wallet id, asset) -> VelocityUsage
+    /// (persistent). One fixed-size record per limited (wallet, asset), always
+    /// overwritten in place, so usage never grows the ledger footprint.
+    VelocityUsage(u64, Address),
+}
+
+/// Number of equal sub-buckets a velocity window is divided into. Spends are
+/// bucketed by ledger time; a bucket's volume counts against the limit until
+/// it slides out of the trailing window.
+pub const VELOCITY_BUCKETS: u32 = 4;
+
+/// A wallet's velocity ceiling for one asset: at most `max_amount` may leave
+/// the wallet within the rolling window of `window_seconds`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityLimit {
+    /// Ceiling on outbound volume inside the window, in the asset's smallest
+    /// unit. Strictly positive.
+    pub max_amount: i128,
+    /// Window length in seconds; a positive multiple of [`VELOCITY_BUCKETS`].
+    pub window_seconds: u64,
+}
+
+/// Outbound volume recorded per bucket for one (wallet, asset).
+///
+/// `spent[i]` is the volume moved during bucket number `bucket - i`, where a
+/// bucket number is `ledger_timestamp / (window_seconds / VELOCITY_BUCKETS)`.
+/// `spent` always holds exactly [`VELOCITY_BUCKETS`] entries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityUsage {
+    pub bucket: u64,
+    pub spent: soroban_sdk::Vec<i128>,
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -99,8 +176,153 @@ pub struct WalletData {
     pub state: ResourceState,
 }
 
-/// Maximum enforceable collateral reserve ratio, in basis points (10000 = 100%).
-pub const MAX_RESERVE_RATIO_BPS: u32 = 10_000;
+/// A single sub-call to be executed as part of a batch. `contract_addr` is the
+/// target contract, `fn_name` is the entry-point symbol, and `args` are the
+/// serialized arguments. The batch executor invokes each sub-call sequentially;
+/// if any fails the entire transaction is atomically reverted by the Soroban
+/// runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractCall {
+    pub contract_addr: Address,
+    pub fn_name: Symbol,
+    pub args: soroban_sdk::Vec<Val>,
+}
+
+/// One policy- and budget-gated action of a validated batch. Carries the raw
+/// [`ContractCall`] to execute plus the metadata the wallet needs to validate
+/// the action before any value moves: the policy envelope and asset/recipient
+/// the spend is checked against, and the budget envelope it is consumed from.
+///
+/// An empty `policy_id` skips the policy gate for that action; an empty
+/// `budget_id` skips budget consumption — mirrors how the treasury wires each
+/// holding to a specific envelope.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAction {
+    /// The external sub-call to execute.
+    pub call: ContractCall,
+    /// Policy envelope id validated against this action; empty = skip.
+    pub policy_id: String,
+    /// Budget envelope id consumed by this action; empty = skip.
+    pub budget_id: String,
+    /// Asset moved by this action, used by the policy check.
+    pub asset: Address,
+    /// Recipient of this action's value, used by the policy check.
+    pub recipient: Address,
+    /// Value moved by this action, checked against policy and budget.
+    pub amount: i128,
+}
+
+/// Aggregated outcome of a validated batch execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchReceipt {
+    /// Number of sub-calls executed.
+    pub executed: u32,
+    /// Cumulative value across the batch (checked-sum of all action amounts).
+    pub total_amount: i128,
+    /// Remaining allocation of the last budget envelope consumed; `0` when the
+    /// batch touched no budget.
+    pub budget_remaining: i128,
+}
+
+/// Per-invocation cache for the velocity ceiling.
+///
+/// A batch routinely moves value in one asset across many actions. Without this
+/// cache every action re-reads that asset's ceiling and re-reads the usage
+/// record the previous action had just written, so an `n`-action batch spends
+/// `n` times the ledger traffic the window actually needs. Entries are kept in
+/// first-touch order, one per distinct asset, so a batch pays a single read of
+/// the ceiling and the usage record per asset however many actions reference
+/// it, and a single write and pair of TTL bumps on flush.
+///
+/// Reusing the rolled usage is sound because the ledger clock is fixed for the
+/// whole invocation: aging a record to "now" twice within one call yields the
+/// same result as aging it once, so only the first action on an asset pays for
+/// the roll.
+struct VelocityGate {
+    wallet_id: u64,
+    /// `(asset, ceiling, live usage)`. A `None` ceiling marks an asset with no
+    /// limit configured, which costs one read and never grows a usage record.
+    entries: soroban_sdk::Vec<(Address, Option<VelocityLimit>, Option<VelocityUsage>)>,
+}
+
+impl VelocityGate {
+    fn new(env: &Env, wallet_id: u64) -> Self {
+        Self {
+            wallet_id,
+            entries: soroban_sdk::Vec::new(env),
+        }
+    }
+
+    /// Charge `amount` against `asset`'s ceiling, loading the asset's records on
+    /// first touch and reusing them for every later action in this invocation.
+    fn enforce(&mut self, env: &Env, asset: &Address, amount: i128) -> Result<(), Error> {
+        let index = self.position(env, asset);
+        let (_, limit, usage) = self.entries.get(index).unwrap();
+        // No ceiling for this asset: there is nothing to charge and nothing to
+        // record, exactly as an ungated asset behaves.
+        let (Some(limit), Some(mut usage)) = (limit, usage) else {
+            return Ok(());
+        };
+        // A sum that does not even fit in an i128 exceeds every ceiling.
+        let within = WalletContract::velocity_total(&usage)?
+            .checked_add(amount)
+            .map(|after| after <= limit.max_amount)
+            .unwrap_or(false);
+        ensure!(within, Error::VelocityLimitExceeded);
+        let current = usage.spent.get(0).unwrap_or(0).safe_add(amount)?;
+        usage.spent.set(0, current);
+        self.entries
+            .set(index, (asset.clone(), Some(limit), Some(usage)));
+        Ok(())
+    }
+
+    /// Persist every record this invocation charged, once per asset.
+    ///
+    /// Writes are deferred to the end of validation so a batch touches each
+    /// usage record once. A failure before the flush reverts the invocation and
+    /// leaves no usage recorded, which is the same net state as rolling back the
+    /// per-action writes.
+    fn flush(&self, env: &Env) {
+        for (asset, limit, usage) in self.entries.iter() {
+            let (Some(_), Some(usage)) = (limit, usage) else {
+                continue;
+            };
+            let usage_key = DataKey::VelocityUsage(self.wallet_id, asset.clone());
+            env.storage().persistent().set(&usage_key, &usage);
+            // The ceiling is bumped next to its usage so the pair cannot lapse
+            // mid-window: an expired ceiling would silently stop applying.
+            WalletContract::bump_persistent(env, &usage_key);
+            WalletContract::bump_persistent(env, &DataKey::VelocityLimit(self.wallet_id, asset));
+        }
+    }
+
+    /// Index of `asset`'s entry, loading its records on first touch. The
+    /// scanned prefix is bounded by [`constants::MAX_BATCH_CALLS`] because a
+    /// batch cannot hold more actions than that, so the lookup stays a
+    /// comparison over in-memory handles and costs no ledger access.
+    fn position(&mut self, env: &Env, asset: &Address) -> u32 {
+        for index in 0..self.entries.len() {
+            if self.entries.get(index).unwrap().0 == *asset {
+                return index;
+            }
+        }
+        let wallet_id = self.wallet_id;
+        let limit: Option<VelocityLimit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VelocityLimit(wallet_id, asset.clone()));
+        // The usage record is only read for an asset that has a ceiling, so an
+        // unlimited asset costs a single read.
+        let usage = limit
+            .as_ref()
+            .map(|limit| WalletContract::rolled_velocity_usage(env, wallet_id, asset, limit));
+        self.entries.push_back((asset.clone(), limit, usage));
+        self.entries.len() - 1
+    }
+}
 
 #[contract]
 pub struct WalletContract;
@@ -197,6 +419,174 @@ impl WalletContract {
         Ok(id)
     }
 
+    /// Wire the org's Policy contract consulted before every outbound
+    /// movement (admin only). Pass an address previously registered to enable
+    /// the gate; `clear_policy` removes it. The policy is invoked through the
+    /// generated [`PolicyClient`] so a rejection propagates as a deterministic
+    /// error and the spend never executes.
+    pub fn set_policy(env: Env, caller: Address, policy: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Policy, &policy);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("policy")),
+            (caller, policy),
+        );
+        Ok(())
+    }
+
+    /// Remove the policy gate (admin only). Subsequent spends run ungated.
+    pub fn clear_policy(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&DataKey::Policy) {
+            return Err(Error::NotFound);
+        }
+        env.storage().instance().remove(&DataKey::Policy);
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("policy")),
+            (caller, "cleared"),
+        );
+        Ok(())
+    }
+
+    /// Read the wired policy contract, if any.
+    pub fn get_policy(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Policy)
+    }
+
+    /// Excuse a single wallet from the org-wide policy gate (admin only).
+    ///
+    /// The gate is org-wide by design; this escape hatch exists for wallets
+    /// whose outflows are governed by a stricter contract-level control (a
+    /// multisig-guarded payroll wallet, for example). The flag persists so the
+    /// opt-out survives TTL expiry of the wallet record.
+    pub fn set_policy_bypass(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        bypass: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        // Only existing wallets can be configured.
+        Self::load_wallet(&env, wallet_id)?;
+        let key = DataKey::PolicyBypass(wallet_id);
+        if bypass {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("pol_byp")),
+            (wallet_id, bypass),
+        );
+        Ok(())
+    }
+
+    /// Whether a wallet is excused from the policy gate.
+    pub fn get_policy_bypass(env: Env, wallet_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PolicyBypass(wallet_id))
+            .unwrap_or(false)
+    }
+
+    /// Set the velocity ceiling for `asset` on a wallet ([`Role::Admin`]):
+    /// at most `max_amount` may leave the wallet within any rolling window of
+    /// `window_seconds`, across `transfer`, `withdraw` and validated batch
+    /// actions. Agents cannot change it.
+    ///
+    /// `max_amount` must be positive ([`Error::InvalidAmount`]) and
+    /// `window_seconds` a positive multiple of [`VELOCITY_BUCKETS`]
+    /// ([`Error::InvalidInput`]). Changing only `max_amount` keeps the volume
+    /// already recorded in the window; changing `window_seconds` re-buckets
+    /// time, so recorded usage restarts from zero.
+    pub fn set_velocity_limit(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        asset: Address,
+        max_amount: i128,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
+        require_positive_amount(max_amount)?;
+        let buckets = VELOCITY_BUCKETS as u64;
+        ensure!(
+            window_seconds >= buckets && window_seconds % buckets == 0,
+            Error::InvalidInput
+        );
+        let lkey = DataKey::VelocityLimit(wallet_id, asset.clone());
+        let previous: Option<VelocityLimit> = env.storage().persistent().get(&lkey);
+        if previous.map(|p| p.window_seconds) != Some(window_seconds) {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::VelocityUsage(wallet_id, asset.clone()));
+        }
+        let limit = VelocityLimit {
+            max_amount,
+            window_seconds,
+        };
+        env.storage().persistent().set(&lkey, &limit);
+        Self::bump_persistent(&env, &lkey);
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("velocity")),
+            (wallet_id, asset, max_amount, window_seconds),
+        );
+        Ok(())
+    }
+
+    /// Remove a wallet's velocity ceiling for `asset` ([`Role::Admin`]),
+    /// deleting its usage record too. [`Error::NotFound`] when none is set.
+    pub fn clear_velocity_limit(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        asset: Address,
+    ) -> Result<(), Error> {
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        let lkey = DataKey::VelocityLimit(wallet_id, asset.clone());
+        ensure!(env.storage().persistent().has(&lkey), Error::NotFound);
+        env.storage().persistent().remove(&lkey);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VelocityUsage(wallet_id, asset.clone()));
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("velocity")),
+            (wallet_id, asset, "cleared"),
+        );
+        Ok(())
+    }
+
+    /// Read a wallet's velocity ceiling for `asset`, if any.
+    pub fn get_velocity_limit(env: Env, wallet_id: u64, asset: Address) -> Option<VelocityLimit> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VelocityLimit(wallet_id, asset))
+    }
+
+    /// Volume of `asset` that has left the wallet within the current rolling
+    /// window, as of the current ledger time (`0` when no ceiling is set).
+    pub fn get_velocity_usage(env: Env, wallet_id: u64, asset: Address) -> Result<i128, Error> {
+        let limit: VelocityLimit =
+            match Self::get_velocity_limit(env.clone(), wallet_id, asset.clone()) {
+                Some(limit) => limit,
+                None => return Ok(0),
+            };
+        let usage = Self::rolled_velocity_usage(&env, wallet_id, &asset, &limit);
+        Self::velocity_total(&usage)
+    }
+
     /// Fund a wallet: pulls `amount` of `asset` from `from` into custody and
     /// credits the wallet's internal balance. Requires `from` authorization.
     pub fn deposit(
@@ -244,7 +634,14 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
-        Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
+        // Pre-execution policy check: the configured Policy contract gets a
+        // veto over the spend before any value moves. A rejection aborts the
+        // whole invocation with the policy's own deterministic error.
+        Self::require_policy_allows(&env, wallet_id, &asset, &to, amount)?;
+        // Velocity ceiling: a spend the policy allows may still be refused
+        // for moving too much too fast. Recorded here, before the debit; any
+        // later failure reverts the invocation and the recorded usage with it.
+        Self::enforce_velocity(&env, wallet_id, &asset, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -271,7 +668,9 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active(&wallet)?;
-        Self::require_reserve_ok(&env, wallet_id, &asset, amount)?;
+        // Pre-execution policy check — withdrawals are outbound movements too.
+        Self::require_policy_allows(&env, wallet_id, &asset, &wallet.owner, amount)?;
+        Self::enforce_velocity(&env, wallet_id, &asset, amount)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -346,41 +745,6 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Set the minimum collateral reserve ratio for a wallet/asset pair (owner
-    /// only). `ratio_bps` is in basis points (0..=10000); 0 disables the check.
-    /// Once set, every outbound transfer/withdrawal must leave at least
-    /// `ratio_bps/10000` of the current balance behind, so organizations can
-    /// enforce a mandatory backing ratio before high-risk agent transactions.
-    pub fn set_reserve_ratio(
-        env: Env,
-        caller: Address,
-        wallet_id: u64,
-        asset: Address,
-        ratio_bps: u32,
-    ) -> Result<(), Error> {
-        Self::require_owner(&env, wallet_id, &caller)?;
-        if ratio_bps > MAX_RESERVE_RATIO_BPS {
-            return Err(Error::InvalidInput);
-        }
-        let key = DataKey::MinReserve(wallet_id, asset.clone());
-        if ratio_bps == 0 {
-            env.storage().persistent().remove(&key);
-        } else {
-            env.storage().persistent().set(&key, &ratio_bps);
-            env.storage().persistent().extend_ttl(
-                &key,
-                constants::PERSISTENT_LIFETIME_THRESHOLD,
-                constants::PERSISTENT_BUMP_AMOUNT,
-            );
-        }
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("resv_set")),
-            (wallet_id, asset, ratio_bps),
-        );
-        Ok(())
-    }
-
-    /// Archive a wallet (owner only). Terminal state; no further transactions.
     /// Archive a wallet ([`Role::Admin`]). Terminal state; no further
     /// transactions.
     pub fn archive(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
@@ -393,6 +757,125 @@ impl WalletContract {
         Self::store_wallet(&env, wallet_id, &wallet);
         Self::emit_state(&env, wallet_id, symbol_short!("archived"));
         Ok(())
+    }
+
+    /// Execute a batch of [`BatchAction`]s atomically, validating every action
+    /// against the contract's policy and budget gates before any sub-call
+    /// fires. Each action opts into the gates via `policy_id` / `budget_id`: a
+    /// non-empty id requires the corresponding contract to be wired up
+    /// ([`WalletContract::set_policy`] / [`WalletContract::set_budget`]) or the
+    /// batch is refused, while an empty id skips that gate for the action.
+    ///
+    /// Phase 1 verifies every action and aggregates its value with checked math
+    /// in a single pass (one budget consumption per envelope — no speculative
+    /// pre-flights), then Phase 2 executes the sub-calls sequentially. Any
+    /// failure — a policy denial, a budget overrun, a cumulative overflow, or a
+    /// failing sub-call — reverts the entire transaction, so validation and
+    /// execution are atomic. On success an aggregated [`BatchReceipt`] is
+    /// returned and `("wallet", "batch_validated")` is published.
+    pub fn batch_execute_validated(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        actions: soroban_sdk::Vec<BatchAction>,
+    ) -> Result<BatchReceipt, Error> {
+        Self::when_not_paused(&env)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
+        Self::require_active(&wallet)?;
+
+        if actions.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        if actions.len() > constants::MAX_BATCH_CALLS {
+            return Err(Error::InvalidInput);
+        }
+
+        let policy: Option<Address> = env.storage().instance().get(&DataKey::Policy);
+        let budget: Option<Address> = env.storage().instance().get(&DataKey::Budget);
+
+        // Phase 1 — verify every action and aggregate its value with checked
+        // math so a cumulative overflow is caught before any value moves.
+        let mut total_amount: i128 = 0;
+        let mut budget_remaining: i128 = 0;
+        // One gate for the whole batch: a batch that moves the same asset
+        // repeatedly reads and writes that asset's velocity records once.
+        let mut velocity = VelocityGate::new(&env, wallet_id);
+        for action in actions.iter() {
+            require_positive_amount(action.amount)?;
+            total_amount = checked_add(total_amount, action.amount)?;
+
+            if !action.policy_id.is_empty() {
+                let policy_addr = policy.as_ref().ok_or(Error::InvalidInput)?;
+                Self::require_policy_check(
+                    &env,
+                    policy_addr,
+                    &action.policy_id,
+                    &action.asset,
+                    &action.recipient,
+                    action.amount,
+                )?;
+            }
+
+            // The velocity ceiling is not opt-out per action: an agent cannot
+            // route around it by leaving `policy_id` empty. Actions accumulate
+            // against the same cached record, so a batch can never split a
+            // window's allowance across actions to slip past the ceiling.
+            velocity.enforce(&env, &action.asset, action.amount)?;
+
+            if !action.budget_id.is_empty() {
+                let budget_addr = budget.as_ref().ok_or(Error::InvalidInput)?;
+                budget_remaining = BudgetClient::new(&env, budget_addr).consume(
+                    &caller,
+                    &action.budget_id,
+                    &action.amount,
+                );
+            }
+        }
+
+        // Record the window usage validated above before any value moves; a
+        // later failure reverts the invocation and the recording with it.
+        velocity.flush(&env);
+
+        // Phase 2 — execute every action sequentially; the runtime rolls the
+        // whole batch back if any sub-call fails.
+        let mut executed: u32 = 0;
+        for action in actions.into_iter() {
+            Self::execute_call(&env, &action.call)?;
+            executed += 1;
+        }
+
+        events::wallet_batch_validated(&env, wallet_id, executed, total_amount, budget_remaining);
+        Ok(BatchReceipt {
+            executed,
+            total_amount,
+            budget_remaining,
+        })
+    }
+
+    /// Wire the budget contract batch actions consume from (contract admin
+    /// only). Mirrors [`WalletContract::set_policy`].
+    pub fn set_budget(env: Env, caller: Address, budget: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Budget, &budget);
+        Ok(())
+    }
+
+    /// Invoke a single batch call so a callee failure surfaces as its own
+    /// contract error, reverting the whole batch atomically; system-level
+    /// failures are reported as [`Error::BatchCallFailed`].
+    fn execute_call(env: &Env, call: &ContractCall) -> Result<(), Error> {
+        match env.try_invoke_contract::<Val, Error>(
+            &call.contract_addr,
+            &call.fn_name,
+            call.args.clone(),
+        ) {
+            Ok(_) => Ok(()),
+            // A raw `Val` always decodes, so this arm is unreachable in
+            // practice; kept for exhaustiveness.
+            Err(Ok(e)) => Err(e),
+            // System-level failure (panic / abort / unknown error code).
+            Err(Err(_)) => Err(Error::BatchCallFailed),
+        }
     }
 
     /// Delegate `role` on a wallet to `account`, replacing any role it already
@@ -479,13 +962,6 @@ impl WalletContract {
             .unwrap_or(0)
     }
 
-    /// Read the configured minimum reserve ratio for a wallet/asset pair in
-    /// basis points (0 when no reserve requirement is set).
-    pub fn reserve_ratio(env: Env, wallet_id: u64, asset: Address) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MinReserve(wallet_id, asset))
-            .unwrap_or(0)
     /// Whether the contract-wide circuit breaker is currently tripped.
     pub fn is_paused(env: Env) -> bool {
         Self::paused(&env)
@@ -500,6 +976,137 @@ impl WalletContract {
     }
 
     // --- internal helpers ---
+
+    /// Pre-execution policy hook, applied to every outbound movement.
+    ///
+    /// When an org-wide policy contract is configured and the wallet has not
+    /// been excused, the spend is submitted to `check_transfer` under the
+    /// canonical "active" policy id (the same id the treasury uses). The
+    /// generated [`PolicyClient`] maps the remote error straight through, so a
+    /// policy rejection surfaces deterministically and no value moves.
+    /// With no policy wired the hook is a no-op.
+    fn require_policy_allows(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        // Read the wired policy first. With none configured the hook is a no-op
+        // for every wallet, so the per-wallet bypass flag never has to be read
+        // at all - saving a persistent read on each movement of an unwired org.
+        let Some(policy_addr) = Self::get_policy(env.clone()) else {
+            return Ok(());
+        };
+        if Self::get_policy_bypass(env.clone(), wallet_id) {
+            return Ok(());
+        }
+        Self::require_policy_check(
+            env,
+            &policy_addr,
+            &String::from_str(env, "active"),
+            asset,
+            recipient,
+            amount,
+        )
+    }
+
+    /// Map policy denials and cross-contract invocation failures to one stable
+    /// wallet-facing error. Only a successful policy response authorizes spend.
+    fn require_policy_check(
+        env: &Env,
+        policy_addr: &Address,
+        policy_id: &String,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        match PolicyClient::new(env, policy_addr)
+            .try_check_transfer(policy_id, asset, recipient, &amount)
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(Error::PolicyDenied),
+        }
+    }
+
+    /// Velocity hook, applied to every outbound movement after the policy
+    /// check. With no ceiling configured for `(wallet_id, asset)` it is a
+    /// no-op. Otherwise it rejects with [`Error::VelocityLimitExceeded`] when
+    /// the trailing-window volume plus `amount` would exceed the ceiling, and
+    /// records `amount` in the current bucket when it fits.
+    ///
+    /// The window is `VELOCITY_BUCKETS` epoch-aligned buckets of
+    /// `window_seconds / VELOCITY_BUCKETS` each: the current bucket plus the
+    /// three before it. A spend therefore counts for between 3/4 and all of a
+    /// window after it happens, and any span shorter than 3/4 of a window can
+    /// never carry more than `max_amount` out of the wallet.
+    ///
+    /// A single movement is a one-asset [`VelocityGate`], which keeps the rule
+    /// in exactly one place; batches share a gate across all their actions.
+    fn enforce_velocity(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let mut velocity = VelocityGate::new(env, wallet_id);
+        velocity.enforce(env, asset, amount)?;
+        velocity.flush(env);
+        Ok(())
+    }
+
+    /// Load the usage record aged to the current ledger time: buckets that
+    /// slid out of the window are dropped and bucket 0 is the current one.
+    /// If the ledger clock reads earlier than the recorded bucket, nothing is
+    /// aged out, so a clock anomaly can never free allowance.
+    fn rolled_velocity_usage(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        limit: &VelocityLimit,
+    ) -> VelocityUsage {
+        let bucket_seconds = limit.window_seconds / VELOCITY_BUCKETS as u64;
+        let now_bucket = env.ledger().timestamp() / bucket_seconds;
+        let stored: Option<VelocityUsage> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VelocityUsage(wallet_id, asset.clone()));
+        let mut spent = soroban_sdk::Vec::new(env);
+        for _ in 0..VELOCITY_BUCKETS {
+            spent.push_back(0i128);
+        }
+        let bucket = match stored {
+            None => now_bucket,
+            Some(usage) => {
+                let bucket = now_bucket.max(usage.bucket);
+                let shift = bucket - usage.bucket;
+                for i in 0..VELOCITY_BUCKETS {
+                    let target = i as u64 + shift;
+                    if target < VELOCITY_BUCKETS as u64 {
+                        spent.set(target as u32, usage.spent.get(i).unwrap_or(0));
+                    }
+                }
+                bucket
+            }
+        };
+        VelocityUsage { bucket, spent }
+    }
+
+    fn velocity_total(usage: &VelocityUsage) -> Result<i128, Error> {
+        let mut total: i128 = 0;
+        for amount in usage.spent.iter() {
+            total = total.safe_add(amount)?;
+        }
+        Ok(total)
+    }
+
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
 
     fn load_wallet(env: &Env, id: u64) -> Result<WalletData, Error> {
         env.storage()
@@ -614,36 +1221,6 @@ impl WalletContract {
         Ok(())
     }
 
-    /// Pre-execution reserve hook: verify that a planned outbound movement keeps
-    /// the wallet's remaining balance at or above the configured minimum reserve
-    /// ratio. Uses cross-multiplication (`projected * 10000 >= current * bps`)
-    /// so no division is ever performed — division-by-zero is impossible even
-    /// when the current balance is zero. Emits a precise event on failure.
-    fn require_reserve_ok(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
-        let key = DataKey::MinReserve(id, asset.clone());
-        let ratio_bps: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        if ratio_bps == 0 {
-            return Ok(());
-        }
-        let current: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(id, asset.clone()))
-            .unwrap_or(0);
-        if current < amount {
-            return Err(Error::InsufficientFunds);
-        }
-        let projected = checked_sub(current, amount)?;
-        if checked_mul(projected, 10_000)? < checked_mul(current, ratio_bps as i128)? {
-            env.events().publish(
-                (symbol_short!("wallet"), symbol_short!("resv_fail")),
-                (id, asset.clone(), amount, ratio_bps),
-            );
-            return Err(Error::ReserveViolation);
-        }
-        Ok(())
-    }
-
     fn debit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
         let key = DataKey::Balance(id, asset.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -685,6 +1262,45 @@ impl WalletContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for WalletContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Wallet` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Wallet,
+            wasm_hash,
+        )
     }
 }
 

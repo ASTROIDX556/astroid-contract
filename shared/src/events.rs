@@ -21,7 +21,7 @@
 //! existing nor new consumers break.
 
 use crate::types::{AssetAmount, ModuleKind};
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -42,6 +42,14 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// A contract implementation version was registered in the global upgrade
+    /// map, bound to the approved WASM hash it runs.
+    RegistryVersionRegistered {
+        kind: ModuleKind,
+        version: u32,
+        address: Address,
+        wasm_hash: BytesN<32>,
+    },
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
@@ -68,6 +76,24 @@ pub enum ContractEvent {
     TreasuryFrozen { org: String },
     /// A treasury was unfrozen by the multisig.
     TreasuryUnfrozen { org: String },
+    /// Value was deposited into a treasury. `balance` is the treasury's
+    /// recorded balance of `asset` after the deposit.
+    TreasuryDeposited {
+        org: String,
+        from: Address,
+        asset: Address,
+        amount: i128,
+        balance: i128,
+    },
+    /// Value was withdrawn from a treasury. `balance` is the treasury's
+    /// recorded balance of `asset` after the withdrawal.
+    TreasuryWithdrawn {
+        org: String,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        balance: i128,
+    },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -82,6 +108,19 @@ pub enum ContractEvent {
         escrow_id: u64,
         recipient: Address,
         assets: Vec<AssetAmount>,
+    },
+    /// Gas usage telemetry for a single operation execution.
+    GasTelemetry {
+        operation: Symbol,
+        gas_used: u64,
+        storage_bytes: u64,
+    },
+    /// Cumulative resource usage summary for an entire transaction.
+    TransactionSummary {
+        total_gas: u64,
+        total_cpu: u64,
+        total_storage: u64,
+        operation_count: u32,
     },
 }
 
@@ -105,6 +144,17 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
+        }
+        ContractEvent::RegistryVersionRegistered {
+            kind,
+            version,
+            address,
+            wasm_hash,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryVersionRegistered"),),
+                (kind, version, address, wasm_hash),
+            );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
@@ -164,6 +214,30 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events()
                 .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
         }
+        ContractEvent::TreasuryDeposited {
+            org,
+            from,
+            asset,
+            amount,
+            balance,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryDeposited"),),
+                (org, from, asset, amount, balance),
+            );
+        }
+        ContractEvent::TreasuryWithdrawn {
+            org,
+            to,
+            asset,
+            amount,
+            balance,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryWithdrawn"),),
+                (org, to, asset, amount, balance),
+            );
+        }
         ContractEvent::EscrowReleased {
             escrow_id,
             recipient,
@@ -172,6 +246,27 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "EscrowReleased"),),
                 (escrow_id, recipient, assets),
+            );
+        }
+        ContractEvent::GasTelemetry {
+            operation,
+            gas_used,
+            storage_bytes,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "GasTelemetry"),),
+                (operation, gas_used, storage_bytes),
+            );
+        }
+        ContractEvent::TransactionSummary {
+            total_gas,
+            total_cpu,
+            total_storage,
+            operation_count,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TransactionSummary"),),
+                (total_gas, total_cpu, total_storage, operation_count),
             );
         }
     }
@@ -247,4 +342,26 @@ pub fn allowance_consumed(env: &Env, agent: &Address, asset: &Address, amount: i
 /// for policy/budget violations) so all call sites share one construction path.
 pub fn reason(env: &Env, name: &str) -> Symbol {
     Symbol::new(env, name)
+}
+
+/// `WalletBatchExecuted` — topic `("wallet", "batch")`.
+pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
+    let topics = (symbol_short!("wallet"), symbol_short!("batch"));
+    env.events().publish(topics, (wallet_id, call_count));
+}
+
+/// `WalletBatchValidated` — topic `("wallet", "batch_validated")`. Published by
+/// the wallet after a policy- and budget-validated batch run completes.
+pub fn wallet_batch_validated(
+    env: &Env,
+    wallet_id: u64,
+    executed: u32,
+    total_amount: i128,
+    budget_remaining: i128,
+) {
+    let topics = (symbol_short!("wallet"), Symbol::new(env, "batch_validated"));
+    env.events().publish(
+        topics,
+        (wallet_id, executed, total_amount, budget_remaining),
+    );
 }

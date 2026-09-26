@@ -14,6 +14,27 @@
 //! Cross-contract calls go through the typed clients generated from
 //! [`astroid_interfaces`], keeping the graph acyclic: `Treasury → {Policy, Budget}`.
 //!
+//! ## Asset whitelist
+//!
+//! Policy and budget gates constrain *how much* may move and *to whom*, but
+//! neither says anything about *which token contract* is being invoked. An
+//! agent that can name an arbitrary `Address` as the asset can point the
+//! treasury at a hostile Stellar asset contract, whose `transfer` is arbitrary
+//! code running with the treasury as the authorizer.
+//!
+//! Every routing decision is therefore checked against a persistent whitelist
+//! of approved token contracts before any value moves:
+//!
+//! ```text
+//! asset whitelisted → admin auth → policy.check_transfer → budget.consume → assets move
+//! ```
+//!
+//! The whitelist is governance-managed (`add_approved_asset` /
+//! `remove_approved_asset`, both admin-gated — point `admin` at the
+//! organization's multisig to require a threshold of signers) and unapproved
+//! assets are refused deterministically with [`Error::AssetNotAuthorized`] on
+//! both inflows and outflows.
+//!
 //! [`TreasuryContract::batch_transfer`] applies the same gate chain to a whole
 //! vector of payouts in a single, atomic invocation: the cumulative amount is
 //! accumulated with checked math and validated against the treasury balance
@@ -21,24 +42,72 @@
 //! the fee of one transaction. If any leg fails, the host reverts the entire
 //! invocation and no recipient is paid.
 //!
-//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`, `freeze`,
-//! `unfreeze`, `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`,
-//! `set_allowance`, `remove_allowance`, `allowance`, `init_milestone_disbursement`,
-//! `release_next_milestone`, `get`, `holding`.
+//! ## Emergency circuit breaker (pause)
+//!
+//! Alongside the multisig-only `freeze`, the treasury carries a dedicated
+//! `paused: bool` flag and an authorized `guardian: Address` in its instance
+//! storage. `pause` / `unpause` may only be called by that guardian or by the
+//! organization's multisig, and they flip nothing but the flag - structural
+//! ownership and configuration stay untouched:
+//!
+//! ```text
+//! paused ── withdraw / batch_transfer / release_next_milestone ──▶ Error::TreasuryPaused
+//! paused ── deposit ─────────────────────────────────────────────▶ still accepted
+//! ```
+//!
+//! Inbound deposits are deliberately left open while the breaker is engaged,
+//! so an organization can keep receiving recovery funding during an incident;
+//! only value leaving the treasury is refused, with the dedicated
+//! [`Error::TreasuryPaused`] code so off-chain monitors can distinguish "we
+//! paused on purpose" from a generic state failure.
+//!
+//! ## Multi-token accounting
+//!
+//! The treasury custodies any number of approved Soroban token contracts side
+//! by side (up to [`MAX_TREASURY_ASSETS`]). Each asset keeps its own
+//! [`Holding`] record and the approved set is enumerable, so
+//! [`TreasuryContract::portfolio`] reports every asset's live custody balance,
+//! recorded balance and `decimals` in one call. Amounts are always in the
+//! token's own base units; the treasury never normalizes across decimals.
+//!
+//! Token contracts are not trusted to move exactly what they are asked to:
+//!
+//! - `deposit` credits the amount that *actually arrived* (the custody balance
+//!   delta), so a fee-on-transfer token cannot inflate the books, and a
+//!   transfer that delivers nothing is rejected with [`Error::InvalidAmount`].
+//! - Every outflow checks the live custody balance first
+//!   ([`Error::InsufficientFunds`] instead of a token-level panic) and then
+//!   verifies the balance fell by exactly the amount paid, reverting with
+//!   [`Error::InvalidState`] otherwise.
+//!
+//! All token math goes through the shared checked helpers.
+//!
+//! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`,
+//! `set_guardian`, `add_approved_asset`, `remove_approved_asset`, `freeze`,
+//! `unfreeze`, `pause`, `unpause`, `deposit`, `withdraw`, `batch_transfer`,
+//! `allocate_budget`, `set_allowance`, `remove_allowance`, `allowance`,
+//! `init_milestone_disbursement`, `release_next_milestone`, `get`, `holding`,
+//! `is_paused`, `guardian`, `is_approved_asset`, `approved_asset_count`,
+//! `approved_assets`, `portfolio`.
 
-use astroid_interfaces::PolicyClient;
+use astroid_interfaces::{PolicyClient, TreasuryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::{checked_add, checked_sub};
+use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
 use astroid_shared::types::{Payment, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
+
+/// Maximum number of token contracts a treasury may have approved at once.
+/// Bounds every per-asset iteration (e.g. [`TreasuryContract::portfolio`]).
+pub const MAX_TREASURY_ASSETS: u32 = 32;
+const MAX_BALANCE_ASSETS: u32 = MAX_TREASURY_ASSETS;
 
 /// Stored treasury record.
 #[contracttype]
@@ -54,6 +123,15 @@ pub struct Treasury {
     pub budget: Option<Address>,
     /// Lifecycle state shared with wallets.
     pub state: ResourceState,
+    /// Emergency circuit-breaker guardian: may engage or release the pause
+    /// alongside the multisig. Bootstrapped to `admin` at `initialize` and
+    /// rotated through [`TreasuryContract::set_guardian`].
+    pub guardian: Address,
+    /// Whether the emergency circuit breaker is currently engaged. While
+    /// `true`, every outbound disbursement or transfer is refused with
+    /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
+    /// funding can still arrive.
+    pub paused: bool,
 }
 
 /// Per-asset accounting within the treasury.
@@ -73,10 +151,35 @@ pub struct MilestoneDisbursement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holding {
     pub asset: Address,
+    /// Cumulative amount deposited for this asset.
     pub total_in: i128,
+    /// Cumulative amount withdrawn for this asset.
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetBalance {
+    pub asset: Address,
+    pub balance: i128,
+}
+
+/// One approved asset's position, as reported by
+/// [`TreasuryContract::portfolio`]. All amounts are in the token's base units.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetPosition {
+    pub asset: Address,
+    /// The token contract's own `decimals()`.
+    pub decimals: u32,
+    /// Live balance held by the treasury contract on the token ledger.
+    pub balance: i128,
+    /// Balance according to the treasury's internal accounting.
+    pub recorded: i128,
+    /// Cumulative amount paid out of the treasury in this asset.
+    pub total_out: i128,
 }
 
 /// Composite key identifying a withdrawal allowance scoped to a specific agent
@@ -110,6 +213,15 @@ pub struct Allowance {
 enum DataKey {
     Treasury,
     Holding(Address),
+    /// Whitelist membership: token contract address -> approved (persistent).
+    ApprovedAsset(Address),
+    /// Number of currently approved assets (instance).
+    ApprovedAssetCount,
+    /// Enumerable list of currently approved assets (instance).
+    ApprovedAssetList,
+    /// Recorded per-asset custody balance backing the structured deposit and
+    /// withdrawal events (persistent).
+    AssetBalance(Address),
     ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
@@ -124,6 +236,11 @@ pub struct TreasuryContract;
 #[contractimpl]
 impl TreasuryContract {
     /// Create a treasury for `org`, gated on the admin's signature.
+    ///
+    /// The circuit breaker starts disengaged (`paused == false`) and the
+    /// deployer admin is recorded as the initial guardian, so a freshly
+    /// created treasury always has at least one account that can pause it;
+    /// rotate the guardian afterwards with [`Self::set_guardian`].
     pub fn initialize(env: Env, org: String, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Treasury) {
             return Err(Error::AlreadyInitialized);
@@ -138,6 +255,8 @@ impl TreasuryContract {
                 policy: None,
                 budget: None,
                 state: ResourceState::Active,
+                guardian: admin.clone(),
+                paused: false,
             },
         );
         env.storage()
@@ -181,6 +300,58 @@ impl TreasuryContract {
         env.events()
             .publish((symbol_short!("treasury"), symbol_short!("budget")), ());
         Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Approve a token contract for use by this treasury (governance-gated).
+    ///
+    /// Only whitelisted assets may be deposited, withdrawn or bound to a budget
+    /// envelope, so this is the single point at which an organization decides
+    /// which token contracts its funds are ever routed through.
+    pub fn add_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedAsset(asset.clone());
+        if env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(Error::AlreadyExists);
+        }
+        let mut list = Self::approved_list(&env);
+        if list.len() >= MAX_TREASURY_ASSETS {
+            return Err(Error::InvalidInput);
+        }
+        list.push_back(asset.clone());
+        Self::store_approved_list(&env, &list);
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        let count = checked_add(Self::approved_count(&env) as i128, 1)? as u32;
+        Self::store_approved_count(&env, count);
+        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_add"));
+        Ok(())
+    }
+
+    /// Revoke a token contract's approval (governance-gated).
+    ///
+    /// Existing internal accounting for the asset is deliberately left intact
+    /// so a revoked holding stays inspectable; what stops is any further
+    /// routing through it.
+    pub fn remove_approved_asset(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        let t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::ApprovedAsset(asset.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        let mut list = Self::approved_list(&env);
+        if let Some(i) = list.first_index_of(&asset) {
+            list.remove(i);
+            Self::store_approved_list(&env, &list);
+        }
+        let count = Self::approved_count(&env).saturating_sub(1);
+        Self::store_approved_count(&env, count);
+        Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_rm"));
         Ok(())
     }
 
@@ -242,27 +413,131 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Rotate the emergency circuit-breaker guardian (admin-gated).
+    ///
+    /// The guardian is a dedicated key whose only powers are
+    /// [`Self::pause`] / [`Self::unpause`]; pointing it at a hot
+    /// monitoring key (or at another multisig) lets an organization decouple
+    /// "who can stop the treasury" from "who can spend from it".
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), Error> {
+        let mut t = Self::require_admin(&env, &caller)?;
+        t.guardian = guardian;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("guardian"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("guardian")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Engage the emergency circuit breaker.
+    ///
+    /// Restricted to the recorded guardian or the organization's multisig
+    /// (both checked against instance storage, then authorized with
+    /// `require_auth`). While engaged, every outbound value movement
+    /// ([`Self::withdraw`], [`Self::batch_transfer`],
+    /// [`Self::release_next_milestone`]) short-circuits with
+    /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
+    /// funding can still arrive. Unlike [`Self::freeze`] this does not change
+    /// any structural ownership or configuration - only the pause flag moves.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        let mut t = Self::require_guardian(&env, &caller)?;
+        if t.paused {
+            return Err(Error::InvalidState);
+        }
+        t.paused = true;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("pause"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("paused")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
+    /// Release the emergency circuit breaker and restore outbound transfers.
+    ///
+    /// Same guardian/multisig gate as [`Self::pause`], and symmetric: an
+    /// attempt to unpause a treasury that is not paused fails with
+    /// [`Error::InvalidState`] rather than silently doing nothing.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        let mut t = Self::require_guardian(&env, &caller)?;
+        if !t.paused {
+            return Err(Error::InvalidState);
+        }
+        t.paused = false;
+        Self::store(&env, &t);
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("unpause"),
+            },
+        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("unpaused")), ());
+        Self::unlock(&env);
+        Ok(())
+    }
+
     /// Deposit assets into the treasury (any funder may authorize). Moves real
-    /// SAC tokens from `from` into the treasury's custody, then credits the
-    /// internal per-asset accounting.
+    /// tokens from `from` into the treasury's custody, then credits the
+    /// internal per-asset accounting with the amount that actually arrived.
+    ///
+    /// The custody balance is measured before and after the transfer, so a
+    /// token that delivers less than `amount` (e.g. fee-on-transfer) is only
+    /// credited what it delivered; one that delivers nothing, or claims to
+    /// deliver more than was sent, is rejected.
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
+        // Inbound routing is validated too: an unapproved token contract is
+        // never invoked, not even to pull funds in.
+        Self::require_approved_asset(&env, &asset)?;
         Self::lock(&env)?;
+        // Pull tokens into the contract's own custody and measure the delta.
+        let token_client = token::TokenClient::new(&env, &asset);
+        let custody = env.current_contract_address();
+        let before = token_client.balance(&custody);
+        token_client.transfer(&from, &custody, &amount);
+        let received = checked_sub(token_client.balance(&custody), before)?;
+        if received <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if received > amount {
+            return Err(Error::InvalidState);
+        }
         let mut h = Self::load_holding(&env, &asset);
-        h.total_in = checked_add(h.total_in, amount)?;
+        h.total_in = checked_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
+        let balance = checked_add(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
-            (asset.clone(), amount),
+            (asset.clone(), received),
         );
-        // Pull tokens into the contract's own custody.
-        token::TokenClient::new(&env, &asset).transfer(
-            &from,
-            &env.current_contract_address(),
-            &amount,
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryDeposited {
+                org: t.org.clone(),
+                from: from.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
+            },
         );
         Self::unlock(&env);
         Self::unlock(&env);
@@ -278,6 +553,7 @@ impl TreasuryContract {
     ) -> Result<(), Error> {
         let _t = Self::require_admin(&env, &admin)?;
         require_non_empty(&budget_id)?;
+        Self::require_approved_asset(&env, &asset)?;
         let mut h = Self::load_holding(&env, &asset);
         h.budget_id = Some(budget_id);
         Self::store_holding(&env, &asset, &h);
@@ -372,6 +648,9 @@ impl TreasuryContract {
 
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
     /// must clear policy and budget gates before the ledger is debited.
+    ///
+    /// While the circuit breaker is engaged this short-circuits with
+    /// [`Error::TreasuryPaused`] before any other gate is consulted.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -380,15 +659,20 @@ impl TreasuryContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
 
-        // 1. Policy verification — the policy contract evaluates the spend.
+        // 1. Routing validation — refuse to invoke a token contract the
+        //    organization has not approved, before any gate is consulted.
+        Self::require_approved_asset(&env, &asset)?;
+
+        // 2. Policy verification — the policy contract evaluates the spend.
         if let Some(policy_addr) = &t.policy {
             PolicyClient::new(&env, policy_addr).check_transfer(
                 &String::from_str(&env, "active"),
@@ -398,7 +682,7 @@ impl TreasuryContract {
             );
         }
 
-        // 2. Budget consumption — aborts if the envelope lacks headroom.
+        // 3. Budget consumption — aborts if the envelope lacks headroom.
         let mut holding = Self::load_holding(&env, &asset);
         if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
             astroid_interfaces::BudgetClient::new(&env, budget_addr)
@@ -408,7 +692,7 @@ impl TreasuryContract {
         // 3. Withdrawal allowance enforcement — restrict agent-driven spends to
         //    pre-approved periodic ceilings per (agent, recipient, asset).
         Self::lock(&env)?;
-        
+
         let allowance_id = AllowanceId {
             agent: caller.clone(),
             recipient: to.clone(),
@@ -442,12 +726,10 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        let balance = checked_sub(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
-        token::TokenClient::new(&env, &asset).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
+        Self::transfer_out(&env, &asset, &to, amount)?;
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         events::publish(
             &env,
@@ -456,6 +738,16 @@ impl TreasuryContract {
                 to: to.clone(),
                 asset: asset.clone(),
                 amount,
+            },
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryWithdrawn {
+                org: t.org.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
             },
         );
         Self::unlock(&env);
@@ -474,6 +766,10 @@ impl TreasuryContract {
     /// sub-call, such as a policy denial or a token transfer) rolls back every
     /// storage write and every transfer made earlier in the invocation, so a
     /// batch either pays every recipient or none of them.
+    ///
+    /// Like every other outflow it is refused with [`Error::TreasuryPaused`]
+    /// while the emergency circuit breaker is engaged - a batch payout is a
+    /// disbursement like any other.
     pub fn batch_transfer(
         env: Env,
         caller: Address,
@@ -483,8 +779,9 @@ impl TreasuryContract {
         if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
             return Err(Error::InvalidInput);
         }
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
@@ -530,8 +827,16 @@ impl TreasuryContract {
 
         let token_client = token::TokenClient::new(&env, &asset);
         let custody = env.current_contract_address();
+        let before = token_client.balance(&custody);
+        if before < total {
+            return Err(Error::InsufficientFunds);
+        }
         for payment in payments.iter() {
             token_client.transfer(&custody, &payment.recipient, &payment.amount);
+        }
+        // The token must have debited exactly the batch total from custody.
+        if checked_sub(before, token_client.balance(&custody))? != total {
+            return Err(Error::InvalidState);
         }
 
         // A single summary event keeps the log concise; the per-recipient moves
@@ -557,6 +862,12 @@ impl TreasuryContract {
 
     // --- views ---
 
+    /// The address currently authorized to pause / unpause this treasury
+    /// (alongside the multisig).
+    pub fn guardian(env: Env) -> Result<Address, Error> {
+        Ok(Self::load(&env)?.guardian)
+    }
+
     /// Initialize a milestone-based disbursement.
     pub fn init_milestone_disbursement(
         env: Env,
@@ -568,15 +879,20 @@ impl TreasuryContract {
     ) -> Result<u64, Error> {
         let _t = Self::require_admin(&env, &caller)?;
         require_positive_amount(total_amount)?;
+        Self::require_approved_asset(&env, &asset)?;
         if milestones == 0 {
             return Err(Error::InvalidInput);
         }
 
-        let amount_per_milestone = total_amount / (milestones as i128);
+        let amount_per_milestone = checked_div(total_amount, milestones as i128)?;
+        // Fewer base units than milestones would schedule zero-value payouts.
+        if amount_per_milestone == 0 {
+            return Err(Error::InvalidAmount);
+        }
 
         let count_key = DataKey::MilestoneCount;
-        let mut count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
-        count += 1;
+        let count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
+        let count = count.checked_add(1).ok_or(Error::Overflow)?;
 
         let disbursement = MilestoneDisbursement {
             total_amount,
@@ -604,11 +920,15 @@ impl TreasuryContract {
     }
 
     /// Release the next milestone payout.
+    ///
+    /// An outflow like any other: refused with [`Error::TreasuryPaused`] while
+    /// the emergency circuit breaker is engaged.
     pub fn release_next_milestone(
         env: Env,
         caller: Address,
         milestone_id: u64,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         let t = Self::require_admin(&env, &caller)?;
         let key = DataKey::Milestone(milestone_id);
         let mut d: MilestoneDisbursement = env
@@ -621,13 +941,17 @@ impl TreasuryContract {
             return Err(Error::InvalidState);
         }
 
+        Self::require_approved_asset(&env, &d.asset)?;
+
         let mut amount = d.amount_per_milestone;
-        if d.disbursed == d.milestones - 1 {
-            let disbursed_so_far = d.amount_per_milestone * (d.milestones - 1) as i128;
-            amount = d.total_amount - disbursed_so_far;
+        let last = d.milestones - 1; // milestones > 0, checked at init
+        if d.disbursed == last {
+            // The final payout absorbs the rounding remainder.
+            let disbursed_so_far = checked_mul(d.amount_per_milestone, last as i128)?;
+            amount = checked_sub(d.total_amount, disbursed_so_far)?;
         }
 
-        d.disbursed += 1;
+        d.disbursed = d.disbursed.checked_add(1).ok_or(Error::Overflow)?;
         env.storage().persistent().set(&key, &d);
         env.storage().persistent().extend_ttl(
             &key,
@@ -649,11 +973,7 @@ impl TreasuryContract {
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &d.asset, &holding);
 
-        token::TokenClient::new(&env, &d.asset).transfer(
-            &env.current_contract_address(),
-            &d.to,
-            &amount,
-        );
+        Self::transfer_out(&env, &d.asset, &d.to, amount)?;
         env.events().publish(
             (symbol_short!("milestone"), symbol_short!("disbursed")),
             (milestone_id, d.disbursed, amount),
@@ -662,7 +982,9 @@ impl TreasuryContract {
         Ok(())
     }
 
-    pub fn get(env: Env) -> Treasury {
+    /// The full treasury record. [`Error::NotInitialized`] before
+    /// [`Self::initialize`].
+    pub fn get(env: Env) -> Result<Treasury, Error> {
         Self::load(&env)
     }
 
@@ -670,13 +992,78 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
+    pub fn balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error> {
+        if assets.len() > MAX_BALANCE_ASSETS {
+            return Err(Error::InvalidInput);
+        }
+        for i in 0..assets.len() {
+            let asset = assets.get_unchecked(i);
+            for j in (i + 1)..assets.len() {
+                if assets.get_unchecked(j) == asset {
+                    return Err(Error::InvalidInput);
+                }
+            }
+        }
+
+        let mut report = Vec::new(&env);
+        for asset in assets.iter() {
+            let balance = Self::read_token_balance(&env, &asset)?;
+            report.push_back(AssetBalance { asset, balance });
+        }
+        Ok(report)
+    }
+
+    /// Live balances for every approved token, bounded by `MAX_TREASURY_ASSETS`.
+    pub fn get_all_balances(env: Env) -> Result<Vec<(Address, i128)>, Error> {
+        let mut report = Vec::new(&env);
+        for asset in Self::approved_list(&env).iter() {
+            report.push_back((asset.clone(), Self::read_token_balance(&env, &asset)?));
+        }
+        Ok(report)
+    }
+
+    /// Number of token contracts currently on the whitelist.
+    pub fn approved_asset_count(env: Env) -> u32 {
+        Self::approved_count(&env)
+    }
+
+    /// Every token contract currently on the whitelist, in approval order.
+    pub fn approved_assets(env: Env) -> Vec<Address> {
+        Self::approved_list(&env)
+    }
+
+    /// Position of every approved asset: live custody balance, recorded
+    /// balance, cumulative outflow and the token's `decimals`. Bounded by
+    /// [`MAX_TREASURY_ASSETS`]. Assets never deposited report zero balances.
+    pub fn portfolio(env: Env) -> Vec<AssetPosition> {
+        let custody = env.current_contract_address();
+        let mut report = Vec::new(&env);
+        for asset in Self::approved_list(&env).iter() {
+            let token_client = token::TokenClient::new(&env, &asset);
+            let holding = Self::load_holding(&env, &asset);
+            report.push_back(AssetPosition {
+                decimals: token_client.decimals(),
+                balance: token_client.balance(&custody),
+                recorded: holding.total_in,
+                total_out: holding.total_out,
+                asset,
+            });
+        }
+        report
+    }
+
     // --- internals ---
 
-    fn load(env: &Env) -> Treasury {
+    /// Read the treasury record.
+    ///
+    /// Returns [`Error::NotInitialized`] when [`Self::initialize`] has not run,
+    /// so every entry point reports a deterministic code instead of trapping
+    /// the whole invocation with an opaque host error.
+    fn load(env: &Env) -> Result<Treasury, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Treasury)
-            .expect("treasury not initialized")
+            .ok_or(Error::NotInitialized)
     }
 
     fn store(env: &Env, t: &Treasury) {
@@ -687,7 +1074,7 @@ impl TreasuryContract {
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         if t.admin != *caller {
             return Err(Error::Unauthorized);
         }
@@ -695,8 +1082,118 @@ impl TreasuryContract {
         Ok(t)
     }
 
+    fn is_asset_approved(env: &Env, asset: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovedAsset(asset.clone()))
+            .unwrap_or(false)
+    }
+
+    fn read_token_balance(env: &Env, asset: &Address) -> Result<i128, Error> {
+        if !Self::is_asset_approved(env, asset) {
+            return Err(Error::AssetNotAuthorized);
+        }
+        Ok(token::TokenClient::new(env, asset).balance(&env.current_contract_address()))
+    }
+
+    /// Reject any routing through a token contract that governance has not
+    /// approved. The whitelist starts empty, so a freshly initialized treasury
+    /// moves nothing until an asset is explicitly approved.
+    fn require_approved_asset(env: &Env, asset: &Address) -> Result<(), Error> {
+        if !Self::is_asset_approved(env, asset) {
+            return Err(Error::AssetNotAuthorized);
+        }
+        env.storage().persistent().extend_ttl(
+            &DataKey::ApprovedAsset(asset.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Pay `amount` of `asset` out of custody to `to`, checking the live
+    /// custody balance first and verifying afterwards that it fell by exactly
+    /// `amount`.
+    fn transfer_out(env: &Env, asset: &Address, to: &Address, amount: i128) -> Result<(), Error> {
+        let token_client = token::TokenClient::new(env, asset);
+        let custody = env.current_contract_address();
+        let before = token_client.balance(&custody);
+        if before < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        token_client.transfer(&custody, to, &amount);
+        if checked_sub(before, token_client.balance(&custody))? != amount {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn approved_list(env: &Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedAssetList)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn store_approved_list(env: &Env, list: &Vec<Address>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovedAssetList, list);
+    }
+
+    fn approved_count(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedAssetCount)
+            .unwrap_or(0)
+    }
+
+    /// Current recorded balance for `asset` (0 when the asset never moved).
+    fn asset_balance_internal(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBalance(asset.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Persist the per-asset balance used by the structured deposit and
+    /// withdrawal events so the resulting balance never has to be recomputed
+    /// from the flow totals at emission time.
+    fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
+        let key = DataKey::AssetBalance(asset.clone());
+        env.storage().persistent().set(&key, &balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn store_approved_count(env: &Env, count: u32) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovedAssetCount, &count);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Publish a whitelist change under both the contract-local tuple topic and
+    /// the canonical cross-cutting schema.
+    fn emit_asset_change(env: &Env, t: &Treasury, asset: &Address, action: Symbol) {
+        env.events()
+            .publish((symbol_short!("treasury"), action.clone()), asset.clone());
+        events::publish(
+            env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action,
+            },
+        );
+    }
+
     fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         match &t.multisig {
             Some(multisig) if multisig == caller => {
                 caller.require_auth();
@@ -704,6 +1201,32 @@ impl TreasuryContract {
             }
             _ => Err(Error::Unauthorized),
         }
+    }
+
+    /// Authorize a circuit-breaker operation: the caller must be either the
+    /// recorded guardian or the organization's multisig, verified against
+    /// instance storage before `require_auth` is demanded.
+    fn require_guardian(env: &Env, caller: &Address) -> Result<Treasury, Error> {
+        let t = Self::load(env)?;
+        let is_multisig = matches!(&t.multisig, Some(multisig) if multisig == caller);
+        if t.guardian != *caller && !is_multisig {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        Ok(t)
+    }
+
+    /// Short-circuit an outbound value movement while the emergency circuit
+    /// breaker is engaged, with the dedicated [`Error::TreasuryPaused`] code.
+    ///
+    /// Reads the flag from instance storage on every call rather than caching
+    /// it, and is never called on inbound paths: deposits must keep working
+    /// during a pause so recovery funding can arrive.
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::load(env)?.paused {
+            return Err(Error::TreasuryPaused);
+        }
+        Ok(())
     }
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
@@ -715,7 +1238,7 @@ impl TreasuryContract {
         if frozen {
             return Err(Error::InvalidState);
         }
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 
@@ -746,7 +1269,7 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .set(&DataKey::ReentrancyLock, &true);
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 
@@ -777,6 +1300,69 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared read surface, exposed through `TreasuryInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl TreasuryInterface for TreasuryContract {
+    fn balance(env: Env, asset: Address) -> Result<i128, Error> {
+        Self::read_token_balance(&env, &asset)
+    }
+
+    /// Whether `asset` is currently approved for routing.
+    fn is_approved_asset(env: Env, asset: Address) -> bool {
+        Self::is_asset_approved(&env, &asset)
+    }
+
+    /// Whether the emergency circuit breaker is currently engaged.
+    ///
+    /// An uninitialized treasury has no breaker to engage, so this reports
+    /// `false` rather than failing. Use [`TreasuryContract::get`] when the
+    /// caller needs to distinguish "not paused" from "not initialized".
+    fn is_paused(env: Env) -> bool {
+        Self::load(&env).map(|t| t.paused).unwrap_or(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for TreasuryContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Treasury` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Treasury,
+            wasm_hash,
+        )
     }
 }
 
