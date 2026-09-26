@@ -1078,6 +1078,17 @@ fn verify_threshold_accumulates_weight_of_distinct_signers() {
 }
 
 #[test]
+fn verify_threshold_returns_weight_above_threshold() {
+    let h = setup(&[3, 2, 1], 5);
+    let weight = h.client.verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1, 2]),
+        &payload(&h.env),
+    );
+    assert_eq!(weight, 6);
+}
+
+#[test]
 fn verify_threshold_below_threshold_is_refused() {
     let h = setup(&[3, 2, 1], 5);
     let res = h.client.try_verify_threshold(
