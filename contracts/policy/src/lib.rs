@@ -1140,7 +1140,7 @@ impl PolicyContract {
             .storage()
             .persistent()
             .get(&DataKey::PolicyRules(policy_id.clone()))
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         let count = stack.len();
         for i in 0..count {
             // `get` bounds-checks the index; a miss means the stack changed
