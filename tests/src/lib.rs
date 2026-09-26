@@ -15,7 +15,7 @@
 #[cfg(test)]
 pub mod e2e_agent_spending;
 #[cfg(test)]
-pub mod escrow_timelock;
+pub mod error_codes;
 #[cfg(test)]
 pub mod interface_compliance;
 #[cfg(test)]

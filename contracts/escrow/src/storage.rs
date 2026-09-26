@@ -83,6 +83,16 @@ pub enum DataKey {
     Count,
     Escrow(u64),
     Milestones(u64),
+    /// The address allowed to manage the token whitelist, recorded at
+    /// `initialize` (instance). The escrow has no per-org roles, so token
+    /// governance sits with this single address.
+    Admin,
+    /// Token whitelist membership: token contract address -> approved
+    /// (persistent). Keeping the flag on its own key makes a deposit check a
+    /// single read regardless of how many tokens are approved.
+    ApprovedToken(Address),
+    /// Enumerable list of approved tokens, in approval order (instance).
+    ApprovedTokenList,
 }
 
 pub fn get_count(env: &Env) -> u64 {

@@ -97,10 +97,12 @@ fn setup() -> Harness<'static> {
     let wallet = WalletContractClient::new(&env, &wallet_id);
     wallet.initialize(&admin);
 
-    // 6. Escrow — time-locked conditional custody.
+    // 6. Escrow — time-locked conditional custody. The token whitelist starts
+    // empty, so the admin must approve the asset before anything can be
+    // escrowed.
     let escrow_id = env.register_contract(None, EscrowContract);
     let escrow = EscrowContractClient::new(&env, &escrow_id);
-    escrow.initialize();
+    escrow.initialize(&admin);
 
     // 7. Multisig + proposal — deployed and recorded in the registry like the
     //    other modules; governance flows in these tests act through the
@@ -164,6 +166,9 @@ fn setup() -> Harness<'static> {
     //     [`wire_policy`] to exercise the gate it cares about.
     treasury.add_approved_asset(&admin, &asset);
     treasury.set_budget(&admin, &budget_id);
+    // The escrow's own token whitelist starts empty, so the same asset has to
+    // be approved there before any test can lock value in it.
+    escrow.approve_token(&admin, &asset);
 
     // Mint the funding pool to the admin, then deposit into the treasury.
     token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000_000);
