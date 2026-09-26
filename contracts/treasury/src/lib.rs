@@ -151,7 +151,9 @@ pub struct MilestoneDisbursement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holding {
     pub asset: Address,
+    /// Cumulative amount deposited for this asset.
     pub total_in: i128,
+    /// Cumulative amount withdrawn for this asset.
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
@@ -217,6 +219,9 @@ enum DataKey {
     ApprovedAssetCount,
     /// Enumerable list of currently approved assets (instance).
     ApprovedAssetList,
+    /// Recorded per-asset custody balance backing the structured deposit and
+    /// withdrawal events (persistent).
+    AssetBalance(Address),
     ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
@@ -497,7 +502,7 @@ impl TreasuryContract {
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         // Inbound routing is validated too: an unapproved token contract is
         // never invoked, not even to pull funds in.
@@ -518,9 +523,21 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
+        let balance = checked_add(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
             (asset.clone(), received),
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryDeposited {
+                org: t.org.clone(),
+                from: from.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
+            },
         );
         Self::unlock(&env);
         Self::unlock(&env);
@@ -644,7 +661,7 @@ impl TreasuryContract {
         require_positive_amount(amount)?;
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
@@ -709,6 +726,8 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        let balance = checked_sub(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         Self::transfer_out(&env, &asset, &to, amount)?;
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
@@ -719,6 +738,16 @@ impl TreasuryContract {
                 to: to.clone(),
                 asset: asset.clone(),
                 amount,
+            },
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryWithdrawn {
+                org: t.org.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
             },
         );
         Self::unlock(&env);
@@ -752,7 +781,7 @@ impl TreasuryContract {
         }
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
@@ -835,8 +864,8 @@ impl TreasuryContract {
 
     /// The address currently authorized to pause / unpause this treasury
     /// (alongside the multisig).
-    pub fn guardian(env: Env) -> Address {
-        Self::load(&env).guardian
+    pub fn guardian(env: Env) -> Result<Address, Error> {
+        Ok(Self::load(&env)?.guardian)
     }
 
     /// Initialize a milestone-based disbursement.
@@ -953,7 +982,9 @@ impl TreasuryContract {
         Ok(())
     }
 
-    pub fn get(env: Env) -> Treasury {
+    /// The full treasury record. [`Error::NotInitialized`] before
+    /// [`Self::initialize`].
+    pub fn get(env: Env) -> Result<Treasury, Error> {
         Self::load(&env)
     }
 
@@ -1023,11 +1054,16 @@ impl TreasuryContract {
 
     // --- internals ---
 
-    fn load(env: &Env) -> Treasury {
+    /// Read the treasury record.
+    ///
+    /// Returns [`Error::NotInitialized`] when [`Self::initialize`] has not run,
+    /// so every entry point reports a deterministic code instead of trapping
+    /// the whole invocation with an opaque host error.
+    fn load(env: &Env) -> Result<Treasury, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Treasury)
-            .expect("treasury not initialized")
+            .ok_or(Error::NotInitialized)
     }
 
     fn store(env: &Env, t: &Treasury) {
@@ -1038,7 +1074,7 @@ impl TreasuryContract {
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         if t.admin != *caller {
             return Err(Error::Unauthorized);
         }
@@ -1112,6 +1148,27 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
+    /// Current recorded balance for `asset` (0 when the asset never moved).
+    fn asset_balance_internal(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBalance(asset.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Persist the per-asset balance used by the structured deposit and
+    /// withdrawal events so the resulting balance never has to be recomputed
+    /// from the flow totals at emission time.
+    fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
+        let key = DataKey::AssetBalance(asset.clone());
+        env.storage().persistent().set(&key, &balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
     fn store_approved_count(env: &Env, count: u32) {
         env.storage()
             .instance()
@@ -1136,7 +1193,7 @@ impl TreasuryContract {
     }
 
     fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         match &t.multisig {
             Some(multisig) if multisig == caller => {
                 caller.require_auth();
@@ -1150,7 +1207,7 @@ impl TreasuryContract {
     /// recorded guardian or the organization's multisig, verified against
     /// instance storage before `require_auth` is demanded.
     fn require_guardian(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         let is_multisig = matches!(&t.multisig, Some(multisig) if multisig == caller);
         if t.guardian != *caller && !is_multisig {
             return Err(Error::Unauthorized);
@@ -1166,7 +1223,7 @@ impl TreasuryContract {
     /// it, and is never called on inbound paths: deposits must keep working
     /// during a pause so recovery funding can arrive.
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::load(env).paused {
+        if Self::load(env)?.paused {
             return Err(Error::TreasuryPaused);
         }
         Ok(())
@@ -1261,8 +1318,12 @@ impl TreasuryInterface for TreasuryContract {
     }
 
     /// Whether the emergency circuit breaker is currently engaged.
+    ///
+    /// An uninitialized treasury has no breaker to engage, so this reports
+    /// `false` rather than failing. Use [`TreasuryContract::get`] when the
+    /// caller needs to distinguish "not paused" from "not initialized".
     fn is_paused(env: Env) -> bool {
-        Self::load(&env).paused
+        Self::load(&env).map(|t| t.paused).unwrap_or(false)
     }
 }
 
