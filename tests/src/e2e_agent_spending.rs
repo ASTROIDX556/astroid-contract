@@ -26,10 +26,10 @@ use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
 use astroid_treasury::{TreasuryContract, TreasuryContractClient};
 use astroid_wallet::access::Role;
-use astroid_wallet::{WalletContract, WalletContractClient};
+use astroid_wallet::{BatchAction, ContractCall, WalletContract, WalletContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, vec, Address, BytesN, Env, String, Vec,
+    token, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 const START: u64 = 1_000;
@@ -351,6 +351,99 @@ fn policy_denial_blocks_treasury_withdrawal() {
     // Nothing moved.
     assert_eq!(h.treasury.holding(&h.asset).total_out, 0);
     assert_eq!(token_balance(&h, &stranger), 0);
+}
+
+/// The wallet's real cross-contract policy hook rejects unauthorized and
+/// policy-violating transfers before debiting wallet state or moving tokens.
+#[test]
+fn wallet_policy_pre_execution_blocks_unauthorized_and_violating_spends() {
+    let h = setup();
+    let wallet_id = fund_agent_wallet(&h, 5_000);
+    h.wallet.set_policy(&h.admin, &h.policy.address);
+    register_active_policy(&h, 1_000, true);
+
+    let unauthorized = Address::generate(&h.env);
+    let unauthorized_result =
+        h.wallet
+            .try_transfer(&unauthorized, &wallet_id, &h.recipient, &h.asset, &500);
+    assert_eq!(unauthorized_result, Err(Ok(Error::Unauthorized)));
+
+    let amount_result = h
+        .wallet
+        .try_transfer(&h.agent, &wallet_id, &h.recipient, &h.asset, &1_001);
+    assert_eq!(amount_result, Err(Ok(Error::PolicyDenied)));
+
+    let stranger = Address::generate(&h.env);
+    let recipient_result = h
+        .wallet
+        .try_transfer(&h.agent, &wallet_id, &stranger, &h.asset, &500);
+    assert_eq!(recipient_result, Err(Ok(Error::PolicyDenied)));
+
+    let owner = h.wallet.get_wallet(&wallet_id).owner;
+    let withdrawal_result = h.wallet.try_withdraw(&owner, &wallet_id, &h.asset, &500);
+    assert_eq!(withdrawal_result, Err(Ok(Error::PolicyDenied)));
+
+    assert_eq!(h.wallet.balance(&wallet_id, &h.asset), 5_000);
+    assert_eq!(token_balance(&h, &h.recipient), 0);
+    assert_eq!(token_balance(&h, &stranger), 0);
+    assert_eq!(token_balance(&h, &owner), 0);
+
+    h.wallet
+        .transfer(&h.agent, &wallet_id, &h.recipient, &h.asset, &500);
+    assert_eq!(h.wallet.balance(&wallet_id, &h.asset), 4_500);
+    assert_eq!(token_balance(&h, &h.recipient), 500);
+}
+
+/// A policy denial in batch preflight must happen before any forwarded call.
+#[test]
+fn wallet_policy_denial_blocks_forwarded_batch_calls() {
+    let h = setup();
+    let wallet_id = fund_agent_wallet(&h, 5_000);
+    h.wallet.set_policy(&h.admin, &h.policy.address);
+    register_active_policy(&h, 1_000, false);
+
+    let recipient = Address::generate(&h.env);
+    let mut args: Vec<Val> = Vec::new(&h.env);
+    args.push_back(h.wallet.address.clone().into_val(&h.env));
+    args.push_back(recipient.clone().into_val(&h.env));
+    args.push_back(1_001i128.into_val(&h.env));
+    let action = BatchAction {
+        call: ContractCall {
+            contract_addr: h.asset.clone(),
+            fn_name: Symbol::new(&h.env, "transfer"),
+            args,
+        },
+        policy_id: string(&h, POLICY_ID),
+        budget_id: String::from_str(&h.env, ""),
+        asset: h.asset.clone(),
+        recipient: recipient.clone(),
+        amount: 1_001,
+    };
+    let actions = vec![&h.env, action];
+
+    let result = h
+        .wallet
+        .try_batch_execute_validated(&h.agent, &wallet_id, &actions);
+    assert_eq!(result, Err(Ok(Error::PolicyDenied)));
+    assert_eq!(h.wallet.balance(&wallet_id, &h.asset), 5_000);
+    assert_eq!(token_balance(&h, &recipient), 0);
+}
+
+/// A configured contract that cannot answer `check_transfer` fails closed.
+#[test]
+fn wallet_policy_invocation_failure_maps_to_policy_denied() {
+    let h = setup();
+    let wallet_id = fund_agent_wallet(&h, 5_000);
+    // A token contract is a valid address but does not implement the policy
+    // interface, exercising the cross-contract invocation-error path.
+    h.wallet.set_policy(&h.admin, &h.asset);
+
+    let result = h
+        .wallet
+        .try_transfer(&h.agent, &wallet_id, &h.recipient, &h.asset, &500);
+    assert_eq!(result, Err(Ok(Error::PolicyDenied)));
+    assert_eq!(h.wallet.balance(&wallet_id, &h.asset), 5_000);
+    assert_eq!(token_balance(&h, &h.recipient), 0);
 }
 
 /// An empty budget envelope cannot absorb any spend.
