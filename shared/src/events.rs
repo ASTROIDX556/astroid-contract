@@ -302,6 +302,36 @@ pub fn reason(env: &Env, name: &str) -> Symbol {
     Symbol::new(env, name)
 }
 
+/// `UpgradeProposed` — topic `("version", "proposed")`. Published when an
+/// org owner or admin proposes a version upgrade for a module kind.
+pub fn upgrade_proposed(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
+    let topics = (symbol_short!("version"), symbol_short!("proposed"));
+    env.events()
+        .publish(topics, (kind, version, wasm_hash.clone()));
+}
+
+/// `UpgradeRejected` — topic `("version", "rejected")`. Published when a
+/// pending upgrade proposal is rejected (or withdrawn by its proposer).
+pub fn upgrade_rejected(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
+    let topics = (symbol_short!("version"), symbol_short!("rejected"));
+    env.events()
+        .publish(topics, (kind, version, wasm_hash.clone()));
+}
+
+/// `UpgradeCommitted` — topic `("version", "committed")`. Published when a
+/// proposed upgrade is committed into the version table.
+pub fn upgrade_committed(
+    env: &Env,
+    kind: ModuleKind,
+    version: u32,
+    wasm_hash: &BytesN<32>,
+    address: &Address,
+) {
+    let topics = (symbol_short!("version"), symbol_short!("committed"));
+    env.events()
+        .publish(topics, (kind, version, wasm_hash.clone(), address.clone()));
+}
+
 /// `WalletBatchExecuted` — topic `("wallet", "batch")`.
 pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
     let topics = (symbol_short!("wallet"), symbol_short!("batch"));
