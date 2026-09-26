@@ -32,8 +32,12 @@
 //! this table at compile time (trait bounds) and at runtime (every deployed
 //! contract answers through the shared client).
 
+pub mod errors;
 pub mod upgrade;
 
+use crate::errors::Error;
+use astroid_shared::types::ModuleKind;
+use soroban_sdk::{contractclient, Address, Env, String};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env, String, Vec};
