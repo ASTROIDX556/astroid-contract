@@ -38,15 +38,17 @@
 //! recorded org owner and the protocol admin, so no grant can be used to
 //! escalate into ownership or to widen its own reach.
 
-use astroid_interfaces::RegistryInterface;
-use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
+use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
+use astroid_shared::constants::{
+    MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
-use astroid_shared::types::ModuleKind;
+use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Vec,
 };
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
@@ -74,6 +76,10 @@ enum DataKey {
     Frozen,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
+    /// WASM hash a registered version is bound to: (kind, version) -> hash.
+    /// Kept beside `Version` rather than folded into it so version records
+    /// written before hashes were bound still decode.
+    VersionWasm(ModuleKind, u32),
 }
 
 /// A delegated administrative role over one organization's registry records.
@@ -123,44 +129,6 @@ pub struct RegistryContract;
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl RegistryContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Organization`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Organization,
-            wasm_hash,
-        )
-    }
     /// Initialize the registry with its administrator. Callable once.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -452,21 +420,43 @@ impl RegistryContract {
             .unwrap_or(false)
     }
 
-    /// Record a contract implementation address for a `(kind, version)` pair and
-    /// advance the latest-version pointer if newer. Admin-gated; this is what
-    /// powers the version-lookup upgrade strategy.
+    /// Record a contract implementation for a `(kind, version)` pair, bound to
+    /// the WASM hash it runs, and advance the latest-version pointer if newer.
+    /// This is what powers the version-lookup upgrade strategy.
+    ///
+    /// Checks, in order: the registry is not frozen ([`Error::RegistryFrozen`]);
+    /// `caller` is the protocol admin and signed ([`Error::Unauthorized`]);
+    /// `version` is non-zero ([`Error::InvalidInput`]); the pair is not already
+    /// registered ([`Error::AlreadyExists`]); `wasm_hash` is approved for `kind`
+    /// via [`Self::add_approved_wasm`] ([`Error::Unauthorized`], the same code
+    /// the upgrade gate reports for unapproved code). Nothing is written unless
+    /// every check passes.
+    ///
+    /// Version records are immutable: a published version can never be
+    /// repointed at different code, so a consumer pinned to it keeps getting
+    /// what it pinned. Rolling forward means registering a new version.
     pub fn register_version(
         env: Env,
         caller: Address,
         kind: ModuleKind,
         version: u32,
         address: Address,
+        wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
         let vkey = DataKey::Version(kind, version);
+        ensure!(!env.storage().persistent().has(&vkey), Error::AlreadyExists);
+        ensure!(
+            Self::is_wasm_approved(env.clone(), kind, wasm_hash.clone()),
+            Error::Unauthorized
+        );
         env.storage().persistent().set(&vkey, &address);
         Self::bump(&env, &vkey);
+        let hkey = DataKey::VersionWasm(kind, version);
+        env.storage().persistent().set(&hkey, &wasm_hash);
+        Self::bump(&env, &hkey);
 
         let lkey = DataKey::LatestVersion(kind);
         let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
@@ -474,6 +464,15 @@ impl RegistryContract {
             env.storage().persistent().set(&lkey, &version);
             Self::bump(&env, &lkey);
         }
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryVersionRegistered {
+                kind,
+                version,
+                address: address.clone(),
+                wasm_hash,
+            },
+        );
         env.events().publish(
             (
                 symbol_short!("version"),
@@ -496,6 +495,49 @@ impl RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(val)
+    }
+
+    /// Read the WASM hash a registered version is bound to. Fails with
+    /// [`Error::NotFound`] for an unknown `(kind, version)`, and for a version
+    /// registered before hashes were bound (it has no hash to report).
+    pub fn get_version_wasm(env: Env, kind: ModuleKind, version: u32) -> Result<BytesN<32>, Error> {
+        let key = DataKey::VersionWasm(kind, version);
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
+    }
+
+    /// Verify that `(kind, version)` is registered, runs exactly `wasm_hash`,
+    /// and that the hash is still approved; on success return the version's
+    /// address. Read-only, so a deployer or consumer can check an upgrade
+    /// target before acting on it.
+    ///
+    /// Errors: [`Error::NotFound`] for an unknown version;
+    /// [`Error::InvalidInput`] when `wasm_hash` differs from the bound hash (or
+    /// the version predates hash binding and so has none to match);
+    /// [`Error::Unauthorized`] when the bound hash has since been removed from
+    /// the approved list.
+    pub fn verify_version(
+        env: Env,
+        kind: ModuleKind,
+        version: u32,
+        wasm_hash: BytesN<32>,
+    ) -> Result<Address, Error> {
+        let address = Self::get_version(env.clone(), kind, version)?;
+        let bound: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VersionWasm(kind, version));
+        ensure!(bound.as_ref() == Some(&wasm_hash), Error::InvalidInput);
+        ensure!(
+            Self::is_wasm_approved(env, kind, wasm_hash),
+            Error::Unauthorized
+        );
+        Ok(address)
     }
 
     /// Look up the latest implementation address for a kind.
@@ -723,6 +765,28 @@ impl RegistryContract {
         }
     }
 
+    /// Read one module record together with its deprecation flag, or `None`
+    /// when `(org, kind)` is not registered. Shared by [`Self::lookup`] and
+    /// [`Self::get_modules_batch`] so both read a record identically: the TTL is
+    /// extended only for a live (non-deprecated) record, as routing has always
+    /// done.
+    fn read_module(env: &Env, org: String, kind: ModuleKind) -> Option<ModuleInfo> {
+        let key = DataKey::Module(org.clone(), kind);
+        let address: Address = env.storage().persistent().get(&key)?;
+        let deprecated = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ModuleDeprecated(org, kind))
+            .unwrap_or(false);
+        if !deprecated {
+            Self::bump(env, &key);
+        }
+        Some(ModuleInfo {
+            address,
+            deprecated,
+        })
+    }
+
     fn bump(env: &Env, key: &DataKey) {
         env.storage().persistent().extend_ttl(
             key,
@@ -740,23 +804,12 @@ impl RegistryContract {
 impl RegistryInterface for RegistryContract {
     fn lookup(env: Env, org: String, kind: ModuleKind) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
-        let key = DataKey::Module(org.clone(), kind);
-        let val = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotFound)?;
+        let module = Self::read_module(&env, org, kind).ok_or(Error::NotFound)?;
         // Routing guard: reject new interactions targeting deprecated modules.
-        if env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::ModuleDeprecated(org, kind))
-            .unwrap_or(false)
-        {
+        if module.deprecated {
             return Err(Error::ModuleDeprecated);
         }
-        Self::bump(&env, &key);
-        Ok(val)
+        Ok(module.address)
     }
 
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error> {
@@ -769,6 +822,77 @@ impl RegistryInterface for RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(recorded == owner)
+    }
+
+    /// Batch counterpart of [`Self::lookup`]: resolve up to
+    /// [`MAX_REGISTRY_BATCH`] module registrations in a single invocation.
+    ///
+    /// - `result[i]` answers `ids[i]`; length and order are preserved and
+    ///   duplicate ids are answered at every position.
+    /// - An unregistered id yields `None` instead of failing the batch, so one
+    ///   missing module does not hide the others.
+    /// - A deprecated module is returned with `deprecated: true` rather than
+    ///   [`Error::ModuleDeprecated`]; callers routing to it should refuse it.
+    /// - An empty `ids` returns an empty list.
+    ///
+    /// Errors: [`Error::InvalidInput`] when more than [`MAX_REGISTRY_BATCH`] ids
+    /// are requested (checked before any storage is read), and
+    /// [`Error::RegistryFrozen`] while the registry is frozen, like every
+    /// other lookup on this interface. Read-only: no auth is required.
+    fn get_modules_batch(env: Env, ids: Vec<ModuleId>) -> Result<Vec<Option<ModuleInfo>>, Error> {
+        ensure!(ids.len() <= MAX_REGISTRY_BATCH, Error::InvalidInput);
+        Self::check_frozen(&env)?;
+        let mut modules = Vec::new(&env);
+        for id in ids.iter() {
+            modules.push_back(Self::read_module(&env, id.org, id.kind));
+        }
+        Ok(modules)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for RegistryContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. The first call must come from the registry's
+    /// protocol admin, so nobody can claim upgrade rights over the source of
+    /// truth between deployment and bootstrap; afterwards only the current
+    /// upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        if astroid_interfaces::upgrade::get_authority(&env).is_err() {
+            // `set_authority` performs the `require_auth`; checking identity
+            // here without a second auth keeps a single signature per call.
+            ensure!(Self::is_admin(&env, &caller), Error::Unauthorized);
+        }
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Organization` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Organization,
+            wasm_hash,
+        )
     }
 }
 

@@ -21,7 +21,7 @@
 //! existing nor new consumers break.
 
 use crate::types::{AssetAmount, ModuleKind};
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -42,6 +42,14 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// A contract implementation version was registered in the global upgrade
+    /// map, bound to the approved WASM hash it runs.
+    RegistryVersionRegistered {
+        kind: ModuleKind,
+        version: u32,
+        address: Address,
+        wasm_hash: BytesN<32>,
+    },
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
@@ -118,6 +126,17 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
+        }
+        ContractEvent::RegistryVersionRegistered {
+            kind,
+            version,
+            address,
+            wasm_hash,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryVersionRegistered"),),
+                (kind, version, address, wasm_hash),
+            );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
@@ -287,4 +306,20 @@ pub fn reason(env: &Env, name: &str) -> Symbol {
 pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
     let topics = (symbol_short!("wallet"), symbol_short!("batch"));
     env.events().publish(topics, (wallet_id, call_count));
+}
+
+/// `WalletBatchValidated` — topic `("wallet", "batch_validated")`. Published by
+/// the wallet after a policy- and budget-validated batch run completes.
+pub fn wallet_batch_validated(
+    env: &Env,
+    wallet_id: u64,
+    executed: u32,
+    total_amount: i128,
+    budget_remaining: i128,
+) {
+    let topics = (symbol_short!("wallet"), Symbol::new(env, "batch_validated"));
+    env.events().publish(
+        topics,
+        (wallet_id, executed, total_amount, budget_remaining),
+    );
 }

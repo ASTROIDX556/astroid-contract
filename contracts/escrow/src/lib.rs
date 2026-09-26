@@ -88,6 +88,7 @@ pub use storage::{
     EscrowState, ReleaseSchedule, ReleaseType,
 };
 
+use astroid_interfaces::UpgradeableInterface;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
@@ -211,44 +212,6 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Escrow`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Escrow,
-            wasm_hash,
-        )
-    }
     pub fn initialize(env: Env) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
             return Err(Error::AlreadyInitialized);
@@ -938,16 +901,26 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Refund remaining funds back to the sender after the deadline.
+    /// Refund remaining funds back to the sender once the escrow has timed out.
+    ///
+    /// Only the stored `sender` may refund. Timing uses the ledger clock:
+    /// before `deadline` the call fails with [`Error::TimeLockActive`], during
+    /// `[deadline, deadline + grace_period)` with [`Error::GraceActive`]; from
+    /// `deadline + grace_period` onward (inclusive) the refund is permitted —
+    /// the same instant at which `release` starts failing with
+    /// [`Error::EscrowExpired`], so the two paths never overlap.
     pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
         if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
             return Err(Error::InvalidState);
         }
         if env.ledger().timestamp() < escrow.deadline {
             // Before the fulfillment deadline the escrow is still live.
-            return Err(Error::InvalidState);
+            return Err(Error::TimeLockActive);
         }
         if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
             // During the grace window the counterparty may still fulfill, so funds
@@ -1068,6 +1041,10 @@ impl EscrowContract {
         }
         if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
             return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            // Before the fulfillment deadline the escrow is still live.
+            return Err(Error::TimeLockActive);
         }
         // The grace window must have fully elapsed without fulfillment.
         let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
@@ -1455,6 +1432,45 @@ impl EscrowContract {
         payload.append(&Bytes::from_array(env, &id.to_be_bytes()));
         payload.append(&Bytes::from_array(env, &nonce.to_be_bytes()));
         payload
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for EscrowContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Escrow` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Escrow,
+            wasm_hash,
+        )
     }
 }
 

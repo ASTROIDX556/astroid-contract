@@ -400,6 +400,22 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ApprovedAssetList"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "vec": [
+                            {
+                              "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "ReentrancyLock"
                             }
                           ]
@@ -436,6 +452,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "guardian"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "multisig"
                               },
                               "val": {
@@ -448,6 +472,14 @@
                               },
                               "val": {
                                 "string": "vault"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "paused"
+                              },
+                              "val": {
+                                "bool": false
                               }
                             },
                             {
