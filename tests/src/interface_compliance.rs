@@ -22,7 +22,7 @@ use astroid_interfaces::{
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::PolicyContract;
 use astroid_proposal::ProposalContract;
-use astroid_registry::RegistryContract;
+use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use astroid_treasury::{TreasuryContract, TreasuryContractClient};
@@ -88,6 +88,9 @@ fn every_contract_serves_the_upgradeable_interface() {
     ];
     let admin = Address::generate(&env);
     let registry = Address::generate(&env);
+    // The registry only lets its own protocol admin bootstrap its upgrade
+    // authority, so it is initialized first, as a real deployment does.
+    RegistryContractClient::new(&env, &contracts[0]).initialize(&admin);
 
     for id in contracts.iter() {
         let client = UpgradeableClient::new(&env, id);

@@ -20,3 +20,5 @@ pub mod interface_compliance;
 pub mod policy_test;
 #[cfg(test)]
 pub mod registry_batch;
+#[cfg(test)]
+pub mod registry_upgrade;
