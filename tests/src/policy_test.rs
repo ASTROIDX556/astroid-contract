@@ -12,7 +12,9 @@
 //! must pass for a transaction to be authorized.
 
 use astroid_interfaces::PolicyClient;
-use astroid_policy::{PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree};
+use astroid_policy::{
+    PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleStrategy, RuleTree,
+};
 use astroid_shared::errors::Error;
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
@@ -32,6 +34,7 @@ fn setup<'a>(env: &'a Env, owner: &Address) -> (PolicyContractClient<'a>, Policy
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
     );
     (managed, PolicyClient::new(env, &id))
 }
@@ -216,6 +219,7 @@ fn rule_stack_composes_with_the_scalar_policy_gates() {
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
     );
     let iface = PolicyClient::new(&env, &id);
 

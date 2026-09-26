@@ -20,7 +20,7 @@
 
 use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState};
-use astroid_policy::{PolicyContract, PolicyContractClient};
+use astroid_policy::{PolicyContract, PolicyContractClient, RuleStrategy};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
@@ -215,6 +215,7 @@ fn register_active_policy(h: &Harness, max_amount: i128, recipient_only: bool) {
         },
         &Some(h.asset.clone()),
         &0u64,
+        &RuleStrategy::All,
     );
 }
 
