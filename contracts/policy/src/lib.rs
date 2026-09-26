@@ -1476,8 +1476,19 @@ impl PolicyInterface for PolicyContract {
         // per-(policy, asset) allowance. An unset allowance is unrestricted.
         Self::check_allowance(env.clone(), policy_id.clone(), asset.clone(), amount)?;
         // --- Composite rule evaluation ---
-        let rule_result =
-            Self::evaluate_composite_rule(env.clone(), policy_id.clone(), payload.clone())?;
+        // The blocklist results computed above seed the evaluation context so
+        // `RecipientBlacklisted` / `MerchantBlacklisted` leaves reuse them
+        // instead of re-reading storage on every node.
+        let mut rule_context = RuleEvaluationContext {
+            recipient_blacklisted: Some(recipient_blacklisted),
+            merchant_blacklisted: Some(merchant_blacklisted),
+        };
+        let rule_result = Self::evaluate_composite_rule_with_context(
+            &env,
+            &policy_id,
+            &payload,
+            &mut rule_context,
+        )?;
         if !rule_result {
             events_policy_violation(&env, &policy_id, "rule_denied");
             return Err(Error::PolicyDenied);
