@@ -113,8 +113,8 @@ fn stranger_cannot_transfer_ownership() {
 #[test]
 fn version_lookup_upgrade_strategy() {
     let (env, client, admin) = setup();
-    let v1 = Address::generate(&env);
-    let v2 = Address::generate(&env);
+    let v1 = env.register_contract(None, RegistryContract);
+    let v2 = env.register_contract(None, RegistryContract);
     client.register_version(&admin, &ModuleKind::Wallet, &1, &v1);
     client.register_version(&admin, &ModuleKind::Wallet, &2, &v2);
     assert_eq!(client.get_version(&ModuleKind::Wallet, &1), v1);
@@ -129,6 +129,50 @@ fn register_version_zero_fails() {
     let addr = Address::generate(&env);
     let res = client.try_register_version(&admin, &ModuleKind::Wallet, &0, &addr);
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn register_version_rejects_duplicate_version() {
+    let (env, client, admin) = setup();
+    let original = env.register_contract(None, RegistryContract);
+    let replacement = env.register_contract(None, RegistryContract);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &original);
+
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &replacement);
+
+    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), original);
+}
+
+#[test]
+fn register_version_rejects_downgrades() {
+    let (env, client, admin) = setup();
+    let latest = env.register_contract(None, RegistryContract);
+    let older = env.register_contract(None, RegistryContract);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &latest);
+
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &older);
+
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(client.get_latest(&ModuleKind::Wallet), latest);
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn register_version_rejects_incompatible_contract() {
+    let (env, client, admin) = setup();
+    let address = Address::generate(&env);
+
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &address);
+
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
 }
 
 #[test]

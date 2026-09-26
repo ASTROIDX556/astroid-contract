@@ -38,7 +38,9 @@
 //! recorded org owner and the protocol admin, so no grant can be used to
 //! escalate into ownership or to widen its own reach.
 
-use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
+use astroid_interfaces::{
+    RegistryInterface, UpgradeableClient, UpgradeableInterface, INTERFACE_VERSION,
+};
 use astroid_shared::constants::{
     MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
@@ -429,15 +431,23 @@ impl RegistryContract {
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
         let vkey = DataKey::Version(kind, version);
-        env.storage().persistent().set(&vkey, &address);
-        Self::bump(&env, &vkey);
+        ensure!(
+            !env.storage().persistent().has(&vkey),
+            Error::AlreadyExists
+        );
 
         let lkey = DataKey::LatestVersion(kind);
         let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
-        if version > latest {
-            env.storage().persistent().set(&lkey, &version);
-            Self::bump(&env, &lkey);
+        ensure!(version > latest, Error::InvalidInput);
+        match UpgradeableClient::new(&env, &address).try_get_interface_version() {
+            Ok(interface_version) if interface_version == INTERFACE_VERSION => {}
+            _ => return Err(Error::InvalidInput),
         }
+
+        env.storage().persistent().set(&vkey, &address);
+        Self::bump(&env, &vkey);
+        env.storage().persistent().set(&lkey, &version);
+        Self::bump(&env, &lkey);
         env.events().publish(
             (
                 symbol_short!("version"),
@@ -777,6 +787,10 @@ impl RegistryInterface for RegistryContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for RegistryContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. Bootstrapped by the deployer alongside
     /// `initialize`; afterwards only the current upgrade admin may rotate it.
