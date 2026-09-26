@@ -33,8 +33,15 @@ pub enum Error {
     // 25 (`AssetNotWhitelisted`) retired: it meant the same thing as
     // `AssetNotAuthorized` (43) and was consolidated into it, freeing a slot
     // for `TreasuryPaused`. The value is never reused.
-    /// A proposed spend would breach a per-asset spending allowance.
-    PolicyAllowanceExceeded = 26,
+    // 26 (`PolicyAllowanceExceeded`) retired: it meant the same thing as
+    // `AllowanceExceeded` (83) — a spend would breach a per-asset allowance —
+    // and was consolidated into it, freeing a slot for
+    // `VelocityLimitExceeded`. The value is never reused.
+    /// VELOCITY_LIMIT_EXCEEDED: an outbound spend would push the volume moved
+    /// out of a wallet within its rolling velocity window past the configured
+    /// ceiling. Nothing moves; the spend may succeed once older volume ages
+    /// out of the window.
+    VelocityLimitExceeded = 27,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -96,6 +103,8 @@ pub enum Error {
     GraceActive = 82,
 
     // --- Treasury (83-85) ---
+    /// A spend would breach a per-asset allowance: the treasury's per-agent
+    /// withdrawal allowance or a policy's per-asset spending allowance.
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
     /// The treasury's emergency circuit breaker is engaged
