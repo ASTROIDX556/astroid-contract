@@ -38,6 +38,12 @@ pub const GOVERNANCE_GRACE_PERIOD: u64 = SECONDS_PER_WEEK;
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
 
+/// Share (as a percentage) of a proposal's approver allow-list that must have
+/// voted before its tally may execute — the protocol's configured quorum.
+/// Applied with integer scaling only (`ceil(approvers * percent / 100)`), so
+/// no floating-point arithmetic ever reaches a contract.
+pub const PROPOSAL_QUORUM_PERCENT: u32 = 50;
+
 /// Upper bound on how many prerequisite proposals one proposal may depend on.
 /// Every prerequisite is read once when the dependent proposal executes, so
 /// this caps the storage reads a single execution can incur.
@@ -68,15 +74,7 @@ pub const MAX_PAUSE_DURATION: u64 = SECONDS_PER_MONTH;
 /// threshold change can be finalized (~1 day on Stellar).
 pub const THRESHOLD_CHANGE_DELAY_LEDGERS: u32 = DAY_IN_LEDGERS;
 
-/// How long a version-upgrade proposal stays valid after being proposed (one
-/// week). Stale proposals must be re-proposed rather than lying dormant
-/// indefinitely, so an old approval cannot be committed after the operators
-/// have changed their minds.
-pub const UPGRADE_PROPOSAL_EXPIRY: u64 = SECONDS_PER_WEEK;
-
-/// Upper bound on how many entries the registry's immutable upgrade audit log
-/// retains (instance storage). The log is a ring buffer: once full, the oldest
-/// entry is dropped as each new one is appended, keeping the audit trail of
-/// the most recent upgrades while capping the storage footprint of an
-/// unbounded version history.
-pub const MAX_UPGRADE_AUDIT_ENTRIES: u32 = 32;
+/// Number of basis points that make up 100%. Protocol percentages (e.g. the
+/// budget contract's maximum rollover percentage) are carried as integer
+/// basis points (1 bp = 0.01%) so cap arithmetic stays in whole numbers.
+pub const BPS_DENOMINATOR: i128 = 10_000;

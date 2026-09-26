@@ -17,6 +17,10 @@ pub mod e2e_agent_spending;
 #[cfg(test)]
 pub mod interface_compliance;
 #[cfg(test)]
+pub mod policy_enforcement;
+#[cfg(test)]
+pub mod policy_test;
+#[cfg(test)]
 pub mod registry_batch;
 #[cfg(test)]
-pub mod upgrade_validation;
+pub mod registry_upgrade;

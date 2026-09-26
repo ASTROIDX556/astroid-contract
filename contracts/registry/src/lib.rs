@@ -77,72 +77,10 @@ enum DataKey {
     Frozen,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
-    /// Pending version-upgrade proposal: kind -> UpgradeProposal.
-    UpgradeProposal(ModuleKind),
-    /// Immutable historical log of upgrade-lifecycle actions (instance).
-    UpgradeAuditLog,
-}
-
-/// A pending version-upgrade proposal for one [`ModuleKind`]: the `(version,
-/// wasm_hash, address)` triple an authorized caller wants committed into the
-/// version table, plus who proposed it and when it expires.
-///
-/// The record is keyed by kind alone — one proposal per kind at a time — so a
-/// kind's upgrade path is always unambiguous and a hostile proposal cannot hide
-/// behind a second, conflicting one.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpgradeProposal {
-    /// The version number this proposal would occupy in the version table.
-    pub version: u32,
-    /// The Wasm hash of the proposed implementation.
-    pub wasm_hash: BytesN<32>,
-    /// The contract address the implementation is expected to be deployed at.
-    pub address: Address,
-    /// The organization the proposal was made under. Recorded so the org's
-    /// owner can reject (or withdraw via the proposer) a proposal they no
-    /// longer want without relying on the protocol admin.
-    pub org: String,
-    /// Who proposed the upgrade (an org owner or the protocol admin).
-    pub proposer: Address,
-    /// Unix timestamp after which the proposal can no longer be committed.
-    pub expires_at: u64,
-}
-
-/// What kind of upgrade-lifecycle action an [`UpgradeAuditRecord`] captures.
-/// Discriminants are part of the public ABI and MUST NOT be reordered or
-/// reused once released.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UpgradeAction {
-    /// A `(version, wasm_hash, address)` triple was proposed for a kind.
-    Proposed = 0,
-    /// A pending proposal was committed into the version table.
-    Committed = 1,
-    /// A pending proposal was rejected or withdrawn by its proposer.
-    Rejected = 2,
-}
-// NOTE: refused upgrade attempts (unauthorized actor, downgrade, identical-WASM
-// re-proposal, …) are deliberately *not* logged. A Soroban invocation is
-// atomic: every storage write and event of a call that returns an error is
-// rolled back, so an audit entry written on the failure path could never be
-// observed on-chain. Refusals stay visible off-chain as reverted transactions
-// carrying their error code; the on-chain trail records successful lifecycle
-// actions only.
-
-/// One immutable entry in the registry's historical upgrade log (Issue #300):
-/// who did what to which version of a module kind, and when. Records are
-/// appended on every successful propose/commit/reject and never edited or
-/// removed; refused attempts revert atomically (see [`UpgradeAction`]) so the
-/// log only ever contains actions that took effect. The log itself is a ring
-/// buffer capped at [`MAX_UPGRADE_AUDIT_ENTRIES`] entries of instance storage.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpgradeAuditRecord {
-    /// Which lifecycle action was taken.
-    pub action: UpgradeAction,
-    /// The typed audit payload shared with the emitted event.
-    pub audit: UpgradeAudit,
+    /// WASM hash a registered version is bound to: (kind, version) -> hash.
+    /// Kept beside `Version` rather than folded into it so version records
+    /// written before hashes were bound still decode.
+    VersionWasm(ModuleKind, u32),
 }
 
 /// A delegated administrative role over one organization's registry records.
@@ -483,16 +421,30 @@ impl RegistryContract {
             .unwrap_or(false)
     }
 
-    /// Record a contract implementation address for a `(kind, version)` pair and
-    /// advance the latest-version pointer if newer. Admin-gated; this is what
-    /// powers the version-lookup upgrade strategy.
+    /// Record a contract implementation for a `(kind, version)` pair, bound to
+    /// the WASM hash it runs, and advance the latest-version pointer if newer.
+    /// This is what powers the version-lookup upgrade strategy.
+    ///
+    /// Checks, in order: the registry is not frozen ([`Error::RegistryFrozen`]);
+    /// `caller` is the protocol admin and signed ([`Error::Unauthorized`]);
+    /// `version` is non-zero ([`Error::InvalidInput`]); the pair is not already
+    /// registered ([`Error::AlreadyExists`]); `wasm_hash` is approved for `kind`
+    /// via [`Self::add_approved_wasm`] ([`Error::Unauthorized`], the same code
+    /// the upgrade gate reports for unapproved code). Nothing is written unless
+    /// every check passes.
+    ///
+    /// Version records are immutable: a published version can never be
+    /// repointed at different code, so a consumer pinned to it keeps getting
+    /// what it pinned. Rolling forward means registering a new version.
     pub fn register_version(
         env: Env,
         caller: Address,
         kind: ModuleKind,
         version: u32,
         address: Address,
+        wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
         // Downgrade protection: the version table is monotonic per kind, so a
@@ -506,8 +458,16 @@ impl RegistryContract {
             .unwrap_or(0);
         ensure!(version > latest, Error::InvalidState);
         let vkey = DataKey::Version(kind, version);
+        ensure!(!env.storage().persistent().has(&vkey), Error::AlreadyExists);
+        ensure!(
+            Self::is_wasm_approved(env.clone(), kind, wasm_hash.clone()),
+            Error::Unauthorized
+        );
         env.storage().persistent().set(&vkey, &address);
         Self::bump(&env, &vkey);
+        let hkey = DataKey::VersionWasm(kind, version);
+        env.storage().persistent().set(&hkey, &wasm_hash);
+        Self::bump(&env, &hkey);
 
         let lkey = DataKey::LatestVersion(kind);
         let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
@@ -515,6 +475,15 @@ impl RegistryContract {
             env.storage().persistent().set(&lkey, &version);
             Self::bump(&env, &lkey);
         }
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryVersionRegistered {
+                kind,
+                version,
+                address: address.clone(),
+                wasm_hash,
+            },
+        );
         env.events().publish(
             (
                 symbol_short!("version"),
@@ -811,6 +780,49 @@ impl RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Ok(val)
+    }
+
+    /// Read the WASM hash a registered version is bound to. Fails with
+    /// [`Error::NotFound`] for an unknown `(kind, version)`, and for a version
+    /// registered before hashes were bound (it has no hash to report).
+    pub fn get_version_wasm(env: Env, kind: ModuleKind, version: u32) -> Result<BytesN<32>, Error> {
+        let key = DataKey::VersionWasm(kind, version);
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(val)
+    }
+
+    /// Verify that `(kind, version)` is registered, runs exactly `wasm_hash`,
+    /// and that the hash is still approved; on success return the version's
+    /// address. Read-only, so a deployer or consumer can check an upgrade
+    /// target before acting on it.
+    ///
+    /// Errors: [`Error::NotFound`] for an unknown version;
+    /// [`Error::InvalidInput`] when `wasm_hash` differs from the bound hash (or
+    /// the version predates hash binding and so has none to match);
+    /// [`Error::Unauthorized`] when the bound hash has since been removed from
+    /// the approved list.
+    pub fn verify_version(
+        env: Env,
+        kind: ModuleKind,
+        version: u32,
+        wasm_hash: BytesN<32>,
+    ) -> Result<Address, Error> {
+        let address = Self::get_version(env.clone(), kind, version)?;
+        let bound: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VersionWasm(kind, version));
+        ensure!(bound.as_ref() == Some(&wasm_hash), Error::InvalidInput);
+        ensure!(
+            Self::is_wasm_approved(env, kind, wasm_hash),
+            Error::Unauthorized
+        );
+        Ok(address)
     }
 
     /// Look up the latest implementation address for a kind.
@@ -1179,14 +1191,21 @@ impl RegistryInterface for RegistryContract {
 #[contractimpl]
 impl UpgradeableInterface for RegistryContract {
     /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    /// authorizes the new code. The first call must come from the registry's
+    /// protocol admin, so nobody can claim upgrade rights over the source of
+    /// truth between deployment and bootstrap; afterwards only the current
+    /// upgrade admin may rotate it.
     fn set_upgrade_authority(
         env: Env,
         caller: Address,
         admin: Address,
         registry: Address,
     ) -> Result<(), Error> {
+        if astroid_interfaces::upgrade::get_authority(&env).is_err() {
+            // `set_authority` performs the `require_auth`; checking identity
+            // here without a second auth keeps a single signature per call.
+            ensure!(Self::is_admin(&env, &caller), Error::Unauthorized);
+        }
         astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
     }
 
