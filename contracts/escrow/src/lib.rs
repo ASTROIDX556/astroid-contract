@@ -66,19 +66,24 @@
 //! [`EscrowContract::release_milestone`], disbursing funds proportionally. The
 //! final milestone pays the dust-free remainder so the full amount is disbursed.
 //! Plain `release` is blocked on milestone escrows to enforce phased settlement.
-//!
-//! ## Time-lock release schedules
+//!//! ## Time-lock release schedules
 //!
 //! Escrows support configurable time-locks and gradual release schedules:
 //! - Bullet / Cliff time-locks (`ReleaseType::Cliff`): 100% unlocked at maturity.
 //! - Linear release schedules (`ReleaseType::Linear`): Continuous linear vesting
 //!   from start_time to end_time with optional cliff_time.
 //! - Partial and multiple gradual withdrawals by the beneficiary.
-//! - Deterministic `Error::TimeLockActive` when withdrawing before maturity or cliff.
+//! - Deterministic errors while locked: the beneficiary-facing `withdraw` /
+//!   `claim` paths report `Error::TimeLockActive` before maturity or cliff,
+//!   while release attempts (the arbiter's `release` and the signature-based
+//!   `override_release`) report the distinct `Error::TimelockNotExpired`
+//!   (`TIMELOCK_NOT_EXPIRED`) — the escrow's release condition is not yet
+//!   satisfied at the current ledger timestamp (Issue #332).
 //!
 //! The time lock is enforced on every value-leaving path, including the
 //! arbiter's `release`: a scheduled escrow cannot be released ahead of its
 //! vesting schedule no matter how much settlement time remains (see
+
 //! [`EscrowContract::release`]).
 
 pub mod storage;
@@ -718,8 +723,11 @@ impl EscrowContract {
     /// Time-locked escrows additionally gate on the release schedule: a `Cliff`
     /// schedule refuses any release before its `cliff_time`, and a `Linear`
     /// schedule refuses a release before the cliff or beyond the amount vested
-    /// at the current ledger timestamp, both with the deterministic
-    /// [`Error::TimeLockActive`] error.
+    /// at the current ledger timestamp. Both early-release cases report the
+    /// distinct [`Error::TimelockNotExpired`] code (`TIMELOCK_NOT_EXPIRED`),
+    /// separating "the escrow's own release clock has not matured" from the
+    /// beneficiary-facing [`Error::TimeLockActive`] reported by `withdraw` /
+    /// `claim`.
     ///
     /// `release_amount` is the amount to release this call. Partial releases are
     /// supported: the cumulative `released_amount` is tracked on the escrow and
@@ -738,9 +746,9 @@ impl EscrowContract {
         if env.storage().persistent().has(&DataKey::Milestones(id)) {
             return Err(Error::InvalidState);
         }
-        // Issue #238 — time-lock validation. A schedule-backed escrow can only
-        // be released once its own release schedule has matured, regardless of
-        // how much time is left on the settlement deadline:
+        // Issue #238 / #332 — time-lock verification. A schedule-backed escrow
+        // can only be released once its own release schedule has matured,
+        // regardless of how much time is left on the settlement deadline:
         //
         // - `Cliff` schedules unlock everything at `cliff_time` (= `end_time`),
         //   so a release before maturity is premature by definition.
@@ -749,20 +757,22 @@ impl EscrowContract {
         //   release may not exceed the amount vested at the current ledger
         //   timestamp.
         //
-        // Deterministic error: [`Error::TimeLockActive`] while the lock holds.
-        // Both checks read the ledger clock via `env.ledger().timestamp()`.
+        // Deterministic error: [`Error::TimelockNotExpired`] while the lock holds —
+        // release requests fail while the ledger timestamp is below the
+        // configured release time and succeed once it has passed. Both checks
+        // read the ledger clock via `env.ledger().timestamp()`.
         let now = env.ledger().timestamp();
         if matches!(escrow.schedule.release_type, ReleaseType::Cliff) {
             if now < escrow.schedule.cliff_time {
-                return Err(Error::TimeLockActive);
+                return Err(Error::TimelockNotExpired);
             }
         } else if matches!(escrow.schedule.release_type, ReleaseType::Linear) {
             if now < escrow.schedule.cliff_time {
-                return Err(Error::TimeLockActive);
+                return Err(Error::TimelockNotExpired);
             }
             let vested = calculate_vested_amount(escrow.funded_amount, &escrow.schedule, now)?;
             if release_amount > vested {
-                return Err(Error::TimeLockActive);
+                return Err(Error::TimelockNotExpired);
             }
         }
         if now >= escrow.deadline + escrow.grace_period {
@@ -814,6 +824,11 @@ impl EscrowContract {
     ///
     /// Permissionless by design: the cryptographic signatures are the
     /// authorization, so any relayer may submit them.
+    ///
+    /// Signatures authorize *who* may release; they do not override *when*.
+    /// A schedule-backed escrow refuses an early override release with the
+    /// same [`Error::TimelockNotExpired`] code the arbiter path uses (Issue #332),
+    /// so the signature path cannot route around a time lock.
     pub fn override_release(
         env: Env,
         id: u64,
@@ -829,6 +844,26 @@ impl EscrowContract {
         }
         if env.ledger().timestamp() >= escrow.deadline {
             return Err(Error::EscrowExpired);
+        }
+        // Issue #332 — the signature override must respect the escrow's own
+        // release clock: a `Cliff` schedule refuses any release before its
+        // `cliff_time`, and a `Linear` schedule refuses a release before the
+        // cliff or beyond the vested amount at the current ledger timestamp.
+        // Deterministic error: [`Error::TimelockNotExpired`].
+        let now = env.ledger().timestamp();
+        if matches!(escrow.schedule.release_type, ReleaseType::Cliff) {
+            if now < escrow.schedule.cliff_time {
+                return Err(Error::TimelockNotExpired);
+            }
+        } else if matches!(escrow.schedule.release_type, ReleaseType::Linear) {
+            if now < escrow.schedule.cliff_time {
+                return Err(Error::TimelockNotExpired);
+            }
+            let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+            let vested = calculate_vested_amount(escrow.funded_amount, &escrow.schedule, now)?;
+            if remaining > vested {
+                return Err(Error::TimelockNotExpired);
+            }
         }
         if nonce <= escrow.override_nonce {
             return Err(Error::InvalidNonce);
