@@ -1215,6 +1215,31 @@ fn reduced_signer_weight_is_applied_at_execution() {
 }
 
 #[test]
+fn approval_weight_uses_current_signer_weights() {
+    let h = setup(&[u32::MAX - 2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), u32::MAX - 1);
+
+    let change = h
+        .client
+        .propose_weight_change(&h.signers[1], &h.signers[0], &1);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &change);
+
+    let newcomer = Address::generate(&h.env);
+    h.client.add_signer(&h.signers[0], &newcomer, &2);
+    // Historical weights would overflow u32; approvals are recomputed using
+    // the current weights of the signers who actually approved.
+    assert_eq!(h.client.approve(&newcomer, &id), 4);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 4);
+}
+
+#[test]
 fn pending_threshold_is_revalidated_on_finalize() {
     let h = setup(&[1, 1, 1], 1);
     h.env.ledger().set_sequence_number(100);
