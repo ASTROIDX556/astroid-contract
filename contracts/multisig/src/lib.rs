@@ -609,12 +609,11 @@ impl MultiSigContract {
         if proposal.executed {
             return Err(Error::InvalidProposalState);
         }
-        let threshold = Self::threshold(&env)?;
-        let weight = Self::live_approval_weight(&env, proposal_id)?;
+        // Evaluate the cumulative weight of every current signer that has
+        // approved against the live threshold; below quorum the proposal does
+        // not execute. The recorded total is refreshed to the evaluated value.
+        let weight = Self::evaluate_quorum(&env, proposal_id)?;
         proposal.approval_weight = weight;
-        if weight < threshold {
-            return Err(Error::InsufficientWeight);
-        }
         if proposal.unlock_at != 0 {
             require_time_reached(&env, proposal.unlock_at)?;
         }
@@ -722,6 +721,18 @@ impl MultiSigContract {
         Self::total_weight(&Self::signers(&env)?)
     }
 
+    /// Cumulative voting weight currently backing `proposal_id`, recomputed
+    /// against the live signer set (removed signers no longer count, re-weighted
+    /// signers count at their new weight, duplicate ballots never stack).
+    ///
+    /// Compare it with [`Self::get_threshold`] to evaluate whether quorum is
+    /// reached without executing the proposal. Returns [`Error::NotFound`] when
+    /// the proposal does not exist.
+    pub fn get_approval_weight(env: Env, proposal_id: u64) -> Result<u32, Error> {
+        Self::load_proposal(&env, proposal_id)?;
+        Self::live_approval_weight(&env, proposal_id)
+    }
+
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<MsProposal, Error> {
         Self::load_proposal(&env, proposal_id)
     }
@@ -826,6 +837,19 @@ impl MultiSigContract {
             }
         }
         Self::to_weight(total)
+    }
+
+    /// Evaluate `proposal_id`'s cumulative approval weight against the current
+    /// threshold. Returns the aggregated weight when quorum is met, otherwise
+    /// [`Error::InsufficientWeight`]. Both the live execution path and the
+    /// read-only [`Self::get_approval_weight`] view share this accumulation, so
+    /// what callers observe is exactly what [`Self::execute`] enforces.
+    fn evaluate_quorum(env: &Env, proposal_id: u64) -> Result<u32, Error> {
+        let weight = Self::live_approval_weight(env, proposal_id)?;
+        if weight < Self::threshold(env)? {
+            return Err(Error::InsufficientWeight);
+        }
+        Ok(weight)
     }
 
     fn threshold(env: &Env) -> Result<u32, Error> {
