@@ -1095,3 +1095,185 @@ fn per_asset_spend_past_max_returns_overflow() {
     // The spend was not recorded.
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic validation (issue #325)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zero_limit_budget_rejects_every_spend() {
+    let h = setup();
+    allocate(&h, "closed", 0, Period::None, false);
+    assert_eq!(h.client.remaining(&id(&h.env, "closed")), 0);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "closed"), &1);
+    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    // Nothing was spent, so nothing can be released either.
+    let res = h.client.try_release(&h.owner, &id(&h.env, "closed"), &1);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn exact_limit_match_is_allowed_and_one_more_is_not() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::None, false);
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000), 0);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 1_000);
+}
+
+#[test]
+fn negative_limits_are_rejected_everywhere() {
+    let h = setup();
+    let res = h
+        .client
+        .try_allocate(&h.owner, &id(&h.env, "neg"), &-1, &Period::None, &false, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+
+    allocate(&h, "eng", 1_000, Period::None, false);
+    let res = h.client.try_set_limit(&h.owner, &id(&h.env, "eng"), &-1);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+
+    let token = Address::generate(&h.env);
+    let res = h
+        .client
+        .try_set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &-1, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+    // Rejected before any state was written.
+    assert_eq!(h.client.get(&id(&h.env, "eng")).limit, 1_000);
+}
+
+#[test]
+fn allocation_with_past_expiry_is_rejected() {
+    let h = setup();
+    // `setup` pins the ledger at t = 1_000.
+    for expires_at in [1u64, 999, 1_000] {
+        let res = h.client.try_allocate(
+            &h.owner,
+            &id(&h.env, "stale"),
+            &1_000,
+            &Period::None,
+            &false,
+            &expires_at,
+        );
+        assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    }
+    // A future expiry (and 0 = never) are accepted.
+    allocate(&h, "never", 1_000, Period::None, false);
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "soon"),
+        &1_000,
+        &Period::None,
+        &false,
+        &1_001,
+    );
+}
+
+#[test]
+fn overflowing_spend_returns_overflow_not_panic() {
+    let h = setup();
+    allocate(&h, "max", i128::MAX, Period::None, false);
+    h.client.consume(&h.owner, &id(&h.env, "max"), &i128::MAX);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "max"), &1);
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+}
+
+#[test]
+fn overflowing_reallocation_returns_overflow() {
+    let h = setup();
+    allocate(&h, "full", i128::MAX, Period::None, false);
+    allocate(&h, "spare", 10, Period::None, false);
+    let res =
+        h.client
+            .try_transfer_allocation(&h.owner, &id(&h.env, "spare"), &id(&h.env, "full"), &10);
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+    // Neither side changed.
+    assert_eq!(h.client.get(&id(&h.env, "spare")).limit, 10);
+    assert_eq!(h.client.get(&id(&h.env, "full")).limit, i128::MAX);
+}
+
+#[test]
+fn non_owner_cannot_change_limits() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::None, false);
+    let stranger = Address::generate(&h.env);
+    let res = h
+        .client
+        .try_set_limit(&stranger, &id(&h.env, "eng"), &5_000);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    let res = h.client.try_release(&stranger, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn archived_budget_rejects_administrative_changes() {
+    let h = setup();
+    allocate(&h, "old", 1_000, Period::Daily, false);
+    h.client.archive(&h.owner, &id(&h.env, "old"));
+    let res = h.client.try_set_limit(&h.owner, &id(&h.env, "old"), &2_000);
+    assert_eq!(res, Err(Ok(Error::BudgetArchived)));
+    let res = h.client.try_reset(&h.owner, &id(&h.env, "old"));
+    assert_eq!(res, Err(Ok(Error::BudgetArchived)));
+    let res = h.client.try_rollover(&h.owner, &id(&h.env, "old"));
+    assert_eq!(res, Err(Ok(Error::BudgetArchived)));
+    assert_eq!(h.client.get(&id(&h.env, "old")).limit, 1_000);
+}
+
+#[test]
+fn expired_budget_rejects_release_and_per_asset_activity() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "exp"),
+        &1_000,
+        &Period::None,
+        &false,
+        &2_000,
+    );
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "exp"), &token, &500, &0);
+    h.client.consume(&h.owner, &id(&h.env, "exp"), &100);
+    allocate(&h, "live", 1_000, Period::None, false);
+
+    h.env.ledger().set_timestamp(2_000);
+    let res = h.client.try_release(&h.owner, &id(&h.env, "exp"), &50);
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "exp"), &token, &10);
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+    let res = h
+        .client
+        .try_set_budget_limit(&h.owner, &id(&h.env, "exp"), &token, &900, &0);
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+    let res =
+        h.client
+            .try_transfer_allocation(&h.owner, &id(&h.env, "live"), &id(&h.env, "exp"), &10);
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+    assert_eq!(h.client.get(&id(&h.env, "exp")).spent, 100);
+}
+
+#[test]
+fn release_reports_the_same_remaining_as_the_view() {
+    let h = setup();
+    h.client.allocate_with_deficit(
+        &h.owner,
+        &id(&h.env, "agent"),
+        &1_000,
+        &Period::Daily,
+        &false,
+        &true,
+        &0,
+    );
+    // First overspend is allowed and becomes next period's deficit.
+    h.client.consume(&h.owner, &id(&h.env, "agent"), &1_500);
+    h.env.ledger().set_timestamp(1_000 + 86_400);
+    h.client.consume(&h.owner, &id(&h.env, "agent"), &200);
+
+    let after_release = h.client.release(&h.owner, &id(&h.env, "agent"), &100);
+    assert_eq!(after_release, h.client.remaining(&id(&h.env, "agent")));
+    // limit 1_000 - deficit 500 - spent 100
+    assert_eq!(after_release, 400);
+}

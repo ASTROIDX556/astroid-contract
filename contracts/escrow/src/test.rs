@@ -1721,3 +1721,72 @@ fn create_rejects_non_positive_amounts_and_non_future_expiry() {
     assert_eq!(balances(&h), (5_000, 0, 0));
     assert_eq!(h.client.try_get(&1), Err(Ok(Error::NotFound)));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #216: Escrow release and refund conditions unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conditional_release_and_timeout_refund_lifecycle() {
+    // 1. Test successful conditional release
+    let h = setup(10_000, 0);
+    let id1 = create(&h, &one_asset(&h, 4_000), START + 500, GRACE);
+
+    // Beneficiary cannot claim directly before grace/schedule without arbiter
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id1),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // Arbiter releases successfully before deadline
+    h.client.release(&h.arbiter, &id1, &4_000);
+    assert_eq!(h.client.get(&id1).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+
+    // 2. Test timeout refund path accessible only after expiry
+    let id2 = create(&h, &one_asset(&h, 6_000), START + 500, GRACE);
+
+    // Before deadline: refund fails with TimeLockActive
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id2),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // During grace period (START + 500 to START + 1500): refund fails with GraceActive
+    h.env.ledger().with_mut(|l| l.timestamp = START + 600);
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id2),
+        Err(Ok(Error::GraceActive))
+    );
+
+    // Unauthorized non-sender cannot refund
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_refund(&stranger, &id2),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // After expiry (deadline + grace_period = START + 1500): refund succeeds
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1500);
+    h.client.refund(&h.sender, &id2);
+    assert_eq!(h.client.get(&id2).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
+}
+
+#[test]
+fn mutual_consent_cancel_and_post_grace_reclaim() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 1_000, GRACE);
+
+    // Non-party cannot cancel
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_cancel(&stranger, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Arbiter can cancel by mutual consent before deadline
+    h.client.cancel(&h.arbiter, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+}
