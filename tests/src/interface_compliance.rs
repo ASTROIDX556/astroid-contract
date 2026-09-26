@@ -68,7 +68,7 @@ fn interface_table_compiles() {
 #[test]
 fn interface_version_is_pinned() {
     // Bumping the version is a deliberate act; this catches accidental edits.
-    assert_eq!(INTERFACE_VERSION, 1);
+    assert_eq!(INTERFACE_VERSION, 2);
 }
 
 #[test]
@@ -91,6 +91,7 @@ fn every_contract_serves_the_upgradeable_interface() {
 
     for id in contracts.iter() {
         let client = UpgradeableClient::new(&env, id);
+        assert_eq!(client.get_interface_version(), INTERFACE_VERSION);
         assert_eq!(
             client.try_get_upgrade_authority(),
             Err(Ok(Error::NotInitialized))

@@ -1265,6 +1265,10 @@ impl MultisigInterface for MultiSigContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for MultiSigContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        astroid_interfaces::INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. Bootstrapped by the deployer alongside
     /// `initialize`; afterwards only the current upgrade admin may rotate it.

@@ -41,7 +41,7 @@ use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env, String, Vec};
 /// Version of the interface surface declared in this crate. Bump it whenever a
 /// trait gains, loses or changes a method so off-chain clients built against
 /// an older definition can detect the drift.
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
 
 /// Registry lookup surface. The registry is the protocol's source of truth for
 /// where each module/contract lives and who owns it (PRD Doc 7 §Registry).
@@ -176,6 +176,9 @@ pub trait MultisigInterface {
 /// operators can drive an upgrade of any contract through one client.
 #[contractclient(name = "UpgradeableClient")]
 pub trait UpgradeableInterface {
+    /// Runtime version of the shared contract interface.
+    fn get_interface_version(env: Env) -> u32;
+
     /// Record (or rotate) who may upgrade the contract and which registry
     /// authorizes the new code. See [`upgrade::set_authority`].
     fn set_upgrade_authority(
