@@ -938,8 +938,10 @@ fn timelock_only_gates_execution_not_state_transitions() {
 // `execute` re-validates the tally that earned `Approved`: the configured
 // threshold, the participation quorum (an integer-scaled percentage of the
 // allow-list) and a strict majority. The cases below pin the boundaries — an
-// exact tie, and tallies one vote short of a bar — where a threshold-only
-// check would let a barely-supported proposal fire.
+// exact tie, tallies one vote short of a bar, and a threshold low enough to
+// be gamed on a large allow-list — where a threshold-only check would let a
+// barely-supported proposal fire. The `can_execute` view is pinned alongside
+// the entrypoint so it can never advertise a tally `execute` would refuse.
 
 #[test]
 fn quorum_calculation_rounds_up_with_integer_scaling() {
@@ -1062,6 +1064,79 @@ fn narrowly_missing_the_threshold_never_approves_and_cannot_execute() {
     assert_eq!(h.client.state(&id), ProposalState::Approved);
     h.client.execute(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn low_threshold_on_a_large_allow_list_cannot_execute_on_one_signature() {
+    // The motivating case for the whole gate: `threshold = 1` on a ten-person
+    // allow-list reaches `Approved` on a single signature, but that signature
+    // is neither the quorum (ceil(10 * 50%) == 5 of 10) nor a majority
+    // (10 / 2 + 1 == 6 of 10), so it must never fire.
+    let h = setup(10);
+    let id = create(&h, 1, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert!(!h.client.can_execute(&id));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approvals, 1);
+}
+
+#[test]
+fn quorum_met_but_majority_missing_blocks_execution() {
+    let h = setup(6);
+    // 6 voters: quorum is ceil(6 * 50%) == 3 and a strict majority is
+    // 6 / 2 + 1 == 4, so this three-signature tally clears the configured
+    // threshold *and* the participation bar while still falling one vote
+    // short of the majority.
+    let id = create(&h, 3, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert!(!h.client.can_execute(&id));
+    // Nothing was consumed: the proposal stays approved and re-attemptable.
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approvals, 3);
+}
+
+#[test]
+fn can_execute_view_agrees_with_execute_on_every_vote_bar() {
+    // Tie: threshold and quorum met, strict majority missed (2 of 4).
+    let tie = setup(4);
+    let tie_id = create(&tie, 2, 5_000);
+    tie.client.approve(&tie.approvers[0], &tie_id);
+    tie.client.approve(&tie.approvers[1], &tie_id);
+    assert_eq!(tie.client.state(&tie_id), ProposalState::Approved);
+    assert!(!tie.client.can_execute(&tie_id));
+
+    // Quorum short by exactly one vote (2 of 5, bar is 3).
+    let quorum = setup(5);
+    let quorum_id = create(&quorum, 2, 5_000);
+    quorum.client.approve(&quorum.approvers[0], &quorum_id);
+    quorum.client.approve(&quorum.approvers[1], &quorum_id);
+    assert_eq!(quorum.client.state(&quorum_id), ProposalState::Approved);
+    assert!(!quorum.client.can_execute(&quorum_id));
+
+    // Exactly on both bars: the view reports executable and the entrypoint
+    // then agrees, so the two can never contradict each other.
+    let ok = setup(5);
+    let ok_id = create(&ok, 3, 5_000);
+    ok.client.approve(&ok.approvers[0], &ok_id);
+    ok.client.approve(&ok.approvers[1], &ok_id);
+    ok.client.approve(&ok.approvers[2], &ok_id);
+    assert!(ok.client.can_execute(&ok_id));
+    ok.client.execute(&ok.proposer, &ok_id);
+    assert_eq!(ok.client.state(&ok_id), ProposalState::Executed);
 }
 
 // ------------------------------------------- timelock / expiry boundary ----
