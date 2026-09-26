@@ -954,3 +954,237 @@ mod token_wrappers {
         assert_eq!(map_token_error(budget), Error::InvalidState);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Error-code audit
+//
+// The code table is the public ABI shared by all eight contracts, so these
+// tests are the guard rail that keeps it deterministic. They are deliberately
+// exhaustive rather than sampled: a single renumbered or duplicated code
+// silently breaks every off-chain consumer, and no runtime test of a business
+// rule would notice.
+// ---------------------------------------------------------------------------
+
+/// Codes that were once assigned to a variant and have been retired. They must
+/// stay empty forever so a stale integrator can never decode a fresh failure
+/// as a retired meaning.
+const RETIRED_CODES: [u32; 3] = [25, 26, 65];
+
+/// The published code for every variant, written out by hand. This is the
+/// audit record: it is deliberately *not* derived from the enum, because a
+/// table derived from the thing it is meant to police cannot detect a
+/// renumbering.
+const EXPECTED_CODES: [(Error, u32); 50] = [
+    // --- Generic / lifecycle (1-6) ---
+    (Error::NotFound, 1),
+    (Error::AlreadyExists, 2),
+    (Error::Unauthorized, 3),
+    (Error::InvalidInput, 4),
+    (Error::NotInitialized, 5),
+    (Error::AlreadyInitialized, 6),
+    // --- Value / arithmetic (10-12) ---
+    (Error::InsufficientFunds, 10),
+    (Error::Overflow, 11),
+    (Error::InvalidAmount, 12),
+    // --- Policy (20-29) ---
+    (Error::PolicyDenied, 20),
+    (Error::EmergencyLock, 21),
+    (Error::PolicyRecipientRestricted, 22),
+    (Error::PolicyMerchantBlocked, 23),
+    (Error::PolicyCategoryRestricted, 24),
+    (Error::VelocityLimitExceeded, 27),
+    // --- Registry (30-39) ---
+    (Error::RegistryFrozen, 30),
+    (Error::ModuleDeprecated, 31),
+    // --- Budget (40-44) ---
+    (Error::BudgetExceeded, 40),
+    (Error::BudgetFrozen, 41),
+    (Error::BudgetArchived, 42),
+    (Error::AssetNotAuthorized, 43),
+    (Error::BudgetExpired, 44),
+    // --- Wallet (50-53) ---
+    (Error::WalletFrozen, 50),
+    (Error::WalletArchived, 51),
+    (Error::WalletPaused, 52),
+    (Error::InvalidState, 53),
+    // --- Multisig / approvals (61-69, 90-92) ---
+    (Error::ThresholdNotMet, 61),
+    (Error::AlreadySigned, 62),
+    (Error::NotASigner, 63),
+    (Error::InvalidThreshold, 64),
+    (Error::TooManySigners, 66),
+    (Error::BatchCallFailed, 67),
+    (Error::InvalidNonce, 68),
+    (Error::InvalidSignerWeight, 69),
+    (Error::InsufficientWeight, 90),
+    (Error::TimelockNotExpired, 91),
+    (Error::UnauthorizedModification, 92),
+    // --- Proposal (71-79) ---
+    (Error::ProposalExpired, 71),
+    (Error::InvalidProposalState, 72),
+    (Error::ProposalNotApproved, 73),
+    (Error::NotAnApprover, 74),
+    (Error::CancellationWindowClosed, 75),
+    (Error::PrerequisiteNotMet, 78),
+    (Error::CircularDependencyDetected, 79),
+    // --- Escrow (80-82) ---
+    (Error::EscrowExpired, 80),
+    (Error::TimeLockActive, 81),
+    (Error::GraceActive, 82),
+    // --- Treasury (83-85) ---
+    (Error::AllowanceExceeded, 83),
+    (Error::AllowanceExpired, 84),
+    (Error::TreasuryPaused, 85),
+];
+
+#[test]
+fn error_code_table_is_frozen() {
+    // Every reachable variant is accounted for: `ALL` is the enumeration the
+    // audit walks, so a mismatch here means a variant was added to (or removed
+    // from) the enum without updating the audited table.
+    assert_eq!(Error::ALL.len(), EXPECTED_CODES.len());
+    for (variant, expected) in EXPECTED_CODES {
+        assert_eq!(
+            variant.code(),
+            expected,
+            "{:?} must keep its published code",
+            variant
+        );
+    }
+}
+
+#[test]
+fn error_codes_are_unique_and_never_overlap() {
+    for (i, variant) in Error::ALL.iter().enumerate() {
+        let code = variant.code();
+        assert_ne!(code, 0, "{:?} may not take the reserved code 0", variant);
+        // Compare against every later variant: two variants sharing a code is
+        // the failure mode that makes a failure unattributable off chain.
+        for other in &Error::ALL[i + 1..] {
+            assert_ne!(
+                other.code(),
+                code,
+                "code {} is claimed by both {:?} and {:?}",
+                code,
+                variant,
+                other
+            );
+        }
+    }
+}
+
+#[test]
+fn error_code_bands_are_ascending() {
+    // Each contract's band is declared ascending, so a variant dropped into the
+    // wrong block — the usual symptom of an accidental renumber — shows up as
+    // a non-ascending band rather than passing silently.
+    let bands: [(u32, u32); 9] = [
+        (1, 6),
+        (10, 12),
+        (20, 29),
+        (30, 39),
+        (40, 44),
+        (50, 53),
+        (60, 69),
+        (70, 79),
+        (90, 92),
+    ];
+    for (low, high) in bands {
+        let mut previous: Option<u32> = None;
+        for variant in Error::ALL {
+            if variant.code() < low || variant.code() > high {
+                continue;
+            }
+            if let Some(prev) = previous {
+                assert!(
+                    prev < variant.code(),
+                    "band {low}-{high} is not ascending: {prev} then {}",
+                    variant.code()
+                );
+            }
+            previous = Some(variant.code());
+        }
+    }
+}
+
+#[test]
+fn retired_error_codes_are_never_reused() {
+    for (variant, code) in EXPECTED_CODES {
+        assert!(
+            !RETIRED_CODES.contains(&code),
+            "{:?} was assigned retired code {}",
+            variant,
+            code
+        );
+    }
+}
+
+#[test]
+fn error_domains_do_not_overlap() {
+    // Each contract's codes live in their own numeric band, so a code observed
+    // on chain attributes to exactly one contract. The generic 1-6 and value
+    // 10-12 bands are shared by design and excluded.
+    let registry = Error::ALL
+        .iter()
+        .filter(|e| (30..40).contains(&e.code()))
+        .count();
+    let budget = Error::ALL
+        .iter()
+        .filter(|e| (40..45).contains(&e.code()))
+        .count();
+    let wallet = Error::ALL
+        .iter()
+        .filter(|e| (50..54).contains(&e.code()))
+        .count();
+    let multisig = Error::ALL
+        .iter()
+        .filter(|e| (60..70).contains(&e.code()) || (90..93).contains(&e.code()))
+        .count();
+    let proposal = Error::ALL
+        .iter()
+        .filter(|e| (70..80).contains(&e.code()))
+        .count();
+    let escrow = Error::ALL
+        .iter()
+        .filter(|e| (80..83).contains(&e.code()))
+        .count();
+    let treasury = Error::ALL
+        .iter()
+        .filter(|e| (83..86).contains(&e.code()))
+        .count();
+    let policy = Error::ALL
+        .iter()
+        .filter(|e| (20..30).contains(&e.code()))
+        .count();
+
+    assert_eq!(registry, 2, "registry band 30-39");
+    assert_eq!(budget, 5, "budget band 40-44");
+    assert_eq!(wallet, 4, "wallet band 50-53");
+    assert_eq!(multisig, 11, "multisig bands 61-69 and 90-92");
+    assert_eq!(proposal, 7, "proposal band 71-79");
+    assert_eq!(escrow, 3, "escrow band 80-82");
+    assert_eq!(treasury, 3, "treasury band 83-85");
+    assert_eq!(policy, 6, "policy band 20-29");
+}
+
+#[test]
+fn error_codes_round_trip_through_the_host_error() {
+    // A contract returning `Err(Error::X)` reaches the caller as a
+    // `soroban_sdk::Error` carrying `X.code()`. The generated `TryFrom` must
+    // map every code back to its variant, otherwise the consumer sees a code it
+    // cannot attribute.
+    for variant in Error::ALL {
+        let host = soroban_sdk::Error::from(variant);
+        assert_eq!(host.get_code(), variant.code());
+        assert_eq!(Error::try_from(host), Ok(variant));
+    }
+}
+
+#[test]
+fn unknown_error_codes_are_never_decoded() {
+    // A code outside the table (e.g. emitted by a future contract version an
+    // old consumer has not learned yet) must stay an opaque error rather than
+    // being guessed at.
+    let unknown = soroban_sdk::Error::from_contract_error(4_294_967_295);
+    assert!(Error::try_from(unknown).is_err());
+}
