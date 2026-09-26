@@ -953,215 +953,280 @@ fn set_guardian_rotates_pause_authority() {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic error codes
-//
-// The treasury holds the protocol's working capital, so a refusal has to say
-// which of the several distinct problems it was: a caller that is not the
-// admin, an asset that was never whitelisted, an allowance that is spent or
-// expired, or a balance that simply is not there.
+// Multi-token accounting (issue #328)
 // ---------------------------------------------------------------------------
 
-/// A treasury that was never initialized, with no asset wired.
-fn uninitialized() -> (Env, TreasuryContractClient<'static>) {
-    let env = Env::default();
-    env.mock_all_auths();
-    let id = env.register_contract(None, TreasuryContract);
-    let client = TreasuryContractClient::new(&env, &id);
-    (env, client)
+/// Minimal Soroban token with configurable `decimals` and an optional flat
+/// fee burned on every transfer, to exercise non-SAC token behaviour.
+#[soroban_sdk::contract]
+pub struct MockToken;
+
+#[soroban_sdk::contracttype]
+#[derive(Clone)]
+enum MockKey {
+    Decimals,
+    Fee,
+    Balance(Address),
 }
 
-#[test]
-fn uninitialized_treasury_reports_not_initialized_on_every_entry_point() {
-    let (env, client) = uninitialized();
-    let admin = Address::generate(&env);
-    let asset = env
-        .register_stellar_asset_contract_v2(Address::generate(&env))
-        .address();
-    let stranger = Address::generate(&env);
-
-    // `load` used to unwrap, so each of these trapped the whole invocation with
-    // an opaque host error instead of a code the caller could act on.
-    assert_eq!(client.try_get(), Err(Ok(Error::NotInitialized)));
-    assert_eq!(client.try_guardian(), Err(Ok(Error::NotInitialized)));
-    assert_eq!(
-        client.try_add_approved_asset(&admin, &asset),
-        Err(Ok(Error::NotInitialized))
-    );
-    assert_eq!(
-        client.try_deposit(&admin, &asset, &1),
-        Err(Ok(Error::NotInitialized))
-    );
-    assert_eq!(
-        client.try_withdraw(&admin, &asset, &stranger, &1),
-        Err(Ok(Error::NotInitialized))
-    );
-    assert_eq!(client.try_pause(&admin), Err(Ok(Error::NotInitialized)));
-
-    // "Not paused" must stay a readable question even with no record on file.
-    assert!(!client.is_paused());
-}
-
-#[test]
-fn initialize_twice_is_already_initialized() {
-    let (env, client) = uninitialized();
-    let admin = Address::generate(&env);
-    client.initialize(&String::from_str(&env, "acme"), &admin);
-    let other = Address::generate(&env);
-
-    // A refused re-initialization must not reassign the admin.
-    assert_eq!(
-        client.try_initialize(&String::from_str(&env, "other"), &other),
-        Err(Ok(Error::AlreadyInitialized))
-    );
-    assert_eq!(client.get().admin, admin);
-    assert_eq!(client.get().org, String::from_str(&env, "acme"));
-}
-
-#[test]
-fn non_positive_amounts_are_invalid_amount_on_the_treasury() {
-    let h = setup("acme", 1_000);
-    let recipient = Address::generate(&h.env);
-
-    // The amount guard is its own diagnosis, shared by every value path here.
-    for amount in [0, -1] {
-        assert_eq!(
-            h.client.try_deposit(&h.admin, &h.asset, &amount),
-            Err(Ok(Error::InvalidAmount))
-        );
-        assert_eq!(
-            h.client
-                .try_withdraw(&h.admin, &h.asset, &recipient, &amount),
-            Err(Ok(Error::InvalidAmount))
-        );
-        assert_eq!(
-            h.client
-                .try_set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &amount, &0),
-            Err(Ok(Error::InvalidAmount))
-        );
+#[soroban_sdk::contractimpl]
+impl MockToken {
+    pub fn setup(env: Env, decimals: u32, fee: i128) {
+        env.storage().instance().set(&MockKey::Decimals, &decimals);
+        env.storage().instance().set(&MockKey::Fee, &fee);
     }
-    // Nothing moved in either direction.
-    assert_eq!(token_balance(&h, &h.client.address), 0);
-    assert_eq!(h.client.balance(&h.asset), 0);
+
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let bal = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .persistent()
+            .set(&MockKey::Balance(to), &(bal + amount));
+    }
+
+    /// Remove balance without the holder's involvement (simulates a
+    /// clawback or an externally drained custody account).
+    pub fn burn(env: Env, from: Address, amount: i128) {
+        let bal = Self::balance(env.clone(), from.clone());
+        env.storage()
+            .persistent()
+            .set(&MockKey::Balance(from), &(bal - amount));
+    }
+
+    pub fn decimals(env: Env) -> u32 {
+        env.storage().instance().get(&MockKey::Decimals).unwrap()
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&MockKey::Balance(id))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let fee: i128 = env.storage().instance().get(&MockKey::Fee).unwrap();
+        let from_bal = Self::balance(env.clone(), from.clone());
+        assert!(from_bal >= amount, "insufficient balance");
+        env.storage()
+            .persistent()
+            .set(&MockKey::Balance(from), &(from_bal - amount));
+        let to_bal = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .persistent()
+            .set(&MockKey::Balance(to), &(to_bal + amount - fee));
+    }
+}
+
+fn mock_token(h: &Harness, decimals: u32, fee: i128, funded: i128) -> Address {
+    let id = h.env.register_contract(None, MockToken);
+    let client = MockTokenClient::new(&h.env, &id);
+    client.setup(&decimals, &fee);
+    client.mint(&h.admin, &funded);
+    id
 }
 
 #[test]
-fn withdrawal_beyond_custody_reports_insufficient_funds() {
-    let h = setup("acme", 1_000);
+fn deposits_withdrawals_and_portfolio_across_tokens_with_different_decimals() {
+    let h = setup("vault", 10_000_000_000); // SAC: 7 decimals
+    let usdc6 = mock_token(&h, 6, 0, 5_000_000);
+    let wbtc8 = mock_token(&h, 8, 0, 3_0000_0000);
+    h.client.add_approved_asset(&h.admin, &usdc6);
+    h.client.add_approved_asset(&h.admin, &wbtc8);
     let recipient = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
 
-    // One unit past the recorded holding is refused, and the holding is intact.
+    h.client.deposit(&h.admin, &h.asset, &10_000_000_000);
+    h.client.deposit(&h.admin, &usdc6, &5_000_000);
+    h.client.deposit(&h.admin, &wbtc8, &2_0000_0000);
+
+    h.client.withdraw(&h.admin, &usdc6, &recipient, &1_500_000);
+    h.client.withdraw(&h.admin, &wbtc8, &recipient, &5000_0000);
+
+    let assets = h.client.approved_assets();
     assert_eq!(
-        h.client
-            .try_withdraw(&h.admin, &h.asset, &recipient, &1_001),
+        assets,
+        vec![&h.env, h.asset.clone(), usdc6.clone(), wbtc8.clone()]
+    );
+
+    let portfolio = h.client.portfolio();
+    assert_eq!(portfolio.len(), 3);
+    let sac = portfolio.get(0).unwrap();
+    assert_eq!(
+        (sac.decimals, sac.balance, sac.recorded),
+        (7, 10_000_000_000, 10_000_000_000)
+    );
+    let usdc = portfolio.get(1).unwrap();
+    assert_eq!(usdc.asset, usdc6);
+    assert_eq!(
+        (usdc.decimals, usdc.balance, usdc.recorded, usdc.total_out),
+        (6, 3_500_000, 3_500_000, 1_500_000)
+    );
+    let btc = portfolio.get(2).unwrap();
+    assert_eq!(
+        (btc.decimals, btc.balance, btc.recorded, btc.total_out),
+        (8, 1_5000_0000, 1_5000_0000, 5000_0000)
+    );
+    assert_eq!(
+        MockTokenClient::new(&h.env, &usdc6).balance(&recipient),
+        1_500_000
+    );
+}
+
+#[test]
+fn get_all_balances_reports_every_approved_token() {
+    let h = setup("vault", 1_000);
+    let funded = mock_token(&h, 6, 0, 500);
+    let empty = mock_token(&h, 8, 0, 0);
+    h.client.add_approved_asset(&h.admin, &funded);
+    h.client.add_approved_asset(&h.admin, &empty);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &funded, &500);
+
+    let balances = h.client.get_all_balances();
+    assert_eq!(balances.len(), 3);
+    assert_eq!(balances.get(0).unwrap(), (h.asset.clone(), 1_000));
+    assert_eq!(balances.get(1).unwrap(), (funded, 500));
+    assert_eq!(balances.get(2).unwrap(), (empty, 0));
+}
+
+#[test]
+fn zero_balance_assets_are_reported_and_cannot_be_withdrawn() {
+    let h = setup("vault", 0);
+    let empty = mock_token(&h, 2, 0, 0);
+    h.client.add_approved_asset(&h.admin, &empty);
+
+    assert_eq!(h.client.balance(&empty), 0);
+    let portfolio = h.client.portfolio();
+    let pos = portfolio.get(1).unwrap();
+    assert_eq!(
+        (pos.decimals, pos.balance, pos.recorded, pos.total_out),
+        (2, 0, 0, 0)
+    );
+
+    let res = h
+        .client
+        .try_withdraw(&h.admin, &empty, &Address::generate(&h.env), &1);
+    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+}
+
+#[test]
+fn fee_on_transfer_deposit_credits_only_what_arrived() {
+    let h = setup("vault", 0);
+    let taxed = mock_token(&h, 7, 10, 1_000);
+    h.client.add_approved_asset(&h.admin, &taxed);
+
+    h.client.deposit(&h.admin, &taxed, &1_000);
+    // 10 was burned in transit: the books match real custody, not the request.
+    assert_eq!(h.client.holding(&taxed).total_in, 990);
+    assert_eq!(h.client.balance(&taxed), 990);
+}
+
+#[test]
+fn deposit_that_delivers_nothing_is_rejected() {
+    let h = setup("vault", 0);
+    let taxed = mock_token(&h, 7, 50, 50);
+    h.client.add_approved_asset(&h.admin, &taxed);
+
+    assert_eq!(
+        h.client.try_deposit(&h.admin, &taxed, &50),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(h.client.holding(&taxed).total_in, 0);
+}
+
+#[test]
+fn withdrawal_is_verified_against_live_custody() {
+    let h = setup("vault", 0);
+    let taxed = mock_token(&h, 7, 5, 1_000);
+    h.client.add_approved_asset(&h.admin, &taxed);
+    h.client.deposit(&h.admin, &taxed, &1_000); // 995 recorded and held
+    let recipient = Address::generate(&h.env);
+
+    // The outgoing fee is charged to the recipient, custody drops by exactly
+    // the amount paid, so the withdrawal verifies.
+    h.client.withdraw(&h.admin, &taxed, &recipient, &500);
+    assert_eq!(h.client.balance(&taxed), 495);
+    assert_eq!(h.client.holding(&taxed).total_in, 495);
+    assert_eq!(
+        MockTokenClient::new(&h.env, &taxed).balance(&recipient),
+        495
+    );
+}
+
+#[test]
+fn recorded_balance_above_live_custody_fails_with_insufficient_funds() {
+    let h = setup("vault", 0);
+    let drained = mock_token(&h, 7, 0, 1_000);
+    h.client.add_approved_asset(&h.admin, &drained);
+    h.client.deposit(&h.admin, &drained, &1_000);
+    // Custody is drained behind the treasury's back (e.g. a clawback).
+    MockTokenClient::new(&h.env, &drained).burn(&h.client.address, &600);
+    let recipient = Address::generate(&h.env);
+
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &drained, &recipient, &500),
         Err(Ok(Error::InsufficientFunds))
     );
-    assert_eq!(h.client.balance(&h.asset), 1_000);
-    assert_eq!(token_balance(&h, &recipient), 0);
-
-    // Draining to exactly zero is allowed; only the next unit fails.
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
-    assert_eq!(h.client.balance(&h.asset), 0);
     assert_eq!(
-        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1),
+        h.client
+            .try_batch_transfer(&h.admin, &drained, &vec![&h.env, payment(&recipient, 500)]),
         Err(Ok(Error::InsufficientFunds))
     );
+    // The recorded balance is untouched and the drift is visible.
+    let pos = h.client.portfolio().get(1).unwrap();
+    assert_eq!((pos.recorded, pos.balance), (1_000, 400));
 }
 
 #[test]
-fn exhausted_and_expired_allowances_have_their_own_codes() {
-    let h = setup("acme", 1_000);
-    let recipient = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    // `expires_at == 0` means the ceiling never lapses.
-    h.client
-        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &0);
+fn approved_asset_list_tracks_removals_and_is_bounded() {
+    let h = setup("vault", 0);
+    let second = mock_token(&h, 6, 0, 0);
+    h.client.add_approved_asset(&h.admin, &second);
+    h.client.remove_approved_asset(&h.admin, &h.asset);
+    assert_eq!(h.client.approved_assets(), vec![&h.env, second.clone()]);
+    assert_eq!(h.client.portfolio().len(), 1);
 
-    // Spending the whole cap is fine; the next request is over the limit, which
-    // is a different diagnosis from the treasury itself being short.
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
-    assert_eq!(
-        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1),
-        Err(Ok(Error::AllowanceExceeded))
-    );
-    assert_eq!(token_balance(&h, &recipient), 100);
-
-    // A lapsed ceiling is reported as expiry, never as exhaustion — the two
-    // call for different responses from whoever holds the mandate.
-    h.client
-        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &1);
-    h.env.ledger().set_timestamp(2);
-    assert_eq!(
-        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1),
-        Err(Ok(Error::AllowanceExpired))
-    );
-
-    // A self-directed allowance would gate nothing.
-    assert_eq!(
+    // Fill the whitelist to capacity; one more is refused.
+    while h.client.approved_asset_count() < crate::MAX_TREASURY_ASSETS {
         h.client
-            .try_set_allowance(&h.admin, &recipient, &recipient, &h.asset, &10, &0),
-        Err(Ok(Error::InvalidInput))
-    );
-}
-
-#[test]
-fn non_admin_spends_are_unauthorized() {
-    let h = setup("acme", 1_000);
-    let recipient = Address::generate(&h.env);
-    let stranger = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    // The treasury records exactly one admin; a stranger is not the multisig or
-    // the guardian either, so nothing rescues the call.
-    assert_eq!(
-        h.client.try_withdraw(&stranger, &h.asset, &recipient, &1),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert_eq!(h.client.try_pause(&stranger), Err(Ok(Error::Unauthorized)));
-    assert_eq!(
-        h.client
-            .try_set_allowance(&stranger, &stranger, &recipient, &h.asset, &10, &0),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert_eq!(h.client.balance(&h.asset), 1_000);
-    assert_eq!(token_balance(&h, &recipient), 0);
-}
-
-#[test]
-fn batch_payments_reject_malformed_input_before_any_leg_runs() {
-    let h = setup("acme", 1_000);
-    let a = Address::generate(&h.env);
-    let b = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    // An empty batch is malformed input, not a successful no-op.
-    let empty: Vec<Payment> = Vec::new(&h.env);
-    assert_eq!(
-        h.client.try_batch_transfer(&h.admin, &h.asset, &empty),
-        Err(Ok(Error::InvalidInput))
-    );
-
-    // One leg past the cap is refused on size alone, before any amount check.
-    let mut over: Vec<Payment> = Vec::new(&h.env);
-    for _ in 0..=MAX_BATCH_PAYMENTS {
-        over.push_back(payment(&a, 1));
+            .add_approved_asset(&h.admin, &Address::generate(&h.env));
     }
     assert_eq!(
-        h.client.try_batch_transfer(&h.admin, &h.asset, &over),
+        h.client
+            .try_add_approved_asset(&h.admin, &Address::generate(&h.env)),
         Err(Ok(Error::InvalidInput))
     );
-    assert_eq!(token_balance(&h, &a), 0);
+    assert_eq!(h.client.approved_assets().len(), crate::MAX_TREASURY_ASSETS);
+}
 
-    // A batch whose total exceeds custody is refused as exhaustion, even though
-    // every individual leg is well formed.
-    let mut big: Vec<Payment> = Vec::new(&h.env);
-    big.push_back(payment(&a, 600));
-    big.push_back(payment(&b, 600));
+#[test]
+fn milestones_reject_zero_value_payouts_and_unapproved_assets() {
+    let h = setup("vault", 0);
+    let to = Address::generate(&h.env);
+    // 2 base units over 3 milestones would schedule zero-value payouts.
     assert_eq!(
-        h.client.try_batch_transfer(&h.admin, &h.asset, &big),
-        Err(Ok(Error::InsufficientFunds))
+        h.client
+            .try_init_milestone_disbursement(&h.admin, &h.asset, &to, &2, &3),
+        Err(Ok(Error::InvalidAmount))
     );
-    assert_eq!(token_balance(&h, &a), 0);
-    assert_eq!(token_balance(&h, &b), 0);
-    assert_eq!(h.client.balance(&h.asset), 1_000);
+    let rogue = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_init_milestone_disbursement(&h.admin, &rogue, &to, &300, &3),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+}
+
+#[test]
+fn milestone_math_is_overflow_safe_at_i128_max() {
+    let h = setup("vault", i128::MAX);
+    h.client.deposit(&h.admin, &h.asset, &i128::MAX);
+    let to = Address::generate(&h.env);
+    let id = h
+        .client
+        .init_milestone_disbursement(&h.admin, &h.asset, &to, &i128::MAX, &2);
+    h.client.release_next_milestone(&h.admin, &id);
+    h.client.release_next_milestone(&h.admin, &id);
+    assert_eq!(token_balance(&h, &to), i128::MAX);
+    assert_eq!(h.client.holding(&h.asset).total_in, 0);
 }

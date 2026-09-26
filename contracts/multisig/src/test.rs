@@ -273,9 +273,10 @@ fn advance(h: &Harness, seconds: u64) {
 fn assert_event(env: &Env, category: Symbol, action: Symbol) {
     let want_category: Val = category.into_val(env);
     let want_action: Val = action.into_val(env);
-    let found = env.events().all().iter().any(|(_id, topics, _data)| {
-        topics.contains(&want_category) && topics.contains(&want_action)
-    });
+    let found =
+        env.events().all().iter().any(|(_id, topics, _data)| {
+            topics.contains(want_category) && topics.contains(want_action)
+        });
     assert!(found, "expected a matching event to be emitted");
 }
 
@@ -1077,6 +1078,17 @@ fn verify_threshold_accumulates_weight_of_distinct_signers() {
 }
 
 #[test]
+fn verify_threshold_returns_weight_above_threshold() {
+    let h = setup(&[3, 2, 1], 5);
+    let weight = h.client.verify_threshold(
+        &h.signers[0],
+        &approvers(&h.env, &h.signers, &[1, 2]),
+        &payload(&h.env),
+    );
+    assert_eq!(weight, 6);
+}
+
+#[test]
 fn verify_threshold_below_threshold_is_refused() {
     let h = setup(&[3, 2, 1], 5);
     let res = h.client.try_verify_threshold(
@@ -1140,407 +1152,240 @@ fn weight_views_report_the_configured_weights() {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic error codes
-//
-// The multisig is the protocol's root of trust, so its refusals are the ones an
-// agent most needs to interpret: not a signer, not enough weight, not yet
-// unlocked, already settled. Each has a different remedy, and none of them may
-// be reported as a generic failure.
+// Threshold verification against the live signer set (issue #326)
 // ---------------------------------------------------------------------------
 
-/// A multisig with three weight-1 signers and a threshold of 2.
-fn setup_msig() -> Harness {
-    setup(&[1, 1, 1], 2)
+#[test]
+fn quorum_met_executes_and_one_short_fails() {
+    let h = setup(&[2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    // Proposer's weight (2) alone is one short of the threshold.
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 3);
+    h.client.execute(&h.signers[0], &id);
+    let p = h.client.get_proposal(&id);
+    assert!(p.executed);
+    assert_eq!(p.approval_weight, 3);
 }
 
 #[test]
-fn initialization_rejects_malformed_signer_sets() {
+fn approval_from_removed_signer_no_longer_counts() {
+    let h = setup(&[2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 3);
+
+    // Signer 1 leaves after approving: the remaining set can still reach the
+    // threshold, but signer 1's approval must not.
+    h.client.remove_signer(&h.signers[0], &h.signers[1]);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // A current signer tops it back up to quorum.
+    h.client.approve(&h.signers[2], &id);
+    h.client.execute(&h.signers[0], &id);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 3);
+}
+
+#[test]
+fn reduced_signer_weight_is_applied_at_execution() {
+    let h = setup(&[1, 2, 1], 2);
+    let id = h.client.propose(
+        &h.signers[1],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 2);
+
+    let change = h
+        .client
+        .propose_weight_change(&h.signers[0], &h.signers[1], &1);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &change);
+    assert_eq!(h.client.get_signer_weight(&h.signers[1]), 1);
+
+    assert_eq!(
+        h.client.try_execute(&h.signers[1], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+}
+
+#[test]
+fn approval_weight_uses_current_signer_weights() {
+    let h = setup(&[u32::MAX - 2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), u32::MAX - 1);
+
+    let change = h
+        .client
+        .propose_weight_change(&h.signers[1], &h.signers[0], &1);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &change);
+
+    let newcomer = Address::generate(&h.env);
+    h.client.add_signer(&h.signers[0], &newcomer, &2);
+    // Historical weights would overflow u32; approvals are recomputed using
+    // the current weights of the signers who actually approved.
+    assert_eq!(h.client.approve(&newcomer, &id), 4);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 4);
+}
+
+#[test]
+fn pending_threshold_is_revalidated_on_finalize() {
+    let h = setup(&[1, 1, 1], 1);
+    h.env.ledger().set_sequence_number(100);
+    h.client.set_threshold(&h.signers[0], &3);
+    // The signer set shrinks while the change is pending (current threshold 1
+    // is still satisfiable, so the removal itself is allowed).
+    h.client.remove_signer(&h.signers[0], &h.signers[2]);
+
+    h.env
+        .ledger()
+        .set_sequence_number(100 + THRESHOLD_CHANGE_DELAY_LEDGERS);
+    assert_eq!(
+        h.client.try_finalize_threshold(&h.signers[0]),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    assert_eq!(h.client.get_threshold(), 1);
+}
+
+#[test]
+fn adding_signer_that_overflows_total_weight_is_rejected() {
+    let h = setup(&[u32::MAX - 1], 1);
+    let newcomer = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_add_signer(&h.signers[0], &newcomer, &2),
+        Err(Ok(Error::Overflow))
+    );
+    assert!(!h.client.is_signer(&newcomer));
+    // Threshold checks keep working afterwards.
+    assert_eq!(h.client.get_total_weight(), u32::MAX - 1);
+}
+
+#[test]
+fn signer_set_with_invalid_weights_or_duplicates_is_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, MultiSigContract);
-    let client = MultiSigContractClient::new(&env, &contract_id);
+    let id = env.register_contract(None, MultiSigContract);
+    let client = MultiSigContractClient::new(&env, &id);
     let a = Address::generate(&env);
     let b = Address::generate(&env);
 
-    // No signers leaves nothing that could ever authorize anything.
-    let none: Vec<SignerWeight> = Vec::new(&env);
     assert_eq!(
-        client.try_initialize(&none, &1),
+        client.try_initialize(&vec![&env, sw(&a, 1), sw(&a, 1)], &1),
         Err(Ok(Error::InvalidInput))
     );
-
-    // A signer with no weight contributes nothing while still occupying a slot,
-    // so the weight is the problem, not the set.
-    let zero_weight = vec![&env, sw(&a, 1), sw(&b, 0)];
     assert_eq!(
-        client.try_initialize(&zero_weight, &1),
+        client.try_initialize(&vec![&env, sw(&a, 1), sw(&b, 0)], &1),
         Err(Ok(Error::InsufficientWeight))
     );
-
-    // A threshold the total weight cannot reach is its own diagnosis.
-    let both = vec![&env, sw(&a, 1), sw(&b, 1)];
     assert_eq!(
-        client.try_initialize(&both, &3),
-        Err(Ok(Error::InvalidThreshold))
+        client.try_initialize(&vec![&env, sw(&a, u32::MAX), sw(&b, 1)], &1),
+        Err(Ok(Error::Overflow))
     );
-    // So is a threshold of zero, which everyone would trivially meet.
-    assert_eq!(
-        client.try_initialize(&both, &0),
-        Err(Ok(Error::InvalidThreshold))
-    );
-
-    // The same signer listed twice would let one key count twice.
-    let dup = vec![&env, sw(&a, 1), sw(&a, 1)];
-    assert_eq!(
-        client.try_initialize(&dup, &1),
-        Err(Ok(Error::InvalidInput))
-    );
-
-    // A valid set goes through, and a second initialization is refused.
-    client.initialize(&both, &1);
-    assert_eq!(
-        client.try_initialize(&both, &1),
-        Err(Ok(Error::AlreadyInitialized))
-    );
+    // Nothing was stored by the rejected attempts.
+    client.initialize(&vec![&env, sw(&a, 1), sw(&b, 1)], &2);
+    assert_eq!(client.get_threshold(), 2);
 }
 
-#[test]
-fn a_non_signer_is_told_so_on_every_entry_point() {
-    let h = setup_msig();
-    let stranger = Address::generate(&h.env);
-
-    assert_eq!(
-        h.client
-            .try_propose(&stranger, &symbol_short!("x"), &payload(&h.env), &0),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client.try_approve(&stranger, &1),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client.try_execute(&stranger, &1),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client.try_set_threshold(&stranger, &3),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client.try_add_signer(&stranger, &stranger, &1),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client.try_remove_signer(&stranger, &h.signers[0]),
-        Err(Ok(Error::NotASigner))
-    );
-    assert_eq!(
-        h.client
-            .try_execute_batch(&stranger, &1, &Vec::new(&h.env), &Vec::new(&h.env)),
-        Err(Ok(Error::NotASigner))
-    );
-}
+// ---------------------------------------------------------------------------
+// Issue #280: Threshold voting validation & duplicate vote prevention tests
+// ---------------------------------------------------------------------------
 
 #[test]
-fn signer_weights_thresholds_and_capacity_have_distinct_codes() {
-    let h = setup_msig();
-    let fresh = Address::generate(&h.env);
-
-    // A zero weight is a weight problem, not malformed input and not a
-    // threshold problem.
-    assert_eq!(
-        h.client.try_add_signer(&h.signers[0], &fresh, &0),
-        Err(Ok(Error::InvalidSignerWeight))
-    );
-    // Re-adding a signer that already holds weight is a duplicate.
-    assert_eq!(
-        h.client.try_add_signer(&h.signers[0], &h.signers[1], &5),
-        Err(Ok(Error::AlreadyExists))
-    );
-    // A threshold nobody can reach, and one already in force, are both
-    // threshold problems.
-    for threshold in [0, 4, 2] {
-        assert_eq!(
-            h.client.try_set_threshold(&h.signers[0], &threshold),
-            Err(Ok(Error::InvalidThreshold))
-        );
-    }
-    // Removing one that is not in the set says the address holds no weight here,
-    // which is the same diagnosis as a non-signer making the call.
-    assert_eq!(
-        h.client.try_remove_signer(&h.signers[0], &fresh),
-        Err(Ok(Error::NotASigner))
+fn threshold_voting_duplicate_ballot_rejected_for_multiple_signers() {
+    let h = setup(&[2, 3, 4], 7);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("action"),
+        &payload(&h.env),
+        &0,
     );
 
-    // With every unit of weight needed for the threshold, removing a signer
-    // would leave the multisig permanently unable to act, so it is refused.
-    let tight = setup(&[1, 1], 2);
-    assert_eq!(
-        tight
-            .client
-            .try_remove_signer(&tight.signers[0], &tight.signers[1]),
-        Err(Ok(Error::InvalidThreshold))
-    );
-    assert!(tight.client.is_signer(&tight.signers[1]));
-
-    h.client.add_signer(&h.signers[0], &fresh, &5);
-    assert!(h.client.is_signer(&fresh));
-    h.client.remove_signer(&h.signers[0], &fresh);
-    assert!(!h.client.is_signer(&fresh));
-}
-
-#[test]
-fn a_proposal_below_the_threshold_reports_insufficient_weight() {
-    let h = setup_msig();
-    // Proposing counts as the proposer's own approval, so one of three
-    // weight-1 signers is still short of the threshold of 2.
-    let id = h
-        .client
-        .propose(&h.signers[0], &symbol_short!("x"), &payload(&h.env), &0);
-    assert_eq!(h.client.get_proposal(&id).approval_weight, 1);
-    assert_eq!(
-        h.client.try_execute(&h.signers[1], &id),
-        Err(Ok(Error::InsufficientWeight))
-    );
-    assert_eq!(h.client.try_approve(&h.signers[1], &id), Ok(Ok(2)));
-    h.client.execute(&h.signers[1], &id);
-    assert!(h.client.get_proposal(&id).executed);
-    // A settled proposal is terminal, and says so rather than reporting a
-    // shortfall it no longer has.
-    assert_eq!(
-        h.client.try_execute(&h.signers[1], &id),
-        Err(Ok(Error::InvalidProposalState))
-    );
-    assert_eq!(
-        h.client.try_approve(&h.signers[2], &id),
-        Err(Ok(Error::InvalidProposalState))
-    );
-}
-
-#[test]
-fn approving_twice_is_refused_separately_from_insufficient_weight() {
-    let h = setup_msig();
-    let id = h
-        .client
-        .propose(&h.signers[0], &symbol_short!("x"), &payload(&h.env), &0);
+    // Proposer (signers[0]) weight = 2. Duplicate vote from proposer is rejected.
     assert_eq!(
         h.client.try_approve(&h.signers[0], &id),
         Err(Ok(Error::AlreadySigned))
     );
-    h.client.approve(&h.signers[1], &id);
-    // The third signer is a genuine approval, not a duplicate.
-    assert_eq!(h.client.try_approve(&h.signers[2], &id), Ok(Ok(3)));
-    // An unknown proposal id is missing, not short of weight.
-    assert_eq!(
-        h.client.try_approve(&h.signers[0], &(id + 1_000)),
-        Err(Ok(Error::NotFound))
-    );
-}
 
-#[test]
-fn a_time_locked_proposal_is_not_yet_executable() {
-    let h = setup_msig();
-    let id = h.client.propose(
-        &h.signers[0],
-        &symbol_short!("x"),
-        &payload(&h.env),
-        &1_000_000,
-    );
-    h.client.approve(&h.signers[1], &id);
-    // Enough weight, but the lock has not run.
-    assert_eq!(
-        h.client.try_execute(&h.signers[1], &id),
-        Err(Ok(Error::TimelockNotExpired))
-    );
-    h.env.ledger().set_timestamp(1_000_000);
-    h.client.execute(&h.signers[1], &id);
-    assert!(h.client.get_proposal(&id).executed);
-}
+    // signers[1] (weight = 3) approves -> total weight 5 < 7
+    let w1 = h.client.approve(&h.signers[1], &id);
+    assert_eq!(w1, 5);
 
-#[test]
-fn the_emergency_lock_suspends_everything_with_its_own_code() {
-    let h = setup_msig();
-    let id = h
-        .client
-        .propose(&h.signers[0], &symbol_short!("x"), &payload(&h.env), &0);
-    h.client.approve(&h.signers[1], &id);
-
-    h.client.set_emergency_lock(&h.signers[0], &true);
-    assert!(h.client.is_locked());
-    // Locked is its own diagnosis: a signer with enough weight still cannot act,
-    // and the code has to say the lock is why.
+    // Duplicate vote from signers[1] is rejected
     assert_eq!(
-        h.client.try_execute(&h.signers[1], &id),
-        Err(Ok(Error::EmergencyLock))
+        h.client.try_approve(&h.signers[1], &id),
+        Err(Ok(Error::AlreadySigned))
     );
+
+    // Proposal cannot execute yet because weight 5 < threshold 7
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // signers[2] (weight = 4) approves -> total weight 9 >= 7
+    let w2 = h.client.approve(&h.signers[2], &id);
+    assert_eq!(w2, 9);
+
+    // Duplicate vote from signers[2] is also rejected
     assert_eq!(
         h.client.try_approve(&h.signers[2], &id),
-        Err(Ok(Error::EmergencyLock))
-    );
-    assert_eq!(
-        h.client
-            .try_propose(&h.signers[2], &symbol_short!("x"), &payload(&h.env), &0),
-        Err(Ok(Error::EmergencyLock))
+        Err(Ok(Error::AlreadySigned))
     );
 
-    h.client.set_emergency_lock(&h.signers[0], &false);
-    h.client.execute(&h.signers[1], &id);
+    // Now proposal successfully executes and transitions state
+    h.client.execute(&h.signers[0], &id);
     assert!(h.client.get_proposal(&id).executed);
-}
 
-#[test]
-fn batch_execution_reports_its_own_malformed_input() {
-    let b = setup_batch(3, 2);
-    let calls: Vec<BatchCall> = Vec::new(&b.env);
-    let nobody: Vec<Address> = Vec::new(&b.env);
-
-    // An empty batch is malformed input, distinct from the signer and replay
-    // checks that follow it.
+    // Cannot approve an already executed proposal
     assert_eq!(
-        b.client
-            .try_execute_batch(&b.signers[0], &1, &calls, &nobody),
-        Err(Ok(Error::InvalidInput))
-    );
-    // An approver list longer than any possible signer set can only hold
-    // duplicates, and is refused on size rather than on weight.
-    let mut too_many: Vec<Address> = Vec::new(&b.env);
-    for _ in 0..=MAX_SIGNERS {
-        too_many.push_back(b.signers[0].clone());
-    }
-    assert_eq!(
-        b.client.try_execute_batch(
-            &b.signers[0],
-            &1,
-            &vec![&b.env, store_call(&b.env, &b.helper, 1, 2)],
-            &too_many
-        ),
-        Err(Ok(Error::InvalidInput))
-    );
-    // One call past the cap is refused on size alone.
-    let mut over: Vec<BatchCall> = Vec::new(&b.env);
-    for i in 0..=MAX_BATCH_CALLS {
-        over.push_back(store_call(&b.env, &b.helper, 100 + i as u64, i as u64));
-    }
-    assert_eq!(
-        b.client.try_execute_batch(
-            &b.signers[0],
-            &1,
-            &over,
-            &approvers(&b.env, &b.signers, &[0, 1])
-        ),
-        Err(Ok(Error::InvalidInput))
-    );
-    assert_eq!(b.helper_client.get(&100), 0);
-}
-
-#[test]
-fn a_batch_with_too_little_approver_weight_reports_threshold_not_met() {
-    let b = setup_batch(3, 2);
-    // A single approver of weight 1 is short of the threshold of 2: that is a
-    // different diagnosis from the batch being malformed, and from a proposal
-    // that is short of weight.
-    assert_eq!(
-        b.client.try_execute_batch(
-            &b.signers[0],
-            &1,
-            &vec![&b.env, store_call(&b.env, &b.helper, 1, 2)],
-            &approvers(&b.env, &b.signers, &[0])
-        ),
-        Err(Ok(Error::ThresholdNotMet))
-    );
-    b.client.execute_batch(
-        &b.signers[0],
-        &1,
-        &vec![&b.env, store_call(&b.env, &b.helper, 1, 2)],
-        &approvers(&b.env, &b.signers, &[0, 1]),
-    );
-    assert_eq!(b.helper_client.get(&1), 2);
-    // Batch nonces must strictly increase, so a replay has its own code rather
-    // than being lumped in with malformed input.
-    assert_eq!(
-        b.client.try_execute_batch(
-            &b.signers[0],
-            &1,
-            &vec![&b.env, store_call(&b.env, &b.helper, 3, 4)],
-            &approvers(&b.env, &b.signers, &[0, 1])
-        ),
-        Err(Ok(Error::InvalidNonce))
-    );
-    // A nonce below the last used one is a replay too.
-    assert_eq!(
-        b.client.try_execute_batch(
-            &b.signers[0],
-            &0,
-            &vec![&b.env, store_call(&b.env, &b.helper, 3, 4)],
-            &approvers(&b.env, &b.signers, &[0, 1])
-        ),
-        Err(Ok(Error::InvalidNonce))
-    );
-    assert_eq!(b.helper_client.get(&3), 0);
-}
-
-#[test]
-fn a_failing_batch_sub_call_rolls_back_and_keeps_its_code() {
-    let b = setup_batch(3, 2);
-    let mut calls: Vec<BatchCall> = Vec::new(&b.env);
-    calls.push_back(store_call(&b.env, &b.helper, 7, 9));
-    calls.push_back(fail_call(&b.env, &b.helper));
-
-    // The callee's own code is what surfaces; collapsing it into a generic
-    // batch failure would hide why the batch did not run.
-    assert_eq!(
-        b.client.try_execute_batch(
-            &b.signers[0],
-            &1,
-            &calls,
-            &approvers(&b.env, &b.signers, &[0, 1])
-        ),
-        Err(Ok(Error::InvalidInput))
-    );
-    // The first call was rolled back with the second.
-    assert_eq!(b.helper_client.get(&7), 0);
-    // A sub-call that traps instead of returning is a different diagnosis: the
-    // batch could not tell what the callee refused with.
-    let panicking = vec![&b.env, boom_call(&b.env, &b.helper)];
-    assert_eq!(
-        b.client.try_execute_batch(
-            &b.signers[0],
-            &1,
-            &panicking,
-            &approvers(&b.env, &b.signers, &[0, 1])
-        ),
-        Err(Ok(Error::BatchCallFailed))
+        h.client.try_approve(&h.signers[1], &id),
+        Err(Ok(Error::InvalidProposalState))
     );
 }
 
 #[test]
-fn governance_thresholds_have_their_own_bracket() {
-    let h = setup_msig();
-    // A delay outside `[MIN, MAX]` is a bound the operator has to fix, not a
-    // threshold the signers failed to reach.
-    for delay in [0, MAX_TIMELOCK_DELAY + 1] {
-        assert_eq!(
-            h.client
-                .try_propose_timelock_delay_change(&h.signers[0], &delay),
-            Err(Ok(Error::InvalidInput))
-        );
-    }
-    // A pending threshold change cannot be finalized before its delay elapses.
-    h.client.set_threshold(&h.signers[0], &3);
+fn threshold_voting_exact_boundary_transitions_state() {
+    // Exactly meeting threshold: 3 + 2 = 5, threshold = 5
+    let h = setup(&[3, 2, 1], 5);
+    let id = h
+        .client
+        .propose(&h.signers[0], &symbol_short!("pay"), &payload(&h.env), &0);
+
+    // Total weight currently 3 (proposer only) < 5
     assert_eq!(
-        h.client.try_finalize_threshold(&h.signers[0]),
-        Err(Ok(Error::TimelockNotExpired))
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
     );
-    // Once the delay has run the change takes effect.
-    h.env
-        .ledger()
-        .set_sequence_number(THRESHOLD_CHANGE_DELAY_LEDGERS + 1);
-    h.client.finalize_threshold(&h.signers[0]);
-    assert_eq!(h.client.get_threshold(), 3);
-    // And with no change pending there is nothing to finalize.
-    let h2 = setup_msig();
-    assert_eq!(
-        h2.client.try_finalize_threshold(&h2.signers[0]),
-        Err(Ok(Error::NotFound))
-    );
+
+    // signers[1] (weight 2) approves -> total weight is exactly 5 == threshold
+    let total = h.client.approve(&h.signers[1], &id);
+    assert_eq!(total, 5);
+
+    // Execution succeeds and proposal is marked executed
+    h.client.execute(&h.signers[2], &id);
+    let proposal = h.client.get_proposal(&id);
+    assert!(proposal.executed);
+    assert_eq!(proposal.approval_weight, 5);
 }

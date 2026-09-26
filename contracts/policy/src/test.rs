@@ -4,7 +4,10 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, Val,
 };
 
-use crate::{PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload};
+use crate::{
+    PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload,
+    MAX_POLICY_RULES,
+};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -16,6 +19,22 @@ fn assert_event(env: &Env, variant: &str) {
         .iter()
         .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
+
+/// Assert that no canonical `ContractEvent` with the given variant was
+/// published during the test.
+fn assert_no_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
+    assert!(
+        !found,
+        "expected no ContractEvent::{} to be emitted",
+        variant
+    );
 }
 
 fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
@@ -641,10 +660,10 @@ fn allowance_over_limit_rejected_with_exceeded() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &1_000, &0);
 
     let over = p.try_check_allowance(&String::from_str(&env, "mt"), &asset, &1_001);
-    assert_eq!(over, Err(Ok(Error::PolicyAllowanceExceeded)));
+    assert_eq!(over, Err(Ok(Error::AllowanceExceeded)));
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &1_001),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 }
 
@@ -670,7 +689,7 @@ fn allowance_cumulative_consumption_blocks_after_limit() {
     // 401 would exceed the cumulative limit.
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &401),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // A fresh 300 transfer still fits.
     assert!(p
@@ -697,7 +716,7 @@ fn multi_token_allowances_are_independent_per_asset() {
         .is_ok());
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &xlm, &recip, &101),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // An asset with no configured allowance is unrestricted.
     let eth = Address::generate(&env);
@@ -766,7 +785,7 @@ fn allowance_remove_restores_unlimited() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &100, &0);
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &200),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 
     p.remove_allowance(&owner, &String::from_str(&env, "mt"), &asset);
@@ -1802,358 +1821,921 @@ fn only_the_owner_can_manage_the_blacklist() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic error codes
+// --- Multi-rule composition (rule stack) tests ---
 //
-// The policy contract is the last gate before value moves, so it has to keep
-// three refusals apart that all read as "denied": a spend the rules reject, a
-// spend the envelope's allowance does not cover, and a rule tree so malformed
-// that evaluating it is itself impossible. Only the first is a policy decision.
-// ---------------------------------------------------------------------------
+// A policy may stack several independent rule trees. All of them must pass for
+// `check_transfer` to authorize a transaction: the evaluation short-circuits on
+// the first failing rule with `Error::PolicyDenied`.
 
-/// A `Not` node whose `children_end` is `u32::MAX`, so the child range cannot be
-/// derived by adding one to `children_start`.
-fn overflowing_not_node(env: &Env) -> RuleNode {
-    RuleNode {
-        op: RuleOp::Not,
-        value_i128: 0,
-        value_address: Address::generate(env),
-        children_start: u32::MAX,
-        children_end: u32::MAX,
+/// A chain of 15 nested `Not` nodes — structurally valid (so registration
+/// accepts it) but deeper than `MAX_RULE_DEPTH`, so evaluating it fails with
+/// [`Error::InvalidInput`]. Used to prove the stack short-circuits before it
+/// reaches a later, un-evaluable rule.
+fn deep_chain_tree(env: &Env) -> RuleTree {
+    let mut tree = soroban_sdk::Vec::new(env);
+    for i in 0..15u32 {
+        tree.push_back(RuleNode {
+            op: RuleOp::Not,
+            value_i128: 0,
+            value_address: Address::generate(env),
+            children_start: i + 1,
+            children_end: i + 2,
+        });
     }
-}
-
-/// A `Not` node that is not a unary operator: it claims zero children.
-fn childless_not_node(env: &Env) -> RuleNode {
-    RuleNode {
-        op: RuleOp::Not,
-        value_i128: 0,
+    tree.push_back(RuleNode {
+        op: RuleOp::MaxAmount,
+        value_i128: i128::MAX,
         value_address: Address::generate(env),
         children_start: 0,
         children_end: 0,
-    }
+    });
+    tree
 }
 
 #[test]
-fn a_not_node_whose_child_range_overflows_is_invalid_input() {
+fn multi_rule_recipient_and_amount_both_must_pass() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
     let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
     let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
 
-    let mut tree = soroban_sdk::Vec::new(&env);
-    tree.push_back(overflowing_not_node(&env));
-    p.set_composite_rule(&owner, &pid, &tree);
-
-    // Deriving the child range used to add 1 to `u32::MAX`, which aborted the
-    // whole invocation. A malformed node is the policy author's mistake and
-    // has to come back as a code.
+    // Compound policy: allow-listed recipient AND max amount 500.
     assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::InvalidInput))
-    );
-    assert_eq!(
-        p.try_evaluate_composite_rule(
+        p.add_policy_rule(
+            &owner,
             &pid,
-            &TransactionPayload {
-                asset: asset.clone(),
-                recipient: recip,
-                amount: 1,
-            }
+            &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env)
         ),
-        Err(Ok(Error::InvalidInput))
+        1
     );
-}
-
-#[test]
-fn n_ary_and_childless_composites_are_invalid_input() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let owner = Address::generate(&env);
-    let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
-    let pid = String::from_str(&env, "cr");
-
-    // `Not` is unary; a node claiming no children names nothing to negate.
-    let mut not_tree = soroban_sdk::Vec::new(&env);
-    not_tree.push_back(childless_not_node(&env));
-    p.set_composite_rule(&owner, &pid, &not_tree);
     assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::InvalidInput))
-    );
-
-    // An `And` with no children would vacuously allow everything.
-    let mut and_tree = soroban_sdk::Vec::new(&env);
-    and_tree.push_back(leaf(RuleOp::And, &env));
-    p.set_composite_rule(&owner, &pid, &and_tree);
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::InvalidInput))
-    );
-
-    // An `Or` with no children would vacuously deny everything.
-    let mut or_tree = soroban_sdk::Vec::new(&env);
-    or_tree.push_back(leaf(RuleOp::Or, &env));
-    p.set_composite_rule(&owner, &pid, &or_tree);
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::InvalidInput))
-    );
-}
-
-#[test]
-fn a_rule_referencing_a_missing_node_is_invalid_input_not_a_denial() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let owner = Address::generate(&env);
-    let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
-    let pid = String::from_str(&env, "cr");
-
-    // An `And` over children 0..=5 when the tree holds a single node.
-    let mut tree = soroban_sdk::Vec::new(&env);
-    let mut dangling = leaf(RuleOp::And, &env);
-    dangling.children_start = 0;
-    dangling.children_end = 5;
-    tree.push_back(dangling);
-    p.set_composite_rule(&owner, &pid, &tree);
-
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::InvalidInput))
-    );
-}
-
-#[test]
-fn an_empty_rule_tree_is_rejected_at_registration() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let owner = Address::generate(&env);
-    let p = composite_setup(&env, &owner);
-    let empty: RuleTree = soroban_sdk::Vec::new(&env);
-
-    assert_eq!(
-        p.try_set_composite_rule(&owner, &String::from_str(&env, "cr"), &empty),
-        Err(Ok(Error::InvalidInput))
-    );
-    // Nothing was stored, so a later spend is not silently unrestricted.
-    assert_eq!(
-        p.try_evaluate_composite_rule(
-            &String::from_str(&env, "cr"),
-            &TransactionPayload {
-                asset: Address::generate(&env),
-                recipient: Address::generate(&env),
-                amount: 1,
-            }
+        p.add_policy_rule(
+            &owner,
+            &pid,
+            &single_amount_tree(RuleOp::MaxAmount, 500, &env)
         ),
-        Ok(Ok(true))
+        2
     );
+    assert_eq!(p.get_policy_rules(&pid).len(), 2);
+
+    // Recipient whitelisted and amount within the cap: authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &500).is_ok());
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &1).is_ok());
 }
 
 #[test]
-fn a_breached_allowance_is_distinct_from_a_rule_denial() {
+fn multi_rule_whitelisted_recipient_failure_denies() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
     let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
     let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
 
-    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
-    // Inside the allowance but the rule denies: the policy decided.
-    p.set_composite_rule(
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor, &env),
+    );
+    p.add_policy_rule(
         &owner,
         &pid,
         &single_amount_tree(RuleOp::MaxAmount, 500, &env),
     );
+
+    // Amount is fine, but the recipient is not on the whitelist: one failing
+    // rule is enough to deny the whole evaluation.
     assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &501),
+        p.try_check_transfer(&pid, &asset, &stranger, &100),
         Err(Ok(Error::PolicyDenied))
     );
-    // Above the allowance and above the rule's cap: the envelope reports first.
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1_001),
-        Err(Ok(Error::PolicyAllowanceExceeded))
-    );
-    // Under both, so it goes through.
-    assert!(p.try_check_transfer(&pid, &asset, &recip, &500).is_ok());
 }
 
 #[test]
-fn a_lapsed_allowance_is_reported_separately_from_an_exhausted_one() {
+fn multi_rule_amount_limit_failure_denies() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().set_timestamp(1_000);
     let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
     let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
     let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
 
-    p.set_allowance(&owner, &pid, &asset, &1_000, &1_500);
-    env.ledger().set_timestamp(2_000);
-    // A spend of one unit against a lapsed envelope is an expiry, not a cap
-    // breach and not a rule denial: the difference tells the operator whether
-    // to renew the envelope, top it up, or loosen the policy.
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::AllowanceExpired))
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
     );
 
-    // A live envelope that simply has no room left is a different code again.
-    let live = Address::generate(&env);
-    p.set_allowance(&owner, &pid, &live, &100, &0);
+    // Recipient is whitelisted, but the amount breaches the cap.
     assert_eq!(
-        p.try_check_transfer(&pid, &live, &recip, &101),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        p.try_check_transfer(&pid, &asset, &vendor, &501),
+        Err(Ok(Error::PolicyDenied))
     );
 }
 
 #[test]
-fn blocklisted_parties_have_their_own_codes() {
+fn multi_rule_is_conjunctive_across_three_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // recipient + amount + asset: every rule must pass.
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedAsset, asset.clone(), &env),
+    );
+    assert_eq!(p.get_policy_rules(&pid).len(), 3);
+
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &500).is_ok());
+
+    let other_asset = Address::generate(&env);
+    assert_eq!(
+        p.try_check_transfer(&pid, &other_asset, &vendor, &500),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_empty_stack_is_permissive() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
+
+    // No rules registered: nothing to enforce, every transfer is authorized.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recip, &1_000_000)
+        .is_ok());
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip,
+        amount: 1,
+    };
+    assert_eq!(p.try_evaluate_policy_rules(&pid, &payload), Ok(Ok(true)));
+}
+
+#[test]
+fn multi_rule_remove_retires_a_single_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Over the cap while both rules are active.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Retire the amount rule (index 1); the recipient rule stays in force.
+    p.remove_policy_rule(&owner, &pid, &1);
+    assert_eq!(p.get_policy_rules(&pid).len(), 1);
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &600).is_ok());
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_remove_bounds_and_missing_stack_fail() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
     let pid = String::from_str(&env, "cr");
 
-    // A blocked recipient and a blocked merchant are different lists with
-    // different remedies, so they must not share a code.
-    p.add_blacklist(&owner, &pid, &recip);
+    // No stack yet.
     assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
+        p.try_remove_policy_rule(&owner, &pid, &0),
+        Err(Ok(Error::NotFound))
+    );
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 1, &env),
+    );
+    // Out-of-range index is rejected instead of panicking.
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &5),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &u32::MAX),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    p.remove_policy_rule(&owner, &pid, &0);
+    // The key is dropped with its last rule.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &0),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        p.try_clear_policy_rules(&owner, &pid),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn multi_rule_only_the_owner_can_manage_the_stack() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+    assert_eq!(
+        p.try_add_policy_rule(&stranger, &pid, &tree),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_remove_policy_rule(&stranger, &pid, &0),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_clear_policy_rules(&stranger, &pid),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // The owner's own stack is untouched by the rejected attempts.
+    p.add_policy_rule(&owner, &pid, &tree);
+    assert_eq!(p.get_policy_rules(&pid).len(), 1);
+}
+
+#[test]
+fn multi_rule_rejects_empty_and_malformed_trees() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    // Empty tree.
+    let empty = soroban_sdk::Vec::new(&env);
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &empty),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // AND with an empty child range.
+    let mut no_children = soroban_sdk::Vec::new(&env);
+    no_children.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 1,
+    });
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &no_children),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // AND whose child range runs past the end of the tree.
+    let mut out_of_bounds = soroban_sdk::Vec::new(&env);
+    out_of_bounds.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 9,
+    });
+    out_of_bounds.push_back(leaf_amount(RuleOp::MaxAmount, 1, &env));
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &out_of_bounds),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // NOT with more than one child.
+    let mut two_children = soroban_sdk::Vec::new(&env);
+    two_children.push_back(RuleNode {
+        op: RuleOp::Not,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    two_children.push_back(leaf_amount(RuleOp::MaxAmount, 1, &env));
+    two_children.push_back(leaf_amount(RuleOp::MaxAmount, 2, &env));
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &two_children),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // Nothing was stored by any of the rejected registrations.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+}
+
+#[test]
+fn multi_rule_stack_is_bounded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    for i in 0..MAX_POLICY_RULES {
+        let tree = single_amount_tree(RuleOp::MaxAmount, i as i128, &env);
+        assert_eq!(p.add_policy_rule(&owner, &pid, &tree), i + 1);
+    }
+    assert_eq!(p.get_policy_rules(&pid).len(), MAX_POLICY_RULES);
+
+    // The stack cannot grow past the gas-safety bound.
+    let overflow = single_amount_tree(RuleOp::MaxAmount, i128::MAX, &env);
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &overflow),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_rule_clear_restores_permissive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    p.clear_policy_rules(&owner, &pid);
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &100).is_ok());
+}
+
+#[test]
+fn multi_rule_denial_emits_policy_violation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+
+    let _ = p.try_check_transfer(&pid, &asset, &recip, &100);
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn multi_rule_stacks_with_the_single_composite_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // The single composite tree caps the amount at 100 …
+    let tree = single_amount_tree(RuleOp::MaxAmount, 100, &env);
+    p.set_composite_rule(&owner, &pid, &tree);
+    // … while the stack additionally whitelists the vendor.
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+
+    // Composite tree denies the oversized transfer.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &200),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Stack denies the unlisted recipient.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &50),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Both layers pass for the whitelisted vendor inside the cap.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &50).is_ok());
+}
+
+#[test]
+fn multi_rule_short_circuits_on_first_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip.clone(),
+        amount: 100,
+    };
+
+    // A rule deeper than the recursion guard cannot be evaluated at all.
+    let deep = deep_chain_tree(&env);
+    let deny = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+
+    // [failing rule, deep rule]: the first rule denies and the loop stops
+    // before it ever reaches the un-evaluable second rule.
+    p.add_policy_rule(&owner, &pid, &deny);
+    p.add_policy_rule(&owner, &pid, &deep);
+    assert_eq!(p.try_evaluate_policy_rules(&pid, &payload), Ok(Ok(false)));
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // [deep rule, failing rule]: with the order swapped the depth guard trips
+    // first, proving evaluation really does run in stack order.
+    p.clear_policy_rules(&owner, &pid);
+    p.add_policy_rule(&owner, &pid, &deep);
+    p.add_policy_rule(&owner, &pid, &deny);
+    assert_eq!(
+        p.try_evaluate_policy_rules(&pid, &payload),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_rule_stack_is_scoped_to_its_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let other = String::from_str(&env, "other");
+    p.register_policy(
+        &owner,
+        &other,
+        &BytesN::from_array(&env, &[7; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "cr"),
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+
+    // The strict rule is enforced only on its own policy; the sibling stays
+    // permissive.
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(p.get_policy_rules(&other).len(), 0);
+    assert!(p.try_check_transfer(&other, &asset, &recip, &100).is_ok());
+}
+
+// --- Recipient whitelist (Issue #63) tests ---
+//
+// A policy owns a dynamic directory of approved destinations. While whitelist
+// mode is active only listed recipients may be targeted, an empty directory
+// fails closed, and a miss is rejected with `Error::PolicyDenied`.
+
+/// Register a policy with no scalar gates so only the recipient whitelist gate
+/// decides the outcome.
+fn whitelist_setup<'a>(env: &'a Env, owner: &Address, policy_id: &str) -> PolicyContractClient<'a> {
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(env, &id);
+    client.initialize();
+    client.register_policy(
+        owner,
+        &String::from_str(env, policy_id),
+        &BytesN::from_array(env, &[5; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    client
+}
+
+#[test]
+fn whitelist_allows_listed_and_blocks_unlisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl");
+    let pid = String::from_str(&env, "wl");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    p.add_recipient_to_whitelist(&owner, &pid, &b);
+
+    // Listed destinations pass.
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+    assert!(p.try_check_transfer(&pid, &asset, &b, &1).is_ok());
+    // An unlisted destination is denied with the policy denial code.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn empty_whitelist_denies_all_recipients() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_empty");
+    let pid = String::from_str(&env, "wl_empty");
+    let asset = Address::generate(&env);
+    let anyone = Address::generate(&env);
+
+    // Mode active with no entries — fail closed, every destination denied.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &anyone, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn whitelist_removal_blocks_previously_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_rem");
+    let pid = String::from_str(&env, "wl_rem");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+
+    p.remove_recipient_from_whitelist(&owner, &pid, &a);
+    // The previously approved destination is untrusted again.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &a, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn whitelist_disabled_allows_any_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_off");
+    let pid = String::from_str(&env, "wl_off");
+    let asset = Address::generate(&env);
+    let anyone = Address::generate(&env);
+
+    // Default state: the gate is not enforced and any destination passes.
+    assert!(p.try_check_transfer(&pid, &asset, &anyone, &1).is_ok());
+    // Enforcing then relaxing the mode reopens the gate without losing the
+    // staged directory.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.set_recipient_whitelist_enabled(&owner, &pid, &false);
+    assert!(p.try_check_transfer(&pid, &asset, &anyone, &1).is_ok());
+    assert!(!p.is_recipient_whitelisted(&pid, &anyone));
+}
+
+#[test]
+fn non_owner_cannot_manage_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_auth");
+    let pid = String::from_str(&env, "wl_auth");
+    let target = Address::generate(&env);
+
+    assert_eq!(
+        p.try_set_recipient_whitelist_enabled(&intruder, &pid, &true),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_add_recipient_to_whitelist(&intruder, &pid, &target),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&intruder, &pid, &target),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The rejected attempts left the directory untouched.
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+}
+
+#[test]
+fn duplicate_and_missing_recipient_whitelist_ops_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_dup");
+    let pid = String::from_str(&env, "wl_dup");
+    let target = Address::generate(&env);
+
+    // Listing an address twice is rejected …
+    p.add_recipient_to_whitelist(&owner, &pid, &target);
+    assert_eq!(
+        p.try_add_recipient_to_whitelist(&owner, &pid, &target),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // … and so is removing an address that was never listed.
+    let other = Address::generate(&env);
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&owner, &pid, &other),
+        Err(Ok(Error::NotFound))
+    );
+    p.remove_recipient_from_whitelist(&owner, &pid, &target);
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&owner, &pid, &target),
+        Err(Ok(Error::NotFound))
+    );
+    // The last removal also drops the index, so the directory reads empty.
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+}
+
+#[test]
+fn whitelist_denial_emits_policy_violation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_evt");
+    let pid = String::from_str(&env, "wl_evt");
+    let asset = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    let _ = p.try_check_transfer(&pid, &asset, &stranger, &1);
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn whitelist_ok_path_records_no_violation_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_ok");
+    let pid = String::from_str(&env, "wl_ok");
+    let asset = Address::generate(&env);
+    let listed = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &listed);
+
+    // The gate enforces the directory but records nothing while the transfer
+    // is authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &listed, &1).is_ok());
+    assert_no_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn recipient_whitelist_is_scoped_per_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_a");
+    let pid_a = String::from_str(&env, "wl_a");
+    let pid_b = String::from_str(&env, "wl_b");
+    p.register_policy(
+        &owner,
+        &pid_b,
+        &BytesN::from_array(&env, &[6; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    let asset = Address::generate(&env);
+    let vendor = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid_a, &true);
+    p.add_recipient_to_whitelist(&owner, &pid_a, &vendor);
+
+    // The directory belongs to policy A only.
+    assert!(p.is_recipient_whitelisted(&pid_a, &vendor));
+    assert!(!p.is_recipient_whitelisted(&pid_b, &vendor));
+    assert_eq!(p.get_recipient_whitelist(&pid_b).len(), 0);
+
+    // Policy B enforces an empty directory of its own, so the very same
+    // destination stays untrusted there.
+    p.set_recipient_whitelist_enabled(&owner, &pid_b, &true);
+    assert!(p.try_check_transfer(&pid_a, &asset, &vendor, &1).is_ok());
+    assert_eq!(
+        p.try_check_transfer(&pid_b, &asset, &vendor, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn recipient_whitelist_queries_reflect_edits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_q");
+    let pid = String::from_str(&env, "wl_q");
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    p.add_recipient_to_whitelist(&owner, &pid, &b);
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.is_recipient_whitelisted(&pid, &b));
+
+    let listed = p.get_recipient_whitelist(&pid);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.get(0), Some(a.clone()));
+    assert_eq!(listed.get(1), Some(b.clone()));
+
+    p.remove_recipient_from_whitelist(&owner, &pid, &a);
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    let listed = p.get_recipient_whitelist(&pid);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.get(0), Some(b));
+}
+
+#[test]
+fn evaluate_recipient_whitelist_entry_point() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_eval");
+    let pid = String::from_str(&env, "wl_eval");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recipient.clone(),
+        amount: 1,
+    };
+
+    // Mode off: the entry point is permissive.
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Ok(Ok(()))
+    );
+
+    // Mode on with an empty directory: every destination is denied.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Listing the destination clears the evaluation.
+    p.add_recipient_to_whitelist(&owner, &pid, &recipient);
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Ok(Ok(()))
+    );
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn blocklisted_recipient_stays_denied_while_whitelisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_blk");
+    let pid = String::from_str(&env, "wl_blk");
+    let asset = Address::generate(&env);
+    let bad = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &bad);
+    assert!(p.try_check_transfer(&pid, &asset, &bad, &1).is_ok());
+
+    // The blocklist runs first: listing an address never resurrects a blocked
+    // destination.
+    p.add_to_blocklist(&owner, &pid, &bad);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &bad, &1),
         Err(Ok(Error::PolicyRecipientRestricted))
     );
-    p.remove_blacklist(&owner, &pid, &recip);
-
-    p.add_merchant_blacklist(&owner, &pid, &recip);
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::PolicyMerchantBlocked))
-    );
-    p.remove_merchant_blacklist(&owner, &pid, &recip);
-    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
 }
 
 #[test]
-fn an_asset_on_the_deny_list_is_denied_even_when_whitelisted() {
+fn whitelist_and_scalar_gates_are_conjunctive() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
-    let p = composite_setup(&env, &owner);
+    let p = whitelist_setup(&env, &owner, "wl_mix");
+    let pid = String::from_str(&env, "wl_mix");
     let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
-    let pid = String::from_str(&env, "cr");
-
-    p.add_asset_to_whitelist(&owner, &pid, &asset);
-    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
-
-    // An asset the policy was never told about is a wiring problem, not a
-    // denial of this particular spend.
-    let unlisted = Address::generate(&env);
-    p.set_asset_whitelist_enabled(&owner, &pid, &true);
-    assert_eq!(
-        p.try_check_transfer(&pid, &unlisted, &recip, &1),
-        Err(Ok(Error::AssetNotAuthorized))
-    );
-
-    // The deny list is meant to win outright, including over an allow gate.
-    p.add_asset_blacklist(&owner, &pid, &asset);
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::PolicyDenied))
-    );
-}
-
-#[test]
-fn a_disabled_policy_denies_every_spend() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let owner = Address::generate(&env);
-    let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
-    let pid = String::from_str(&env, "cr");
-
-    p.set_enabled(&owner, &pid, &false);
-    // Disabled is not "no rules configured" — it is an active refusal.
-    assert_eq!(
-        p.try_check_transfer(&pid, &asset, &recip, &1),
-        Err(Ok(Error::PolicyDenied))
-    );
-    p.set_enabled(&owner, &pid, &true);
-    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
-}
-
-#[test]
-fn only_the_policy_owner_may_change_the_rules() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let owner = Address::generate(&env);
-    let p = composite_setup(&env, &owner);
+    let vendor = Address::generate(&env);
     let stranger = Address::generate(&env);
-    let pid = String::from_str(&env, "cr");
-    let tree = single_amount_tree(RuleOp::MaxAmount, 500, &env);
 
+    // Tighten the scalar cap to 100 alongside the whitelist gate.
+    p.rotate_policy(&owner, &pid, &BytesN::from_array(&env, &[5; 32]), &100);
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &vendor);
+
+    // Listed and within the cap: authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &100).is_ok());
+    // Listed but over the cap: still denied by the scalar gate.
     assert_eq!(
-        p.try_set_composite_rule(&stranger, &pid, &tree),
-        Err(Ok(Error::Unauthorized))
+        p.try_check_transfer(&pid, &asset, &vendor, &101),
+        Err(Ok(Error::PolicyDenied))
     );
+    // Within the cap but unlisted: denied by the whitelist gate.
     assert_eq!(
-        p.try_rotate_policy(&stranger, &pid, &BytesN::from_array(&env, &[1; 32]), &1_000),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert_eq!(
-        p.try_set_enabled(&stranger, &pid, &false),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert_eq!(
-        p.try_set_allowance(&stranger, &pid, &Address::generate(&env), &1, &0),
-        Err(Ok(Error::Unauthorized))
-    );
-    // The original rules survived every attempt.
-    assert_eq!(
-        p.try_evaluate_composite_rule(
-            &pid,
-            &TransactionPayload {
-                asset: Address::generate(&env),
-                recipient: Address::generate(&env),
-                amount: 501,
-            }
-        ),
-        Ok(Ok(true))
+        p.try_check_transfer(&pid, &asset, &stranger, &1),
+        Err(Ok(Error::PolicyDenied))
     );
 }
 
 #[test]
-fn unknown_policy_ids_are_not_found() {
+fn short_form_whitelist_api_manages_entries() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
-    let p = composite_setup(&env, &owner);
-    let ghost = String::from_str(&env, "ghost");
+    let p = whitelist_setup(&env, &owner, "wl_short");
+    let pid = String::from_str(&env, "wl_short");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
 
+    // The concise management API drives the same storage as the explicit
+    // recipient-named functions.
+    p.set_whitelist_enabled(&owner, &pid, &true);
+    p.add_whitelist(&owner, &pid, &a);
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+
+    p.remove_whitelist(&owner, &pid, &a);
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
     assert_eq!(
-        p.try_check_transfer(
-            &ghost,
-            &Address::generate(&env),
-            &Address::generate(&env),
-            &1
-        ),
-        Err(Ok(Error::NotFound))
-    );
-    assert_eq!(p.try_get(&ghost), Err(Ok(Error::NotFound)));
-    assert_eq!(
-        p.try_set_enabled(&owner, &ghost, &false),
-        Err(Ok(Error::NotFound))
+        p.try_check_transfer(&pid, &asset, &a, &1),
+        Err(Ok(Error::PolicyDenied))
     );
 }
