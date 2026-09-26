@@ -86,6 +86,23 @@ const MAX_RULE_DEPTH: u32 = 10;
 /// register an unbounded amount of work for every transfer check.
 const MAX_POLICY_RULES: u32 = 16;
 
+/// Strategy for combining multiple policy rules.
+///
+/// When multiple rules are stacked via `add_policy_rule`, this enum determines
+/// how they are logically combined during evaluation.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RuleStrategy {
+    /// All rules must pass (conjunctive/AND logic). Evaluation short-circuits
+    /// on the first rule that returns `false`. This is the default for backward
+    /// compatibility with existing single-rule policies.
+    All = 0,
+    /// At least one rule must pass (disjunctive/OR logic). Evaluation
+    /// short-circuits on the first rule that returns `true`.
+    Any = 1,
+}
+
 /// A transaction payload submitted for policy evaluation.
 ///
 /// This struct carries the essential fields of a proposed transfer so the
@@ -304,6 +321,8 @@ pub struct Policy {
     pub expires_at: u64,
     /// Whether the policy is currently enabled.
     pub enabled: bool,
+    /// Strategy for combining multiple rules (All = AND logic, Any = OR logic).
+    pub rule_strategy: RuleStrategy,
 }
 
 #[contracttype]
@@ -386,6 +405,7 @@ impl PolicyContract {
         allowed_recipient: Option<Address>,
         allowed_asset: Option<Address>,
         expires_at: u64,
+        rule_strategy: RuleStrategy,
     ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&policy_id)?;
@@ -404,6 +424,7 @@ impl PolicyContract {
             allowed_asset,
             expires_at,
             enabled: true,
+            rule_strategy,
         };
         env.storage()
             .persistent()
@@ -1344,24 +1365,46 @@ impl PolicyContract {
         payload: &TransactionPayload,
         context: &mut RuleEvaluationContext,
     ) -> Result<bool, Error> {
+        let policy = Self::load(env, policy_id)?;
         let stack: RuleStack = env
             .storage()
             .persistent()
             .get(&DataKey::PolicyRules(policy_id.clone()))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         let count = stack.len();
-        for i in 0..count {
-            // `get` bounds-checks the index; a miss means the stack changed
-            // under us, which storage cannot do mid-invocation — fail closed.
-            let tree = stack.get(i).ok_or(Error::InvalidInput)?;
-            if tree.is_empty() {
-                continue;
+
+        match policy.rule_strategy {
+            RuleStrategy::All => {
+                // All rules must pass (AND logic). Short-circuit on first false.
+                for i in 0..count {
+                    let tree = stack.get(i).ok_or(Error::InvalidInput)?;
+                    if tree.is_empty() {
+                        continue;
+                    }
+                    if !evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
-            if !evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
-                return Ok(false);
+            RuleStrategy::Any => {
+                // At least one rule must pass (OR logic). Short-circuit on first true.
+                // If no rules are registered, default to permissive (true).
+                if count == 0 {
+                    return Ok(true);
+                }
+                for i in 0..count {
+                    let tree = stack.get(i).ok_or(Error::InvalidInput)?;
+                    if tree.is_empty() {
+                        continue;
+                    }
+                    if evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
         }
-        Ok(true)
     }
 
     // --- views ---

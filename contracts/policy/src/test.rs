@@ -5,8 +5,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload,
-    MAX_POLICY_RULES,
+    PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleStrategy, RuleTree,
+    TransactionPayload, MAX_POLICY_RULES,
 };
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
@@ -49,6 +49,7 @@ fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
     );
     client
 }
@@ -102,6 +103,7 @@ fn allowlist_recipient_enforced() {
         &Some(allowed.clone()),
         &None,
         &0,
+        &RuleStrategy::All,
     );
 
     // Allowed recipient passes
@@ -601,6 +603,7 @@ fn allowance_setup<'a>(env: &'a Env, owner: &Address) -> PolicyContractClient<'a
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
     );
     client
 }
@@ -807,6 +810,7 @@ fn composite_setup<'a>(env: &'a Env, owner: &Address) -> PolicyContractClient<'a
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
     );
     client
 }
@@ -1762,6 +1766,7 @@ fn blacklist_is_scoped_to_its_policy() {
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
     );
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
@@ -2336,6 +2341,7 @@ fn multi_rule_stack_is_scoped_to_its_policy() {
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
     );
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
@@ -2356,6 +2362,22 @@ fn multi_rule_stack_is_scoped_to_its_policy() {
     assert!(p.try_check_transfer(&other, &asset, &recip, &100).is_ok());
 }
 
+// --- Rule Strategy Tests (All vs Any) ---
+
+#[test]
+fn rule_strategy_all_requires_all_rules_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Register policy with All strategy (AND logic)
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "all_strategy"),
+        &BytesN::from_array(&env, &[123; 32]),
 // --- Recipient whitelist (Issue #63) tests ---
 //
 // A policy owns a dynamic directory of approved destinations. While whitelist
@@ -2376,6 +2398,54 @@ fn whitelist_setup<'a>(env: &'a Env, owner: &Address, policy_id: &str) -> Policy
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
+    );
+
+    let asset = Address::generate(&env);
+    let vendor1 = Address::generate(&env);
+    let vendor2 = Address::generate(&env);
+
+    // Add two rules: AllowedRecipient(vendor1) AND MaxAmount(500)
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "all_strategy"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor1.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "all_strategy"),
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Both rules pass: transfer allowed
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "all_strategy"),
+            &asset,
+            &vendor1,
+            &300
+        )
+        .is_ok());
+
+    // First rule fails (wrong recipient): transfer denied
+    assert_eq!(
+        client.try_check_transfer(
+            &String::from_str(&env, "all_strategy"),
+            &asset,
+            &vendor2,
+            &300
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Second rule fails (amount too high): transfer denied
+    assert_eq!(
+        client.try_check_transfer(
+            &String::from_str(&env, "all_strategy"),
+            &asset,
+            &vendor1,
+            &600
+        ),
     );
     client
 }
@@ -2407,6 +2477,71 @@ fn whitelist_allows_listed_and_blocks_unlisted() {
 }
 
 #[test]
+fn rule_strategy_any_requires_at_least_one_rule_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Register policy with Any strategy (OR logic)
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "any_strategy"),
+        &BytesN::from_array(&env, &[124; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &RuleStrategy::Any,
+    );
+
+    let asset = Address::generate(&env);
+    let vendor1 = Address::generate(&env);
+    let vendor2 = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    // Add two rules: AllowedRecipient(vendor1) OR MaxAmount(500)
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_strategy"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor1.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_strategy"),
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // First rule passes (correct recipient): transfer allowed
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "any_strategy"),
+            &asset,
+            &vendor1,
+            &600
+        )
+        .is_ok());
+
+    // First rule fails but second passes (amount within limit): transfer allowed
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "any_strategy"),
+            &asset,
+            &vendor2,
+            &300
+        )
+        .is_ok());
+
+    // Both rules fail: transfer denied
+    assert_eq!(
+        client.try_check_transfer(
+            &String::from_str(&env, "any_strategy"),
+            &asset,
+            &stranger,
+            &600
+        ),
 fn empty_whitelist_denies_all_recipients() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2425,6 +2560,44 @@ fn empty_whitelist_denies_all_recipients() {
 }
 
 #[test]
+fn rule_strategy_any_with_single_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Register policy with Any strategy
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "any_single"),
+        &BytesN::from_array(&env, &[125; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &RuleStrategy::Any,
+    );
+
+    let asset = Address::generate(&env);
+    let vendor = Address::generate(&env);
+
+    // Add single rule: MaxAmount(500)
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_single"),
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Rule passes: transfer allowed
+    assert!(client
+        .try_check_transfer(&String::from_str(&env, "any_single"), &asset, &vendor, &300)
+        .is_ok());
+
+    // Rule fails: transfer denied
+    assert_eq!(
+        client.try_check_transfer(&String::from_str(&env, "any_single"), &asset, &vendor, &600),
 fn whitelist_removal_blocks_previously_allowed() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2447,6 +2620,170 @@ fn whitelist_removal_blocks_previously_allowed() {
 }
 
 #[test]
+fn rule_strategy_any_empty_stack_is_permissive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Register policy with Any strategy but no rules
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "any_empty"),
+        &BytesN::from_array(&env, &[126; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &RuleStrategy::Any,
+    );
+
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Empty stack with Any strategy is permissive (no rules to evaluate)
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "any_empty"),
+            &asset,
+            &recip,
+            &999_999_999
+        )
+        .is_ok());
+}
+
+#[test]
+fn rule_strategy_all_short_circuits_on_first_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Register policy with All strategy
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "all_shortcircuit"),
+        &BytesN::from_array(&env, &[127; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &RuleStrategy::All,
+    );
+
+    let asset = Address::generate(&env);
+    let vendor = Address::generate(&env);
+
+    // Add three rules for testing short-circuit behavior
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "all_shortcircuit"),
+        &single_amount_tree(RuleOp::MaxAmount, 100, &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "all_shortcircuit"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "all_shortcircuit"),
+        &single_amount_tree(RuleOp::MaxAmount, 200, &env),
+    );
+
+    // First rule fails (amount 150 > 100), evaluation stops immediately
+    assert_eq!(
+        client.try_check_transfer(
+            &String::from_str(&env, "all_shortcircuit"),
+            &asset,
+            &vendor,
+            &150
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // All rules pass
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "all_shortcircuit"),
+            &asset,
+            &vendor,
+            &50
+        )
+        .is_ok());
+}
+
+#[test]
+fn rule_strategy_any_short_circuits_on_first_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Register policy with Any strategy
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "any_shortcircuit"),
+        &BytesN::from_array(&env, &[128; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &RuleStrategy::Any,
+    );
+
+    let asset = Address::generate(&env);
+    let vendor1 = Address::generate(&env);
+    let vendor2 = Address::generate(&env);
+
+    // Add three rules: first will pass, others are irrelevant
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_shortcircuit"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor1.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_shortcircuit"),
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_shortcircuit"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor2.clone(), &env),
+    );
+
+    // First rule passes (correct recipient), second and third are not evaluated
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "any_shortcircuit"),
+            &asset,
+            &vendor1,
+            &50_000
+        )
+        .is_ok());
+}
+
+#[test]
+fn rule_strategy_switch_from_all_to_any() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Start with All strategy
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "switchable"),
+        &BytesN::from_array(&env, &[129; 32]),
 fn whitelist_disabled_allows_any_recipient() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2572,6 +2909,147 @@ fn recipient_whitelist_is_scoped_per_policy() {
         &None,
         &None,
         &0,
+        &RuleStrategy::All,
+    );
+
+    let asset = Address::generate(&env);
+    let vendor1 = Address::generate(&env);
+    let vendor2 = Address::generate(&env);
+
+    // Add two rules
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "switchable"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor1.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "switchable"),
+        &single_amount_tree(RuleOp::MaxAmount, 100, &env),
+    );
+
+    // With All strategy: both rules must pass
+    assert_eq!(
+        client.try_check_transfer(&String::from_str(&env, "switchable"), &asset, &vendor2, &50),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Now re-register with Any strategy (similar to rotating policy)
+    // Clear rules first
+    client.clear_policy_rules(&owner, &String::from_str(&env, "switchable"));
+
+    // Re-register with Any strategy
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "switchable2"),
+        &BytesN::from_array(&env, &[130; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &RuleStrategy::Any,
+    );
+
+    // Add same two rules to new policy
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "switchable2"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor1.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "switchable2"),
+        &single_amount_tree(RuleOp::MaxAmount, 100, &env),
+    );
+
+    // With Any strategy: only one rule needs to pass
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "switchable2"),
+            &asset,
+            &vendor2,
+            &50
+        )
+        .is_ok());
+}
+
+#[test]
+fn rule_strategy_any_with_three_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+
+    // Register policy with Any strategy
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "any_three"),
+        &BytesN::from_array(&env, &[131; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &RuleStrategy::Any,
+    );
+
+    let asset = Address::generate(&env);
+    let vendor1 = Address::generate(&env);
+    let vendor2 = Address::generate(&env);
+    let vendor3 = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    // Add three rules: three different allowed recipients
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_three"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor1.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_three"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor2.clone(), &env),
+    );
+    client.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "any_three"),
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor3.clone(), &env),
+    );
+
+    // vendor1 matches first rule: allowed
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "any_three"),
+            &asset,
+            &vendor1,
+            &999_999
+        )
+        .is_ok());
+
+    // vendor2 matches second rule: allowed
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "any_three"),
+            &asset,
+            &vendor2,
+            &999_999
+        )
+        .is_ok());
+
+    // vendor3 matches third rule: allowed
+    assert!(client
+        .try_check_transfer(
+            &String::from_str(&env, "any_three"),
+            &asset,
+            &vendor3,
+            &999_999
+        )
+        .is_ok());
+
+    // stranger matches no rules: denied
+    assert_eq!(
+        client.try_check_transfer(&String::from_str(&env, "any_three"), &asset, &stranger, &1),
     );
     let asset = Address::generate(&env);
     let vendor = Address::generate(&env);

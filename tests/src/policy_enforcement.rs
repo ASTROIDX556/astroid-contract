@@ -20,7 +20,7 @@
 //! receives, and that no token balance, treasury ledger, or wallet ledger
 //! moved.
 
-use astroid_policy::{PolicyContract, PolicyContractClient};
+use astroid_policy::{PolicyContract, PolicyContractClient, RuleStrategy};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
@@ -151,6 +151,7 @@ fn setup() -> Harness<'static> {
         &None,
         &Some(asset.clone()),
         &0u64,
+        &RuleStrategy::All,
     );
 
     token::StellarAssetClient::new(&env, &asset).mint(&admin, &TREASURY_FUNDS);
