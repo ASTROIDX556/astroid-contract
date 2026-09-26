@@ -73,6 +73,21 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
 
 /// Create a proposal that depends on `deps`.
 fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) -> u64 {
+    create_with_grace_and_deps(h, threshold, expires_at, 0, deps)
+}
+
+/// Create an independent proposal with an explicit cancellation grace window.
+fn create_with_grace(h: &Harness, threshold: u32, expires_at: u64, grace_period: u64) -> u64 {
+    create_with_grace_and_deps(h, threshold, expires_at, grace_period, &[])
+}
+
+fn create_with_grace_and_deps(
+    h: &Harness,
+    threshold: u32,
+    expires_at: u64,
+    grace_period: u64,
+    deps: &[u64],
+) -> u64 {
     h.client.create(
         &h.proposer,
         &String::from_str(&h.env, "acme"),
@@ -83,7 +98,7 @@ fn create_with_deps(h: &Harness, threshold: u32, expires_at: u64, deps: &[u64]) 
         &threshold,
         &soroban_sdk::vec![&h.env],
         &expires_at,
-        &0,
+        &grace_period,
     )
 }
 
@@ -310,6 +325,8 @@ fn execution_blocked_until_prerequisite_executes() {
     h.client.approve(&h.approvers[1], &second);
     assert_eq!(h.client.state(&second), ProposalState::Approved);
     assert!(!h.client.dependencies_met(&second));
+    // The executability view agrees: an unmet prerequisite blocks it too.
+    assert!(!h.client.can_execute(&second));
 
     assert_eq!(
         h.client.try_execute(&h.proposer, &second),
@@ -319,6 +336,7 @@ fn execution_blocked_until_prerequisite_executes() {
     assert_eq!(h.client.state(&second), ProposalState::Approved);
 
     approve_and_execute(&h, first);
+    assert!(h.client.can_execute(&second));
     h.client.execute(&h.proposer, &second);
     assert_eq!(h.client.state(&second), ProposalState::Executed);
 }
@@ -913,4 +931,125 @@ fn timelock_only_gates_execution_not_state_transitions() {
     assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
     h.client.fail(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Failed);
+}
+
+// ------------------------------------------- timelock / expiry boundary ----
+
+#[test]
+fn execution_window_follows_the_ledger_sequence_and_timestamp() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+
+    // Sequence and timestamp move together, exactly as the host fixes them for
+    // a real invocation: still inside the 100s delay, so execution is refused
+    // with the dedicated premature-execution code.
+    advance(&h, 2, 1_050);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // One ledger later the release instant (approved_at + timelock = 1_100)
+    // has been reached.
+    advance(&h, 3, 1_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn expiry_gate_wins_over_the_timelock_gate() {
+    // Timelock 1_000s from an approval at t = 1_000, but the deadline lands at
+    // t = 1_500 — the release instant (2_000) lies beyond the validity window,
+    // so a late attempt must report the deadline rather than the (still true)
+    // timelock: the proposal cannot wait out its own expiry.
+    let h = setup_timelocked(3, 1_000);
+    let id = create(&h, 2, 1_500);
+    approve_to_threshold(&h, id);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+
+    advance(&h, 2, 1_400); // live, but the delay has not elapsed
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    advance(&h, 3, 1_500); // deadline reached, delay still running
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn can_execute_tracks_timelock_and_expiry() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 5_000);
+
+    // Pending is never executable, however much time has passed.
+    assert!(!h.client.can_execute(&id));
+
+    approve_to_threshold(&h, id); // approved at t = 1_000
+    assert!(!h.client.can_execute(&id)); // delay still running
+
+    advance(&h, 2, 1_100); // exactly at approved_at + timelock
+    assert!(h.client.can_execute(&id));
+
+    advance(&h, 6, 5_000); // past the deadline
+    assert!(!h.client.can_execute(&id));
+}
+
+#[test]
+fn unrepresentable_timelock_fails_closed_instead_of_wrapping() {
+    // `approved_at + timelock` cannot be expressed as a ledger timestamp. The
+    // delay must fail closed with the deterministic `Overflow` code — if the
+    // sum were truncated into the past, execution would be allowed the moment
+    // the proposal is approved.
+    let h = setup_timelocked(3, u64::MAX);
+    let id = create(&h, 2, 0);
+    approve_to_threshold(&h, id);
+
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert!(!h.client.can_execute(&id));
+}
+
+// ------------------------------------------------- cancellation window ----
+
+#[test]
+fn cancellation_window_is_inclusive_and_then_closes() {
+    let h = setup(3);
+    h.env.ledger().set_timestamp(1_000);
+    // Both created at t = 1_000 with a 50s grace window: the window ends at
+    // t = 1_050 inclusive.
+    let inside = create_with_grace(&h, 2, 8_000, 50);
+    let outside = create_with_grace(&h, 2, 8_000, 50);
+
+    advance(&h, 2, 1_050);
+    h.client.cancel(&h.proposer, &inside);
+    assert_eq!(h.client.state(&inside), ProposalState::Cancelled);
+
+    // One second later the window has closed for the untouched twin.
+    advance(&h, 3, 1_051);
+    assert_eq!(
+        h.client.try_cancel(&h.proposer, &outside),
+        Err(Ok(Error::CancellationWindowClosed))
+    );
+    assert_eq!(h.client.state(&outside), ProposalState::Pending);
+}
+
+#[test]
+fn unrepresentable_grace_window_does_not_trap_cancellation() {
+    // `created_at + grace_period` overflows a ledger timestamp. The window is
+    // treated as never closing (the deadline still bounds the proposal) and
+    // the arithmetic must not trap the host.
+    let h = setup(3);
+    let id = create_with_grace(&h, 2, 0, u64::MAX);
+    h.client.cancel(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Cancelled);
 }
