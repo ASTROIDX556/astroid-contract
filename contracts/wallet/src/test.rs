@@ -6,7 +6,7 @@ use crate::{BatchAction, BatchReceipt, ContractCall, WalletContract, WalletContr
 use astroid_shared::constants;
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Events, token, Address, Env, IntoVal, String,
     Symbol, Val, Vec,
@@ -1368,235 +1368,480 @@ fn validated_batch_frozen_wallet_rejected() {
     assert_eq!(res, Err(Ok(Error::WalletFrozen)));
 }
 
-// ------------------------------------------------------------- raw batch ----
-// Raw atomic batch execution (Issue #301): arbitrary contract calls fired
-// sequentially under one `Role::Agent` authorization.
+// --- Spending velocity limits (Issue #229) ---
 
-/// Fund a fresh wallet owned by a fresh owner and grant `agent` the Agent
-/// role, returning (wallet_id, owner, agent) — the raw batch's actor set.
-fn funded_agent_wallet_batch(h: &Harness, deposit: i128) -> (u64, Address, Address) {
-    let owner = Address::generate(&h.env);
-    let id = h.client.create_wallet(&owner);
-    let agent = Address::generate(&h.env);
-    h.client.grant_role(&owner, &id, &agent, &Role::Agent);
-    mint(h, &owner, deposit);
-    h.client.deposit(&id, &owner, &h.token, &deposit);
+/// Velocity window used by these tests: one hour, i.e. four 900 s buckets.
+const WINDOW: u64 = 3_600;
+const BUCKET: u64 = WINDOW / crate::VELOCITY_BUCKETS as u64;
+/// Bucket-aligned start time, so bucket boundaries are easy to reason about.
+const T0: u64 = 40 * BUCKET;
+
+fn at(h: &Harness, timestamp: u64) {
+    h.env.ledger().set_timestamp(timestamp);
+}
+
+/// A funded agent wallet with a velocity ceiling of `max` per hour on the
+/// harness token, clock at `T0`. Returns (wallet_id, owner, agent).
+fn velocity_wallet(h: &Harness, deposit: i128, max: i128) -> (u64, Address, Address) {
+    at(h, T0);
+    let (id, owner, agent) = funded_agent_wallet(h, deposit);
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &max, &WINDOW);
     (id, owner, agent)
 }
 
+fn pay(h: &Harness, agent: &Address, id: u64, amount: i128) -> Result<(), Error> {
+    let to = Address::generate(&h.env);
+    match h.client.try_transfer(agent, &id, &to, &h.token, &amount) {
+        Ok(Ok(())) => Ok(()),
+        Err(Ok(e)) => Err(e),
+        other => panic!("unexpected result {:?}", other),
+    }
+}
+
+fn usage(h: &Harness, id: u64) -> i128 {
+    h.client.get_velocity_usage(&id, &h.token)
+}
+
 #[test]
-fn batch_execute_runs_every_call_and_reports_the_count() {
+fn velocity_is_unlimited_until_configured() {
     let h = setup();
+    let (id, _owner, agent) = funded_agent_wallet(&h, 10_000);
+    assert_eq!(h.client.get_velocity_limit(&id, &h.token), None);
+    assert_eq!(pay(&h, &agent, id, 10_000), Ok(()));
+    assert_eq!(usage(&h, id), 0);
+}
+
+#[test]
+fn first_transfer_within_the_limit_succeeds_and_is_recorded() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(
+        h.client.get_velocity_limit(&id, &h.token),
+        Some(crate::VelocityLimit {
+            max_amount: 1_000,
+            window_seconds: WINDOW,
+        })
+    );
+    assert_eq!(pay(&h, &agent, id, 400), Ok(()));
+    assert_eq!(usage(&h, id), 400);
+    assert_eq!(h.client.balance(&id, &h.token), 9_600);
+}
+
+#[test]
+fn transfers_in_the_same_window_accumulate() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 300), Ok(()));
+    at(&h, T0 + 100);
+    assert_eq!(pay(&h, &agent, id, 300), Ok(()));
+    at(&h, T0 + 2 * BUCKET + 5);
+    assert_eq!(pay(&h, &agent, id, 300), Ok(()));
+    assert_eq!(usage(&h, id), 900);
+}
+
+#[test]
+fn reaching_exactly_the_limit_succeeds_and_one_unit_more_fails() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 600), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 400), Ok(()));
+    assert_eq!(usage(&h, id), 1_000);
+
+    let recipient = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_transfer(&agent, &id, &recipient, &h.token, &1),
+        Err(Ok(Error::VelocityLimitExceeded))
+    );
+    assert_eq!(token_balance(&h, &recipient), 0);
+    assert_eq!(h.client.balance(&id, &h.token), 9_000);
+}
+
+#[test]
+fn single_transfer_above_the_limit_is_rejected() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(
+        pay(&h, &agent, id, 1_001),
+        Err(Error::VelocityLimitExceeded)
+    );
+    assert_eq!(usage(&h, id), 0);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+}
+
+#[test]
+fn rejected_transfers_do_not_consume_allowance() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 500, 1_000);
+
+    // Over the ceiling: refused, nothing recorded.
+    assert_eq!(
+        pay(&h, &agent, id, 1_500),
+        Err(Error::VelocityLimitExceeded)
+    );
+    assert_eq!(usage(&h, id), 0);
+
+    // Fits the ceiling but not the balance: the debit fails after the
+    // velocity hook ran, and the revert of the invocation takes the recorded
+    // usage with it.
+    assert_eq!(pay(&h, &agent, id, 600), Err(Error::InsufficientFunds));
+    assert_eq!(usage(&h, id), 0);
+
+    // The full ceiling is still available.
+    assert_eq!(pay(&h, &agent, id, 500), Ok(()));
+    assert_eq!(usage(&h, id), 500);
+}
+
+#[test]
+fn allowance_returns_exactly_when_the_window_slides_past() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+
+    // One second before the bucket of the spend leaves the window: counted.
+    at(&h, T0 + WINDOW - 1);
+    assert_eq!(usage(&h, id), 1_000);
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::VelocityLimitExceeded));
+
+    // At the boundary the bucket slides out and the full ceiling returns.
+    at(&h, T0 + WINDOW);
+    assert_eq!(usage(&h, id), 0);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::VelocityLimitExceeded));
+}
+
+#[test]
+fn buckets_age_out_one_at_a_time() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 400), Ok(())); // bucket 40
+    at(&h, T0 + 2 * BUCKET);
+    assert_eq!(pay(&h, &agent, id, 600), Ok(())); // bucket 42
+
+    // Bucket 44: the 400 has aged out, the 600 has not.
+    at(&h, T0 + 4 * BUCKET);
+    assert_eq!(usage(&h, id), 600);
+    assert_eq!(pay(&h, &agent, id, 401), Err(Error::VelocityLimitExceeded));
+    assert_eq!(pay(&h, &agent, id, 400), Ok(()));
+
+    // Bucket 46: the 600 is gone too; only the latest 400 remains.
+    at(&h, T0 + 6 * BUCKET);
+    assert_eq!(usage(&h, id), 400);
+}
+
+#[test]
+fn no_double_burst_across_a_window_boundary() {
+    // A fixed window would allow ~2x the ceiling in two consecutive seconds.
+    // The rolling window does not.
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    at(&h, T0 + WINDOW - 1);
+    assert_eq!(pay(&h, &agent, id, 999), Ok(()));
+    at(&h, T0 + WINDOW);
+    // Only the 1 unit from T0 aged out.
+    assert_eq!(usage(&h, id), 999);
+    assert_eq!(pay(&h, &agent, id, 2), Err(Error::VelocityLimitExceeded));
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+}
+
+#[test]
+fn a_long_idle_gap_resets_all_buckets() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 700), Ok(()));
+    at(&h, T0 + 100 * WINDOW);
+    assert_eq!(usage(&h, id), 0);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+}
+
+#[test]
+fn a_clock_moving_backwards_never_frees_allowance() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    at(&h, T0 + 3 * BUCKET);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+    at(&h, T0);
+    assert_eq!(usage(&h, id), 1_000);
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::VelocityLimitExceeded));
+}
+
+#[test]
+fn withdrawals_share_the_window_with_transfers() {
+    let h = setup();
+    let (id, owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 700), Ok(()));
+    assert_eq!(
+        h.client.try_withdraw(&owner, &id, &h.token, &301),
+        Err(Ok(Error::VelocityLimitExceeded))
+    );
+    h.client.withdraw(&owner, &id, &h.token, &300);
+    assert_eq!(usage(&h, id), 1_000);
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::VelocityLimitExceeded));
+}
+
+#[test]
+fn limits_are_per_asset_and_per_wallet() {
+    let h = setup();
+    let (id, owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+
+    // Another asset in the same wallet is not limited by the first ceiling.
+    let other_admin = Address::generate(&h.env);
+    let other = h
+        .env
+        .register_stellar_asset_contract_v2(other_admin)
+        .address();
+    token::StellarAssetClient::new(&h.env, &other).mint(&owner, &5_000);
+    h.client.deposit(&id, &owner, &other, &5_000);
+    let to = Address::generate(&h.env);
+    h.client.transfer(&agent, &id, &to, &other, &5_000);
+
+    // Another wallet with its own ceiling has its own window.
+    let (id2, owner2, agent2) = funded_agent_wallet(&h, 5_000);
+    h.client
+        .set_velocity_limit(&owner2, &id2, &h.token, &2_000, &WINDOW);
+    assert_eq!(pay(&h, &agent2, id2, 2_000), Ok(()));
+    assert_eq!(usage(&h, id), 1_000);
+    assert_eq!(usage(&h, id2), 2_000);
+}
+
+#[test]
+fn policy_denial_still_wins_and_consumes_nothing() {
+    let h = setup();
+    h.client.set_policy(&h.admin, &register_stub(&h));
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 5_000);
+
+    // The stub policy caps each spend at 1_000; the velocity ceiling is
+    // looser, so the policy is what refuses and nothing is recorded.
+    assert_eq!(pay(&h, &agent, id, 2_000), Err(Error::PolicyDenied));
+    assert_eq!(usage(&h, id), 0);
+
+    // Five policy-compliant spends fill the ceiling; the sixth is refused by
+    // the velocity check even though the policy would allow it.
+    for _ in 0..5 {
+        assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+    }
+    assert_eq!(
+        pay(&h, &agent, id, 1_000),
+        Err(Error::VelocityLimitExceeded)
+    );
+    assert_eq!(h.client.balance(&id, &h.token), 5_000);
+}
+
+#[test]
+fn policy_bypass_does_not_lift_the_velocity_ceiling() {
+    let h = setup();
+    h.client.set_policy(&h.admin, &register_stub(&h));
+    let (id, _owner, agent) = velocity_wallet(&h, 10_000, 1_500);
+    h.client.set_policy_bypass(&h.admin, &id, &true);
+    assert_eq!(pay(&h, &agent, id, 1_500), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::VelocityLimitExceeded));
+}
+
+#[test]
+fn validated_batch_actions_count_toward_velocity() {
+    let h = setup();
+    let (id, owner, agent) = velocity_wallet(&h, 1_000, 500);
     let r1 = Address::generate(&h.env);
     let r2 = Address::generate(&h.env);
-    let (id, _owner, agent) = funded_agent_wallet_batch(&h, 1_000);
 
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(token_transfer_call(
+    // Two actions with no policy/budget envelope: velocity still applies,
+    // and the second action sees the volume of the first.
+    let mut over: Vec<BatchAction> = Vec::new(&h.env);
+    over.push_back(validated_action(
         &h.env,
         &h.token,
         &h.contract_id,
         &r1,
         300,
+        "",
+        "",
     ));
-    calls.push_back(token_transfer_call(
+    over.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        201,
+        "",
+        "",
+    ));
+    assert_eq!(
+        h.client.try_batch_execute_validated(&agent, &id, &over),
+        Err(Ok(Error::VelocityLimitExceeded))
+    );
+    // Atomic: nothing moved and nothing was recorded.
+    assert_eq!(token_balance(&h, &r1), 0);
+    assert_eq!(usage(&h, id), 0);
+
+    let mut fits: Vec<BatchAction> = Vec::new(&h.env);
+    fits.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        300,
+        "",
+        "",
+    ));
+    fits.push_back(validated_action(
         &h.env,
         &h.token,
         &h.contract_id,
         &r2,
         200,
+        "",
+        "",
     ));
-
-    let executed = h.client.batch_execute(&agent, &id, &calls);
-    assert_eq!(executed, 2);
-    assert_eq!(token_balance(&h, &r1), 300);
+    h.client.batch_execute_validated(&agent, &id, &fits);
+    assert_eq!(usage(&h, id), 500);
     assert_eq!(token_balance(&h, &r2), 200);
-    assert_eq!(token_balance(&h, &h.contract_id), 500);
-
-    // The aggregated outcome is published as ("wallet", "batch").
-    let want: Val = Symbol::new(&h.env, "batch").into_val(&h.env);
-    let found = h
-        .env
-        .events()
-        .all()
-        .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(want));
-    assert!(found, "expected (wallet, batch) event to be emitted");
+    assert_eq!(
+        h.client.try_withdraw(&owner, &id, &h.token, &1),
+        Err(Ok(Error::VelocityLimitExceeded))
+    );
 }
 
 #[test]
-fn batch_execute_admin_and_owner_may_also_drive_it() {
-    // The gate is `Role::Agent` or better; the owner is implicitly Admin.
+fn window_sum_that_would_overflow_is_a_velocity_breach() {
     let h = setup();
-    let recipient = Address::generate(&h.env);
-    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(token_transfer_call(
-        &h.env,
-        &h.token,
-        &h.contract_id,
-        &recipient,
-        40,
-    ));
-    let executed = h.client.batch_execute(&owner, &id, &calls);
-    assert_eq!(executed, 1);
-    assert_eq!(token_balance(&h, &recipient), 40);
+    let (id, owner, agent) = velocity_wallet(&h, i128::MAX, i128::MAX);
+    assert_eq!(pay(&h, &agent, id, i128::MAX), Ok(()));
+    mint(&h, &owner, 1);
+    h.client.deposit(&id, &owner, &h.token, &1);
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::VelocityLimitExceeded));
+    assert_eq!(usage(&h, id), i128::MAX);
 }
 
 #[test]
-fn batch_execute_failing_sub_call_reverts_the_whole_batch() {
+fn only_wallet_admins_configure_velocity() {
     let h = setup();
-    let r1 = Address::generate(&h.env);
-    let r2 = Address::generate(&h.env);
-    let (id, _owner, agent) = funded_agent_wallet_batch(&h, 100);
-
-    // The second call overdraws the wallet's 100 balance, so the token
-    // transfer itself fails — after the first call already succeeded.
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(token_transfer_call(
-        &h.env,
-        &h.token,
-        &h.contract_id,
-        &r1,
-        60,
-    ));
-    calls.push_back(token_transfer_call(
-        &h.env,
-        &h.token,
-        &h.contract_id,
-        &r2,
-        80,
-    ));
-
-    let res = h.client.try_batch_execute(&agent, &id, &calls);
-    assert!(res.is_err(), "overdrawing sub-call must fail the batch");
-
-    // Full rollback: the first transfer's 60 tokens never left custody.
-    assert_eq!(token_balance(&h, &r1), 0);
-    assert_eq!(token_balance(&h, &r2), 0);
-    assert_eq!(token_balance(&h, &h.contract_id), 100);
-
-    // No batch event may survive the revert.
-    let want: Val = Symbol::new(&h.env, "batch").into_val(&h.env);
-    let found = h
-        .env
-        .events()
-        .all()
-        .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(want));
-    assert!(!found, "no (wallet, batch) event may survive a revert");
-}
-
-#[test]
-fn batch_execute_failing_sub_call_system_level_maps_to_batch_call_failed() {
-    // A sub-call naming a function that does not exist on the callee fails at
-    // the system level (no deterministic contract error code), which the
-    // executor reports as [`Error::BatchCallFailed`] — and the leg that ran
-    // before it is rolled back with the batch.
-    let h = setup();
-    let recipient = Address::generate(&h.env);
-    let (id, _owner, agent) = funded_agent_wallet_batch(&h, 100);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(token_transfer_call(
-        &h.env,
-        &h.token,
-        &h.contract_id,
-        &recipient,
-        10,
-    ));
-    calls.push_back(ContractCall {
-        contract_addr: h.token.clone(),
-        fn_name: Symbol::new(&h.env, "no_such_function"),
-        args: Vec::new(&h.env),
-    });
-
-    let res = h.client.try_batch_execute(&agent, &id, &calls);
-    assert_eq!(res, Err(Ok(Error::BatchCallFailed)));
-    assert_eq!(token_balance(&h, &recipient), 0);
-    assert_eq!(token_balance(&h, &h.contract_id), 100);
-}
-
-#[test]
-fn batch_execute_empty_batch_fails() {
-    let h = setup();
-    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
-    let empty: Vec<ContractCall> = Vec::new(&h.env);
-    let res = h.client.try_batch_execute(&owner, &id, &empty);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
-}
-
-#[test]
-fn batch_execute_oversized_batch_fails() {
-    let h = setup();
-    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
-
-    // One call more than the cap is refused before anything fires.
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    for _ in 0..=(constants::MAX_BATCH_CALLS) {
-        calls.push_back(token_transfer_call(
-            &h.env,
-            &h.token,
-            &h.contract_id,
-            &Address::generate(&h.env),
-            1,
-        ));
-    }
-    let res = h.client.try_batch_execute(&owner, &id, &calls);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
-}
-
-#[test]
-fn batch_execute_non_agent_rejected() {
-    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 1_000, 500);
     let stranger = Address::generate(&h.env);
-    let (id, _owner, _agent) = funded_agent_wallet_batch(&h, 100);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(token_transfer_call(
-        &h.env,
-        &h.token,
-        &h.contract_id,
-        &Address::generate(&h.env),
-        10,
-    ));
-    let res = h.client.try_batch_execute(&stranger, &id, &calls);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    for caller in [&agent, &stranger] {
+        assert_eq!(
+            h.client
+                .try_set_velocity_limit(caller, &id, &h.token, &1_000_000, &WINDOW),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            h.client.try_clear_velocity_limit(caller, &id, &h.token),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+    assert_eq!(
+        h.client
+            .get_velocity_limit(&id, &h.token)
+            .unwrap()
+            .max_amount,
+        500
+    );
+    assert_eq!(
+        h.client
+            .try_set_velocity_limit(&h.admin, &999, &h.token, &1, &WINDOW),
+        Err(Ok(Error::NotFound))
+    );
 }
 
 #[test]
-fn batch_execute_frozen_wallet_rejected() {
+fn velocity_configuration_is_validated() {
     let h = setup();
-    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
-    h.client.freeze(&owner, &id);
-
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(token_transfer_call(
-        &h.env,
+    let (id, owner, _agent) = funded_agent_wallet(&h, 1_000);
+    for max in [0, -1, i128::MIN] {
+        assert_eq!(
+            h.client
+                .try_set_velocity_limit(&owner, &id, &h.token, &max, &WINDOW),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+    for window in [0u64, 1, 3, 3_601] {
+        assert_eq!(
+            h.client
+                .try_set_velocity_limit(&owner, &id, &h.token, &100, &window),
+            Err(Ok(Error::InvalidInput))
+        );
+    }
+    // The smallest valid window is one second per bucket.
+    h.client.set_velocity_limit(
+        &owner,
+        &id,
         &h.token,
-        &h.contract_id,
-        &Address::generate(&h.env),
-        10,
-    ));
-    let res = h.client.try_batch_execute(&owner, &id, &calls);
-    assert_eq!(res, Err(Ok(Error::WalletFrozen)));
+        &100,
+        &(crate::VELOCITY_BUCKETS as u64),
+    );
+
+    h.client.archive(&owner, &id);
+    assert_eq!(
+        h.client
+            .try_set_velocity_limit(&owner, &id, &h.token, &100, &WINDOW),
+        Err(Ok(Error::WalletArchived))
+    );
 }
 
 #[test]
-fn batch_execute_contract_wide_breaker_rejected() {
+fn raising_the_ceiling_keeps_usage_and_changing_the_window_resets_it() {
     let h = setup();
-    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
-    h.client.emergency_pause(&h.admin);
+    let (id, owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
 
-    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
-    calls.push_back(token_transfer_call(
-        &h.env,
-        &h.token,
-        &h.contract_id,
-        &Address::generate(&h.env),
-        10,
-    ));
-    let res = h.client.try_batch_execute(&owner, &id, &calls);
-    assert_eq!(res, Err(Ok(Error::WalletPaused)));
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &1_500, &WINDOW);
+    assert_eq!(usage(&h, id), 1_000);
+    assert_eq!(pay(&h, &agent, id, 501), Err(Error::VelocityLimitExceeded));
+    assert_eq!(pay(&h, &agent, id, 500), Ok(()));
+
+    // Lowering below recorded usage blocks spending until it ages out.
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &1_000, &WINDOW);
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::VelocityLimitExceeded));
+
+    // A new window length re-buckets time, so recorded usage restarts.
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &1_000, &(2 * WINDOW));
+    assert_eq!(usage(&h, id), 0);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+}
+
+#[test]
+fn clearing_the_ceiling_removes_limit_and_usage() {
+    let h = setup();
+    let (id, owner, agent) = velocity_wallet(&h, 10_000, 1_000);
+    assert_eq!(pay(&h, &agent, id, 1_000), Ok(()));
+    h.client.clear_velocity_limit(&owner, &id, &h.token);
+    assert_eq!(h.client.get_velocity_limit(&id, &h.token), None);
+    assert_eq!(usage(&h, id), 0);
+    assert_eq!(pay(&h, &agent, id, 5_000), Ok(()));
+    assert_eq!(
+        h.client.try_clear_velocity_limit(&owner, &id, &h.token),
+        Err(Ok(Error::NotFound))
+    );
+
+    // Re-enabling starts from a clean window.
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &1_000, &WINDOW);
+    assert_eq!(usage(&h, id), 0);
+}
+
+#[test]
+fn velocity_storage_stays_constant_size() {
+    let h = setup();
+    let (id, _owner, agent) = velocity_wallet(&h, 100_000, 1_000_000);
+    for i in 0..40u64 {
+        at(&h, T0 + i * BUCKET);
+        assert_eq!(pay(&h, &agent, id, 10), Ok(()));
+    }
+    // After many spends across many buckets there is still exactly one
+    // usage record holding VELOCITY_BUCKETS entries.
+    let record: crate::VelocityUsage = h.env.as_contract(&h.contract_id, || {
+        h.env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::VelocityUsage(id, h.token.clone()))
+            .unwrap()
+    });
+    assert_eq!(record.spent.len(), crate::VELOCITY_BUCKETS);
+    assert_eq!(record.bucket, (T0 + 39 * BUCKET) / BUCKET);
+    // The trailing window holds the last four spends only.
+    assert_eq!(usage(&h, id), 40);
 }

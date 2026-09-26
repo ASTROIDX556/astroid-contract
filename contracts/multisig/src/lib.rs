@@ -577,11 +577,9 @@ impl MultiSigContract {
         if env.storage().persistent().get(&akey).unwrap_or(false) {
             return Err(Error::AlreadySigned);
         }
-        let weight = Self::weight_of(&env, &caller)?;
         env.storage().persistent().set(&akey, &true);
         Self::bump_approval(&env, proposal_id, &caller);
-        proposal.approval_weight =
-            checked_add(proposal.approval_weight as i128, weight as i128)? as u32;
+        proposal.approval_weight = Self::live_approval_weight(&env, proposal_id)?;
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
