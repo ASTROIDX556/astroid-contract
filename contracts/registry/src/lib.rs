@@ -40,15 +40,16 @@
 
 use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
-    MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD, UPGRADE_PROPOSAL_EXPIRY,
 };
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
-use astroid_shared::events::ContractEvent;
+use astroid_shared::events::{self, ContractEvent, UpgradeAudit};
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
-use astroid_shared::validation::require_non_empty;
+use astroid_shared::validation::{require_non_empty, require_valid_wasm_hash};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Vec,
 };
 
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
@@ -76,6 +77,72 @@ enum DataKey {
     Frozen,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
+    /// Pending version-upgrade proposal: kind -> UpgradeProposal.
+    UpgradeProposal(ModuleKind),
+    /// Immutable historical log of upgrade-lifecycle actions (instance).
+    UpgradeAuditLog,
+}
+
+/// A pending version-upgrade proposal for one [`ModuleKind`]: the `(version,
+/// wasm_hash, address)` triple an authorized caller wants committed into the
+/// version table, plus who proposed it and when it expires.
+///
+/// The record is keyed by kind alone — one proposal per kind at a time — so a
+/// kind's upgrade path is always unambiguous and a hostile proposal cannot hide
+/// behind a second, conflicting one.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposal {
+    /// The version number this proposal would occupy in the version table.
+    pub version: u32,
+    /// The Wasm hash of the proposed implementation.
+    pub wasm_hash: BytesN<32>,
+    /// The contract address the implementation is expected to be deployed at.
+    pub address: Address,
+    /// The organization the proposal was made under. Recorded so the org's
+    /// owner can reject (or withdraw via the proposer) a proposal they no
+    /// longer want without relying on the protocol admin.
+    pub org: String,
+    /// Who proposed the upgrade (an org owner or the protocol admin).
+    pub proposer: Address,
+    /// Unix timestamp after which the proposal can no longer be committed.
+    pub expires_at: u64,
+}
+
+/// What kind of upgrade-lifecycle action an [`UpgradeAuditRecord`] captures.
+/// Discriminants are part of the public ABI and MUST NOT be reordered or
+/// reused once released.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpgradeAction {
+    /// A `(version, wasm_hash, address)` triple was proposed for a kind.
+    Proposed = 0,
+    /// A pending proposal was committed into the version table.
+    Committed = 1,
+    /// A pending proposal was rejected or withdrawn by its proposer.
+    Rejected = 2,
+}
+// NOTE: refused upgrade attempts (unauthorized actor, downgrade, identical-WASM
+// re-proposal, …) are deliberately *not* logged. A Soroban invocation is
+// atomic: every storage write and event of a call that returns an error is
+// rolled back, so an audit entry written on the failure path could never be
+// observed on-chain. Refusals stay visible off-chain as reverted transactions
+// carrying their error code; the on-chain trail records successful lifecycle
+// actions only.
+
+/// One immutable entry in the registry's historical upgrade log (Issue #300):
+/// who did what to which version of a module kind, and when. Records are
+/// appended on every successful propose/commit/reject and never edited or
+/// removed; refused attempts revert atomically (see [`UpgradeAction`]) so the
+/// log only ever contains actions that took effect. The log itself is a ring
+/// buffer capped at [`MAX_UPGRADE_AUDIT_ENTRIES`] entries of instance storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeAuditRecord {
+    /// Which lifecycle action was taken.
+    pub action: UpgradeAction,
+    /// The typed audit payload shared with the emitted event.
+    pub audit: UpgradeAudit,
 }
 
 /// A delegated administrative role over one organization's registry records.
@@ -428,6 +495,16 @@ impl RegistryContract {
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
+        // Downgrade protection: the version table is monotonic per kind, so a
+        // registration may never lower or repeat the latest version. Direct
+        // registration is the admin escape hatch and carries the same guard as
+        // the propose/commit flow.
+        let latest: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(kind))
+            .unwrap_or(0);
+        ensure!(version > latest, Error::InvalidState);
         let vkey = DataKey::Version(kind, version);
         env.storage().persistent().set(&vkey, &address);
         Self::bump(&env, &vkey);
@@ -448,6 +525,280 @@ impl RegistryContract {
             address,
         );
         Ok(())
+    }
+
+    // --- Version upgrade validation (Issue #304) ---
+
+    /// Propose a version upgrade for a module kind: record a pending
+    /// `(version, wasm_hash, address)` triple that a protocol admin can later
+    /// commit ([`Self::commit_upgrade`]) or reject
+    /// ([`Self::reject_upgrade`]).
+    ///
+    /// Validation performed:
+    /// - `caller` must be the protocol admin, the recorded owner of `org`, or
+    ///   an account holding a delegated [`RegistryRole::ModuleUpgrader`] over
+    ///   `org` — proposals are exactly the act of rolling a module forward, so
+    ///   the module-management gate is the right one.
+    /// - the registry must not be frozen and `org` must be registered.
+    /// - `version` must be non-zero and strictly greater than the latest
+    ///   registered version for the kind, so a proposal can never be a
+    ///   downgrade (downgrade-attack prevention).
+    /// - `wasm_hash` must pass [`require_valid_wasm_hash`] and must not already
+    ///   be approved for the kind (a re-proposal of deployed bytecode is
+    ///   meaningless and usually a mistake — Issue #300's identical-WASM edge
+    ///   case).
+    /// - the kind must have no pending proposal ([`Error::InvalidState`]),
+    ///   so the upgrade path stays unambiguous.
+    ///
+    /// On success the proposal is stored, `UpgradeProposed` is emitted (both
+    /// the canonical and the tuple-topic form) and the action is appended to
+    /// the immutable upgrade audit log ([`Self::get_upgrade_history`]). A
+    /// refused proposal reverts atomically — Soroban rolls back every storage
+    /// write and event of a failed invocation — so only successful lifecycle
+    /// actions are ever recorded; the refusal itself remains visible off-chain
+    /// as a reverted transaction.
+    pub fn propose_upgrade(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        version: u32,
+        wasm_hash: BytesN<32>,
+        address: Address,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        require_non_empty(&org)?;
+        caller.require_auth();
+        // Authorization: org owners and delegated module upgraders may propose;
+        // everyone else — including holders of unrelated delegated roles — is
+        // rejected with the canonical Unauthorized. An unknown org is reported
+        // as NotFound so callers can tell a typo from a permission failure.
+        if !Self::is_admin(&env, &caller) {
+            match Self::effective_role(&env, &org, &caller) {
+                Some(RegistryRole::ModuleUpgrader) | Some(RegistryRole::Owner) => {}
+                _ => {
+                    if !env.storage().persistent().has(&DataKey::Org(org.clone())) {
+                        return Err(Error::NotFound);
+                    }
+                    return Err(Error::Unauthorized);
+                }
+            }
+        }
+        // Input validation, including the identical-WASM edge case from
+        // Issue #300: re-proposing bytecode that is already approved for the
+        // kind fails rather than laundering a no-op through the flow.
+        ensure!(version != 0, Error::InvalidInput);
+        require_valid_wasm_hash(&env, &wasm_hash)?;
+
+        // Downgrade protection: strictly newer versions only.
+        let latest: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(kind))
+            .unwrap_or(0);
+        ensure!(version > latest, Error::InvalidState);
+
+        // One open proposal per kind keeps the upgrade path unambiguous.
+        let pkey = DataKey::UpgradeProposal(kind);
+        ensure!(!env.storage().persistent().has(&pkey), Error::InvalidState);
+
+        // The hash must not already be approved for the kind: proposals exist
+        // to introduce new bytecode, not to re-commit something deployed.
+        ensure!(
+            !env.storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::ApprovedWasm(kind, wasm_hash.clone()))
+                .unwrap_or(false),
+            Error::InvalidInput
+        );
+
+        let proposal = UpgradeProposal {
+            version,
+            wasm_hash: wasm_hash.clone(),
+            address: address.clone(),
+            org: org.clone(),
+            proposer: caller.clone(),
+            expires_at: env.ledger().timestamp() + UPGRADE_PROPOSAL_EXPIRY,
+        };
+        env.storage().persistent().set(&pkey, &proposal);
+        Self::bump(&env, &pkey);
+
+        let audit_log = UpgradeAudit {
+            kind,
+            version,
+            wasm_hash: wasm_hash.clone(),
+            org: org.clone(),
+            actor: caller,
+            recorded_at: env.ledger().timestamp(),
+        };
+        Self::append_audit(&env, UpgradeAction::Proposed, &audit_log);
+        events::upgrade_proposed(&env, kind, version, &wasm_hash);
+        events::publish(&env, ContractEvent::UpgradeProposed { audit: audit_log });
+        Ok(())
+    }
+
+    /// Commit a pending upgrade proposal: record the proposed address in the
+    /// version table, approve the proposed Wasm hash for the kind, clear the
+    /// pending record and emit `UpgradeCommitted`.
+    ///
+    /// Committing is the higher-bar side of the flow and is admin-gated. All of
+    /// the proposal's validation is re-checked at commit time so nothing that
+    /// became invalid while the proposal was pending can slip through:
+    /// - the proposal must exist for the kind ([`Error::NotFound`]) and must
+    ///   not have expired (a matured proposal stays refuseable forever);
+    /// - `version` must still be strictly greater than the latest registered
+    ///   version (nothing was committed in the meantime);
+    /// - `wasm_hash` must still be well-formed.
+    ///
+    /// A successful commit appends `Committed` to the audit log and emits
+    /// `UpgradeCommitted` (canonical and tuple-topic form); any refusal reverts
+    /// atomically, so refused commits never touch the trail.
+    pub fn commit_upgrade(
+        env: Env,
+        caller: Address,
+        kind: ModuleKind,
+    ) -> Result<(u32, Address), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+
+        let pkey = DataKey::UpgradeProposal(kind);
+        let proposal: UpgradeProposal = env
+            .storage()
+            .persistent()
+            .get(&pkey)
+            .ok_or(Error::NotFound)?;
+
+        // Expiry: a matured proposal is dropped once and for all — committing
+        // it is refused forever after (the check re-runs on every attempt).
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::NotFound);
+        }
+
+        // Re-validate everything the proposal asserted at propose time; the
+        // world may have moved underneath it while it was pending.
+        require_valid_wasm_hash(&env, &proposal.wasm_hash)?;
+        let latest: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(kind))
+            .unwrap_or(0);
+        ensure!(proposal.version > latest, Error::InvalidState);
+
+        // Commit: version table + wasm approval, then clear the pending record.
+        let vkey = DataKey::Version(kind, proposal.version);
+        env.storage().persistent().set(&vkey, &proposal.address);
+        Self::bump(&env, &vkey);
+        let lkey = DataKey::LatestVersion(kind);
+        env.storage().persistent().set(&lkey, &proposal.version);
+        Self::bump(&env, &lkey);
+        let akey = DataKey::ApprovedWasm(kind, proposal.wasm_hash.clone());
+        env.storage().persistent().set(&akey, &true);
+        Self::bump(&env, &akey);
+        env.storage().persistent().remove(&pkey);
+
+        let version = proposal.version;
+        let address = proposal.address.clone();
+        let wasm_hash = proposal.wasm_hash.clone();
+
+        let audit_log = UpgradeAudit {
+            kind,
+            version,
+            wasm_hash: wasm_hash.clone(),
+            org: proposal.org,
+            actor: caller,
+            recorded_at: env.ledger().timestamp(),
+        };
+        Self::append_audit(&env, UpgradeAction::Committed, &audit_log);
+        events::upgrade_committed(&env, kind, version, &wasm_hash, &address);
+        events::publish(
+            &env,
+            ContractEvent::UpgradeCommitted {
+                audit: audit_log,
+                address: address.clone(),
+            },
+        );
+        // Same payload as the canonical event, keeping the legacy
+        // ("version", "register") topic consumers working.
+        env.events().publish(
+            (
+                symbol_short!("version"),
+                symbol_short!("register"),
+                kind,
+                version,
+            ),
+            address.clone(),
+        );
+        Ok((version, address))
+    }
+
+    /// Reject (or withdraw) a pending upgrade proposal: clear the pending
+    /// record and emit `UpgradeRejected`.
+    ///
+    /// The proposer may withdraw their own proposal; the protocol admin may
+    /// reject any proposal. An org owner may also reject a proposal targeting
+    /// their organization's module kind, so an owner can always stop an
+    /// upgrade they no longer want even if they did not propose it. Deleting a
+    /// non-existent proposal fails with [`Error::NotFound`], so a rejection is
+    /// never silently a no-op.
+    ///
+    /// A successful rejection appends `Rejected` to the audit log and emits
+    /// `UpgradeRejected` (canonical and tuple-topic form); any refusal reverts
+    /// atomically, so refused rejections never touch the trail.
+    pub fn reject_upgrade(env: Env, caller: Address, kind: ModuleKind) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        caller.require_auth();
+
+        let pkey = DataKey::UpgradeProposal(kind);
+        let proposal: UpgradeProposal = env
+            .storage()
+            .persistent()
+            .get(&pkey)
+            .ok_or(Error::NotFound)?;
+
+        let authorized = Self::is_admin(&env, &caller)
+            || proposal.proposer == caller
+            || env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::Org(proposal.org.clone()))
+                .map(|owner| owner == caller)
+                .unwrap_or(false);
+        ensure!(authorized, Error::Unauthorized);
+
+        env.storage().persistent().remove(&pkey);
+        let audit_log = UpgradeAudit {
+            kind,
+            version: proposal.version,
+            wasm_hash: proposal.wasm_hash.clone(),
+            org: proposal.org,
+            actor: caller,
+            recorded_at: env.ledger().timestamp(),
+        };
+        Self::append_audit(&env, UpgradeAction::Rejected, &audit_log);
+        events::upgrade_rejected(&env, kind, proposal.version, &proposal.wasm_hash);
+        events::publish(&env, ContractEvent::UpgradeRejected { audit: audit_log });
+        Ok(())
+    }
+
+    /// The immutable historical upgrade log (Issue #300): every successful
+    /// propose, commit and reject, most recent entry first. Records are never
+    /// edited or removed; the log is a ring buffer capped at
+    /// [`MAX_UPGRADE_AUDIT_ENTRIES`] entries.
+    pub fn get_upgrade_history(env: Env) -> Vec<UpgradeAuditRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeAuditLog)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Number of upgrade audit entries currently retained.
+    pub fn get_upgrade_history_len(env: Env) -> u32 {
+        Self::upgrade_log(&env).len()
+    }
+
+    /// Read the pending upgrade proposal for a kind, if any.
+    pub fn get_upgrade_proposal(env: Env, kind: ModuleKind) -> Option<UpgradeProposal> {
+        Self::pending_proposal(&env, &kind)
     }
 
     /// Look up a specific implementation version.
@@ -560,6 +911,13 @@ impl RegistryContract {
     }
 
     /// Record an approved WASM hash for a specific module kind.
+    ///
+    /// The hash must be well-formed ([`require_valid_wasm_hash`]) and must not
+    /// conflict with a pending upgrade proposal for the kind: while a proposal
+    /// is open, an approval of a *different* hash would let the proposal be
+    /// committed against bytecode the proposers never saw, so it is refused
+    /// with [`Error::InvalidState`] until the proposal is committed or
+    /// rejected.
     pub fn add_approved_wasm(
         env: Env,
         caller: Address,
@@ -567,6 +925,10 @@ impl RegistryContract {
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
+        require_valid_wasm_hash(&env, &wasm_hash)?;
+        if let Some(pending) = Self::pending_proposal(&env, &kind) {
+            ensure!(pending.wasm_hash == wasm_hash, Error::InvalidState);
+        }
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         env.storage().persistent().set(&key, &true);
         Self::bump(&env, &key);
@@ -604,6 +966,45 @@ impl RegistryContract {
     }
 
     // --- internal helpers ---
+
+    // --- upgrade audit trail (Issue #300) ---
+
+    /// Read the audit log (most recent entry first).
+    fn upgrade_log(env: &Env) -> Vec<UpgradeAuditRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeAuditLog)
+            .unwrap_or_else(|| vec![env])
+    }
+
+    /// Append `record` to the immutable audit log, newest first, dropping the
+    /// oldest entry once the ring buffer reaches [`MAX_UPGRADE_AUDIT_ENTRIES`].
+    ///
+    /// Only called on the success paths of the upgrade lifecycle; a Soroban
+    /// invocation is atomic, so had the surrounding call failed this write
+    /// would be rolled back along with everything else it did.
+    fn append_audit(env: &Env, action: UpgradeAction, audit: &UpgradeAudit) {
+        let mut log = Self::upgrade_log(env);
+        log.push_front(UpgradeAuditRecord {
+            action,
+            audit: audit.clone(),
+        });
+        while log.len() > MAX_UPGRADE_AUDIT_ENTRIES {
+            log.pop_back();
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeAuditLog, &log);
+    }
+
+    /// Read the pending upgrade proposal for `kind`, if one is stored. The
+    /// only consumer of the raw record besides the upgrade flow itself, so the
+    /// expiry check lives at the flow's commit path rather than here.
+    fn pending_proposal(env: &Env, kind: &ModuleKind) -> Option<UpgradeProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeProposal(*kind))
+    }
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
         ensure!(

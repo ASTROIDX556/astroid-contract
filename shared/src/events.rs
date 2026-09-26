@@ -21,7 +21,30 @@
 //! existing nor new consumers break.
 
 use crate::types::{AssetAmount, ModuleKind};
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
+
+/// Typed payload of the upgrade audit trail: who did what to which version of
+/// a module kind, and when. Emitted as part of every upgrade-lifecycle event
+/// (`UpgradeProposed`, `UpgradeCommitted`, `UpgradeRejected`) and stored
+/// on-chain as an immutable historical log by the registry, so off-chain
+/// indexers and on-chain readers see one identical audit schema.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeAudit {
+    /// The module kind whose upgrade path this record concerns.
+    pub kind: ModuleKind,
+    /// The version number involved in the action.
+    pub version: u32,
+    /// The Wasm hash involved in the action.
+    pub wasm_hash: BytesN<32>,
+    /// The organization the action was taken under.
+    pub org: String,
+    /// The account that performed the action (proposer, committing admin,
+    /// or rejecting actor).
+    pub actor: Address,
+    /// Unix timestamp of the action.
+    pub recorded_at: u64,
+}
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -42,6 +65,26 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// A contract implementation upgrade was proposed for a module kind.
+    /// Carries the audit payload ([`UpgradeAudit`]) written to the registry's
+    /// historical upgrade log at the same moment.
+    UpgradeProposed { audit: UpgradeAudit },
+    /// A proposed upgrade was rejected or withdrawn.
+    UpgradeRejected { audit: UpgradeAudit },
+    /// A proposed upgrade was committed: the implementation address was
+    /// recorded in the version table and its Wasm hash approved for the kind.
+    UpgradeCommitted {
+        audit: UpgradeAudit,
+        address: Address,
+    },
+    // NOTE: there is deliberately no "upgrade attempt rejected" event. A
+    // Soroban invocation is atomic: every event and storage write of a call
+    // that returns an error is rolled back, so an event published on a failure
+    // path could never be observed on-chain. Refused upgrade attempts (an
+    // unauthorized actor, a re-proposal of already-approved bytecode, …) stay
+    // visible off-chain as reverted transactions carrying their error code;
+    // the UpgradeProposed/UpgradeCommitted/UpgradeRejected events and the
+    // registry's on-chain audit log cover the actions that took effect.
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
@@ -118,6 +161,18 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
+        }
+        ContractEvent::UpgradeProposed { audit } => {
+            env.events()
+                .publish((Symbol::new(env, "UpgradeProposed"),), audit);
+        }
+        ContractEvent::UpgradeRejected { audit } => {
+            env.events()
+                .publish((Symbol::new(env, "UpgradeRejected"),), audit);
+        }
+        ContractEvent::UpgradeCommitted { audit, address } => {
+            env.events()
+                .publish((Symbol::new(env, "UpgradeCommitted"),), (audit, address));
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
@@ -281,6 +336,36 @@ pub fn allowance_consumed(env: &Env, agent: &Address, asset: &Address, amount: i
 /// for policy/budget violations) so all call sites share one construction path.
 pub fn reason(env: &Env, name: &str) -> Symbol {
     Symbol::new(env, name)
+}
+
+/// `UpgradeProposed` — topic `("version", "proposed")`. Published when an
+/// org owner or admin proposes a version upgrade for a module kind.
+pub fn upgrade_proposed(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
+    let topics = (symbol_short!("version"), symbol_short!("proposed"));
+    env.events()
+        .publish(topics, (kind, version, wasm_hash.clone()));
+}
+
+/// `UpgradeRejected` — topic `("version", "rejected")`. Published when a
+/// pending upgrade proposal is rejected (or withdrawn by its proposer).
+pub fn upgrade_rejected(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
+    let topics = (symbol_short!("version"), symbol_short!("rejected"));
+    env.events()
+        .publish(topics, (kind, version, wasm_hash.clone()));
+}
+
+/// `UpgradeCommitted` — topic `("version", "committed")`. Published when a
+/// proposed upgrade is committed into the version table.
+pub fn upgrade_committed(
+    env: &Env,
+    kind: ModuleKind,
+    version: u32,
+    wasm_hash: &BytesN<32>,
+    address: &Address,
+) {
+    let topics = (symbol_short!("version"), symbol_short!("committed"));
+    env.events()
+        .publish(topics, (kind, version, wasm_hash.clone(), address.clone()));
 }
 
 /// `WalletBatchExecuted` — topic `("wallet", "batch")`.

@@ -67,3 +67,16 @@ pub const MAX_PAUSE_DURATION: u64 = SECONDS_PER_MONTH;
 /// Minimum number of ledgers that must pass before a pending multisig
 /// threshold change can be finalized (~1 day on Stellar).
 pub const THRESHOLD_CHANGE_DELAY_LEDGERS: u32 = DAY_IN_LEDGERS;
+
+/// How long a version-upgrade proposal stays valid after being proposed (one
+/// week). Stale proposals must be re-proposed rather than lying dormant
+/// indefinitely, so an old approval cannot be committed after the operators
+/// have changed their minds.
+pub const UPGRADE_PROPOSAL_EXPIRY: u64 = SECONDS_PER_WEEK;
+
+/// Upper bound on how many entries the registry's immutable upgrade audit log
+/// retains (instance storage). The log is a ring buffer: once full, the oldest
+/// entry is dropped as each new one is appended, keeping the audit trail of
+/// the most recent upgrades while capping the storage footprint of an
+/// unbounded version history.
+pub const MAX_UPGRADE_AUDIT_ENTRIES: u32 = 32;
