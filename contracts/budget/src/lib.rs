@@ -54,9 +54,12 @@
 //! the remainder accumulates into `rollover_credit`, clamped to the **effective
 //! cap** — the smaller of the owner-set absolute `rollover_cap` (0 = uncapped)
 //! and the protocol percentage ceiling `rollover_max_bps` of the base limit
-//! (0 = uncapped). The cap is what stops a budget that is left idle for a long
-//! stretch from silently accruing a balance far larger than the limit it was
-//! granted, which an agent could then drain in one period.
+//! (0 = uncapped). The closing balance *replaces* the credit carried into the
+//! period instead of stacking on top of it, so an untouched budget gains
+//! exactly one base limit per period and can never outrun the allowance it was
+//! granted. The cap is what stops a budget that is left idle for a long stretch
+//! from silently accruing a balance far larger than the limit it was granted,
+//! which an agent could then drain in one period.
 //!
 //! Functions: `allocate`, `set_recurrence`, `consume`, `reset`, `rollover`,
 //! `freeze`, `unfreeze`, `archive`, `transfer_allocation`.
@@ -577,19 +580,11 @@ impl BudgetContract {
             .get(&key)
             .ok_or(Error::AssetNotAuthorized)?;
         // Recurring per-asset limits replenish lazily, on the spend itself.
+        // The hook settles every elapsed window and re-anchors `window_start`
+        // to the boundary, so the spend below always sees the current period
+        // and no second reset (with a `now`-based anchor, which would drift
+        // off the schedule) can fire afterwards.
         Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &token, true);
-
-        // Window rollover check
-        let now = env.ledger().timestamp();
-        if asset_budget.window_seconds > 0
-            && now
-                >= asset_budget
-                    .window_start
-                    .saturating_add(asset_budget.window_seconds)
-        {
-            asset_budget.spent = 0;
-            asset_budget.window_start = now;
-        }
 
         // Check if within limit
         let new_spent = checked_add(asset_budget.spent, amount)?;
@@ -847,7 +842,12 @@ impl BudgetContract {
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         let leftover = checked_sub(capacity, budget.spent)?;
         if budget.rollover_enabled {
-            let mut credit = leftover;
+            // A negative closing balance (`spent` above `capacity`, reachable
+            // when the owner tightens the cap mid-period through
+            // `set_recurrence`) carries as zero: a shortfall is never an
+            // allowance for the next window, and carrying it would pin the
+            // budget to a permanently reduced ceiling.
+            let mut credit = if leftover > 0 { leftover } else { 0 };
             if periods > 1 {
                 let idle = checked_sub(periods, 1)?;
                 credit = Self::accrue_idle_periods(credit, budget, idle)?;
@@ -862,9 +862,9 @@ impl BudgetContract {
         let spent = budget.spent;
         // Deficit: spent exceeded capacity (base limit + rollover credit).
         // Track it so the next period's effective limit is reduced, and drop
-        // any (negative) rollover credit computed above. `spent > capacity`
-        // with `!allow_deficit` cannot happen — consume rejects it — but is
-        // handled defensively by simply resetting the window.
+        // any surplus that would otherwise mask it. `spent > capacity` with
+        // `!allow_deficit` cannot happen — consume rejects it — but is handled
+        // defensively by simply resetting the window.
         if spent > capacity && budget.allow_deficit {
             let deficit = checked_sub(spent, capacity)?;
             budget.deficit_amount = checked_add(budget.deficit_amount, deficit)?;

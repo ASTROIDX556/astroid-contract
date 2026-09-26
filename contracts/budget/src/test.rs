@@ -407,6 +407,7 @@ fn get_missing_budget_fails_not_found() {
 
 const DAY: u64 = 86_400;
 const WEEK: u64 = 604_800;
+const MONTH: u64 = astroid_shared::constants::SECONDS_PER_MONTH;
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -724,6 +725,263 @@ fn rollover_and_reset_events_are_emitted() {
     assert_event(&h.env, "BudgetUpdated");
 }
 
+// ---------------------------------------------------------------------------
+// Period transition boundaries (issue #46): the rollover hook must settle
+// exactly when — and only when — a boundary is crossed, must settle lazily and
+// idempotently off the ledger timestamp, and must never hand out more
+// allowance than the budget was actually granted.
+// ---------------------------------------------------------------------------
+
+/// One second short of the boundary the old period still stands; on the exact
+/// boundary it turns over; one second later the *new* period still stands
+/// (no second reset). Every assertion is driven by `env.ledger().timestamp()`.
+#[test]
+fn daily_window_rolls_on_the_exact_boundary_timestamp() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, false);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
+
+    h.env.ledger().set_timestamp(1_000 + DAY - 1);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 1_000);
+    assert_eq!(b.window_start, 1_000);
+
+    // The exact boundary is inclusive: the period turns over at
+    // `window_start + window`, not one second later.
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.window_start, 1_000 + DAY);
+
+    h.env.ledger().set_timestamp(1_000 + DAY + 1);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).window_start, 1_000 + DAY);
+}
+
+/// The transition is evaluated lazily: raw storage keeps the old period until
+/// a view or a disbursement runs the hook, and running the hook again is a
+/// no-op rather than a second reset.
+#[test]
+fn transitions_settle_lazily_and_idempotently() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, true);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+
+    // Nobody touched the budget a day later: storage still shows period one.
+    h.env.ledger().set_timestamp(1_000 + DAY + 100);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 600);
+    assert_eq!(b.window_start, 1_000);
+
+    // First read settles exactly one period and persists it.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_400);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.rollover_credit, 400);
+    assert_eq!(b.window_start, 1_000 + DAY);
+
+    // Idempotent: a second read changes nothing.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_400);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).window_start, 1_000 + DAY);
+}
+
+/// Regression: the closing balance *replaces* the carried credit instead of
+/// stacking on top of it. Compounding would let an untouched budget inflate
+/// its ceiling past everything it was ever granted.
+#[test]
+fn rollover_credit_does_not_compound_across_consecutive_periods() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+
+    // Period 1 closes with 400 unspent.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_400);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 400);
+
+    // Period 2 closes untouched: 1_000 fresh + 400 carried = 1_400, never 1_800.
+    h.env.ledger().set_timestamp(1_000 + 2 * WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_400);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 1_400);
+
+    // Period 3 closes untouched: 1_000 fresh + 1_400 carried = 2_400.
+    h.env.ledger().set_timestamp(1_000 + 3 * WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 3_400);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 2_400);
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.window_start, 1_000 + 3 * WEEK);
+
+    // The whole carried balance is spendable in one call — and not a unit more.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &3_400), 0);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+}
+
+/// Catch-up across several missed periods on top of an existing credit: every
+/// period is settled, idle ones contribute one base limit each, and the window
+/// lands on the schedule rather than on the moment of the call.
+#[test]
+fn catch_up_settles_every_period_when_credit_is_already_carried() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+
+    // Period 1 settles: credit 400, anchored to the first boundary.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_400);
+
+    // Three more weeks pass untouched: period 2 closes with 1_400 unspent,
+    // periods 3 and 4 went by fully unspent and add one base limit each.
+    h.env.ledger().set_timestamp(1_000 + 4 * WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000 + 3_400);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 3_400);
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.window_start, 1_000 + 4 * WEEK);
+}
+
+/// A budget spent to the limit every single period never accrues credit, no
+/// matter how many transitions it goes through.
+#[test]
+fn full_spend_each_period_never_accrues_rollover_credit() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, true);
+    for i in 0..5u64 {
+        let now = 1_000 + i * DAY;
+        h.env.ledger().set_timestamp(now);
+        assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+        assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000), 0);
+        let b = h.client.get(&id(&h.env, "eng"));
+        assert_eq!(b.rollover_credit, 0);
+        assert_eq!(b.window_start, now);
+    }
+}
+
+/// The cap is re-applied on *every* transition, so settling period by period
+/// can never overshoot it the way a long catch-up would.
+#[test]
+fn rollover_cap_holds_when_periods_are_settled_one_at_a_time() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &1_500,
+        &0, // percentage ceiling uncapped
+    );
+    let expected = [1_000i128, 1_500, 1_500, 1_500, 1_500];
+    for (i, credit) in expected.iter().enumerate() {
+        h.env.ledger().set_timestamp(1_000 + (i as u64 + 1) * WEEK);
+        assert_eq!(
+            h.client.remaining(&id(&h.env, "eng")),
+            1_000 + *credit,
+            "period {} over- or undershot the cap",
+            i + 1
+        );
+        assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, *credit);
+    }
+}
+
+/// Tightening the cap mid-period can leave `spent` above the new capacity.
+/// That shortfall must not be carried as a negative credit — it would pin the
+/// budget to a reduced (even negative) ceiling for every period after.
+#[test]
+fn a_shortfall_is_never_carried_as_negative_credit() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    // Period 1 idle -> credit 1_000, so period 2 has a 2_000 capacity.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_000);
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &2_000), 0);
+
+    // The owner tightens the cap to 100 while 2_000 is still spent: the new
+    // capacity (1_100) is now below what has already been spent.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &100,
+        &0, // percentage ceiling uncapped
+    );
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 100);
+
+    // On the next boundary the shortfall carries as zero, so the budget falls
+    // back to its base limit instead of carrying a negative allowance.
+    h.env.ledger().set_timestamp(1_000 + 2 * WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 0);
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.window_start, 1_000 + 2 * WEEK);
+}
+
+#[test]
+fn monthly_window_resets_on_its_boundary() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Monthly, false);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
+
+    h.env.ledger().set_timestamp(1_000 + MONTH - 1);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
+
+    h.env.ledger().set_timestamp(1_000 + MONTH);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).window_start, 1_000 + MONTH);
+}
+
+/// `Period::None` has no window: the elapsed-time check must be a no-op.
+#[test]
+fn one_shot_budget_never_rolls_over() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::None, false);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+
+    h.env.ledger().set_timestamp(1_000 + 10 * DAY);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 400);
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 600);
+    assert_eq!(b.window_start, 1_000);
+}
+
+/// Expiration and a rollover boundary that land on the same timestamp must
+/// resolve the same way every time: expiration is checked first, so the budget
+/// dies instead of quietly opening a fresh window.
+#[test]
+fn expiry_at_the_rollover_boundary_wins_deterministically() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Daily,
+        &false,
+        &(1_000 + DAY),
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
+
+    h.env.ledger().set_timestamp(1_000 + DAY - 1);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExpired)));
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
+    // No reset was granted: the expired budget still holds its old window.
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 1_000);
+    assert_eq!(b.window_start, 1_000);
+}
+
 // --- per-asset recurring limits ---
 
 #[test]
@@ -752,6 +1010,39 @@ fn per_asset_limit_replenishes_on_its_own_window() {
     let b = h.client.get_asset_budget(&id(&h.env, "eng"), &token);
     assert_eq!(b.window_start, 1_000 + 3_600);
     assert_eq!(b.window_seconds, 3_600);
+}
+
+/// Same boundary rule as the envelope budget: the per-asset window turns over
+/// on `window_start + window_seconds` exactly, and the anchor stays on that
+/// boundary instead of drifting to the moment of the spend.
+#[test]
+fn per_asset_window_rolls_on_the_exact_boundary_timestamp() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::None, false);
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &100, &3_600);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &100);
+
+    h.env.ledger().set_timestamp(1_000 + 3_600 - 1);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 0);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    h.env.ledger().set_timestamp(1_000 + 3_600);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 100);
+    let b = h.client.get_asset_budget(&id(&h.env, "eng"), &token);
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.window_start, 1_000 + 3_600);
+
+    // One second later it is still the same window: no second reset, no drift.
+    h.env.ledger().set_timestamp(1_000 + 3_600 + 1);
+    let b = h.client.get_asset_budget(&id(&h.env, "eng"), &token);
+    assert_eq!(b.window_start, 1_000 + 3_600);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 100);
 }
 
 #[test]
