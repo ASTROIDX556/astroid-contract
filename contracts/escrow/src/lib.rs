@@ -81,6 +81,34 @@
 //! vesting schedule no matter how much settlement time remains (see
 //! [`EscrowContract::release`]).
 
+//! ## Token whitelist
+//!
+//! Anyone may create an escrow, so without a gate the contract would let a
+//! caller lock an arbitrary token contract into custody — spam-token escrows
+//! that pad a record the caller controls, at the protocol's expense. Every
+//! token therefore has to be approved by the contract admin recorded at
+//! [`EscrowContract::initialize`]:
+//!
+//! ```text
+//! unapproved token ──▶ create / create_timelock / create_scheduled /
+//!                       initialize_timelock / fund / deposit_with_milestones
+//!                   ──▶ Error::AssetNotAuthorized
+//! approved token   ──▶ escrow created, funds move into custody
+//! ```
+//!
+//! The check is the same [`Error::AssetNotAuthorized`] code the treasury
+//! whitelist, the budget asset registry and the policy asset whitelist report,
+//! so one handler covers a "this token is not usable here" refusal across every
+//! Astroid contract. Approval is a persistent flag per token address, so a
+//! deposit check costs one read no matter how large the whitelist is.
+//!
+//! Revoking a token stops it being escrowed *going forward* only: escrows that
+//! already hold it stay releasable and refundable, so revoking can never strand
+//! funds. An escrow that was initialized but not yet funded is re-checked at
+//! [`EscrowContract::fund`] time, so a token revoked in between is refused there
+//! too. Escrows capped per agreement by [`MAX_ESCROW_ASSETS`]; the whitelist
+//! itself by [`MAX_ESCROW_TOKENS`].
+
 pub mod storage;
 
 pub use storage::{
@@ -101,8 +129,13 @@ use astroid_shared::validation::require_positive_amount;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes, BytesN, Env,
-    String, Vec,
+    String, Symbol, Vec,
 };
+
+/// Upper bound on the number of distinct token contracts the admin may
+/// whitelist. Each approval costs a persistent entry plus a slot in the
+/// enumerable list, so the list is capped rather than left unbounded.
+pub const MAX_ESCROW_TOKENS: u32 = 32;
 
 /// Calculate vested amount according to a ReleaseSchedule at a given ledger timestamp.
 pub fn calculate_vested_amount(
@@ -212,15 +245,95 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
-    pub fn initialize(env: Env) -> Result<(), Error> {
+    /// Initialize the contract, recording `admin` as the only address allowed
+    /// to manage the token whitelist.
+    ///
+    /// The whitelist starts empty, which approves nothing: until an admin calls
+    /// [`Self::approve_token`], every token-bearing entrypoint refuses its
+    /// deposit with [`Error::AssetNotAuthorized`]. That is deliberate — an
+    /// escrow that accepts any token is trivially spammable, since anyone may
+    /// park a worthless token contract to pad a record they control.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Count) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Count, &0u64);
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
+    }
+
+    /// Approve a token contract so it may be escrowed (admin only).
+    ///
+    /// Approval is the gate that keeps arbitrary token contracts out of
+    /// custody. Re-approving an already-approved token is refused with
+    /// [`Error::AlreadyExists`] rather than silently absorbed, so a
+    /// re-run governance script cannot mistake a no-op for a change.
+    pub fn approve_token(env: Env, caller: Address, token: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if Self::is_token_approved_internal(&env, &token) {
+            return Err(Error::AlreadyExists);
+        }
+        let mut list = Self::approved_token_list(&env);
+        if list.len() >= MAX_ESCROW_TOKENS {
+            return Err(Error::InvalidInput);
+        }
+        list.push_back(token.clone());
+        Self::store_approved_token_list(&env, &list);
+
+        let key = DataKey::ApprovedToken(token.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Self::emit_token_change(&env, &token, symbol_short!("tok_add"));
+        Ok(())
+    }
+
+    /// Revoke a token contract's approval (admin only).
+    ///
+    /// This only stops the token being escrowed *going forward*. Escrows that
+    /// already hold it stay releasable and refundable, so a revocation can
+    /// never strand funds in custody; the sender can still `reclaim` or
+    /// `refund`, and the arbiter can still `release`. Escrows that were
+    /// initialized but never funded are refused at `fund` instead.
+    ///
+    /// Revoking a token that is not approved is refused with
+    /// [`Error::NotFound`], so a revocation is never silently a no-op.
+    pub fn revoke_token(env: Env, caller: Address, token: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !Self::is_token_approved_internal(&env, &token) {
+            return Err(Error::NotFound);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ApprovedToken(token.clone()));
+        let mut list = Self::approved_token_list(&env);
+        if let Some(i) = list.first_index_of(&token) {
+            list.remove(i);
+            Self::store_approved_token_list(&env, &list);
+        }
+        Self::emit_token_change(&env, &token, symbol_short!("tok_rm"));
+        Ok(())
+    }
+
+    /// The address recorded at `initialize` that manages the whitelist.
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        Self::load_admin(&env)
+    }
+
+    /// Whether `token` may currently be escrowed.
+    pub fn is_token_approved(env: Env, token: Address) -> bool {
+        Self::is_token_approved_internal(&env, &token)
+    }
+
+    /// Every approved token contract, in approval order.
+    pub fn approved_tokens(env: Env) -> Vec<Address> {
+        Self::approved_token_list(&env)
     }
 
     /// Create + fund an escrow in one call. `sender` locks every listed asset
@@ -292,7 +405,7 @@ impl EscrowContract {
         if deadline <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
         }
-        Self::validate_assets(&assets)?;
+        Self::validate_assets(&env, &assets)?;
         Self::validate_override_config(&release_signers, release_threshold)?;
 
         let id = increment_count(&env)?;
@@ -352,7 +465,7 @@ impl EscrowContract {
         if unlock_time <= now {
             return Err(Error::InvalidInput);
         }
-        Self::validate_assets(&assets)?;
+        Self::validate_assets(&env, &assets)?;
 
         let id = increment_count(&env)?;
 
@@ -419,7 +532,7 @@ impl EscrowContract {
         if recipient == sender {
             return Err(Error::InvalidInput);
         }
-        Self::validate_assets(&assets)?;
+        Self::validate_assets(&env, &assets)?;
         if schedule.start_time > schedule.cliff_time
             || schedule.cliff_time > schedule.end_time
             || schedule.end_time <= schedule.start_time
@@ -510,7 +623,7 @@ impl EscrowContract {
         if unlock_time <= now {
             return Err(Error::InvalidInput);
         }
-        Self::validate_assets(&assets)?;
+        Self::validate_assets(&env, &assets)?;
 
         let id = increment_count(&env)?;
 
@@ -557,6 +670,10 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Created) {
             return Err(Error::InvalidState);
         }
+        // Re-check the whitelist rather than trusting the check made when the
+        // escrow was initialized: an admin may have revoked one of these tokens
+        // in between, and funding is the moment value actually enters custody.
+        Self::require_tokens_approved(&env, &escrow.assets)?;
 
         let mut total: i128 = 0;
         for a in escrow.assets.iter() {
@@ -647,7 +764,7 @@ impl EscrowContract {
             ) {
                 calculate_claimable_amount(&escrow, now)?
             } else {
-                if now < escrow.deadline + escrow.grace_period {
+                if now < Self::grace_end(&escrow)? {
                     return Err(Error::TimeLockActive);
                 }
                 checked_sub(escrow.funded_amount, escrow.released_amount)?
@@ -687,7 +804,7 @@ impl EscrowContract {
             );
             Ok(claimable)
         } else if matches!(escrow.state, EscrowState::Created) {
-            if now < escrow.deadline + escrow.grace_period {
+            if now < Self::grace_end(&escrow)? {
                 return Err(Error::TimeLockActive);
             }
             escrow.state = EscrowState::Released;
@@ -765,7 +882,7 @@ impl EscrowContract {
                 return Err(Error::TimeLockActive);
             }
         }
-        if now >= escrow.deadline + escrow.grace_period {
+        if now >= Self::grace_end(&escrow)? {
             // Past the grace window the arbiter can no longer release. We do NOT
             // persist an `Expired` transition here: returning `Err` rolls back every
             // storage write, so the marker is set through the permissionless `expire`
@@ -889,7 +1006,7 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
             // The grace window is still open — the arbiter may still release, so the
             // escrow cannot be marked expired yet.
             return Err(Error::InvalidState);
@@ -922,7 +1039,7 @@ impl EscrowContract {
             // Before the fulfillment deadline the escrow is still live.
             return Err(Error::TimeLockActive);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
             // During the grace window the counterparty may still fulfill, so funds
             // may not yet be reclaimed via refund. Use `reclaim` after grace expiry.
             return Err(Error::GraceActive);
@@ -966,7 +1083,7 @@ impl EscrowContract {
         ) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
             return Err(Error::TimeLockActive);
         }
         Self::require_refund_window_open(&env, &escrow)?;
@@ -1047,7 +1164,7 @@ impl EscrowContract {
             return Err(Error::TimeLockActive);
         }
         // The grace window must have fully elapsed without fulfillment.
-        let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
+        let grace_end = Self::grace_end(&escrow)?;
         if env.ledger().timestamp() < grace_end {
             return Err(Error::GraceActive);
         }
@@ -1099,6 +1216,7 @@ impl EscrowContract {
     ) -> Result<u64, Error> {
         sender.require_auth();
         require_positive_amount(amount)?;
+        Self::require_token_approved(&env, &asset)?;
         if recipient == sender {
             return Err(Error::InvalidInput);
         }
@@ -1301,7 +1419,7 @@ impl EscrowContract {
             return Ok(false);
         }
         let now = env.ledger().timestamp();
-        if now < escrow.deadline + escrow.grace_period {
+        if now < Self::grace_end(&escrow)? {
             return Ok(false);
         }
         Ok(Self::require_refund_window_open(&env, &escrow).is_ok())
@@ -1347,8 +1465,6 @@ impl EscrowContract {
         total
     }
 
-    /// Validate a multi-asset list: non-empty, within the size cap, every
-    /// amount strictly positive, and no asset listed more than once.
     /// Timestamp the refund window closes at (`0` = never). Refunds open at
     /// `deadline + grace_period`, so the window is measured from there.
     /// `saturating_add` keeps an absurd `refund_window` from wrapping around
@@ -1363,6 +1479,17 @@ impl EscrowContract {
             .saturating_add(escrow.refund_window)
     }
 
+    /// The instant the grace period ends, i.e. when the escrow becomes
+    /// fulfillable / refundable.
+    ///
+    /// `grace_period` is caller-supplied and unbounded, so the sum is computed
+    /// through the checked helper: with `overflow-checks` on even in release, a
+    /// raw `deadline + grace_period` would abort the invocation (and silently
+    /// wrap in Wasm) instead of reporting [`Error::Overflow`].
+    fn grace_end(escrow: &Escrow) -> Result<u64, Error> {
+        Ok(checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64)
+    }
+
     /// Refuse a reclaim once a bounded refund window has elapsed, so an
     /// un-refunded, timed-out escrow can be treated as final. An unbounded
     /// window (`refund_window == 0`) never closes.
@@ -1374,7 +1501,19 @@ impl EscrowContract {
         Ok(())
     }
 
-    fn validate_assets(assets: &Vec<AssetAmount>) -> Result<(), Error> {
+    /// Validate a multi-asset list: non-empty, within the size cap, every
+    /// amount strictly positive, no asset listed more than once, and every
+    /// asset approved for escrow.
+    ///
+    /// The whitelist check lives here, ahead of the shape checks, so that every
+    /// creation path — [`Self::create`], [`Self::create_timelock`],
+    /// [`Self::create_scheduled`] and [`Self::initialize_timelock`] — is gated
+    /// by construction rather than by remembering to call the check. A token
+    /// that is not approved is refused before the list is even inspected,
+    /// because the question of whether the caller may use that token at all
+    /// precedes the question of whether the amounts are well formed.
+    fn validate_assets(env: &Env, assets: &Vec<AssetAmount>) -> Result<(), Error> {
+        Self::require_tokens_approved(env, assets)?;
         if assets.is_empty() || assets.len() > MAX_ESCROW_ASSETS {
             return Err(Error::InvalidInput);
         }
@@ -1388,6 +1527,72 @@ impl EscrowContract {
             }
         }
         Ok(())
+    }
+
+    /// Refuse any listed token the admin has not approved. An empty whitelist
+    /// approves nothing, so a freshly initialized contract escrows no token
+    /// until an admin acts.
+    fn require_tokens_approved(env: &Env, assets: &Vec<AssetAmount>) -> Result<(), Error> {
+        for a in assets.iter() {
+            Self::require_token_approved(env, &a.asset)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a single token that is not approved for escrow.
+    fn require_token_approved(env: &Env, token: &Address) -> Result<(), Error> {
+        if Self::is_token_approved_internal(env, token) {
+            Ok(())
+        } else {
+            Err(Error::AssetNotAuthorized)
+        }
+    }
+
+    fn is_token_approved_internal(env: &Env, token: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovedToken(token.clone()))
+            .unwrap_or(false)
+    }
+
+    fn approved_token_list(env: &Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedTokenList)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn store_approved_token_list(env: &Env, list: &Vec<Address>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovedTokenList, list);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    fn load_admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Gate a whitelist change on the recorded admin's signature. The identity
+    /// check precedes `require_auth` so a call from a non-admin is refused
+    /// without recording an authorization it could never use.
+    fn require_admin(env: &Env, caller: &Address) -> Result<Address, Error> {
+        let admin = Self::load_admin(env)?;
+        if admin != *caller {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        Ok(admin)
+    }
+
+    fn emit_token_change(env: &Env, token: &Address, action: Symbol) {
+        env.events()
+            .publish((symbol_short!("escrow"), action), token.clone());
     }
 
     /// Validate an override signer set + threshold: either both empty/zero
