@@ -1332,12 +1332,9 @@ fn threshold_voting_duplicate_ballot_rejected_for_multiple_signers() {
 fn threshold_voting_exact_boundary_transitions_state() {
     // Exactly meeting threshold: 3 + 2 = 5, threshold = 5
     let h = setup(&[3, 2, 1], 5);
-    let id = h.client.propose(
-        &h.signers[0],
-        &symbol_short!("pay"),
-        &payload(&h.env),
-        &0,
-    );
+    let id = h
+        .client
+        .propose(&h.signers[0], &symbol_short!("pay"), &payload(&h.env), &0);
 
     // Total weight currently 3 (proposer only) < 5
     assert_eq!(
@@ -1355,4 +1352,3 @@ fn threshold_voting_exact_boundary_transitions_state() {
     assert!(proposal.executed);
     assert_eq!(proposal.approval_weight, 5);
 }
-

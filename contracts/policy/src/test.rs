@@ -1829,7 +1829,11 @@ fn composite_multi_condition_rules_evaluation_and_denial_events() {
         children_end: 4,
     });
     tree.push_back(leaf_amount(RuleOp::MaxAmount, 500, &env));
-    tree.push_back(leaf_addr(RuleOp::AllowedRecipient, allowed_recip.clone(), &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        allowed_recip.clone(),
+        &env,
+    ));
     tree.push_back(leaf_addr(RuleOp::AllowedAsset, asset.clone(), &env));
 
     p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
@@ -1910,4 +1914,3 @@ fn composite_fails_closed_on_invalid_tree_structure() {
         Err(Ok(Error::InvalidInput))
     );
 }
-

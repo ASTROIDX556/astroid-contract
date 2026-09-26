@@ -1790,4 +1790,3 @@ fn mutual_consent_cancel_and_post_grace_reclaim() {
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
 }
-
