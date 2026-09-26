@@ -151,7 +151,9 @@ pub struct MilestoneDisbursement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holding {
     pub asset: Address,
+    /// Cumulative amount deposited for this asset.
     pub total_in: i128,
+    /// Cumulative amount withdrawn for this asset.
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
@@ -217,6 +219,9 @@ enum DataKey {
     ApprovedAssetCount,
     /// Enumerable list of currently approved assets (instance).
     ApprovedAssetList,
+    /// Recorded per-asset custody balance backing the structured deposit and
+    /// withdrawal events (persistent).
+    AssetBalance(Address),
     ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
@@ -518,9 +523,21 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
+        let balance = checked_add(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
             (asset.clone(), received),
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryDeposited {
+                org: t.org.clone(),
+                from: from.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
+            },
         );
         Self::unlock(&env);
         Self::unlock(&env);
@@ -709,6 +726,8 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        let balance = checked_sub(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         Self::transfer_out(&env, &asset, &to, amount)?;
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
@@ -719,6 +738,16 @@ impl TreasuryContract {
                 to: to.clone(),
                 asset: asset.clone(),
                 amount,
+            },
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryWithdrawn {
+                org: t.org.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
             },
         );
         Self::unlock(&env);
@@ -1117,6 +1146,27 @@ impl TreasuryContract {
             .instance()
             .get(&DataKey::ApprovedAssetCount)
             .unwrap_or(0)
+    }
+
+    /// Current recorded balance for `asset` (0 when the asset never moved).
+    fn asset_balance_internal(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBalance(asset.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Persist the per-asset balance used by the structured deposit and
+    /// withdrawal events so the resulting balance never has to be recomputed
+    /// from the flow totals at emission time.
+    fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
+        let key = DataKey::AssetBalance(asset.clone());
+        env.storage().persistent().set(&key, &balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn store_approved_count(env: &Env, count: u32) {
