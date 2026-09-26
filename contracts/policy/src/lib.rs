@@ -939,7 +939,7 @@ impl PolicyContract {
         Ok(())
     }
 
-    /// Short alias of [`Self::set_recipient_whitelist_enabled`].
+    /// Short alias of [`PolicyContract::set_recipient_whitelist_enabled`].
     pub fn set_whitelist_enabled(
         env: Env,
         caller: Address,
@@ -949,7 +949,7 @@ impl PolicyContract {
         Self::set_recipient_whitelist_enabled(env, caller, policy_id, enabled)
     }
 
-    /// Short alias of [`Self::add_recipient_to_whitelist`].
+    /// Short alias of [`PolicyContract::add_recipient_to_whitelist`].
     pub fn add_whitelist(
         env: Env,
         caller: Address,
@@ -959,7 +959,7 @@ impl PolicyContract {
         Self::add_recipient_to_whitelist(env, caller, policy_id, recipient)
     }
 
-    /// Short alias of [`Self::remove_recipient_from_whitelist`].
+    /// Short alias of [`PolicyContract::remove_recipient_from_whitelist`].
     pub fn remove_whitelist(
         env: Env,
         caller: Address,
