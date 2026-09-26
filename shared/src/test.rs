@@ -652,3 +652,305 @@ fn contract_event_transaction_summary_variant() {
 
     publish(&env, event);
 }
+
+// ---------------------------------------------------------------------------
+// Token transfer wrappers (Issue #204)
+// ---------------------------------------------------------------------------
+
+mod token_wrappers {
+    use crate::errors::Error;
+    use crate::token::{
+        checked_transfer_total, map_token_error, safe_transfer, safe_transfer_tracked,
+        token_balance, validate_transfer_amount,
+    };
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+    use soroban_sdk::xdr::{ScErrorCode, ScErrorType};
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    /// A contract paying out of its own token balance, the way wallets,
+    /// treasuries and escrows use the wrapper.
+    #[contract]
+    pub struct Vault;
+
+    #[contractimpl]
+    impl Vault {
+        pub fn pay(env: Env, token: Address, to: Address, amount: i128) -> Result<(), Error> {
+            safe_transfer(&env, &token, &env.current_contract_address(), &to, amount)
+        }
+    }
+
+    struct Setup {
+        env: Env,
+        token: Address,
+        alice: Address,
+        bob: Address,
+    }
+
+    fn setup() -> Setup {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(admin).address();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        Setup {
+            env,
+            token,
+            alice,
+            bob,
+        }
+    }
+
+    fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+        StellarAssetClient::new(env, token).mint(to, &amount);
+    }
+
+    fn balance(env: &Env, token: &Address, who: &Address) -> i128 {
+        TokenClient::new(env, token).balance(who)
+    }
+
+    #[test]
+    fn transfer_amount_must_be_strictly_positive() {
+        assert_eq!(validate_transfer_amount(1), Ok(()));
+        assert_eq!(validate_transfer_amount(i128::MAX), Ok(()));
+        assert_eq!(validate_transfer_amount(0), Err(Error::InvalidAmount));
+        assert_eq!(validate_transfer_amount(-1), Err(Error::InvalidAmount));
+        assert_eq!(
+            validate_transfer_amount(i128::MIN),
+            Err(Error::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn successful_transfer_moves_exact_amount() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, 1_000);
+        safe_transfer(&s.env, &s.token, &s.alice, &s.bob, 400).unwrap();
+        assert_eq!(balance(&s.env, &s.token, &s.alice), 600);
+        assert_eq!(balance(&s.env, &s.token, &s.bob), 400);
+    }
+
+    #[test]
+    fn transferring_the_entire_balance_succeeds() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, 250);
+        safe_transfer(&s.env, &s.token, &s.alice, &s.bob, 250).unwrap();
+        assert_eq!(balance(&s.env, &s.token, &s.alice), 0);
+        assert_eq!(balance(&s.env, &s.token, &s.bob), 250);
+    }
+
+    #[test]
+    fn zero_and_negative_amounts_are_rejected_without_moving_funds() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, 100);
+        for amount in [0, -1, i128::MIN] {
+            assert_eq!(
+                safe_transfer(&s.env, &s.token, &s.alice, &s.bob, amount),
+                Err(Error::InvalidAmount)
+            );
+        }
+        assert_eq!(balance(&s.env, &s.token, &s.alice), 100);
+        assert_eq!(balance(&s.env, &s.token, &s.bob), 0);
+    }
+
+    #[test]
+    fn insufficient_funds_is_distinct_from_invalid_amount() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, 99);
+        assert_eq!(
+            safe_transfer(&s.env, &s.token, &s.alice, &s.bob, 100),
+            Err(Error::InsufficientFunds)
+        );
+        // An empty sender is insufficient, not invalid.
+        assert_eq!(
+            safe_transfer(&s.env, &s.token, &s.bob, &s.alice, 1),
+            Err(Error::InsufficientFunds)
+        );
+        assert_eq!(balance(&s.env, &s.token, &s.alice), 99);
+    }
+
+    #[test]
+    fn recipient_overflow_is_rejected_before_the_token_is_called() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.bob, i128::MAX);
+        mint(&s.env, &s.token, &s.alice, 1);
+        assert_eq!(
+            safe_transfer(&s.env, &s.token, &s.alice, &s.bob, 1),
+            Err(Error::Overflow)
+        );
+        assert_eq!(balance(&s.env, &s.token, &s.alice), 1);
+        assert_eq!(balance(&s.env, &s.token, &s.bob), i128::MAX);
+    }
+
+    #[test]
+    fn maximum_representable_amount_transfers() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, i128::MAX);
+        safe_transfer(&s.env, &s.token, &s.alice, &s.bob, i128::MAX).unwrap();
+        assert_eq!(balance(&s.env, &s.token, &s.bob), i128::MAX);
+        assert_eq!(balance(&s.env, &s.token, &s.alice), 0);
+    }
+
+    #[test]
+    fn recipient_filled_to_exactly_max_succeeds() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.bob, i128::MAX - 5);
+        mint(&s.env, &s.token, &s.alice, 5);
+        safe_transfer(&s.env, &s.token, &s.alice, &s.bob, 5).unwrap();
+        assert_eq!(balance(&s.env, &s.token, &s.bob), i128::MAX);
+    }
+
+    #[test]
+    fn self_transfer_at_max_balance_does_not_report_overflow() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, i128::MAX);
+        safe_transfer(&s.env, &s.token, &s.alice, &s.alice, i128::MAX).unwrap();
+        assert_eq!(balance(&s.env, &s.token, &s.alice), i128::MAX);
+    }
+
+    #[test]
+    fn missing_authorization_is_an_error_not_a_trap() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, 10);
+        // Drop the blanket mock: alice has now authorized nothing. The host
+        // hides the token's auth failure behind a context error, so the
+        // wrapper reports it as InvalidState instead of trapping.
+        s.env.set_auths(&[]);
+        assert_eq!(
+            safe_transfer(&s.env, &s.token, &s.alice, &s.bob, 10),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(balance(&s.env, &s.token, &s.alice), 10);
+        assert_eq!(balance(&s.env, &s.token, &s.bob), 0);
+    }
+
+    #[test]
+    fn token_address_that_is_not_a_contract_fails_closed() {
+        let s = setup();
+        let not_a_token = Address::generate(&s.env);
+        assert_eq!(
+            token_balance(&s.env, &not_a_token, &s.alice),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(
+            safe_transfer(&s.env, &not_a_token, &s.alice, &s.bob, 1),
+            Err(Error::InvalidState)
+        );
+    }
+
+    #[test]
+    fn token_refusal_codes_reach_the_caller_mapped() {
+        // A raw SAC refusal (bypassing the wrapper's pre-checks) arrives as
+        // the SAC's contract code, which the wrapper maps.
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, 10);
+        let raw = TokenClient::new(&s.env, &s.token).try_transfer(&s.alice, &s.bob, &11);
+        match raw {
+            Err(Ok(err)) => assert_eq!(map_token_error(err), Error::InsufficientFunds),
+            other => panic!("expected a token contract error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn contract_pays_from_its_own_balance_and_surfaces_codes() {
+        let s = setup();
+        let vault_id = s.env.register_contract(None, Vault);
+        let vault = VaultClient::new(&s.env, &vault_id);
+        mint(&s.env, &s.token, &vault_id, 50);
+
+        vault.pay(&s.token, &s.bob, &20);
+        assert_eq!(balance(&s.env, &s.token, &s.bob), 20);
+        assert_eq!(balance(&s.env, &s.token, &vault_id), 30);
+
+        // Failures reach the caller as contract error codes, not host traps.
+        assert_eq!(
+            vault.try_pay(&s.token, &s.bob, &31),
+            Err(Ok(Error::InsufficientFunds))
+        );
+        assert_eq!(
+            vault.try_pay(&s.token, &s.bob, &0),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(balance(&s.env, &s.token, &vault_id), 30);
+    }
+
+    #[test]
+    fn tracked_transfer_debits_the_internal_ledger() {
+        let s = setup();
+        mint(&s.env, &s.token, &s.alice, 1_000);
+        let remaining = safe_transfer_tracked(&s.env, &s.token, &s.alice, &s.bob, 300, 120);
+        assert_eq!(remaining, Ok(180));
+        assert_eq!(balance(&s.env, &s.token, &s.bob), 120);
+    }
+
+    #[test]
+    fn tracked_transfer_checks_the_ledger_before_the_token() {
+        let s = setup();
+        // The token balance would cover it; the internal ledger does not.
+        mint(&s.env, &s.token, &s.alice, 1_000);
+        assert_eq!(
+            safe_transfer_tracked(&s.env, &s.token, &s.alice, &s.bob, 100, 101),
+            Err(Error::InsufficientFunds)
+        );
+        assert_eq!(
+            safe_transfer_tracked(&s.env, &s.token, &s.alice, &s.bob, -1, 1),
+            Err(Error::InvalidAmount)
+        );
+        assert_eq!(
+            safe_transfer_tracked(&s.env, &s.token, &s.alice, &s.bob, 100, 0),
+            Err(Error::InvalidAmount)
+        );
+        assert_eq!(balance(&s.env, &s.token, &s.bob), 0);
+    }
+
+    #[test]
+    fn tracked_transfer_fails_when_the_token_balance_is_short() {
+        let s = setup();
+        // The ledger says 500 is spendable but only 10 tokens are held.
+        mint(&s.env, &s.token, &s.alice, 10);
+        assert_eq!(
+            safe_transfer_tracked(&s.env, &s.token, &s.alice, &s.bob, 500, 50),
+            Err(Error::InsufficientFunds)
+        );
+    }
+
+    #[test]
+    fn batch_total_is_checked() {
+        assert_eq!(checked_transfer_total([]), Ok(0));
+        assert_eq!(checked_transfer_total([1, 2, 3]), Ok(6));
+        assert_eq!(checked_transfer_total([i128::MAX]), Ok(i128::MAX));
+        assert_eq!(checked_transfer_total([i128::MAX - 1, 1]), Ok(i128::MAX));
+        assert_eq!(checked_transfer_total([i128::MAX, 1]), Err(Error::Overflow));
+        assert_eq!(checked_transfer_total([5, 0, 5]), Err(Error::InvalidAmount));
+        assert_eq!(checked_transfer_total([5, -5]), Err(Error::InvalidAmount));
+    }
+
+    #[test]
+    fn token_balance_reads_without_trapping() {
+        let s = setup();
+        assert_eq!(token_balance(&s.env, &s.token, &s.alice), Ok(0));
+        mint(&s.env, &s.token, &s.alice, 7);
+        assert_eq!(token_balance(&s.env, &s.token, &s.alice), Ok(7));
+    }
+
+    #[test]
+    fn token_errors_map_deterministically() {
+        let c = soroban_sdk::Error::from_contract_error;
+        assert_eq!(map_token_error(c(10)), Error::InsufficientFunds);
+        assert_eq!(map_token_error(c(8)), Error::InvalidAmount);
+        assert_eq!(map_token_error(c(12)), Error::Overflow);
+        for code in [4, 5, 6, 11, 13] {
+            assert_eq!(map_token_error(c(code)), Error::Unauthorized);
+        }
+        for code in [1, 2, 3, 7, 9, 99] {
+            assert_eq!(map_token_error(c(code)), Error::InvalidState);
+        }
+        let auth =
+            soroban_sdk::Error::from_type_and_code(ScErrorType::Auth, ScErrorCode::InvalidAction);
+        assert_eq!(map_token_error(auth), Error::Unauthorized);
+        let budget =
+            soroban_sdk::Error::from_type_and_code(ScErrorType::Budget, ScErrorCode::ExceededLimit);
+        assert_eq!(map_token_error(budget), Error::InvalidState);
+    }
+}
