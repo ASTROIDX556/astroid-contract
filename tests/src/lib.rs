@@ -20,3 +20,5 @@ pub mod interface_compliance;
 pub mod registry_batch;
 #[cfg(test)]
 pub mod upgrade_validation;
+#[cfg(test)]
+pub mod wallet_batch;

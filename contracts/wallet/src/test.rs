@@ -3,6 +3,7 @@ extern crate std;
 
 use crate::access::Role;
 use crate::{BatchAction, BatchReceipt, ContractCall, WalletContract, WalletContractClient};
+use astroid_shared::constants;
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
@@ -1365,4 +1366,237 @@ fn validated_batch_frozen_wallet_rejected() {
     ));
     let res = h.client.try_batch_execute_validated(&owner, &id, &actions);
     assert_eq!(res, Err(Ok(Error::WalletFrozen)));
+}
+
+// ------------------------------------------------------------- raw batch ----
+// Raw atomic batch execution (Issue #301): arbitrary contract calls fired
+// sequentially under one `Role::Agent` authorization.
+
+/// Fund a fresh wallet owned by a fresh owner and grant `agent` the Agent
+/// role, returning (wallet_id, owner, agent) — the raw batch's actor set.
+fn funded_agent_wallet_batch(h: &Harness, deposit: i128) -> (u64, Address, Address) {
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let agent = Address::generate(&h.env);
+    h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+    mint(h, &owner, deposit);
+    h.client.deposit(&id, &owner, &h.token, &deposit);
+    (id, owner, agent)
+}
+
+#[test]
+fn batch_execute_runs_every_call_and_reports_the_count() {
+    let h = setup();
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    let (id, _owner, agent) = funded_agent_wallet_batch(&h, 1_000);
+
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        300,
+    ));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        200,
+    ));
+
+    let executed = h.client.batch_execute(&agent, &id, &calls);
+    assert_eq!(executed, 2);
+    assert_eq!(token_balance(&h, &r1), 300);
+    assert_eq!(token_balance(&h, &r2), 200);
+    assert_eq!(token_balance(&h, &h.contract_id), 500);
+
+    // The aggregated outcome is published as ("wallet", "batch").
+    let want: Val = Symbol::new(&h.env, "batch").into_val(&h.env);
+    let found = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
+    assert!(found, "expected (wallet, batch) event to be emitted");
+}
+
+#[test]
+fn batch_execute_admin_and_owner_may_also_drive_it() {
+    // The gate is `Role::Agent` or better; the owner is implicitly Admin.
+    let h = setup();
+    let recipient = Address::generate(&h.env);
+    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
+
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        40,
+    ));
+    let executed = h.client.batch_execute(&owner, &id, &calls);
+    assert_eq!(executed, 1);
+    assert_eq!(token_balance(&h, &recipient), 40);
+}
+
+#[test]
+fn batch_execute_failing_sub_call_reverts_the_whole_batch() {
+    let h = setup();
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    let (id, _owner, agent) = funded_agent_wallet_batch(&h, 100);
+
+    // The second call overdraws the wallet's 100 balance, so the token
+    // transfer itself fails — after the first call already succeeded.
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        60,
+    ));
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        80,
+    ));
+
+    let res = h.client.try_batch_execute(&agent, &id, &calls);
+    assert!(res.is_err(), "overdrawing sub-call must fail the batch");
+
+    // Full rollback: the first transfer's 60 tokens never left custody.
+    assert_eq!(token_balance(&h, &r1), 0);
+    assert_eq!(token_balance(&h, &r2), 0);
+    assert_eq!(token_balance(&h, &h.contract_id), 100);
+
+    // No batch event may survive the revert.
+    let want: Val = Symbol::new(&h.env, "batch").into_val(&h.env);
+    let found = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
+    assert!(!found, "no (wallet, batch) event may survive a revert");
+}
+
+#[test]
+fn batch_execute_failing_sub_call_system_level_maps_to_batch_call_failed() {
+    // A sub-call naming a function that does not exist on the callee fails at
+    // the system level (no deterministic contract error code), which the
+    // executor reports as [`Error::BatchCallFailed`] — and the leg that ran
+    // before it is rolled back with the batch.
+    let h = setup();
+    let recipient = Address::generate(&h.env);
+    let (id, _owner, agent) = funded_agent_wallet_batch(&h, 100);
+
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &recipient,
+        10,
+    ));
+    calls.push_back(ContractCall {
+        contract_addr: h.token.clone(),
+        fn_name: Symbol::new(&h.env, "no_such_function"),
+        args: Vec::new(&h.env),
+    });
+
+    let res = h.client.try_batch_execute(&agent, &id, &calls);
+    assert_eq!(res, Err(Ok(Error::BatchCallFailed)));
+    assert_eq!(token_balance(&h, &recipient), 0);
+    assert_eq!(token_balance(&h, &h.contract_id), 100);
+}
+
+#[test]
+fn batch_execute_empty_batch_fails() {
+    let h = setup();
+    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
+    let empty: Vec<ContractCall> = Vec::new(&h.env);
+    let res = h.client.try_batch_execute(&owner, &id, &empty);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn batch_execute_oversized_batch_fails() {
+    let h = setup();
+    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
+
+    // One call more than the cap is refused before anything fires.
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    for _ in 0..=(constants::MAX_BATCH_CALLS) {
+        calls.push_back(token_transfer_call(
+            &h.env,
+            &h.token,
+            &h.contract_id,
+            &Address::generate(&h.env),
+            1,
+        ));
+    }
+    let res = h.client.try_batch_execute(&owner, &id, &calls);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn batch_execute_non_agent_rejected() {
+    let h = setup();
+    let stranger = Address::generate(&h.env);
+    let (id, _owner, _agent) = funded_agent_wallet_batch(&h, 100);
+
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &Address::generate(&h.env),
+        10,
+    ));
+    let res = h.client.try_batch_execute(&stranger, &id, &calls);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn batch_execute_frozen_wallet_rejected() {
+    let h = setup();
+    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
+    h.client.freeze(&owner, &id);
+
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &Address::generate(&h.env),
+        10,
+    ));
+    let res = h.client.try_batch_execute(&owner, &id, &calls);
+    assert_eq!(res, Err(Ok(Error::WalletFrozen)));
+}
+
+#[test]
+fn batch_execute_contract_wide_breaker_rejected() {
+    let h = setup();
+    let (id, owner, _agent) = funded_agent_wallet_batch(&h, 100);
+    h.client.emergency_pause(&h.admin);
+
+    let mut calls: Vec<ContractCall> = Vec::new(&h.env);
+    calls.push_back(token_transfer_call(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &Address::generate(&h.env),
+        10,
+    ));
+    let res = h.client.try_batch_execute(&owner, &id, &calls);
+    assert_eq!(res, Err(Ok(Error::WalletPaused)));
 }
