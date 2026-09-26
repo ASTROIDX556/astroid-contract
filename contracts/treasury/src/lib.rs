@@ -1008,6 +1008,15 @@ impl TreasuryContract {
         Ok(report)
     }
 
+    /// Live balances for every approved token, bounded by `MAX_TREASURY_ASSETS`.
+    pub fn get_all_balances(env: Env) -> Result<Vec<(Address, i128)>, Error> {
+        let mut report = Vec::new(&env);
+        for asset in Self::approved_list(&env).iter() {
+            report.push_back((asset.clone(), Self::read_token_balance(&env, &asset)?));
+        }
+        Ok(report)
+    }
+
     /// Number of token contracts currently on the whitelist.
     pub fn approved_asset_count(env: Env) -> u32 {
         Self::approved_count(&env)

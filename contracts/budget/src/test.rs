@@ -416,7 +416,7 @@ fn assert_event(env: &Env, variant: &str) {
         .events()
         .all()
         .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
@@ -446,6 +446,11 @@ fn several_elapsed_periods_are_all_settled_at_once() {
     assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000 + 2_400);
     let b: Budget = h.client.get(&id(&h.env, "eng"));
     assert_eq!(b.rollover_credit, 2_400);
+    // Rollover does not compound across the gap: the credit is the sum of the
+    // per-window parts (see the #246 gap-semantics decision in lib.rs), not a
+    // surplus rebased on ever-larger capacity in each lapsed window.
+    assert_eq!(b.rollover_credit, 400 + 2 * 1_000);
+    assert_ne!(b.rollover_credit, 400 + 2 * 1_400);
     assert_eq!(b.spent, 0);
     // The window is re-anchored to the period boundary, not to "now".
     assert_eq!(b.window_start, 1_000 + 3 * WEEK);
@@ -487,6 +492,70 @@ fn windows_do_not_drift_when_transitions_land_mid_period() {
 }
 
 #[test]
+fn consecutive_rollovers_do_not_double_count_credit() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+
+    // Week 1 goes by entirely unspent, so the whole base allowance carries as
+    // credit and the week-2 capacity is 1_000 + 1_000 = 2_000.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_000);
+
+    // Spend that entire rolled-over capacity during week 2.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &2_000), 0);
+
+    // Nothing is left to carry, so week 3 must fall back to the base limit.
+    // Re-adding the prior credit on the transition would leave a phantom 1_000
+    // in `rollover_credit` and hand the agent an unearned second allowance.
+    h.env.ledger().set_timestamp(1_000 + 2 * WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 0);
+    assert_eq!(b.spent, 0);
+}
+
+#[test]
+fn consecutive_rollovers_carry_only_the_unspent_remainder() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+
+    // Week 1 idle -> credit 1_000, so week 2 starts with a 2_000 capacity.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_000);
+
+    // Spend 1_500 of it, leaving 500 to carry into week 3.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_500), 500);
+
+    h.env.ledger().set_timestamp(1_000 + 2 * WEEK);
+    // Capacity is base 1_000 + remaining 500 = 1_500, not 2_500.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_500);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 500);
+}
+
+#[test]
+fn multi_period_jump_settles_remnant_and_idle_periods_once() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+
+    // Settle week 1 first so a non-zero credit is already in force.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).window_start, 1_000 + WEEK);
+
+    // Jump three more whole weeks untouched. Week 2 contributes its unspent
+    // 2_000 capacity; weeks 3 and 4 each contribute a full base limit (1_000).
+    h.env.ledger().set_timestamp(1_000 + 4 * WEEK);
+    // The check itself settles the jump; `get` then reflects the new state.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 5_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 4_000);
+    // The window is still anchored to the original weekly boundary.
+    assert_eq!(
+        h.client.get(&id(&h.env, "eng")).window_start,
+        1_000 + 4 * WEEK
+    );
+}
+
+#[test]
 fn rollover_credit_is_clamped_to_its_cap() {
     let h = setup();
     allocate(&h, "eng", 1_000, Period::Weekly, true);
@@ -499,6 +568,7 @@ fn rollover_credit_is_clamped_to_its_cap() {
         &0,
         &true,
         &1_500,
+        &0,
     );
 
     h.env.ledger().set_timestamp(1_000 + 10 * WEEK);
@@ -518,6 +588,7 @@ fn custom_period_recurs_on_its_configured_interval() {
         &Period::Custom,
         &3_600,
         &false,
+        &0,
         &0,
     );
     let b: Budget = h.client.get(&id(&h.env, "agent"));
@@ -547,6 +618,7 @@ fn custom_period_requires_an_interval() {
         &0,
         &false,
         &0,
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
 
@@ -557,6 +629,7 @@ fn custom_period_requires_an_interval() {
         &0,
         &true,
         &-1,
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
@@ -569,8 +642,15 @@ fn set_recurrence_settles_the_old_policy_before_switching() {
 
     // A day has already turned over when the cadence is changed to weekly.
     h.env.ledger().set_timestamp(1_000 + DAY);
-    h.client
-        .set_recurrence(&h.owner, &id(&h.env, "eng"), &Period::Weekly, &0, &true, &0);
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &0,
+    );
 
     // The reset owed under the daily policy was applied, not discarded.
     let b: Budget = h.client.get(&id(&h.env, "eng"));
@@ -593,6 +673,7 @@ fn set_recurrence_requires_the_owner() {
         &0,
         &false,
         &0,
+        &0,
     );
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
@@ -611,6 +692,7 @@ fn disabling_rollover_drops_accrued_credit() {
         &Period::Weekly,
         &0,
         &false,
+        &0,
         &0,
     );
     assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 0);
@@ -971,6 +1053,7 @@ fn capped_rollover_accrual_saturates_instead_of_overflowing() {
         &0,
         &true,
         &limit, // rollover_cap
+        &0,     // percentage ceiling uncapped
     );
     h.env.ledger().set_timestamp(1_000 + 3 * WEEK);
     h.client.rollover(&h.owner, &id(&h.env, "eng"));
@@ -1094,6 +1177,303 @@ fn per_asset_spend_past_max_returns_overflow() {
     assert_eq!(res, Err(Ok(Error::Overflow)));
     // The spend was not recorded.
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #246: budget window expiration checks and rollover logic.
+// ---------------------------------------------------------------------------
+
+/// Sanity-check the boundary rule at the helper level (no storage writes: the
+/// helper is a pure predicate over the ledger clock and the stored window).
+#[test]
+fn window_expiration_helper_matches_the_transition_boundary() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, false);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &100);
+
+    let budget = || h.client.get(&id(&h.env, "eng"));
+
+    // Well inside the window: not lapsed.
+    h.env.ledger().set_timestamp(1_000 + DAY - 1);
+    assert!(!crate::BudgetContract::is_window_expired(&h.env, &budget()).unwrap());
+
+    // The boundary itself: the window end is *exclusive*, so the first instant
+    // at-or-after `start + window` counts as expired.
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    assert!(crate::BudgetContract::is_window_expired(&h.env, &budget()).unwrap());
+}
+
+#[test]
+fn window_rolls_over_at_exactly_the_boundary_timestamp() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, false);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
+
+    // One second before the boundary the allowance is still exhausted...
+    h.env.ledger().set_timestamp(1_000 + DAY - 1);
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+
+    // ...and at the boundary itself the window is already expired: the very
+    // first timestamp at-or-after `start + window` belongs to the next window.
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &1);
+    assert_eq!(rem, 999);
+    // Re-anchored to the period boundary, not to `now` (equal here anyway).
+    assert_eq!(h.client.get(&id(&h.env, "eng")).window_start, 1_000 + DAY);
+}
+
+#[test]
+fn rollover_at_exactly_the_max_percentage_cap_is_allowed() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    // Exactly 25% of the 1_000 base limit (2_500 bps).
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0, // absolute cap uncapped
+        &2_500,
+    );
+
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &750); // 250 unspent
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    // Unspent 250 is exactly 25% of the limit: the boundary is inclusive.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_250);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 250);
+}
+
+#[test]
+fn rollover_under_the_max_percentage_cap_carries_in_full() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    // 10% cap (1_000 bps) on a 1_000 limit -> 100 units of credit.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0, // absolute cap uncapped
+        &1_000,
+    );
+
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &950); // 50 unspent
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    // 50 < 100: the whole unspent remainder rolls over untouched.
+    // (`remaining` evaluates the lazy transition hook and persists it.)
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_050);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 50);
+}
+
+#[test]
+fn rollover_over_the_max_percentage_cap_is_clamped() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    // 25% cap (2_500 bps) on a 1_000 limit -> 250 units of credit.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0, // absolute cap uncapped
+        &2_500,
+    );
+
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &100); // 900 unspent
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    // 900 unspent would blow past the cap; the credit is clamped to 250.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_250);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 250);
+}
+
+#[test]
+fn percentage_cap_tightens_a_looser_absolute_cap() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    // Absolute cap 1_500, percentage cap 10% (100): effective cap = 100.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &1_500, // absolute cap
+        &1_000, // 10% of the limit
+    );
+
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &100); // 900 unspent
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    // The tighter percentage ceiling wins over the looser absolute one.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_100);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 100);
+}
+
+#[test]
+fn absolute_cap_tightens_a_looser_percentage_cap() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    // Absolute cap 300, percentage cap 50% (500): effective cap = 300.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &300,   // absolute cap
+        &5_000, // 50% of the limit
+    );
+
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &100); // 900 unspent
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    // The tighter absolute ceiling wins over the looser percentage one.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_300);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 300);
+}
+
+#[test]
+fn rollover_max_bps_of_100_or_more_is_rejected() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    // 100% would not bound anything, so the boundary itself is invalid.
+    let res = h.client.try_set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &10_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    // Strictly greater is rejected too, and no state was written.
+    let res = h.client.try_set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &20_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_max_bps, 0);
+}
+
+#[test]
+fn negative_rollover_max_bps_is_rejected() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    let res = h.client.try_set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &-1,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn multi_window_gap_does_not_compound_rollover() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+
+    // Ten whole windows pass with no activity in between.
+    h.env.ledger().set_timestamp(1_000 + 10 * WEEK);
+    // Only the immediately preceding window contributes its unspent
+    // remainder (400) and each fully idle window contributes one base limit:
+    // 400 + 9 * 1_000 = 9_400 — *not* the compounded 4_000 + 9 * 1_400.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000 + 9_400);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 9_400);
+}
+
+#[test]
+fn percentage_cap_bounds_a_multi_window_gap() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0, // absolute cap uncapped
+        &2_500,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+
+    h.env.ledger().set_timestamp(1_000 + 10 * WEEK);
+    // Uncapped-credit-wise the gap would accrue 400 + 9 * 1_000; the 25%
+    // percentage cap holds the credit at 250 across the whole gap.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_250);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 250);
+}
+
+#[test]
+fn large_balance_percentage_accrual_saturates_at_the_cap_not_overflow() {
+    let h = setup();
+    // Pathological near-i128::MAX balance with a percentage cap: computing
+    // limit * bps overflows a raw i128 product, but the checked arithmetic
+    // routes the accrual through saturating fallbacks instead of panicking or
+    // silently wrapping.
+    let limit = i128::MAX - 5;
+    allocate(&h, "eng", limit, Period::Weekly, true);
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &limit, // absolute cap = one base limit
+        &5_000, // and 50% of the limit
+    );
+
+    h.env.ledger().set_timestamp(1_000 + 5 * WEEK);
+    // The effective cap is min(limit, limit/2) = 50% of the limit; the accrual
+    // saturates at that cap rather than overflowing. (Calling `remaining` here
+    // would legitimately surface Error::Overflow — limit + limit/2 no longer
+    // fits i128 — so the explicit `rollover` entry settles and persists the
+    // window, and only the stored credit is asserted.)
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    let expected = limit / 2;
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, expected);
+}
+
+#[test]
+fn capacity_beyond_i128_max_surfaces_overflow_not_wrapping() {
+    let h = setup();
+    // Near-max limit with a percentage cap: the cap itself is computed
+    // exactly (limit/4 fits), the rollover succeeds, but the *effective
+    // capacity* limit + limit/4 no longer fits i128. The checked addition in
+    // the allowance view must surface Error::Overflow instead of a wrapped
+    // value or a panic.
+    let limit = i128::MAX - 5;
+    allocate(&h, "eng", limit, Period::Weekly, true);
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,     // absolute cap uncapped
+        &2_500, // 25% of the limit
+    );
+
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    // The percentage cap was applied exactly: floor(limit * 2_500 / 10_000).
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, limit / 4);
+    // limit + limit/4 overflows i128: the allowance view reports the
+    // contract error rather than wrapping to a negative number.
+    let res = h.client.try_remaining(&id(&h.env, "eng"));
+    assert_eq!(res, Err(Ok(Error::Overflow)));
 }
 
 // ---------------------------------------------------------------------------

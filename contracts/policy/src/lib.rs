@@ -40,6 +40,18 @@
 //! [`Error`] already carries the 50 cases a Soroban error enum may declare, so
 //! the deny list reuses [`Error::PolicyDenied`] and is distinguished by its
 //! violation event reason.
+//!
+//! ## Multi-rule composition
+//!
+//! On top of the single composite tree set through `set_composite_rule`, a
+//! policy can stack up to [`MAX_POLICY_RULES`] independent rule trees with
+//! `add_policy_rule`. The stack is evaluated on every `check_transfer` and the
+//! rules are combined conjunctively: **all** registered rules must pass. The
+//! iteration short-circuits — the first rule that evaluates to `false` aborts
+//! the loop immediately (gas-efficient) and the transfer is denied with
+//! [`Error::PolicyDenied`]. `remove_policy_rule` / `clear_policy_rules` shrink
+//! the stack again, so the governance team can retire a rule without touching
+//! the remaining ones.
 
 use astroid_interfaces::{PolicyInterface, UpgradeableInterface};
 use astroid_shared::errors::Error;
@@ -53,6 +65,11 @@ use soroban_sdk::{
 /// Maximum recursion depth for composite rule evaluation to prevent stack
 /// overflows and excessive gas consumption on-chain.
 const MAX_RULE_DEPTH: u32 = 10;
+
+/// Maximum number of independent rule trees a policy may stack. Bounds the
+/// cost of the all-rules-must-pass evaluation loop so a policy owner cannot
+/// register an unbounded amount of work for every transfer check.
+const MAX_POLICY_RULES: u32 = 16;
 
 /// A transaction payload submitted for policy evaluation.
 ///
@@ -121,6 +138,80 @@ pub struct RuleNode {
 /// **Gas safety:** Evaluation is depth-limited to [`MAX_RULE_DEPTH`].
 pub type RuleTree = soroban_sdk::Vec<RuleNode>;
 
+/// A stack of independently registered rule trees for one policy. Every entry
+/// is an independent [`RuleTree`] and **all** of them must pass for a
+/// transaction to be authorized.
+pub type RuleStack = soroban_sdk::Vec<RuleTree>;
+
+/// Reject a malformed [`RuleTree`] at write time.
+///
+/// The tree must contain a root node at index 0 and every branch node's child
+/// range must resolve inside the tree (`children_start < children_end <= len`,
+/// exactly one child for `Not`). Validating on registration keeps the
+/// evaluation loop's iteration bounds safe: `evaluate_node` then only has to
+/// walk ranges that are known to resolve.
+fn validate_rule_tree(tree: &RuleTree) -> Result<(), Error> {
+    if tree.is_empty() {
+        return Err(Error::InvalidInput);
+    }
+    let len = tree.len();
+    for i in 0..len {
+        let node = tree.get(i).ok_or(Error::InvalidInput)?;
+        // `checked_sub` keeps the range arithmetic panic-free: a crafted
+        // `children_start > children_end` must yield `InvalidInput`, never an
+        // overflow abort.
+        let bad_children = match node.op {
+            RuleOp::And | RuleOp::Or => {
+                node.children_start >= node.children_end || node.children_end > len
+            }
+            RuleOp::Not => {
+                node.children_end.checked_sub(node.children_start) != Some(1)
+                    || node.children_end > len
+            }
+            // Leaves carry a payload instead of children.
+            _ => false,
+        };
+        if bad_children {
+            return Err(Error::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
+/// Cache blacklist membership for the recipient while evaluating a policy's
+/// composite rule and rule stack.
+#[derive(Default)]
+struct RuleEvaluationContext {
+    recipient_blacklisted: Option<bool>,
+    merchant_blacklisted: Option<bool>,
+}
+
+impl RuleEvaluationContext {
+    fn recipient_blacklisted(&mut self, env: &Env, recipient: &Address) -> bool {
+        if let Some(is_blacklisted) = self.recipient_blacklisted {
+            return is_blacklisted;
+        }
+        let is_blacklisted = env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(recipient.clone()));
+        self.recipient_blacklisted = Some(is_blacklisted);
+        is_blacklisted
+    }
+
+    fn merchant_blacklisted(&mut self, env: &Env, recipient: &Address) -> bool {
+        if let Some(is_blacklisted) = self.merchant_blacklisted {
+            return is_blacklisted;
+        }
+        let is_blacklisted = env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()));
+        self.merchant_blacklisted = Some(is_blacklisted);
+        is_blacklisted
+    }
+}
+
 /// Evaluate a node in a [`RuleTree`] against `payload`.
 ///
 /// `depth` is decremented on every recursive call; returns
@@ -131,6 +222,7 @@ fn evaluate_node(
     node_idx: u32,
     payload: &TransactionPayload,
     depth: u32,
+    context: &mut RuleEvaluationContext,
 ) -> Result<bool, Error> {
     if depth == 0 {
         return Err(Error::InvalidInput);
@@ -141,20 +233,14 @@ fn evaluate_node(
         RuleOp::MaxAmount => Ok(payload.amount <= node.value_i128),
         RuleOp::AllowedRecipient => Ok(payload.recipient == node.value_address),
         RuleOp::AllowedAsset => Ok(payload.asset == node.value_address),
-        RuleOp::RecipientBlacklisted => Ok(env
-            .storage()
-            .persistent()
-            .has(&DataKey::Blacklist(payload.recipient.clone()))),
-        RuleOp::MerchantBlacklisted => Ok(env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(payload.recipient.clone()))),
+        RuleOp::RecipientBlacklisted => Ok(context.recipient_blacklisted(env, &payload.recipient)),
+        RuleOp::MerchantBlacklisted => Ok(context.merchant_blacklisted(env, &payload.recipient)),
         RuleOp::And => {
             if node.children_start == node.children_end {
                 return Err(Error::InvalidInput);
             }
             for i in node.children_start..node.children_end {
-                if !evaluate_node(env, tree, i, payload, remaining)? {
+                if !evaluate_node(env, tree, i, payload, remaining, context)? {
                     return Ok(false);
                 }
             }
@@ -165,17 +251,21 @@ fn evaluate_node(
                 return Err(Error::InvalidInput);
             }
             for i in node.children_start..node.children_end {
-                if evaluate_node(env, tree, i, payload, remaining)? {
+                if evaluate_node(env, tree, i, payload, remaining, context)? {
                     return Ok(true);
                 }
             }
             Ok(false)
         }
         RuleOp::Not => {
-            if node.children_start + 1 != node.children_end {
+            // `checked_sub` keeps the range arithmetic panic-free: a crafted
+            // `children_start == u32::MAX` must yield `InvalidInput`, never an
+            // overflow abort. Exactly one child is required.
+            if node.children_end.checked_sub(node.children_start) != Some(1) {
                 return Err(Error::InvalidInput);
             }
-            let result = evaluate_node(env, tree, node.children_start, payload, remaining)?;
+            let result =
+                evaluate_node(env, tree, node.children_start, payload, remaining, context)?;
             Ok(!result)
         }
     }
@@ -221,6 +311,9 @@ enum DataKey {
     Allowance(String, Address),
     /// Composite rule tree for a policy (set via `set_composite_rule`).
     CompositeRule(String),
+    /// Stack of independently registered rule trees for a policy (all must
+    /// pass; managed through `add_policy_rule` / `remove_policy_rule`).
+    PolicyRules(String),
 }
 
 /// A per-asset spending allowance attached to a policy.
@@ -899,6 +992,16 @@ impl PolicyContract {
         policy_id: String,
         payload: TransactionPayload,
     ) -> Result<bool, Error> {
+        let mut context = RuleEvaluationContext::default();
+        Self::evaluate_composite_rule_with_context(&env, &policy_id, &payload, &mut context)
+    }
+
+    fn evaluate_composite_rule_with_context(
+        env: &Env,
+        policy_id: &String,
+        payload: &TransactionPayload,
+        context: &mut RuleEvaluationContext,
+    ) -> Result<bool, Error> {
         let key = DataKey::CompositeRule(policy_id.clone());
         let tree: RuleTree = match env.storage().persistent().get(&key) {
             Some(t) => t,
@@ -907,7 +1010,150 @@ impl PolicyContract {
         if tree.is_empty() {
             return Ok(true);
         }
-        evaluate_node(&env, &tree, 0, &payload, MAX_RULE_DEPTH)
+        evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)
+    }
+
+    // --- multi-rule composition ---
+
+    /// Register an additional rule tree on the policy's rule stack.
+    ///
+    /// Every rule on the stack is evaluated during `check_transfer` and **all**
+    /// of them must pass: the first rule that evaluates to `false`
+    /// short-circuits the evaluation and the transfer is denied with
+    /// [`Error::PolicyDenied`]. This is how a policy composes independent
+    /// governance constraints — e.g. an allow-listed recipient *plus* a maximum
+    /// amount — without folding them into a single hand-built tree.
+    ///
+    /// `owner` only. The tree must be non-empty and structurally sound (see
+    /// [`validate_rule_tree`]) so a malformed rule is rejected at write time
+    /// rather than aborting evaluation later. Returns the number of rules now
+    /// registered for the policy and fails with [`Error::InvalidInput`] once
+    /// [`MAX_POLICY_RULES`] rules are stacked.
+    pub fn add_policy_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        rule_tree: RuleTree,
+    ) -> Result<u32, Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        validate_rule_tree(&rule_tree)?;
+        let key = DataKey::PolicyRules(policy_id.clone());
+        let mut stack: RuleStack = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if stack.len() >= MAX_POLICY_RULES {
+            return Err(Error::InvalidInput);
+        }
+        stack.push_back(rule_tree);
+        let count = stack.len();
+        env.storage().persistent().set(&key, &stack);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_add")),
+            (policy_id, count),
+        );
+        Ok(count)
+    }
+
+    /// Remove the rule at `index` from the policy's rule stack (owner only).
+    ///
+    /// The index is bounds-checked against the current stack length, so an
+    /// out-of-range removal fails with [`Error::InvalidInput`] instead of
+    /// panicking. Removing the last rule drops the storage key entirely.
+    pub fn remove_policy_rule(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        index: u32,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::PolicyRules(policy_id.clone());
+        let mut stack: RuleStack = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        if index >= stack.len() {
+            return Err(Error::InvalidInput);
+        }
+        stack.remove(index);
+        if stack.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &stack);
+        }
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rule_rem")),
+            (policy_id, index),
+        );
+        Ok(())
+    }
+
+    /// Drop every registered rule for a policy (owner only).
+    pub fn clear_policy_rules(env: Env, caller: Address, policy_id: String) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::PolicyRules(policy_id.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("rules_clr")),
+            policy_id,
+        );
+        Ok(())
+    }
+
+    /// Read the whole rule stack for a policy. Returns an empty stack when no
+    /// rule has been registered yet (permissive default).
+    pub fn get_policy_rules(env: Env, policy_id: String) -> RuleStack {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PolicyRules(policy_id))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Evaluate every registered rule against `payload`.
+    ///
+    /// Rules are combined conjunctively and walked in stack order; the loop
+    /// returns `Ok(false)` — "denied" — as soon as one rule fails, so later
+    /// rules are never paid for. An empty stack is permissive. Malformed trees
+    /// surface as [`Error::InvalidInput`] (defensive: registration already
+    /// validates the shape).
+    pub fn evaluate_policy_rules(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<bool, Error> {
+        let mut context = RuleEvaluationContext::default();
+        Self::evaluate_policy_rules_with_context(&env, &policy_id, &payload, &mut context)
+    }
+
+    fn evaluate_policy_rules_with_context(
+        env: &Env,
+        policy_id: &String,
+        payload: &TransactionPayload,
+        context: &mut RuleEvaluationContext,
+    ) -> Result<bool, Error> {
+        let stack: RuleStack = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PolicyRules(policy_id.clone()))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        let count = stack.len();
+        for i in 0..count {
+            // `get` bounds-checks the index; a miss means the stack changed
+            // under us, which storage cannot do mid-invocation — fail closed.
+            let tree = stack.get(i).ok_or(Error::InvalidInput)?;
+            if tree.is_empty() {
+                continue;
+            }
+            if !evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     // --- views ---
@@ -957,19 +1203,19 @@ impl PolicyInterface for PolicyContract {
             return Err(Error::PolicyDenied);
         }
         // --- Blocklist checks (Issue #32) — evaluated first ---
-        if env
+        let recipient_blacklisted = env
             .storage()
             .persistent()
-            .has(&DataKey::Blacklist(recipient.clone()))
-        {
+            .has(&DataKey::Blacklist(recipient.clone()));
+        if recipient_blacklisted {
             events_policy_violation(&env, &policy_id, "blacklisted");
             return Err(Error::PolicyRecipientRestricted);
         }
-        if env
+        let merchant_blacklisted = env
             .storage()
             .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()))
-        {
+            .has(&DataKey::MerchantBlacklist(recipient.clone()));
+        if merchant_blacklisted {
             events_policy_violation(&env, &policy_id, "merchant_blocked");
             return Err(Error::PolicyMerchantBlocked);
         }
@@ -1015,9 +1261,26 @@ impl PolicyInterface for PolicyContract {
             recipient: recipient.clone(),
             amount,
         };
-        let rule_result = Self::evaluate_composite_rule(env.clone(), policy_id.clone(), payload)?;
+        let mut rule_context = RuleEvaluationContext {
+            recipient_blacklisted: Some(recipient_blacklisted),
+            merchant_blacklisted: Some(merchant_blacklisted),
+        };
+        let rule_result = Self::evaluate_composite_rule_with_context(
+            &env,
+            &policy_id,
+            &payload,
+            &mut rule_context,
+        )?;
         if !rule_result {
             events_policy_violation(&env, &policy_id, "rule_denied");
+            return Err(Error::PolicyDenied);
+        }
+        // --- Multi-rule stack: every registered rule must pass ---
+        // The stack short-circuits on the first failing rule, so evaluation
+        // stops (and the transfer is denied) as soon as one rule says no.
+        if !Self::evaluate_policy_rules_with_context(&env, &policy_id, &payload, &mut rule_context)?
+        {
+            events_policy_violation(&env, &policy_id, "rules_denied");
             return Err(Error::PolicyDenied);
         }
         Ok(())

@@ -30,12 +30,33 @@
 //! to the period boundary rather than to "now", so windows never drift and a
 //! dormant budget cannot be made to skip a reset.
 //!
+//! ## Window boundaries and gaps (Issue #246)
+//!
+//! A window is half-open: `[window_start, window_start + duration)`. The
+//! **start timestamp is inclusive, the end timestamp is exclusive** — a ledger
+//! timestamp exactly equal to the window end already belongs to the next
+//! window, i.e. the period counts as expired at `now >= window_start +
+//! duration`. [`BudgetContract::is_window_expired`] states this rule in one
+//! place and every transition path routes through it.
+//!
+//! When several whole windows lapse with no activity in between (a multi-window
+//! gap), the hook still settles in a single step. Rollover **does not compound
+//! across lapsed windows**: only the immediately preceding window contributes
+//! its unspent remainder; every fully idle window inside the gap contributes a
+//! full base limit, and the accumulated total is clamped once to the budget's
+//! effective rollover cap. Without that clamp a budget left dormant for `n`
+//! windows could accrue roughly `n × limit`, letting an agent drain far more
+//! than one period's worth of allowance in a single window — exactly what the
+//! cap exists to prevent. (Deliberate design decision, see the PR for #246.)
+//!
 //! Rollover is bounded. When `rollover_enabled` is false the unspent remainder
 //! is dropped and the next period starts from the base limit; when it is true
-//! the remainder accumulates into `rollover_credit`, clamped to
-//! `rollover_cap` (0 = uncapped). The cap is what stops a budget that is left
-//! idle for a long stretch from silently accruing a balance far larger than
-//! the limit it was granted, which an agent could then drain in one period.
+//! the remainder accumulates into `rollover_credit`, clamped to the **effective
+//! cap** — the smaller of the owner-set absolute `rollover_cap` (0 = uncapped)
+//! and the protocol percentage ceiling `rollover_max_bps` of the base limit
+//! (0 = uncapped). The cap is what stops a budget that is left idle for a long
+//! stretch from silently accruing a balance far larger than the limit it was
+//! granted, which an agent could then drain in one period.
 //!
 //! Functions: `allocate`, `set_recurrence`, `consume`, `reset`, `rollover`,
 //! `freeze`, `unfreeze`, `archive`, `transfer_allocation`.
@@ -57,12 +78,12 @@
 
 use astroid_interfaces::{BudgetInterface, UpgradeableInterface};
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+    BPS_DENOMINATOR, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
-use astroid_shared::math::{checked_add, checked_mul, checked_sub};
+use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_rem, checked_sub};
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use astroid_shared::{constants, events};
@@ -105,6 +126,10 @@ pub struct Budget {
     /// Upper bound on `rollover_credit` (0 = uncapped). Bounds how much idle
     /// allowance a recurring budget can accrue before it is spendable at once.
     pub rollover_cap: i128,
+    /// Protocol-wide maximum rollover in basis points of the base limit
+    /// (0 = uncapped, configured via `set_recurrence`). Applied in addition to
+    /// [`Budget::rollover_cap`] — the effective cap is the smaller of the two.
+    pub rollover_max_bps: i128,
     /// Whether the budget allows spending beyond its limit (deficit).
     pub allow_deficit: bool,
     /// Accumulated deficit carried from prior periods.
@@ -213,6 +238,7 @@ impl BudgetContract {
             rollover_enabled,
             rollover_credit: 0,
             rollover_cap: 0,
+            rollover_max_bps: 0,
             allow_deficit,
             deficit_amount: 0,
             expires_at,
@@ -235,6 +261,14 @@ impl BudgetContract {
     /// next period, and `rollover_cap` bounds how much may accumulate
     /// (0 = uncapped).
     ///
+    /// `rollover_max_bps` is the maximum rollover as a percentage of the base
+    /// `limit`, in basis points (0 = uncapped, 2_500 = 25%). It is a
+    /// protocol-safety ceiling layered on top of the owner's absolute
+    /// `rollover_cap`: the effective cap is the smaller of the two. A
+    /// percentage of 100% or more is rejected with [`Error::InvalidInput`] so
+    /// the cap can never loosen a bounded rollover, and `Self::effective_rollover_cap`
+    /// applies it through the shared checked arithmetic.
+    ///
     /// Any transition already due under the *previous* policy is settled first,
     /// so switching cadence can neither erase nor duplicate an owed reset. The
     /// window is then re-anchored to now, which is the boundary the new cadence
@@ -247,8 +281,14 @@ impl BudgetContract {
         period_seconds: u64,
         rollover_enabled: bool,
         rollover_cap: i128,
+        rollover_max_bps: i128,
     ) -> Result<(), Error> {
         Self::require_valid_limit(rollover_cap)?;
+        Self::require_valid_limit(rollover_max_bps)?;
+        // A percentage cap of 100% or more would not bound anything.
+        if rollover_max_bps >= BPS_DENOMINATOR {
+            return Err(Error::InvalidInput);
+        }
         if period == Period::Custom && period_seconds == 0 {
             return Err(Error::InvalidInput);
         }
@@ -265,10 +305,21 @@ impl BudgetContract {
         };
         budget.rollover_enabled = rollover_enabled;
         budget.rollover_cap = rollover_cap;
+        budget.rollover_max_bps = rollover_max_bps;
         if !rollover_enabled {
             budget.rollover_credit = 0;
-        } else {
-            budget.rollover_credit = Self::apply_cap(budget.rollover_credit, rollover_cap);
+        } else if budget.rollover_credit > 0 {
+            // Clamp the accrued credit to the *effective* (absolute ∩
+            // percentage) ceiling the new policy implies, so an already
+            // over-limit credit cannot outlive a tightening. A zero credit has
+            // nothing to clamp, and skipping the computation there keeps
+            // configuration deterministic even on limits whose percentage cap
+            // itself cannot be represented (it then surfaces where the cap is
+            // applied, at the transition).
+            budget.rollover_credit = Self::apply_cap(
+                budget.rollover_credit,
+                Self::effective_rollover_cap(&budget)?,
+            );
         }
         budget.window_start = env.ledger().timestamp();
         Self::store(&env, &budget_id, &budget);
@@ -594,12 +645,90 @@ impl BudgetContract {
         }
     }
 
+    /// The two-layer rollover ceiling for a budget: the owner-configured
+    /// absolute cap (0 = uncapped) intersected with the protocol-wide maximum
+    /// rollover percentage of the base limit (see [`Budget::rollover_max_bps`]).
+    /// The effective cap is the *smaller* of the two, so a percentage cap
+    /// always wins over a more permissive absolute one and vice versa.
+    ///
+    /// The percentage side is computed by [`Self::percentage_of_limit`], which
+    /// cannot overflow for any configuration `set_recurrence` accepts; the
+    /// absolute side is used verbatim via [`Self::apply_cap`].
+    fn effective_rollover_cap(budget: &Budget) -> Result<i128, Error> {
+        let pct_cap = Self::percentage_of_limit(budget.limit, budget.rollover_max_bps)?;
+        match (budget.rollover_cap, pct_cap) {
+            // A recurring budget always carries one nonzero bound
+            // (`set_recurrence` rejects percentages of 100% and more), so this
+            // arm is defensive only.
+            (0, 0) => Ok(0),
+            (0, p) => Ok(p),
+            (c, 0) => Ok(c),
+            (c, p) => Ok(c.min(p)),
+        }
+    }
+
+    /// `floor(limit * bps / 10_000)` — `bps` basis points of `limit` — without
+    /// any intermediate that can overflow `i128`.
+    ///
+    /// `limit` is split into its 10_000-ary quotient and remainder:
+    /// `limit * bps / 10_000 = q * bps + (r * bps) / 10_000`. Because
+    /// `set_recurrence` rejects `bps >= 10_000` (100% and above), `q * bps <=
+    /// limit` and `r * bps < 10^8`, so even a pathological `i128::MAX` limit
+    /// yields an exact, representable cap rather than [`Error::Overflow`].
+    /// Every step still routes through the shared checked arithmetic, so an
+    /// out-of-band percentage (only possible if that bound were ever relaxed)
+    /// degrades to [`Error::Overflow`], never a wrapped value.
+    fn percentage_of_limit(limit: i128, bps: i128) -> Result<i128, Error> {
+        if bps == 0 {
+            return Ok(0);
+        }
+        let q = checked_div(limit, BPS_DENOMINATOR)?;
+        let r = checked_rem(limit, BPS_DENOMINATOR)?;
+        let whole = checked_mul(q, bps)?;
+        let part = checked_div(checked_mul(r, bps)?, BPS_DENOMINATOR)?;
+        checked_add(whole, part)
+    }
+
+    /// Whether the budget's current window has lapsed.
+    ///
+    /// A window is defined by its inclusive start (`window_start`) and its
+    /// *exclusive* end (`window_start + window_seconds`). The boundary rule is
+    /// therefore **half-open: `[start, end)` — the very first timestamp at or
+    /// after `window_start + window_seconds` belongs to the *next* window**,
+    /// i.e. a ledger timestamp exactly equal to the window end counts as
+    /// expired. This matches the existing catch-up convention
+    /// (`elapsed = now - window_start`, `elapsed >= window`) and the fixed
+    /// cadences themselves (a daily budget re-arms at `start + 86_400`), and
+    /// keeps `window_end` readable as "allowed until this instant, not
+    /// including it".
+    ///
+    /// Returns `Ok(false)` for non-recurring budgets (`Period::None`, or a
+    /// `Custom` period without an interval): their window never lapses.
+    fn is_window_expired(env: &Env, budget: &Budget) -> Result<bool, Error> {
+        let window = match Self::window_of(budget) {
+            Some(w) => w,
+            None => return Ok(false),
+        };
+        let now = env.ledger().timestamp();
+        let end = budget
+            .window_start
+            .checked_add(window)
+            .ok_or(Error::Overflow)?;
+        Ok(now >= end)
+    }
+
     /// The conditional execution hook for recurring allowances.
     ///
     /// Applies every period transition that is due (auto-reset / rollover) and
     /// checks expiration. Mutates `budget` in place. When `publish` is true,
     /// emits the `rollover`/`reset`/`expired` events. Returns
     /// [`Error::BudgetExpired`] if the budget has passed its expiration window.
+    ///
+    /// Window expiry is determined by [`Self::is_window_expired`] (half-open
+    /// boundary: a timestamp equal to the window end belongs to the next
+    /// window), and the rollover credit computed here is clamped to the
+    /// effective cap — the smaller of the stored absolute `rollover_cap` and
+    /// the percentage ceiling `rollover_max_bps` of the base limit.
     ///
     /// Settling *all* elapsed periods at once — rather than one per call — is
     /// what makes the hook safe to evaluate lazily: a budget nobody touched for
@@ -625,24 +754,35 @@ impl BudgetContract {
             Some(w) => w,
             None => return Ok(()),
         };
-        let elapsed = now.saturating_sub(budget.window_start);
-        if elapsed < window {
+        // The single place the period-lapse rule lives: half-open
+        // [start, start + window), so a timestamp equal to the window end
+        // already belongs to the next period (see `is_window_expired`).
+        if !Self::is_window_expired(env, budget)? {
             return Ok(());
         }
+        let elapsed = now.saturating_sub(budget.window_start);
         // Whole periods to settle. `window` is non-zero, so this is >= 1.
         let periods = (elapsed / window) as i128;
 
         // The current period's remainder, plus one full base limit for every
-        // further period that came and went entirely untouched.
+        // further period that came and went entirely untouched. `leftover`
+        // already accounts for any credit carried into this window because the
+        // period's capacity is `limit + rollover_credit`, so it is the base for
+        // the next period's credit. Re-adding the old credit here would count
+        // it a second time and let an agent that spent its whole rolled-over
+        // allowance bank another period's worth of unearned capacity.
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         let leftover = checked_sub(capacity, budget.spent)?;
         if budget.rollover_enabled {
-            let mut credit = checked_add(budget.rollover_credit, leftover)?;
+            let mut credit = leftover;
             if periods > 1 {
                 let idle = checked_sub(periods, 1)?;
                 credit = Self::accrue_idle_periods(credit, budget, idle)?;
             }
-            budget.rollover_credit = Self::apply_cap(credit, budget.rollover_cap);
+            // Clamp to the effective cap = min(absolute `rollover_cap`,
+            // percentage-of-limit `rollover_max_bps`); see
+            // [`Self::effective_rollover_cap`].
+            budget.rollover_credit = Self::apply_cap(credit, Self::effective_rollover_cap(budget)?);
         } else {
             budget.rollover_credit = 0;
         }
