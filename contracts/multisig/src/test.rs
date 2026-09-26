@@ -1189,6 +1189,7 @@ fn approval_from_removed_signer_no_longer_counts() {
     h.client.execute(&h.signers[0], &id);
     assert_eq!(h.client.get_proposal(&id).approval_weight, 3);
 }
+
 #[test]
 fn reduced_signer_weight_is_applied_at_execution() {
     let h = setup(&[1, 2, 1], 2);
