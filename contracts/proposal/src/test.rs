@@ -1,8 +1,8 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{ProposalContract, ProposalContractClient, ProposalState};
-use astroid_shared::constants::{MAX_APPROVERS, MAX_DEPENDENCIES};
+use crate::{ProposalContract, ProposalContractClient, ProposalState, VoteBars};
+use astroid_shared::constants::MAX_DEPENDENCIES;
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
 use soroban_sdk::{Address, Env, IntoVal, String, Symbol, Val, Vec};
@@ -913,43 +913,45 @@ fn timelock_only_gates_execution_not_state_transitions() {
 // `execute` re-validates the tally that earned `Approved`: the configured
 // threshold, the participation quorum (an integer-scaled percentage of the
 // allow-list) and a strict majority. The cases below pin the boundaries — an
-// exact tie, and tallies one vote short of a bar — where a threshold-only
-// check would let a barely-supported proposal fire.
+// exact tie, tallies one vote short of a bar, and a threshold low enough to
+// be gamed on a large allow-list — where a threshold-only check would let a
+// barely-supported proposal fire. The `can_execute` view is pinned alongside
+// the entrypoint so it can never advertise a tally `execute` would refuse.
 
 #[test]
 fn quorum_calculation_rounds_up_with_integer_scaling() {
     // ceil(eligible * percent / 100) — exact shares stay exact ...
-    assert_eq!(ProposalContract::quorum_required(4, 50), 2);
-    assert_eq!(ProposalContract::quorum_required(2, 50), 1);
+    assert_eq!(VoteBars::quorum_required(4, 50), 2);
+    assert_eq!(VoteBars::quorum_required(2, 50), 1);
     // ... partial shares round up so they can never slip under the bar.
-    assert_eq!(ProposalContract::quorum_required(5, 50), 3); // 2.5 -> 3
-    assert_eq!(ProposalContract::quorum_required(3, 60), 2); // 1.8 -> 2
+    assert_eq!(VoteBars::quorum_required(5, 50), 3); // 2.5 -> 3
+    assert_eq!(VoteBars::quorum_required(3, 60), 2); // 1.8 -> 2
 
     // Degenerate bounds: the full allow-list, and no participation at all.
-    assert_eq!(ProposalContract::quorum_required(7, 100), 7);
-    assert_eq!(ProposalContract::quorum_required(0, 50), 0);
-    assert_eq!(ProposalContract::quorum_required(7, 0), 0);
+    assert_eq!(VoteBars::quorum_required(7, 100), 7);
+    assert_eq!(VoteBars::quorum_required(0, 50), 0);
+    assert_eq!(VoteBars::quorum_required(7, 0), 0);
     // A percentage above 100 is clamped: never more than the allow-list.
-    assert_eq!(ProposalContract::quorum_required(4, 250), 4);
+    assert_eq!(VoteBars::quorum_required(4, 250), 4);
 }
 
 #[test]
 fn majority_check_never_accepts_a_tie() {
     // The bar is always one past half of the allow-list ...
-    assert_eq!(ProposalContract::majority_required(4), 3);
-    assert_eq!(ProposalContract::majority_required(5), 3);
+    assert_eq!(VoteBars::majority_required(4), 3);
+    assert_eq!(VoteBars::majority_required(5), 3);
     // ... an empty allow-list can never be reached by any tally ...
-    assert_eq!(ProposalContract::majority_required(0), 1);
+    assert_eq!(VoteBars::majority_required(0), 1);
     // Exactly half of an even allow-list is a tie, not a majority ...
-    assert!(!ProposalContract::has_majority(2, 4));
-    assert!(ProposalContract::has_majority(3, 4));
+    assert!(!VoteBars::has_majority(2, 4));
+    assert!(VoteBars::has_majority(3, 4));
     // ... and one short of an odd one is still short.
-    assert!(!ProposalContract::has_majority(2, 5));
-    assert!(ProposalContract::has_majority(3, 5));
-    assert!(!ProposalContract::has_majority(1, 3));
-    assert!(ProposalContract::has_majority(2, 3));
+    assert!(!VoteBars::has_majority(2, 5));
+    assert!(VoteBars::has_majority(3, 5));
+    assert!(!VoteBars::has_majority(1, 3));
+    assert!(VoteBars::has_majority(2, 3));
     // A sole voter is its own majority.
-    assert!(ProposalContract::has_majority(1, 1));
+    assert!(VoteBars::has_majority(1, 1));
 }
 
 #[test]
@@ -1037,6 +1039,152 @@ fn narrowly_missing_the_threshold_never_approves_and_cannot_execute() {
     assert_eq!(h.client.state(&id), ProposalState::Approved);
     h.client.execute(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn low_threshold_on_a_large_allow_list_cannot_execute_on_one_signature() {
+    // The motivating case for the whole gate: `threshold = 1` on a ten-person
+    // allow-list reaches `Approved` on a single signature, but that signature
+    // is neither the quorum (ceil(10 * 50%) == 5 of 10) nor a majority
+    // (10 / 2 + 1 == 6 of 10), so it must never fire.
+    let h = setup(10);
+    let id = create(&h, 1, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert!(!h.client.can_execute(&id));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approvals, 1);
+}
+
+#[test]
+fn quorum_met_but_majority_missing_blocks_execution() {
+    let h = setup(6);
+    // 6 voters: quorum is ceil(6 * 50%) == 3 and a strict majority is
+    // 6 / 2 + 1 == 4, so this three-signature tally clears the configured
+    // threshold *and* the participation bar while still falling one vote
+    // short of the majority.
+    let id = create(&h, 3, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert!(!h.client.can_execute(&id));
+    // Nothing was consumed: the proposal stays approved and re-attemptable.
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approvals, 3);
+}
+
+#[test]
+fn can_execute_view_agrees_with_execute_on_every_vote_bar() {
+    // Tie: threshold and quorum met, strict majority missed (2 of 4).
+    let tie = setup(4);
+    let tie_id = create(&tie, 2, 5_000);
+    tie.client.approve(&tie.approvers[0], &tie_id);
+    tie.client.approve(&tie.approvers[1], &tie_id);
+    assert_eq!(tie.client.state(&tie_id), ProposalState::Approved);
+    assert!(!tie.client.can_execute(&tie_id));
+
+    // Quorum short by exactly one vote (2 of 5, bar is 3).
+    let quorum = setup(5);
+    let quorum_id = create(&quorum, 2, 5_000);
+    quorum.client.approve(&quorum.approvers[0], &quorum_id);
+    quorum.client.approve(&quorum.approvers[1], &quorum_id);
+    assert_eq!(quorum.client.state(&quorum_id), ProposalState::Approved);
+    assert!(!quorum.client.can_execute(&quorum_id));
+
+    // Exactly on both bars: the view reports executable and the entrypoint
+    // then agrees, so the two can never contradict each other.
+    let ok = setup(5);
+    let ok_id = create(&ok, 3, 5_000);
+    ok.client.approve(&ok.approvers[0], &ok_id);
+    ok.client.approve(&ok.approvers[1], &ok_id);
+    ok.client.approve(&ok.approvers[2], &ok_id);
+    assert!(ok.client.can_execute(&ok_id));
+    ok.client.execute(&ok.proposer, &ok_id);
+    assert_eq!(ok.client.state(&ok_id), ProposalState::Executed);
+}
+
+#[test]
+fn vote_bar_helpers_compose_threshold_quorum_and_majority() {
+    let h = setup(6);
+    let id = create(&h, 3, 5_000);
+    let bars = VoteBars::for_proposal(&h.client.get(&id));
+
+    // All three bars, derived from the stored record: threshold 3, quorum
+    // ceil(6 * 50%) == 3 and majority 6 / 2 + 1 == 4.
+    assert_eq!(bars.threshold, 3);
+    assert_eq!(bars.quorum, VoteBars::quorum_required(6, 50));
+    assert_eq!(bars.majority, VoteBars::majority_required(6));
+    assert_eq!((bars.quorum, bars.majority), (3, 4));
+
+    // Clearing every bar passes ...
+    assert!(bars.met_by(4));
+    assert_eq!(bars.ensure_met(4), Ok(()));
+    // ... and every shorter tally is refused with the protocol-wide code,
+    // whether it misses the majority alone (3), the quorum too (2) or the
+    // configured threshold as well (0).
+    for approvals in [0u32, 1, 2, 3] {
+        assert!(!bars.met_by(approvals));
+        assert_eq!(bars.ensure_met(approvals), Err(Error::ThresholdNotMet));
+    }
+}
+
+#[test]
+fn vote_bars_view_reports_the_bars_execute_enforces() {
+    let h = setup(5);
+
+    // The view derives the bars from the stored record — quorum and majority
+    // are both ceil(2.5) == 3 and 5 / 2 + 1 == 3 for a five-person list.
+    let short = create(&h, 2, 5_000);
+    let bars = h.client.vote_bars(&short);
+    assert_eq!(
+        bars,
+        VoteBars {
+            threshold: 2,
+            quorum: 3,
+            majority: 3,
+        }
+    );
+    // Two approvals clear the threshold but not the other two bars ...
+    assert!(!bars.met_by(2));
+
+    h.client.approve(&h.approvers[0], &short);
+    h.client.approve(&h.approvers[1], &short);
+    assert!(!h.client.can_execute(&short));
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &short),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+
+    // ... while a tally sitting exactly on all three bars executes, so the
+    // view never advertises a verdict the entrypoint would contradict.
+    let exact = create(&h, 3, 5_000);
+    let exact_bars = h.client.vote_bars(&exact);
+    assert_eq!(
+        exact_bars,
+        VoteBars {
+            threshold: 3,
+            quorum: 3,
+            majority: 3,
+        }
+    );
+    assert!(exact_bars.met_by(3));
+    h.client.approve(&h.approvers[0], &exact);
+    h.client.approve(&h.approvers[1], &exact);
+    h.client.approve(&h.approvers[2], &exact);
+    assert!(h.client.can_execute(&exact));
+    h.client.execute(&h.proposer, &exact);
+    assert_eq!(h.client.state(&exact), ProposalState::Executed);
 }
 
 // ------------------------------------------- timelock / expiry boundary ----
