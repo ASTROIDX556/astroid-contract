@@ -29,6 +29,42 @@
 //! and `execute` refuses with [`Error::TimelockNotExpired`] until
 //! `approved_at + timelock` has passed.
 //!
+//! ## Quorum and majority
+//!
+//! A bare approval threshold can be gamed — `threshold = 1` on a ten-person
+//! allow-list would execute on a single signature — so `execute` re-validates
+//! the tally against two further bars before anything fires:
+//!
+//! * **Quorum (participation).** At least [`PROPOSAL_QUORUM_PERCENT`]% of the
+//!   approver allow-list must have voted. The requirement is computed with
+//!   integer scaling only — `ceil(approvers * percent / 100)`, never
+//!   floating point — and rounded *up* so a partial vote can never round the
+//!   bar away.
+//! * **Majority (the vote itself).** The approvals must form a *strict*
+//!   majority of the allow-list: `approvals > approvers / 2`. An exact tie is
+//!   not a majority.
+//!
+//! The proposal's own configured `threshold` is re-checked as well — behind
+//! the `Approved` state gate, which already guarantees it — as defence in
+//! depth against a tally that somehow slipped below the bar it declared.
+//!
+//! Every shortfall reports the protocol-wide [`Error::ThresholdNotMet`]: a
+//! missed quorum *is* a missed threshold (the participation bar was not
+//! crossed), and the shared error enum already sits at the Stellar spec's
+//! 50-case cap for contract errors, so there is no room for a dedicated
+//! quorum code.
+//!
+//! ```text
+//! approvals < threshold              ──▶ ProposalNotApproved (state gate)
+//! approvals < quorum(allow-list)     ──▶ Error::ThresholdNotMet
+//! approvals <= allow-list / 2 (tie)  ──▶ Error::ThresholdNotMet
+//! otherwise                          ──▶ timelock / dependency gates, then run
+//! ```
+//!
+//! All three bars are re-derived from the stored record on every call rather
+//! than cached, so the verdict is a pure function of on-chain state and every
+//! node agrees on it.
+//!
 //! ## Dependency chaining
 //!
 //! A proposal may declare prerequisite proposals it depends on. `execute` then
@@ -83,7 +119,7 @@
 use astroid_interfaces::UpgradeableInterface;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, PROPOSAL_QUORUM_PERCENT,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
@@ -521,6 +557,13 @@ impl ProposalContract {
     /// Execute an approved proposal. Only the proposer may execute (the actual
     /// value movement happens in the wallet/treasury; this records completion).
     ///
+    /// Immediately after the state gate the tally itself is re-validated: the
+    /// participation quorum, the configured `threshold` and a strict majority
+    /// of the approver allow-list must all hold, or the call is refused with
+    /// [`Error::ThresholdNotMet`] (see the module-level *Quorum and majority*
+    /// notes). Reaching `Approved` once is therefore not a licence forever —
+    /// an under-supported or merely-tied tally can never fire.
+    ///
     /// Every declared prerequisite must have executed first, otherwise the call
     /// fails with [`Error::PrerequisiteNotMet`] and nothing changes. This is
     /// checked after the timelock so that a proposal blocked only by its chain
@@ -544,6 +587,10 @@ impl ProposalContract {
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
+        // Re-check the tally that earned `Approved` — quorum participation,
+        // the configured threshold and a strict majority — so execution can
+        // never out-run the votes that authorised it.
+        Self::ensure_vote_valid(&proposal)?;
         // Mandatory timelock: an approved proposal may not be executed until
         // `timelock` seconds have elapsed since it was approved. Guards against
         // a sudden takeover executing freshly-approved proposals before honest
@@ -691,6 +738,60 @@ impl ProposalContract {
             .persistent()
             .set(&DataKey::Proposal(id), proposal);
         Self::bump(env, id);
+    }
+
+    /// The number of approvals that makes a vote among `eligible` voters
+    /// quorate: `percent`% of the approver allow-list, rounded **up** so a
+    /// partial vote can never round the requirement away.
+    ///
+    /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
+    /// [`u64::div_ceil`] — never floating point, so every node derives the
+    /// identical integer. `percent` is clamped to 100, so a misconfigured
+    /// percentage can never demand more than the whole allow-list.
+    fn quorum_required(eligible: u32, percent: u32) -> u32 {
+        let percent = percent.min(100);
+        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
+    }
+
+    /// The smallest number of approvals that exceeds half the allow-list — a
+    /// strict majority. An exact tie (exactly half) never reaches it.
+    fn majority_required(eligible: u32) -> u32 {
+        eligible / 2 + 1
+    }
+
+    /// Whether `approvals` forms a strict majority of the `eligible` voters.
+    fn has_majority(approvals: u32, eligible: u32) -> bool {
+        approvals >= Self::majority_required(eligible)
+    }
+
+    /// Refuse to execute a proposal whose tally does not clear every vote bar.
+    ///
+    /// Re-derived from the stored record on each call — nothing is cached —
+    /// and checked in order of increasing strictness:
+    ///
+    /// 1. the proposal's configured `threshold` (defence in depth: the
+    ///    `Approved` state gate in `execute` already guarantees it);
+    /// 2. the participation quorum — at least [`PROPOSAL_QUORUM_PERCENT`]% of
+    ///    the allow-list must have voted, rounded up;
+    /// 3. a strict majority of the allow-list (an exact tie is not a
+    ///    majority).
+    ///
+    /// Every shortfall reports [`Error::ThresholdNotMet`] — a missed quorum
+    /// *is* a missed threshold, and the shared error enum is at the Stellar
+    /// spec's 50-case cap, so one protocol-wide code covers all three bars.
+    ///
+    /// Nothing is mutated: a refusal leaves the proposal `Approved` and free
+    /// to be re-attempted, failed or cancelled.
+    fn ensure_vote_valid(proposal: &Proposal) -> Result<(), Error> {
+        let eligible = proposal.approvers.len();
+        let quorum = Self::quorum_required(eligible, PROPOSAL_QUORUM_PERCENT);
+        if proposal.approvals < proposal.threshold
+            || proposal.approvals < quorum
+            || !Self::has_majority(proposal.approvals, eligible)
+        {
+            return Err(Error::ThresholdNotMet);
+        }
+        Ok(())
     }
 
     /// Require that every prerequisite proposal has executed.
