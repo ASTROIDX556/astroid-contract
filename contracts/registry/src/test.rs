@@ -603,6 +603,7 @@ struct UpgradeHarness {
     registry: RegistryContractClient<'static>,
     registry_id: Address,
     member: RegistryContractClient<'static>,
+    member_id: Address,
     admin: Address,
 }
 
@@ -624,6 +625,7 @@ fn setup_upgrade() -> UpgradeHarness {
         registry,
         registry_id,
         member,
+        member_id,
         admin,
     }
 }
@@ -640,6 +642,52 @@ fn upgrade_authority_is_recorded_and_readable() {
     let authority = h.member.get_upgrade_authority();
     assert_eq!(authority.admin, h.admin);
     assert_eq!(authority.registry, h.registry_id);
+}
+
+#[test]
+fn upgrade_authority_bootstrap_requires_registry_admin() {
+    let h = setup_upgrade();
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.member
+            .try_set_upgrade_authority(&stranger, &stranger, &h.registry_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.member.try_get_upgrade_authority(),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn approved_upgrade_records_history_and_emits_event() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    let wasm_hash = h.env.deployer().upload_contract_wasm([0u8; 0].as_slice());
+    h.registry
+        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &wasm_hash);
+
+    h.member.upgrade(&h.admin, &wasm_hash);
+
+    let record: crate::UpgradeRecord = h.env.as_contract(&h.member_id, || {
+        h.env
+            .storage()
+            .persistent()
+            .get(&DataKey::UpgradeHistory(0))
+            .unwrap()
+    });
+    assert_eq!(record.caller, h.admin);
+    assert_eq!(record.wasm_hash, wasm_hash);
+    assert_eq!(
+        h.env.as_contract(&h.member_id, || h
+            .env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::UpgradeHistoryCount)),
+        Some(1)
+    );
+    assert_event(&h.env, "RegistryUpgraded");
 }
 
 #[test]

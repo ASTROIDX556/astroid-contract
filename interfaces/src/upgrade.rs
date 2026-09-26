@@ -140,13 +140,21 @@ pub fn perform(
     wasm_hash: BytesN<32>,
 ) -> Result<(), Error> {
     check(env, caller, kind, &wasm_hash)?;
+    apply_approved(env, kind, wasm_hash);
+    Ok(())
+}
+
+/// Apply a registry-approved upgrade after the caller has run [`check`].
+///
+/// Exposed separately for contracts that must atomically write audit state
+/// after authorization and before scheduling the executable replacement.
+pub fn apply_approved(env: &Env, kind: ModuleKind, wasm_hash: BytesN<32>) {
     env.deployer()
         .update_current_contract_wasm(wasm_hash.clone());
     env.events().publish(
         (symbol_short!("upgrade"), symbol_short!("applied")),
         (kind, wasm_hash),
     );
-    Ok(())
 }
 
 fn stored(env: &Env) -> Option<UpgradeAuthority> {

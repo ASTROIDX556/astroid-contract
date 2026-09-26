@@ -76,6 +76,18 @@ enum DataKey {
     Frozen,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
+    /// Monotonic count and records for upgrades applied to this registry.
+    UpgradeHistoryCount,
+    UpgradeHistory(u32),
+}
+
+/// Persistent audit record for an applied registry upgrade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeRecord {
+    pub caller: Address,
+    pub wasm_hash: BytesN<32>,
+    pub timestamp: u64,
 }
 
 /// A delegated administrative role over one organization's registry records.
@@ -474,6 +486,26 @@ impl RegistryContract {
         Self::get_version(env, kind, latest)
     }
 
+    /// Number of upgrades applied to this registry.
+    pub fn upgrade_history_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeHistoryCount)
+            .unwrap_or(0)
+    }
+
+    /// Read one upgrade audit record by its zero-based sequence number.
+    pub fn get_upgrade_record(env: Env, sequence: u32) -> Result<UpgradeRecord, Error> {
+        let key = DataKey::UpgradeHistory(sequence);
+        let record = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(record)
+    }
+
     /// Read the recorded owner of an organization.
     pub fn get_org_owner(env: Env, org: String) -> Result<Address, Error> {
         let key = DataKey::Org(org);
@@ -786,6 +818,11 @@ impl UpgradeableInterface for RegistryContract {
         admin: Address,
         registry: Address,
     ) -> Result<(), Error> {
+        if astroid_interfaces::upgrade::get_authority(&env).is_err() {
+            if !Self::is_admin(&env, &caller) {
+                return Err(Error::Unauthorized);
+            }
+        }
         astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
     }
 
@@ -802,12 +839,39 @@ impl UpgradeableInterface for RegistryContract {
     /// `wasm_hash` must be approved for `ModuleKind::Organization` in the registry.
     /// Any other outcome leaves the contract running its current code.
     fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
-        astroid_interfaces::upgrade::perform(
+        astroid_interfaces::upgrade::check(
             &env,
             &caller,
             astroid_shared::types::ModuleKind::Organization,
+            &wasm_hash,
+        )?;
+        let sequence = Self::upgrade_history_count(env.clone());
+        let next_sequence = sequence.checked_add(1).ok_or(Error::InvalidInput)?;
+        let key = DataKey::UpgradeHistory(sequence);
+        let record = UpgradeRecord {
+            caller: caller.clone(),
+            wasm_hash: wasm_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &record);
+        Self::bump(&env, &key);
+        let count_key = DataKey::UpgradeHistoryCount;
+        env.storage().persistent().set(&count_key, &next_sequence);
+        Self::bump(&env, &count_key);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryUpgraded {
+                sequence,
+                caller: caller.clone(),
+                wasm_hash: wasm_hash.clone(),
+            },
+        );
+        astroid_interfaces::upgrade::apply_approved(
+            &env,
+            astroid_shared::types::ModuleKind::Organization,
             wasm_hash,
-        )
+        );
+        Ok(())
     }
 }
 
