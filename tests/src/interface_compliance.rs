@@ -16,13 +16,14 @@ use astroid_escrow::EscrowContract;
 use astroid_interfaces::upgrade::UpgradeAuthority;
 use astroid_interfaces::{
     BudgetClient, BudgetInterface, MultisigClient, MultisigInterface, PolicyClient,
-    PolicyInterface, RegistryClient, RegistryInterface, TreasuryClient, TreasuryInterface,
-    UpgradeableClient, UpgradeableInterface, INTERFACE_VERSION,
+    PolicyInterface, ProposalClient, ProposalInterface, ProposalState, RegistryClient,
+    RegistryInterface, TreasuryClient, TreasuryInterface, UpgradeableClient, UpgradeableInterface,
+    INTERFACE_VERSION,
 };
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::PolicyContract;
 use astroid_proposal::ProposalContract;
-use astroid_registry::RegistryContract;
+use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use astroid_treasury::{TreasuryContract, TreasuryContractClient};
@@ -39,6 +40,7 @@ fn implements_policy<T: PolicyInterface>() {}
 fn implements_budget<T: BudgetInterface>() {}
 fn implements_treasury<T: TreasuryInterface>() {}
 fn implements_multisig<T: MultisigInterface>() {}
+fn implements_proposal<T: ProposalInterface>() {}
 fn implements_upgradeable<T: UpgradeableInterface>() {}
 
 /// Never called at runtime: it exists so the trait bounds are checked by the
@@ -50,6 +52,7 @@ fn interface_table_compiles() {
     implements_budget::<BudgetContract>();
     implements_treasury::<TreasuryContract>();
     implements_multisig::<MultiSigContract>();
+    implements_proposal::<ProposalContract>();
 
     implements_upgradeable::<RegistryContract>();
     implements_upgradeable::<WalletContract>();
@@ -88,6 +91,9 @@ fn every_contract_serves_the_upgradeable_interface() {
     ];
     let admin = Address::generate(&env);
     let registry = Address::generate(&env);
+    // The registry only lets its own protocol admin bootstrap its upgrade
+    // authority, so it is initialized first, as a real deployment does.
+    RegistryContractClient::new(&env, &contracts[0]).initialize(&admin);
 
     for id in contracts.iter() {
         let client = UpgradeableClient::new(&env, id);
@@ -167,6 +173,42 @@ fn treasury_serves_the_treasury_interface() {
     TreasuryContractClient::new(&env, &id).add_approved_asset(&admin, &asset);
     assert!(treasury.is_approved_asset(&asset));
     assert_eq!(treasury.balance(&asset), 0);
+}
+
+#[test]
+fn proposal_serves_the_proposal_interface() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let proposer = Address::generate(&env);
+    let approver = Address::generate(&env);
+
+    let id = env.register_contract(None, ProposalContract);
+    let contract = astroid_proposal::ProposalContractClient::new(&env, &id);
+    contract.initialize(&0);
+
+    let proposal = ProposalClient::new(&env, &id);
+    // An unknown id decodes to the canonical error code through the shared
+    // client, exactly as a cross-contract caller would observe it.
+    assert_eq!(proposal.try_state(&404), Err(Ok(Error::NotFound)));
+
+    let pid = contract.create(
+        &proposer,
+        &String::from_str(&env, "acme"),
+        &String::from_str(&env, "wallet-1"),
+        &String::from_str(&env, "policy-1"),
+        &vec![&env, approver.clone()],
+        &vec![&env],
+        &1,
+        &vec![&env],
+        &0,
+        &0,
+    );
+    assert_eq!(proposal.state(&pid), ProposalState::Pending);
+    assert!(!proposal.is_expired(&pid));
+    assert!(!proposal.is_executed(&pid));
+    assert!(proposal.dependencies_met(&pid));
+    // A pending proposal is never executable.
+    assert!(!proposal.can_execute(&pid));
 }
 
 #[test]

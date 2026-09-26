@@ -52,6 +52,21 @@
 //! [`Error::PolicyDenied`]. `remove_policy_rule` / `clear_policy_rules` shrink
 //! the stack again, so the governance team can retire a rule without touching
 //! the remaining ones.
+//!
+//! ## Recipient whitelisting
+//!
+//! A policy can additionally own an on-chain *recipient whitelist* — the
+//! organization's approved destination directory. Entries are stored per rule
+//! set under `(policy_id, recipient)` and managed dynamically with
+//! `add_recipient_to_whitelist` / `remove_recipient_from_whitelist`, while the
+//! mode itself is a per-policy toggle (`set_recipient_whitelist_enabled`) so a
+//! directory can be staged before it is enforced.
+//!
+//! While the mode is active every destination must be listed: an **empty**
+//! whitelist denies every recipient (fail closed by default) and a miss is
+//! rejected with [`Error::PolicyDenied`] plus a `not_whitelisted` violation
+//! event. With the mode off the gate is a no-op, so existing policies keep
+//! their behaviour until governance opts in.
 
 use astroid_interfaces::{PolicyInterface, UpgradeableInterface};
 use astroid_shared::errors::Error;
@@ -178,6 +193,40 @@ fn validate_rule_tree(tree: &RuleTree) -> Result<(), Error> {
     Ok(())
 }
 
+/// Cache blacklist membership for the recipient while evaluating a policy's
+/// composite rule and rule stack.
+#[derive(Default)]
+struct RuleEvaluationContext {
+    recipient_blacklisted: Option<bool>,
+    merchant_blacklisted: Option<bool>,
+}
+
+impl RuleEvaluationContext {
+    fn recipient_blacklisted(&mut self, env: &Env, recipient: &Address) -> bool {
+        if let Some(is_blacklisted) = self.recipient_blacklisted {
+            return is_blacklisted;
+        }
+        let is_blacklisted = env
+            .storage()
+            .persistent()
+            .has(&DataKey::Blacklist(recipient.clone()));
+        self.recipient_blacklisted = Some(is_blacklisted);
+        is_blacklisted
+    }
+
+    fn merchant_blacklisted(&mut self, env: &Env, recipient: &Address) -> bool {
+        if let Some(is_blacklisted) = self.merchant_blacklisted {
+            return is_blacklisted;
+        }
+        let is_blacklisted = env
+            .storage()
+            .persistent()
+            .has(&DataKey::MerchantBlacklist(recipient.clone()));
+        self.merchant_blacklisted = Some(is_blacklisted);
+        is_blacklisted
+    }
+}
+
 /// Evaluate a node in a [`RuleTree`] against `payload`.
 ///
 /// `depth` is decremented on every recursive call; returns
@@ -188,6 +237,7 @@ fn evaluate_node(
     node_idx: u32,
     payload: &TransactionPayload,
     depth: u32,
+    context: &mut RuleEvaluationContext,
 ) -> Result<bool, Error> {
     if depth == 0 {
         return Err(Error::InvalidInput);
@@ -198,20 +248,14 @@ fn evaluate_node(
         RuleOp::MaxAmount => Ok(payload.amount <= node.value_i128),
         RuleOp::AllowedRecipient => Ok(payload.recipient == node.value_address),
         RuleOp::AllowedAsset => Ok(payload.asset == node.value_address),
-        RuleOp::RecipientBlacklisted => Ok(env
-            .storage()
-            .persistent()
-            .has(&DataKey::Blacklist(payload.recipient.clone()))),
-        RuleOp::MerchantBlacklisted => Ok(env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(payload.recipient.clone()))),
+        RuleOp::RecipientBlacklisted => Ok(context.recipient_blacklisted(env, &payload.recipient)),
+        RuleOp::MerchantBlacklisted => Ok(context.merchant_blacklisted(env, &payload.recipient)),
         RuleOp::And => {
             if node.children_start == node.children_end {
                 return Err(Error::InvalidInput);
             }
             for i in node.children_start..node.children_end {
-                if !evaluate_node(env, tree, i, payload, remaining)? {
+                if !evaluate_node(env, tree, i, payload, remaining, context)? {
                     return Ok(false);
                 }
             }
@@ -222,7 +266,7 @@ fn evaluate_node(
                 return Err(Error::InvalidInput);
             }
             for i in node.children_start..node.children_end {
-                if evaluate_node(env, tree, i, payload, remaining)? {
+                if evaluate_node(env, tree, i, payload, remaining, context)? {
                     return Ok(true);
                 }
             }
@@ -235,7 +279,8 @@ fn evaluate_node(
             if node.children_end.checked_sub(node.children_start) != Some(1) {
                 return Err(Error::InvalidInput);
             }
-            let result = evaluate_node(env, tree, node.children_start, payload, remaining)?;
+            let result =
+                evaluate_node(env, tree, node.children_start, payload, remaining, context)?;
             Ok(!result)
         }
     }
@@ -277,6 +322,15 @@ enum DataKey {
     /// Whether an org uses a permissive (all-assets-allowed) or restrictive
     /// (whitelist-enforced) asset mode. Stored per policy_id.
     AssetWhitelistEnabled(String),
+    /// Per-policy recipient whitelist: (policy_id, recipient) -> true. Keys the
+    /// approved destination directory of one organization rule set.
+    RecipientWhitelist(String, Address),
+    /// Whether a policy enforces its recipient whitelist (default: off).
+    RecipientWhitelistEnabled(String),
+    /// Ordered index of the recipients listed under a policy. Soroban contract
+    /// storage cannot be enumerated, so this vector is kept in sync with
+    /// `RecipientWhitelist` to make the directory readable back to callers.
+    RecipientWhitelistIndex(String),
     /// Per-(policy, asset) multi-token spending allowance.
     Allowance(String, Address),
     /// Composite rule tree for a policy (set via `set_composite_rule`).
@@ -731,6 +785,190 @@ impl PolicyContract {
         Ok(())
     }
 
+    // --- recipient whitelist ---
+
+    /// Turn recipient whitelist mode on or off for a policy (owner only).
+    ///
+    /// While enabled, `check_transfer` only permits destinations listed in this
+    /// policy's approved directory — an **empty** whitelist therefore denies
+    /// every recipient (fail closed by default). Disabling restores the
+    /// permissive behaviour without touching the stored entries, so a directory
+    /// can be staged before it is enforced.
+    pub fn set_recipient_whitelist_enabled(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        env.storage().persistent().set(
+            &DataKey::RecipientWhitelistEnabled(policy_id.clone()),
+            &enabled,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wl_mode")),
+            (policy_id, enabled),
+        );
+        Ok(())
+    }
+
+    /// Add a recipient to the policy's whitelist (owner only).
+    ///
+    /// Fails with [`Error::AlreadyExists`] when the address is already listed
+    /// for this policy, so the directory stays duplicate-free.
+    pub fn add_recipient_to_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::RecipientWhitelist(policy_id.clone(), recipient.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyExists);
+        }
+        env.storage().persistent().set(&key, &true);
+        // Mirror the entry in the read index so the directory can be listed
+        // back (Soroban offers no key enumeration).
+        let index_key = DataKey::RecipientWhitelistIndex(policy_id.clone());
+        let mut index: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        index.push_back(recipient.clone());
+        env.storage().persistent().set(&index_key, &index);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wl_add")),
+            (policy_id, recipient),
+        );
+        Ok(())
+    }
+
+    /// Remove a recipient from the policy's whitelist (owner only).
+    ///
+    /// Fails with [`Error::NotFound`] when the address was never listed (or
+    /// was already removed), so a stale governance transaction cannot silently
+    /// no-op. Dropping the last entry also drops the index key.
+    pub fn remove_recipient_from_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::RecipientWhitelist(policy_id.clone(), recipient.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        let index_key = DataKey::RecipientWhitelistIndex(policy_id.clone());
+        let mut index: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if let Some(pos) = index.iter().position(|a| a == recipient) {
+            // `position` reports a `usize`; convert without panicking so a
+            // malformed index surfaces as an error rather than an abort.
+            index.remove(u32::try_from(pos).map_err(|_| Error::InvalidInput)?);
+        }
+        if index.is_empty() {
+            env.storage().persistent().remove(&index_key);
+        } else {
+            env.storage().persistent().set(&index_key, &index);
+        }
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("wl_rem")),
+            (policy_id, recipient),
+        );
+        Ok(())
+    }
+
+    /// Whether `recipient` is on `policy_id`'s approved destination directory.
+    ///
+    /// A pure membership probe: it reports the stored state regardless of
+    /// whether whitelist mode is currently enforced, so callers can diff the
+    /// directory against an off-chain list.
+    pub fn is_recipient_whitelisted(env: Env, policy_id: String, recipient: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::RecipientWhitelist(policy_id, recipient))
+    }
+
+    /// Read back every recipient whitelisted for `policy_id`, in insertion
+    /// order. Returns an empty vector when the directory has no entries.
+    pub fn get_recipient_whitelist(env: Env, policy_id: String) -> soroban_sdk::Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecipientWhitelistIndex(policy_id))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Evaluate `payload` against the policy's active recipient whitelist.
+    ///
+    /// This is the whitelist's evaluation entry point: it is called by
+    /// `check_transfer` for every proposed transfer and can also be invoked
+    /// directly to dry-run a destination. Returns `Ok(())` when whitelist mode
+    /// is off (gate not enforced) or when `payload.recipient` is listed, and
+    /// [`Error::PolicyDenied`] — with a `not_whitelisted` violation event —
+    /// when an untrusted destination is targeted while the mode is active.
+    ///
+    /// The policy itself is resolved by the caller (`check_transfer` loads it
+    /// before any gate runs), so an unknown policy never reaches this probe.
+    pub fn evaluate_recipient_whitelist(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<(), Error> {
+        let enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecipientWhitelistEnabled(policy_id.clone()))
+            .unwrap_or(false);
+        if !enabled {
+            return Ok(());
+        }
+        if !env.storage().persistent().has(&DataKey::RecipientWhitelist(
+            policy_id.clone(),
+            payload.recipient,
+        )) {
+            events_policy_violation(&env, &policy_id, "not_whitelisted");
+            return Err(Error::PolicyDenied);
+        }
+        Ok(())
+    }
+
+    /// Short alias of [`PolicyContract::set_recipient_whitelist_enabled`].
+    pub fn set_whitelist_enabled(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        Self::set_recipient_whitelist_enabled(env, caller, policy_id, enabled)
+    }
+
+    /// Short alias of [`PolicyContract::add_recipient_to_whitelist`].
+    pub fn add_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        Self::add_recipient_to_whitelist(env, caller, policy_id, recipient)
+    }
+
+    /// Short alias of [`PolicyContract::remove_recipient_from_whitelist`].
+    pub fn remove_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        Self::remove_recipient_from_whitelist(env, caller, policy_id, recipient)
+    }
+
     /// Check if a spending category is restricted. Returns Ok(()) if the category
     /// is allowed, or PolicyCategoryRestricted if it's blacklisted.
     pub fn check_category(env: Env, policy_id: String, category: String) -> Result<(), Error> {
@@ -830,7 +1068,7 @@ impl PolicyContract {
     /// the configured allowance. Returns the remaining headroom after the spend
     /// (0 = the allowance would be fully consumed, which is permitted). An
     /// unset allowance is unrestricted. Returns
-    /// [`Error::PolicyAllowanceExceeded`] when the spend would breach the
+    /// [`Error::AllowanceExceeded`] when the spend would breach the
     /// allowance.
     pub fn check_allowance(
         env: Env,
@@ -851,14 +1089,14 @@ impl PolicyContract {
         let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
         if amount > headroom_after_spend {
             events_policy_violation(&env, &policy_id, "allowance_exceeded");
-            return Err(Error::PolicyAllowanceExceeded);
+            return Err(Error::AllowanceExceeded);
         }
         checked_sub(headroom_after_spend, amount)
     }
 
     /// Atomically consume `amount` against the `(policy_id, asset)` allowance.
     /// Returns `Ok(())` when the allowance was decremented, or
-    /// [`Error::PolicyAllowanceExceeded`] when it would be breached.
+    /// [`Error::AllowanceExceeded`] when it would be breached.
     pub fn update_allowance(
         env: Env,
         caller: Address,
@@ -878,7 +1116,7 @@ impl PolicyContract {
         }
         let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
         if amount > headroom_after_spend {
-            return Err(Error::PolicyAllowanceExceeded);
+            return Err(Error::AllowanceExceeded);
         }
         allowance.spent = checked_add(allowance.spent, amount)?;
         env.storage().persistent().set(
@@ -962,6 +1200,16 @@ impl PolicyContract {
         policy_id: String,
         payload: TransactionPayload,
     ) -> Result<bool, Error> {
+        let mut context = RuleEvaluationContext::default();
+        Self::evaluate_composite_rule_with_context(&env, &policy_id, &payload, &mut context)
+    }
+
+    fn evaluate_composite_rule_with_context(
+        env: &Env,
+        policy_id: &String,
+        payload: &TransactionPayload,
+        context: &mut RuleEvaluationContext,
+    ) -> Result<bool, Error> {
         let key = DataKey::CompositeRule(policy_id.clone());
         let tree: RuleTree = match env.storage().persistent().get(&key) {
             Some(t) => t,
@@ -970,7 +1218,7 @@ impl PolicyContract {
         if tree.is_empty() {
             return Ok(true);
         }
-        evaluate_node(&env, &tree, 0, &payload, MAX_RULE_DEPTH)
+        evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)
     }
 
     // --- multi-rule composition ---
@@ -1086,11 +1334,21 @@ impl PolicyContract {
         policy_id: String,
         payload: TransactionPayload,
     ) -> Result<bool, Error> {
+        let mut context = RuleEvaluationContext::default();
+        Self::evaluate_policy_rules_with_context(&env, &policy_id, &payload, &mut context)
+    }
+
+    fn evaluate_policy_rules_with_context(
+        env: &Env,
+        policy_id: &String,
+        payload: &TransactionPayload,
+        context: &mut RuleEvaluationContext,
+    ) -> Result<bool, Error> {
         let stack: RuleStack = env
             .storage()
             .persistent()
-            .get(&DataKey::PolicyRules(policy_id))
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            .get(&DataKey::PolicyRules(policy_id.clone()))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         let count = stack.len();
         for i in 0..count {
             // `get` bounds-checks the index; a miss means the stack changed
@@ -1099,7 +1357,7 @@ impl PolicyContract {
             if tree.is_empty() {
                 continue;
             }
-            if !evaluate_node(&env, &tree, 0, &payload, MAX_RULE_DEPTH)? {
+            if !evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
                 return Ok(false);
             }
         }
@@ -1138,7 +1396,10 @@ impl PolicyInterface for PolicyContract {
     ///
     /// Blocklist checks run **first** so that compromised or malicious
     /// addresses are rejected immediately, before any allowance, asset or
-    /// amount evaluation (Issue #32).
+    /// amount evaluation (Issue #32). The recipient whitelist gate follows in
+    /// the same family: while a policy enforces its approved destination
+    /// directory, an untrusted recipient is denied with
+    /// [`Error::PolicyDenied`].
     fn check_transfer(
         env: Env,
         policy_id: String,
@@ -1153,22 +1414,31 @@ impl PolicyInterface for PolicyContract {
             return Err(Error::PolicyDenied);
         }
         // --- Blocklist checks (Issue #32) — evaluated first ---
-        if env
+        let recipient_blacklisted = env
             .storage()
             .persistent()
-            .has(&DataKey::Blacklist(recipient.clone()))
-        {
+            .has(&DataKey::Blacklist(recipient.clone()));
+        if recipient_blacklisted {
             events_policy_violation(&env, &policy_id, "blacklisted");
             return Err(Error::PolicyRecipientRestricted);
         }
-        if env
+        let merchant_blacklisted = env
             .storage()
             .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()))
-        {
+            .has(&DataKey::MerchantBlacklist(recipient.clone()));
+        if merchant_blacklisted {
             events_policy_violation(&env, &policy_id, "merchant_blocked");
             return Err(Error::PolicyMerchantBlocked);
         }
+        // --- Recipient whitelist: approved destinations only (Issue #63) ---
+        // Runs with the other recipient gates and fails closed: an enabled
+        // whitelist with no entries denies every destination.
+        let payload = TransactionPayload {
+            asset: asset.clone(),
+            recipient: recipient.clone(),
+            amount,
+        };
+        Self::evaluate_recipient_whitelist(env.clone(), policy_id.clone(), payload.clone())?;
         // --- Allowance / amount gates ---
         if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
             events_policy_violation(&env, &policy_id, "expired");
@@ -1206,13 +1476,19 @@ impl PolicyInterface for PolicyContract {
         // per-(policy, asset) allowance. An unset allowance is unrestricted.
         Self::check_allowance(env.clone(), policy_id.clone(), asset.clone(), amount)?;
         // --- Composite rule evaluation ---
-        let payload = TransactionPayload {
-            asset: asset.clone(),
-            recipient: recipient.clone(),
-            amount,
+        // The blocklist results computed above seed the evaluation context so
+        // `RecipientBlacklisted` / `MerchantBlacklisted` leaves reuse them
+        // instead of re-reading storage on every node.
+        let mut rule_context = RuleEvaluationContext {
+            recipient_blacklisted: Some(recipient_blacklisted),
+            merchant_blacklisted: Some(merchant_blacklisted),
         };
-        let rule_result =
-            Self::evaluate_composite_rule(env.clone(), policy_id.clone(), payload.clone())?;
+        let rule_result = Self::evaluate_composite_rule_with_context(
+            &env,
+            &policy_id,
+            &payload,
+            &mut rule_context,
+        )?;
         if !rule_result {
             events_policy_violation(&env, &policy_id, "rule_denied");
             return Err(Error::PolicyDenied);
@@ -1220,7 +1496,8 @@ impl PolicyInterface for PolicyContract {
         // --- Multi-rule stack: every registered rule must pass ---
         // The stack short-circuits on the first failing rule, so evaluation
         // stops (and the transfer is denied) as soon as one rule says no.
-        if !Self::evaluate_policy_rules(env.clone(), policy_id.clone(), payload)? {
+        if !Self::evaluate_policy_rules_with_context(&env, &policy_id, &payload, &mut rule_context)?
+        {
             events_policy_violation(&env, &policy_id, "rules_denied");
             return Err(Error::PolicyDenied);
         }
