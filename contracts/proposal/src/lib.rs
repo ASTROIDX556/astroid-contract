@@ -111,7 +111,12 @@
 //! `dependencies`, `dependencies_met` and `can_execute` views. `initialize`
 //! also stores the mandatory per-proposal timelock.
 
-use astroid_interfaces::UpgradeableInterface;
+use astroid_interfaces::{ProposalInterface, UpgradeableInterface};
+// The lifecycle vocabulary lives in the interfaces crate so the multisig, the
+// wallet and off-chain consumers all decode the same `u32` discriminants. The
+// contract consumes the shared definition and re-exports it under its old name,
+// so existing callers keep working against a single source of truth.
+pub use astroid_interfaces::proposal::ProposalState;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, PROPOSAL_QUORUM_PERCENT,
@@ -124,56 +129,6 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
     Vec,
 };
-
-/// Proposal lifecycle state.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProposalState {
-    Created = 0,
-    Pending = 1,
-    Approved = 2,
-    Executed = 3,
-    Closed = 4,
-    Rejected = 5,
-    Cancelled = 6,
-    Expired = 7,
-    /// Approved, but the action it authorized did not go through. Terminal, and
-    /// deliberately distinct from `Executed` so a dependent proposal stays
-    /// blocked rather than inheriting a broken prerequisite.
-    Failed = 8,
-}
-
-impl ProposalState {
-    /// Whether a proposal in this state has carried out its action, and so can
-    /// satisfy a dependent proposal's prerequisite.
-    ///
-    /// `Closed` counts: it is only reachable from `Executed`, and tidying an
-    /// executed proposal away must not retroactively block its dependents.
-    pub fn has_executed(self) -> bool {
-        matches!(self, ProposalState::Executed | ProposalState::Closed)
-    }
-
-    /// Whether a proposal in this state has already returned its deposit (or
-    /// never held one), and so may be purged from storage by
-    /// [`ProposalContract::cleanup_expired`].
-    ///
-    /// `Pending` and `Approved` are excluded: a stale proposal in either state
-    /// still holds the proposer's deposit, and deleting the record would
-    /// strand it. Those states must first pass through
-    /// [`ProposalContract::expire`], which refunds the deposit as it records
-    /// the transition. `Failed` is excluded for the same custody reason — its
-    /// deposit has not been returned by any transition, so the record is kept.
-    pub fn deposit_settled(self) -> bool {
-        matches!(
-            self,
-            ProposalState::Expired
-                | ProposalState::Rejected
-                | ProposalState::Cancelled
-                | ProposalState::Executed
-                | ProposalState::Closed
-        )
-    }
-}
 
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
 /// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
@@ -681,65 +636,6 @@ impl ProposalContract {
         Ok(proposal)
     }
 
-    pub fn state(env: Env, id: u64) -> Result<ProposalState, Error> {
-        let mut proposal = Self::load(&env, id)?;
-        Self::expire_if_due(&env, id, &mut proposal)?;
-        Ok(proposal.state)
-    }
-
-    /// Whether the proposal's deadline has been reached on the current ledger
-    /// (and it therefore has a deadline at all). Lets a client check before
-    /// spending a transaction on a stale proposal.
-    pub fn is_expired(env: Env, id: u64) -> Result<bool, Error> {
-        let mut proposal = Self::load(&env, id)?;
-        Self::expire_if_due(&env, id, &mut proposal)?;
-        Ok(proposal.state == ProposalState::Expired || proposal.is_expired(&env))
-    }
-
-    /// The prerequisite proposal ids this proposal declares.
-    pub fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
-        let mut proposal = Self::load(&env, id)?;
-        Self::expire_if_due(&env, id, &mut proposal)?;
-        Ok(proposal.dependencies)
-    }
-
-    /// Whether the proposal has completed its action — `Executed` or `Closed`
-    /// (the only terminal states reachable from a successful run). This is the
-    /// completion check downstream contracts should read before chaining onto a
-    /// proposal, so dependency resolution needs no private state.
-    pub fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
-        let mut proposal = Self::load(&env, id)?;
-        Self::expire_if_due(&env, id, &mut proposal)?;
-        Ok(proposal.state.has_executed())
-    }
-
-    /// Whether every prerequisite has executed — the same question `execute`
-    /// asks, exposed so callers can check before spending a transaction on it.
-    pub fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
-        let mut proposal = Self::load(&env, id)?;
-        Self::expire_if_due(&env, id, &mut proposal)?;
-        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
-    }
-
-    /// Whether `execute` would accept this proposal on the current ledger:
-    /// live (not past its deadline), `Approved`, the tally still clearing the
-    /// quorum / threshold / majority bars, the mandatory delay since approval
-    /// elapsed, and every prerequisite executed. The conjunction of exactly
-    /// the gates `execute` applies, in the order it applies them, so a client
-    /// can check before spending a transaction on it and never get an answer
-    /// the entrypoint would then contradict.
-    pub fn can_execute(env: Env, id: u64) -> Result<bool, Error> {
-        let mut proposal = Self::load(&env, id)?;
-        Self::expire_if_due(&env, id, &mut proposal)?;
-        if !proposal.can_execute(&env) {
-            return Ok(false);
-        }
-        if Self::ensure_vote_valid(&proposal).is_err() {
-            return Ok(false);
-        }
-        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
-    }
-
     // --- internal helpers ---
 
     /// Materialize expiry when an interaction observes a stale or already
@@ -902,6 +798,77 @@ fn require_timelock_elapsed(env: &Env, proposal: &Proposal) -> Result<(), Error>
     let release_at = checked_add(proposal.approved_at as i128, timelock as i128)?;
     let release_at = u64::try_from(release_at).map_err(|_| Error::Overflow)?;
     require_time_reached(env, release_at)
+}
+
+// ---------------------------------------------------------------------------
+// Status surface, exposed through the shared `ProposalInterface`.
+//
+// Declaring these in the trait impl (rather than an inherent one) is what makes
+// the contract's entrypoints provably match the cross-contract client other
+// contracts are generated against. Each read settles a stale proposal first,
+// so the answer always reflects the deterministic ledger clock.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl ProposalInterface for ProposalContract {
+    /// Current lifecycle state of proposal `id`.
+    fn state(env: Env, id: u64) -> Result<ProposalState, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.state)
+    }
+
+    /// Whether the proposal's deadline has been reached on the current ledger
+    /// (and it therefore has a deadline at all). Lets a client check before
+    /// spending a transaction on a stale proposal.
+    fn is_expired(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.state == ProposalState::Expired || proposal.is_expired(&env))
+    }
+
+    /// Whether the proposal has completed its action — `Executed` or `Closed`
+    /// (the only terminal states reachable from a successful run). This is the
+    /// completion check downstream contracts should read before chaining onto a
+    /// proposal, so dependency resolution needs no private state.
+    fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.state.has_executed())
+    }
+
+    /// The prerequisite proposal ids this proposal declares.
+    fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.dependencies)
+    }
+
+    /// Whether every prerequisite has executed — the same question `execute`
+    /// asks, exposed so callers can check before spending a transaction on it.
+    fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
+    }
+
+    /// Whether `execute` would accept this proposal on the current ledger:
+    /// live (not past its deadline), `Approved`, the tally still clearing the
+    /// quorum / threshold / majority bars, the mandatory delay since approval
+    /// elapsed, and every prerequisite executed. The conjunction of exactly
+    /// the gates `execute` applies, in the order it applies them, so a client
+    /// can check before spending a transaction on it and never get an answer
+    /// the entrypoint would then contradict.
+    fn can_execute(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        if !proposal.can_execute(&env) {
+            return Ok(false);
+        }
+        if Self::ensure_vote_valid(&proposal).is_err() {
+            return Ok(false);
+        }
+        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
+    }
 }
 
 // ---------------------------------------------------------------------------
