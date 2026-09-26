@@ -19,6 +19,23 @@ makes upgrades fast — the backend rotates the hash when a policy is updated.
 Because the recorded max/timing gates live on-chain too, the verification path
 stays fully deterministic and cheap.
 
+## Recipient whitelist
+
+A policy can own an on-chain directory of approved destinations. Entries are
+stored per policy under `(policy_id, recipient)` and managed dynamically:
+
+- `set_recipient_whitelist_enabled` — turn enforcement on/off (owner-gated).
+- `add_recipient_to_whitelist` / `remove_recipient_from_whitelist` — edit the
+  directory (owner-gated, duplicate/missing entries are rejected).
+- `is_recipient_whitelisted` / `get_recipient_whitelist` — query the directory.
+- `evaluate_recipient_whitelist` — evaluation entry point used by
+  `check_transfer` for every payload; denies with `Error::PolicyDenied` and a
+  `not_whitelisted` violation when an untrusted destination is targeted.
+
+While enforcement is active the gate fails closed: an empty whitelist denies
+every recipient. With enforcement off the gate is a no-op, so existing policies
+are unaffected until governance opts in.
+
 ## Operations
 
 - `register_policy` — install a new policy.
@@ -30,4 +47,6 @@ stays fully deterministic and cheap.
 
 - `("policy", "registd")` on registration.
 - `("policy", "rotated")` on rotation.
+- `("policy", "wl_mode")` / `("policy", "wl_add")` / `("policy", "wl_rem")` on
+  recipient whitelist edits.
 - `("policy", "violation")` on every denial, with a short `Symbol` reason.

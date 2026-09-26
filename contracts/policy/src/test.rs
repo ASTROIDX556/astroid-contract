@@ -21,6 +21,22 @@ fn assert_event(env: &Env, variant: &str) {
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
+/// Assert that no canonical `ContractEvent` with the given variant was
+/// published during the test.
+fn assert_no_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
+    assert!(
+        !found,
+        "expected no ContractEvent::{} to be emitted",
+        variant
+    );
+}
+
 fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
     let id = env.register_contract(None, PolicyContract);
     let client = PolicyContractClient::new(env, &id);
@@ -2362,6 +2378,22 @@ fn rule_strategy_all_requires_all_rules_pass() {
         &owner,
         &String::from_str(&env, "all_strategy"),
         &BytesN::from_array(&env, &[123; 32]),
+// --- Recipient whitelist (Issue #63) tests ---
+//
+// A policy owns a dynamic directory of approved destinations. While whitelist
+// mode is active only listed recipients may be targeted, an empty directory
+// fails closed, and a miss is rejected with `Error::PolicyDenied`.
+
+/// Register a policy with no scalar gates so only the recipient whitelist gate
+/// decides the outcome.
+fn whitelist_setup<'a>(env: &'a Env, owner: &Address, policy_id: &str) -> PolicyContractClient<'a> {
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(env, &id);
+    client.initialize();
+    client.register_policy(
+        owner,
+        &String::from_str(env, policy_id),
+        &BytesN::from_array(env, &[5; 32]),
         &0,
         &None,
         &None,
@@ -2414,6 +2446,32 @@ fn rule_strategy_all_requires_all_rules_pass() {
             &vendor1,
             &600
         ),
+    );
+    client
+}
+
+#[test]
+fn whitelist_allows_listed_and_blocks_unlisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl");
+    let pid = String::from_str(&env, "wl");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    p.add_recipient_to_whitelist(&owner, &pid, &b);
+
+    // Listed destinations pass.
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+    assert!(p.try_check_transfer(&pid, &asset, &b, &1).is_ok());
+    // An unlisted destination is denied with the policy denial code.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &1),
         Err(Ok(Error::PolicyDenied))
     );
 }
@@ -2484,6 +2542,19 @@ fn rule_strategy_any_requires_at_least_one_rule_pass() {
             &stranger,
             &600
         ),
+fn empty_whitelist_denies_all_recipients() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_empty");
+    let pid = String::from_str(&env, "wl_empty");
+    let asset = Address::generate(&env);
+    let anyone = Address::generate(&env);
+
+    // Mode active with no entries — fail closed, every destination denied.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &anyone, &1),
         Err(Ok(Error::PolicyDenied))
     );
 }
@@ -2527,6 +2598,23 @@ fn rule_strategy_any_with_single_rule() {
     // Rule fails: transfer denied
     assert_eq!(
         client.try_check_transfer(&String::from_str(&env, "any_single"), &asset, &vendor, &600),
+fn whitelist_removal_blocks_previously_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_rem");
+    let pid = String::from_str(&env, "wl_rem");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+
+    p.remove_recipient_from_whitelist(&owner, &pid, &a);
+    // The previously approved destination is untrusted again.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &a, &1),
         Err(Ok(Error::PolicyDenied))
     );
 }
@@ -2696,6 +2784,127 @@ fn rule_strategy_switch_from_all_to_any() {
         &owner,
         &String::from_str(&env, "switchable"),
         &BytesN::from_array(&env, &[129; 32]),
+fn whitelist_disabled_allows_any_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_off");
+    let pid = String::from_str(&env, "wl_off");
+    let asset = Address::generate(&env);
+    let anyone = Address::generate(&env);
+
+    // Default state: the gate is not enforced and any destination passes.
+    assert!(p.try_check_transfer(&pid, &asset, &anyone, &1).is_ok());
+    // Enforcing then relaxing the mode reopens the gate without losing the
+    // staged directory.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.set_recipient_whitelist_enabled(&owner, &pid, &false);
+    assert!(p.try_check_transfer(&pid, &asset, &anyone, &1).is_ok());
+    assert!(!p.is_recipient_whitelisted(&pid, &anyone));
+}
+
+#[test]
+fn non_owner_cannot_manage_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_auth");
+    let pid = String::from_str(&env, "wl_auth");
+    let target = Address::generate(&env);
+
+    assert_eq!(
+        p.try_set_recipient_whitelist_enabled(&intruder, &pid, &true),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_add_recipient_to_whitelist(&intruder, &pid, &target),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&intruder, &pid, &target),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The rejected attempts left the directory untouched.
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+}
+
+#[test]
+fn duplicate_and_missing_recipient_whitelist_ops_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_dup");
+    let pid = String::from_str(&env, "wl_dup");
+    let target = Address::generate(&env);
+
+    // Listing an address twice is rejected …
+    p.add_recipient_to_whitelist(&owner, &pid, &target);
+    assert_eq!(
+        p.try_add_recipient_to_whitelist(&owner, &pid, &target),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // … and so is removing an address that was never listed.
+    let other = Address::generate(&env);
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&owner, &pid, &other),
+        Err(Ok(Error::NotFound))
+    );
+    p.remove_recipient_from_whitelist(&owner, &pid, &target);
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&owner, &pid, &target),
+        Err(Ok(Error::NotFound))
+    );
+    // The last removal also drops the index, so the directory reads empty.
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+}
+
+#[test]
+fn whitelist_denial_emits_policy_violation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_evt");
+    let pid = String::from_str(&env, "wl_evt");
+    let asset = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    let _ = p.try_check_transfer(&pid, &asset, &stranger, &1);
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn whitelist_ok_path_records_no_violation_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_ok");
+    let pid = String::from_str(&env, "wl_ok");
+    let asset = Address::generate(&env);
+    let listed = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &listed);
+
+    // The gate enforces the directory but records nothing while the transfer
+    // is authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &listed, &1).is_ok());
+    assert_no_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn recipient_whitelist_is_scoped_per_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_a");
+    let pid_a = String::from_str(&env, "wl_a");
+    let pid_b = String::from_str(&env, "wl_b");
+    p.register_policy(
+        &owner,
+        &pid_b,
+        &BytesN::from_array(&env, &[6; 32]),
         &0,
         &None,
         &None,
@@ -2841,6 +3050,169 @@ fn rule_strategy_any_with_three_rules() {
     // stranger matches no rules: denied
     assert_eq!(
         client.try_check_transfer(&String::from_str(&env, "any_three"), &asset, &stranger, &1),
+    );
+    let asset = Address::generate(&env);
+    let vendor = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid_a, &true);
+    p.add_recipient_to_whitelist(&owner, &pid_a, &vendor);
+
+    // The directory belongs to policy A only.
+    assert!(p.is_recipient_whitelisted(&pid_a, &vendor));
+    assert!(!p.is_recipient_whitelisted(&pid_b, &vendor));
+    assert_eq!(p.get_recipient_whitelist(&pid_b).len(), 0);
+
+    // Policy B enforces an empty directory of its own, so the very same
+    // destination stays untrusted there.
+    p.set_recipient_whitelist_enabled(&owner, &pid_b, &true);
+    assert!(p.try_check_transfer(&pid_a, &asset, &vendor, &1).is_ok());
+    assert_eq!(
+        p.try_check_transfer(&pid_b, &asset, &vendor, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn recipient_whitelist_queries_reflect_edits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_q");
+    let pid = String::from_str(&env, "wl_q");
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    p.add_recipient_to_whitelist(&owner, &pid, &b);
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.is_recipient_whitelisted(&pid, &b));
+
+    let listed = p.get_recipient_whitelist(&pid);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.get(0), Some(a.clone()));
+    assert_eq!(listed.get(1), Some(b.clone()));
+
+    p.remove_recipient_from_whitelist(&owner, &pid, &a);
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    let listed = p.get_recipient_whitelist(&pid);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.get(0), Some(b));
+}
+
+#[test]
+fn evaluate_recipient_whitelist_entry_point() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_eval");
+    let pid = String::from_str(&env, "wl_eval");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recipient.clone(),
+        amount: 1,
+    };
+
+    // Mode off: the entry point is permissive.
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Ok(Ok(()))
+    );
+
+    // Mode on with an empty directory: every destination is denied.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Listing the destination clears the evaluation.
+    p.add_recipient_to_whitelist(&owner, &pid, &recipient);
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Ok(Ok(()))
+    );
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn blocklisted_recipient_stays_denied_while_whitelisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_blk");
+    let pid = String::from_str(&env, "wl_blk");
+    let asset = Address::generate(&env);
+    let bad = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &bad);
+    assert!(p.try_check_transfer(&pid, &asset, &bad, &1).is_ok());
+
+    // The blocklist runs first: listing an address never resurrects a blocked
+    // destination.
+    p.add_to_blocklist(&owner, &pid, &bad);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &bad, &1),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+}
+
+#[test]
+fn whitelist_and_scalar_gates_are_conjunctive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_mix");
+    let pid = String::from_str(&env, "wl_mix");
+    let asset = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    // Tighten the scalar cap to 100 alongside the whitelist gate.
+    p.rotate_policy(&owner, &pid, &BytesN::from_array(&env, &[5; 32]), &100);
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &vendor);
+
+    // Listed and within the cap: authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &100).is_ok());
+    // Listed but over the cap: still denied by the scalar gate.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &101),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Within the cap but unlisted: denied by the whitelist gate.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn short_form_whitelist_api_manages_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_short");
+    let pid = String::from_str(&env, "wl_short");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+
+    // The concise management API drives the same storage as the explicit
+    // recipient-named functions.
+    p.set_whitelist_enabled(&owner, &pid, &true);
+    p.add_whitelist(&owner, &pid, &a);
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+
+    p.remove_whitelist(&owner, &pid, &a);
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &a, &1),
         Err(Ok(Error::PolicyDenied))
     );
 }
