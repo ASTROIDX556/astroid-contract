@@ -227,6 +227,103 @@ pub struct BatchReceipt {
     pub budget_remaining: i128,
 }
 
+/// Per-invocation cache for the velocity ceiling.
+///
+/// A batch routinely moves value in one asset across many actions. Without this
+/// cache every action re-reads that asset's ceiling and re-reads the usage
+/// record the previous action had just written, so an `n`-action batch spends
+/// `n` times the ledger traffic the window actually needs. Entries are kept in
+/// first-touch order, one per distinct asset, so a batch pays a single read of
+/// the ceiling and the usage record per asset however many actions reference
+/// it, and a single write and pair of TTL bumps on flush.
+///
+/// Reusing the rolled usage is sound because the ledger clock is fixed for the
+/// whole invocation: aging a record to "now" twice within one call yields the
+/// same result as aging it once, so only the first action on an asset pays for
+/// the roll.
+struct VelocityGate {
+    wallet_id: u64,
+    /// `(asset, ceiling, live usage)`. A `None` ceiling marks an asset with no
+    /// limit configured, which costs one read and never grows a usage record.
+    entries: soroban_sdk::Vec<(Address, Option<VelocityLimit>, Option<VelocityUsage>)>,
+}
+
+impl VelocityGate {
+    fn new(env: &Env, wallet_id: u64) -> Self {
+        Self {
+            wallet_id,
+            entries: soroban_sdk::Vec::new(env),
+        }
+    }
+
+    /// Charge `amount` against `asset`'s ceiling, loading the asset's records on
+    /// first touch and reusing them for every later action in this invocation.
+    fn enforce(&mut self, env: &Env, asset: &Address, amount: i128) -> Result<(), Error> {
+        let index = self.position(env, asset);
+        let (_, limit, usage) = self.entries.get(index).unwrap();
+        // No ceiling for this asset: there is nothing to charge and nothing to
+        // record, exactly as an ungated asset behaves.
+        let (Some(limit), Some(mut usage)) = (limit, usage) else {
+            return Ok(());
+        };
+        // A sum that does not even fit in an i128 exceeds every ceiling.
+        let within = WalletContract::velocity_total(&usage)?
+            .checked_add(amount)
+            .map(|after| after <= limit.max_amount)
+            .unwrap_or(false);
+        ensure!(within, Error::VelocityLimitExceeded);
+        let current = usage.spent.get(0).unwrap_or(0).safe_add(amount)?;
+        usage.spent.set(0, current);
+        self.entries
+            .set(index, (asset.clone(), Some(limit), Some(usage)));
+        Ok(())
+    }
+
+    /// Persist every record this invocation charged, once per asset.
+    ///
+    /// Writes are deferred to the end of validation so a batch touches each
+    /// usage record once. A failure before the flush reverts the invocation and
+    /// leaves no usage recorded, which is the same net state as rolling back the
+    /// per-action writes.
+    fn flush(&self, env: &Env) {
+        for (asset, limit, usage) in self.entries.iter() {
+            let (Some(_), Some(usage)) = (limit, usage) else {
+                continue;
+            };
+            let usage_key = DataKey::VelocityUsage(self.wallet_id, asset.clone());
+            env.storage().persistent().set(&usage_key, &usage);
+            // The ceiling is bumped next to its usage so the pair cannot lapse
+            // mid-window: an expired ceiling would silently stop applying.
+            WalletContract::bump_persistent(env, &usage_key);
+            WalletContract::bump_persistent(env, &DataKey::VelocityLimit(self.wallet_id, asset));
+        }
+    }
+
+    /// Index of `asset`'s entry, loading its records on first touch. The
+    /// scanned prefix is bounded by [`constants::MAX_BATCH_CALLS`] because a
+    /// batch cannot hold more actions than that, so the lookup stays a
+    /// comparison over in-memory handles and costs no ledger access.
+    fn position(&mut self, env: &Env, asset: &Address) -> u32 {
+        for index in 0..self.entries.len() {
+            if self.entries.get(index).unwrap().0 == *asset {
+                return index;
+            }
+        }
+        let wallet_id = self.wallet_id;
+        let limit: Option<VelocityLimit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VelocityLimit(wallet_id, asset.clone()));
+        // The usage record is only read for an asset that has a ceiling, so an
+        // unlimited asset costs a single read.
+        let usage = limit
+            .as_ref()
+            .map(|limit| WalletContract::rolled_velocity_usage(env, wallet_id, asset, limit));
+        self.entries.push_back((asset.clone(), limit, usage));
+        self.entries.len() - 1
+    }
+}
+
 #[contract]
 pub struct WalletContract;
 
@@ -700,6 +797,9 @@ impl WalletContract {
         // math so a cumulative overflow is caught before any value moves.
         let mut total_amount: i128 = 0;
         let mut budget_remaining: i128 = 0;
+        // One gate for the whole batch: a batch that moves the same asset
+        // repeatedly reads and writes that asset's velocity records once.
+        let mut velocity = VelocityGate::new(&env, wallet_id);
         for action in actions.iter() {
             require_positive_amount(action.amount)?;
             total_amount = checked_add(total_amount, action.amount)?;
@@ -717,8 +817,10 @@ impl WalletContract {
             }
 
             // The velocity ceiling is not opt-out per action: an agent cannot
-            // route around it by leaving `policy_id` empty.
-            Self::enforce_velocity(&env, wallet_id, &action.asset, action.amount)?;
+            // route around it by leaving `policy_id` empty. Actions accumulate
+            // against the same cached record, so a batch can never split a
+            // window's allowance across actions to slip past the ceiling.
+            velocity.enforce(&env, &action.asset, action.amount)?;
 
             if !action.budget_id.is_empty() {
                 let budget_addr = budget.as_ref().ok_or(Error::InvalidInput)?;
@@ -729,6 +831,10 @@ impl WalletContract {
                 );
             }
         }
+
+        // Record the window usage validated above before any value moves; a
+        // later failure reverts the invocation and the recording with it.
+        velocity.flush(&env);
 
         // Phase 2 — execute every action sequentially; the runtime rolls the
         // whole batch back if any sub-call fails.
@@ -886,21 +992,23 @@ impl WalletContract {
         recipient: &Address,
         amount: i128,
     ) -> Result<(), Error> {
+        // Read the wired policy first. With none configured the hook is a no-op
+        // for every wallet, so the per-wallet bypass flag never has to be read
+        // at all - saving a persistent read on each movement of an unwired org.
+        let Some(policy_addr) = Self::get_policy(env.clone()) else {
+            return Ok(());
+        };
         if Self::get_policy_bypass(env.clone(), wallet_id) {
             return Ok(());
         }
-        let policy = Self::get_policy(env.clone());
-        if let Some(policy_addr) = policy {
-            Self::require_policy_check(
-                env,
-                &policy_addr,
-                &String::from_str(env, "active"),
-                asset,
-                recipient,
-                amount,
-            )?;
-        }
-        Ok(())
+        Self::require_policy_check(
+            env,
+            &policy_addr,
+            &String::from_str(env, "active"),
+            asset,
+            recipient,
+            amount,
+        )
     }
 
     /// Map policy denials and cross-contract invocation failures to one stable
@@ -932,30 +1040,18 @@ impl WalletContract {
     /// three before it. A spend therefore counts for between 3/4 and all of a
     /// window after it happens, and any span shorter than 3/4 of a window can
     /// never carry more than `max_amount` out of the wallet.
+    ///
+    /// A single movement is a one-asset [`VelocityGate`], which keeps the rule
+    /// in exactly one place; batches share a gate across all their actions.
     fn enforce_velocity(
         env: &Env,
         wallet_id: u64,
         asset: &Address,
         amount: i128,
     ) -> Result<(), Error> {
-        let key = DataKey::VelocityLimit(wallet_id, asset.clone());
-        let limit: VelocityLimit = match env.storage().persistent().get(&key) {
-            Some(limit) => limit,
-            None => return Ok(()),
-        };
-        let mut usage = Self::rolled_velocity_usage(env, wallet_id, asset, &limit);
-        // A sum that does not even fit in an i128 exceeds every ceiling.
-        let within = Self::velocity_total(&usage)?
-            .checked_add(amount)
-            .map(|after| after <= limit.max_amount)
-            .unwrap_or(false);
-        ensure!(within, Error::VelocityLimitExceeded);
-        let current = usage.spent.get(0).unwrap_or(0).safe_add(amount)?;
-        usage.spent.set(0, current);
-        let ukey = DataKey::VelocityUsage(wallet_id, asset.clone());
-        env.storage().persistent().set(&ukey, &usage);
-        Self::bump_persistent(env, &ukey);
-        Self::bump_persistent(env, &key);
+        let mut velocity = VelocityGate::new(env, wallet_id);
+        velocity.enforce(env, asset, amount)?;
+        velocity.flush(env);
         Ok(())
     }
 
