@@ -9,6 +9,7 @@ use soroban_sdk::{
     token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
+use astroid_shared::constants::{MAX_ESCROW_ASSETS, MAX_SIGNERS};
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 

@@ -1702,6 +1702,181 @@ fn validated_batch_actions_count_toward_velocity() {
     );
 }
 
+/// A batch spanning several assets keeps each asset's window its own: a
+/// ceiling reached on one asset must not refuse an action in another, and
+/// every charged asset ends up with its own usage record.
+#[test]
+fn validated_batch_charges_each_asset_its_own_ceiling() {
+    let h = setup();
+    at(&h, T0);
+    let token_admin = Address::generate(&h.env);
+    let token_b = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+
+    let (id, owner, agent) = funded_agent_wallet(&h, 1_000);
+    sac_b.mint(&owner, &2_000);
+    h.client.deposit(&id, &owner, &token_b, &2_000);
+    // Token A's ceiling is tight enough to be reached; token B's leaves room.
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &400, &WINDOW);
+    h.client
+        .set_velocity_limit(&owner, &id, &token_b, &1_500, &WINDOW);
+
+    // Four actions over two assets, interleaved, so both cache entries have to
+    // stay live at once and neither can be answered from the other's.
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        200,
+        "",
+        "",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &token_b,
+        &h.contract_id,
+        &r1,
+        500,
+        "",
+        "",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        200,
+        "",
+        "",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &token_b,
+        &h.contract_id,
+        &r2,
+        400,
+        "",
+        "",
+    ));
+    h.client.batch_execute_validated(&agent, &id, &actions);
+
+    // Each asset recorded only its own volume, and value moved for both.
+    assert_eq!(h.client.get_velocity_usage(&id, &h.token), 400);
+    assert_eq!(h.client.get_velocity_usage(&id, &token_b), 900);
+    assert_eq!(token_balance(&h, &r2), 200);
+    assert_eq!(token::TokenClient::new(&h.env, &token_b).balance(&r2), 400);
+
+    // Token A is at its ceiling and refuses.
+    let mut over_a: Vec<BatchAction> = Vec::new(&h.env);
+    over_a.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        1,
+        "",
+        "",
+    ));
+    assert_eq!(
+        h.client.try_batch_execute_validated(&agent, &id, &over_a),
+        Err(Ok(Error::VelocityLimitExceeded))
+    );
+    // Token A's refusal left token B's record untouched, and B still has room.
+    assert_eq!(h.client.get_velocity_usage(&id, &token_b), 900);
+    let mut more_b: Vec<BatchAction> = Vec::new(&h.env);
+    more_b.push_back(validated_action(
+        &h.env,
+        &token_b,
+        &h.contract_id,
+        &r2,
+        600,
+        "",
+        "",
+    ));
+    h.client.batch_execute_validated(&agent, &id, &more_b);
+    assert_eq!(h.client.get_velocity_usage(&id, &token_b), 1_500);
+}
+
+/// A limited and an unlimited asset can share one batch: the unlimited asset
+/// is never charged and never grows a usage record, while the limited one is
+/// still enforced. A batch may not use the unlimited asset to launder volume
+/// past the limited asset's ceiling.
+#[test]
+fn validated_batch_leaves_an_unlimited_asset_untracked() {
+    let h = setup();
+    at(&h, T0);
+    let token_admin = Address::generate(&h.env);
+    let token_b = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+
+    let (id, owner, agent) = funded_agent_wallet(&h, 1_000);
+    sac_b.mint(&owner, &2_000);
+    h.client.deposit(&id, &owner, &token_b, &2_000);
+    // Only token A carries a ceiling.
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &400, &WINDOW);
+
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        300,
+        "",
+        "",
+    ));
+    // Far beyond token A's ceiling, and legal because it is a different asset.
+    actions.push_back(validated_action(
+        &h.env,
+        &token_b,
+        &h.contract_id,
+        &r2,
+        1_500,
+        "",
+        "",
+    ));
+    h.client.batch_execute_validated(&agent, &id, &actions);
+
+    // The limited asset is charged, the unlimited one has no record at all.
+    assert_eq!(h.client.get_velocity_usage(&id, &h.token), 300);
+    assert_eq!(h.client.get_velocity_usage(&id, &token_b), 0);
+    assert_eq!(h.client.get_velocity_limit(&id, &token_b), None);
+    assert_eq!(
+        token::TokenClient::new(&h.env, &token_b).balance(&r2),
+        1_500
+    );
+
+    // Token A's ceiling still counts only token A.
+    let mut over_a: Vec<BatchAction> = Vec::new(&h.env);
+    over_a.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        101,
+        "",
+        "",
+    ));
+    assert_eq!(
+        h.client.try_batch_execute_validated(&agent, &id, &over_a),
+        Err(Ok(Error::VelocityLimitExceeded))
+    );
+}
+
 #[test]
 fn window_sum_that_would_overflow_is_a_velocity_breach() {
     let h = setup();
