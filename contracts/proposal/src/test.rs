@@ -1549,15 +1549,9 @@ fn expired_execution_settles_once_and_never_executes() {
 fn vote_bars_hold_at_the_approver_cap_and_do_not_overflow() {
     // Integer scaling is done in `u64`, so even an out-of-range allow-list
     // size cannot overflow the quorum or majority arithmetic.
-    assert_eq!(ProposalContract::quorum_required(u32::MAX, 100), u32::MAX);
-    assert_eq!(
-        ProposalContract::quorum_required(u32::MAX, 50),
-        u32::MAX / 2 + 1
-    );
-    assert_eq!(
-        ProposalContract::majority_required(u32::MAX),
-        u32::MAX / 2 + 1
-    );
+    assert_eq!(VoteBars::quorum_required(u32::MAX, 100), u32::MAX);
+    assert_eq!(VoteBars::quorum_required(u32::MAX, 50), u32::MAX / 2 + 1);
+    assert_eq!(VoteBars::majority_required(u32::MAX), u32::MAX / 2 + 1);
 
     // At the largest allow-list `create` accepts, the bars still land on the
     // exact boundary: half of the allow-list is a tie, one more is a strict
