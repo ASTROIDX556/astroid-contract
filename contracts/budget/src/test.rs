@@ -1183,24 +1183,22 @@ fn per_asset_spend_past_max_returns_overflow() {
 // Issue #246: budget window expiration checks and rollover logic.
 // ---------------------------------------------------------------------------
 
-/// Sanity-check the boundary rule at the helper level (no storage writes: the
-/// helper is a pure predicate over the ledger clock and the stored window).
+/// Sanity-check the boundary rule at the helper level (no storage access: the
+/// helper is a pure predicate over the caller's instant and the stored window).
 #[test]
 fn window_expiration_helper_matches_the_transition_boundary() {
     let h = setup();
     allocate(&h, "eng", 1_000, Period::Daily, false);
     h.client.consume(&h.owner, &id(&h.env, "eng"), &100);
 
-    let budget = || h.client.get(&id(&h.env, "eng"));
+    let budget = h.client.get(&id(&h.env, "eng"));
 
     // Well inside the window: not lapsed.
-    h.env.ledger().set_timestamp(1_000 + DAY - 1);
-    assert!(!crate::BudgetContract::is_window_expired(&h.env, &budget()).unwrap());
+    assert!(!crate::BudgetContract::is_window_expired(&budget, 1_000 + DAY - 1).unwrap());
 
     // The boundary itself: the window end is *exclusive*, so the first instant
     // at-or-after `start + window` counts as expired.
-    h.env.ledger().set_timestamp(1_000 + DAY);
-    assert!(crate::BudgetContract::is_window_expired(&h.env, &budget()).unwrap());
+    assert!(crate::BudgetContract::is_window_expired(&budget, 1_000 + DAY).unwrap());
 }
 
 #[test]
@@ -1656,4 +1654,278 @@ fn release_reports_the_same_remaining_as_the_view() {
     assert_eq!(after_release, h.client.remaining(&id(&h.env, "agent")));
     // limit 1_000 - deficit 500 - spent 100
     assert_eq!(after_release, 400);
+}
+
+// ---------------------------------------------------------------------------
+// Rollover calculation helper (Issue #313)
+// ---------------------------------------------------------------------------
+
+/// The pure calculation surfaced through `rollover_preview`.
+#[test]
+fn rollover_preview_reports_carry_periods_and_due_flag() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+
+    // Before the boundary the window is not yet due and the carry is the
+    // credit already banked (none).
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    assert!(!outcome.is_due);
+    assert_eq!(outcome.periods, 0);
+    assert_eq!(outcome.carry_over, 0);
+
+    // At the boundary the unspent 400 is what moves into the next period.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    assert!(outcome.is_due);
+    assert_eq!(outcome.periods, 1);
+    assert_eq!(outcome.carry_over, 400);
+
+    // Consuming the preview transitions the budget to exactly that state.
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    let b = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 400);
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.window_start, 1_000 + WEEK);
+}
+
+#[test]
+fn rollover_preview_matches_transition_for_multi_period_gaps() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &0,
+    );
+    // 300 spent, then three whole periods idle: the remainder (700) plus two
+    // fully idle periods at the base limit (2 x 1_000) settle in one step.
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &300);
+    h.env.ledger().set_timestamp(1_000 + 3 * WEEK);
+
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    assert_eq!(outcome.periods, 3);
+    assert_eq!(outcome.carry_over, 700 + 2 * 1_000);
+
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(
+        h.client.get(&id(&h.env, "eng")).rollover_credit,
+        outcome.carry_over
+    );
+}
+
+#[test]
+fn rollover_preview_clamps_to_absolute_cap() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    // Absolute cap of 500: a 900 unspent remainder carries only 500.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &500,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &100);
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    assert_eq!(outcome.carry_over, 500);
+
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 500);
+}
+
+#[test]
+fn rollover_preview_clamps_to_percentage_cap() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    // 25% of the 1_000 limit = 250: the tighter of the two bounds wins even
+    // though the absolute cap would allow more.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &2_500,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &100);
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    assert_eq!(outcome.carry_over, 250);
+}
+
+#[test]
+fn rollover_preview_zero_carry_when_rollover_disabled() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &false,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &400);
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+
+    // The window is due but the unspent remainder is dropped.
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    assert!(outcome.is_due);
+    assert_eq!(outcome.carry_over, 0);
+
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 0);
+}
+
+#[test]
+fn rollover_preview_reports_deficit_as_negative_carry() {
+    let h = setup();
+    h.client.allocate_with_deficit(
+        &h.owner,
+        &id(&h.env, "agent"),
+        &1_000,
+        &Period::Daily,
+        &false,
+        &true,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "agent"), &1_500);
+    h.env.ledger().set_timestamp(1_000 + DAY);
+
+    // The over-spend is what crosses the boundary — carried as a deficit,
+    // so the preview reports it negative and no surplus is banked.
+    let outcome = h.client.rollover_preview(&id(&h.env, "agent"));
+    assert!(outcome.is_due);
+    assert_eq!(outcome.carry_over, -500);
+
+    h.client.rollover(&h.owner, &id(&h.env, "agent"));
+    let b = h.client.get(&id(&h.env, "agent"));
+    assert_eq!(b.deficit_amount, 500);
+    assert_eq!(b.rollover_credit, 0);
+}
+
+#[test]
+fn rollover_preview_non_recurring_budget_is_never_due() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &true,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &400);
+    h.env.ledger().set_timestamp(1_000 + 30 * DAY);
+
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    assert!(!outcome.is_due);
+    assert_eq!(outcome.periods, 0);
+    // A one-shot budget carries nothing between periods.
+    assert_eq!(outcome.carry_over, 0);
+}
+
+#[test]
+fn rollover_preview_remaining_stays_consistent_across_transition() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &true,
+        &0,
+    );
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Weekly,
+        &0,
+        &true,
+        &0,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &600);
+    // Remaining before the boundary is plain: limit - spent.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 400);
+
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    // After the boundary the preview's carry becomes the new capacity
+    // (base limit + banked credit), with the spent counter cleared.
+    let outcome = h.client.rollover_preview(&id(&h.env, "eng"));
+    h.client.rollover(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(
+        h.client.remaining(&id(&h.env, "eng")),
+        1_000 + outcome.carry_over
+    );
+}
+
+#[test]
+fn rollover_preview_unknown_budget_is_not_found() {
+    let h = setup();
+    let res = h.client.try_rollover_preview(&id(&h.env, "ghost"));
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn rollover_preview_expired_budget_is_rejected() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::Weekly,
+        &true,
+        &2_000,
+    );
+    h.env.ledger().set_timestamp(2_000);
+    let res = h.client.try_rollover_preview(&id(&h.env, "eng"));
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
 }
