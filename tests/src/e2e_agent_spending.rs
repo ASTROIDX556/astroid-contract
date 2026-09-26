@@ -394,6 +394,43 @@ fn wallet_policy_pre_execution_blocks_unauthorized_and_violating_spends() {
     assert_eq!(token_balance(&h, &h.recipient), 500);
 }
 
+/// The wallet velocity ceiling (Issue #229) sits behind the real policy
+/// contract: the policy vetoes an oversized spend first, a policy-compliant
+/// burst is then capped by velocity, and the allowance returns once the
+/// rolling window slides past.
+#[test]
+fn wallet_velocity_ceiling_applies_after_real_policy_approval() {
+    let h = setup();
+    let wallet_id = fund_agent_wallet(&h, 10_000);
+    h.wallet.set_policy(&h.admin, &h.policy.address);
+    // Real policy: at most 1_000 per spend, only to `recipient`.
+    register_active_policy(&h, 1_000, true);
+    // Velocity: at most 2_500 per hour.
+    h.wallet
+        .set_velocity_limit(&h.org_owner, &wallet_id, &h.asset, &2_500, &3_600);
+
+    let spend = |amount: i128| {
+        h.wallet
+            .try_transfer(&h.agent, &wallet_id, &h.recipient, &h.asset, &amount)
+    };
+    // Oversized for the policy: PolicyDenied, and no velocity consumed.
+    assert_eq!(spend(1_001), Err(Ok(Error::PolicyDenied)));
+    assert_eq!(h.wallet.get_velocity_usage(&wallet_id, &h.asset), 0);
+
+    // Policy-compliant burst: the third 1_000 would breach the ceiling.
+    assert_eq!(spend(1_000), Ok(Ok(())));
+    assert_eq!(spend(1_000), Ok(Ok(())));
+    assert_eq!(spend(1_000), Err(Ok(Error::VelocityLimitExceeded)));
+    assert_eq!(spend(500), Ok(Ok(())));
+    assert_eq!(token_balance(&h, &h.recipient), 2_500);
+    assert_eq!(h.wallet.balance(&wallet_id, &h.asset), 7_500);
+
+    // An hour later the window has slid past and spending resumes.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 3_600);
+    assert_eq!(spend(1_000), Ok(Ok(())));
+    assert_eq!(token_balance(&h, &h.recipient), 3_500);
+}
+
 /// A policy denial in batch preflight must happen before any forwarded call.
 #[test]
 fn wallet_policy_denial_blocks_forwarded_batch_calls() {

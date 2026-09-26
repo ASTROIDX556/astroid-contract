@@ -860,7 +860,7 @@ impl PolicyContract {
     /// the configured allowance. Returns the remaining headroom after the spend
     /// (0 = the allowance would be fully consumed, which is permitted). An
     /// unset allowance is unrestricted. Returns
-    /// [`Error::PolicyAllowanceExceeded`] when the spend would breach the
+    /// [`Error::AllowanceExceeded`] when the spend would breach the
     /// allowance.
     pub fn check_allowance(
         env: Env,
@@ -881,14 +881,14 @@ impl PolicyContract {
         let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
         if amount > headroom_after_spend {
             events_policy_violation(&env, &policy_id, "allowance_exceeded");
-            return Err(Error::PolicyAllowanceExceeded);
+            return Err(Error::AllowanceExceeded);
         }
         checked_sub(headroom_after_spend, amount)
     }
 
     /// Atomically consume `amount` against the `(policy_id, asset)` allowance.
     /// Returns `Ok(())` when the allowance was decremented, or
-    /// [`Error::PolicyAllowanceExceeded`] when it would be breached.
+    /// [`Error::AllowanceExceeded`] when it would be breached.
     pub fn update_allowance(
         env: Env,
         caller: Address,
@@ -908,7 +908,7 @@ impl PolicyContract {
         }
         let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
         if amount > headroom_after_spend {
-            return Err(Error::PolicyAllowanceExceeded);
+            return Err(Error::AllowanceExceeded);
         }
         allowance.spent = checked_add(allowance.spent, amount)?;
         env.storage().persistent().set(
