@@ -51,6 +51,59 @@ pub enum EscrowState {
     Closed = 5,
 }
 
+/// Lifecycle status of a single milestone within a milestone-based escrow.
+///
+/// A milestone starts `Pending`; the arbiter moves it to `Completed` by
+/// approving it (which disburses its share), or to `Disputed` if the
+/// deliverable is contested. A `Disputed` milestone cannot be approved until
+/// the arbiter resolves it back to `Pending`; a `Completed` milestone is
+/// terminal.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MilestoneStatus {
+    /// Awaiting reviewer approval; the milestone's share is still in custody.
+    Pending = 0,
+    /// Approved by the arbiter and paid out; terminal.
+    Completed = 1,
+    /// Contested, so it can no longer be approved until resolved.
+    Disputed = 2,
+}
+
+/// A single milestone within a milestone-based escrow. `release_bps` is the
+/// proportion of the total escrow amount (in basis points, 10_000 = 100%) that
+/// is disbursed to the recipient when this milestone is approved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub index: u32,
+    pub description: String,
+    pub release_bps: u32,
+    pub status: MilestoneStatus,
+}
+
+/// Input describing a milestone when the escrow is created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSpec {
+    pub description: String,
+    pub release_bps: u32,
+}
+
+/// Aggregate milestone state for an escrow: the ordered milestones, how much
+/// of the escrow has been disbursed so far, and whether the sender cancelled
+/// the remaining unreleased milestones.
+///
+/// `released_amount` is the cumulative payout. Once every milestone is
+/// completed it equals the funded amount — the final approval pays the
+/// dust-free remainder so checked per-milestone division can never leak funds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSet {
+    pub milestones: Vec<Milestone>,
+    pub released_amount: i128,
+    pub cancelled: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Escrow {
@@ -124,6 +177,18 @@ pub fn store_escrow(env: &Env, id: u64, escrow: &Escrow) {
 pub fn bump_escrow(env: &Env, id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::Escrow(id),
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+/// Extend the TTL of an escrow's milestone schedule. Called after every write
+/// to `DataKey::Milestones(id)` so a long-running phased agreement does not see
+/// its schedule archived between approvals (which would strand the remaining
+/// funds).
+pub fn bump_milestones(env: &Env, id: u64) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Milestones(id),
         PERSISTENT_LIFETIME_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );

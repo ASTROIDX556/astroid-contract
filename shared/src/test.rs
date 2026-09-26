@@ -2,7 +2,7 @@
 //! Unit tests for the shared math, validation and constant helpers.
 
 use crate::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS};
-use crate::errors::Error;
+use crate::errors::{Error, MilestoneError, MILESTONE_ERROR_CODES};
 use crate::math::{
     checked_abs, checked_add, checked_add_u64, checked_balance_add, checked_balance_sub,
     checked_div, checked_div_u64, checked_mul, checked_mul_u64, checked_neg, checked_rem,
@@ -1187,4 +1187,68 @@ fn unknown_error_codes_are_never_decoded() {
     // being guessed at.
     let unknown = soroban_sdk::Error::from_contract_error(4_294_967_295);
     assert!(Error::try_from(unknown).is_err());
+}
+
+#[test]
+fn milestone_error_codes_are_frozen_and_unique() {
+    // A milestone refusal that is really a generic failure must decode to the
+    // exact canonical number, so a consumer's existing handler still matches.
+    assert_eq!(MilestoneError::NotFound.code(), Error::NotFound.code());
+    assert_eq!(
+        MilestoneError::Unauthorized.code(),
+        Error::Unauthorized.code()
+    );
+    assert_eq!(
+        MilestoneError::InvalidInput.code(),
+        Error::InvalidInput.code()
+    );
+    assert_eq!(MilestoneError::Overflow.code(), Error::Overflow.code());
+    assert_eq!(
+        MilestoneError::InvalidAmount.code(),
+        Error::InvalidAmount.code()
+    );
+    assert_eq!(
+        MilestoneError::InvalidState.code(),
+        Error::InvalidState.code()
+    );
+    // The two milestone-only codes are the next free slots after the escrow
+    // band (80-82) and must never be reassigned.
+    assert_eq!(MilestoneError::InvalidMilestone.code(), 86);
+    assert_eq!(MilestoneError::MilestoneAlreadyCompleted.code(), 87);
+
+    let declared = [
+        MilestoneError::NotFound,
+        MilestoneError::Unauthorized,
+        MilestoneError::InvalidInput,
+        MilestoneError::Overflow,
+        MilestoneError::InvalidAmount,
+        MilestoneError::InvalidState,
+        MilestoneError::InvalidMilestone,
+        MilestoneError::MilestoneAlreadyCompleted,
+    ];
+    assert_eq!(declared.len(), MILESTONE_ERROR_CODES.len());
+    for (variant, code) in declared.iter().zip(MILESTONE_ERROR_CODES) {
+        assert_eq!(variant.code(), code, "{:?} must keep its code", variant);
+        assert_ne!(code, 0, "{:?} may not take the reserved code 0", variant);
+        assert!(
+            !RETIRED_CODES.contains(&code),
+            "{:?} was assigned retired code {}",
+            variant,
+            code
+        );
+    }
+    // Every code is unique, so a failure is attributable to one variant.
+    for (i, code) in MILESTONE_ERROR_CODES.iter().enumerate() {
+        assert!(
+            !MILESTONE_ERROR_CODES[i + 1..].contains(code),
+            "duplicate milestone code {}",
+            code
+        );
+    }
+    // A contract returning any variant round-trips as that exact number.
+    for variant in declared {
+        let host = soroban_sdk::Error::from(variant);
+        assert_eq!(host.get_code(), variant.code());
+        assert_eq!(MilestoneError::try_from(host), Ok(variant));
+    }
 }

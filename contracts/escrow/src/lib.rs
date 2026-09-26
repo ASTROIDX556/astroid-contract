@@ -117,8 +117,9 @@
 pub mod storage;
 
 pub use storage::{
-    bump_escrow, get_count, increment_count, load_escrow, store_escrow, DataKey, Escrow,
-    EscrowState, ReleaseSchedule, ReleaseType,
+    bump_escrow, bump_milestones, get_count, increment_count, load_escrow, store_escrow, DataKey,
+    Escrow, EscrowState, Milestone, MilestoneSet, MilestoneSpec, MilestoneStatus, ReleaseSchedule,
+    ReleaseType,
 };
 
 use astroid_interfaces::UpgradeableInterface;
@@ -126,7 +127,7 @@ use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
-use astroid_shared::errors::Error;
+use astroid_shared::errors::{Error, MilestoneError};
 use astroid_shared::events::{self, ContractEvent};
 use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
 use astroid_shared::types::AssetAmount;
@@ -214,35 +215,6 @@ pub fn calculate_claimable_amount(escrow: &Escrow, current_time: u64) -> Result<
 pub struct OverrideSignature {
     pub public_key: BytesN<32>,
     pub signature: BytesN<64>,
-}
-
-/// A single milestone within a milestone-based escrow. `release_bps` is the
-/// proportion of the total escrow amount (in basis points, 10_000 = 100%) that
-/// is disbursed to the recipient when this milestone is approved.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Milestone {
-    pub index: u32,
-    pub description: String,
-    pub release_bps: u32,
-    pub released: bool,
-}
-
-/// Input describing a milestone when the escrow is created.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MilestoneSpec {
-    pub description: String,
-    pub release_bps: u32,
-}
-
-/// Aggregate milestone state for an escrow: the ordered milestones and the total
-/// amount disbursed so far (used to compute the final, dust-free payout).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MilestoneSet {
-    pub milestones: Vec<Milestone>,
-    pub released_amount: i128,
 }
 
 #[contract]
@@ -706,6 +678,7 @@ impl EscrowContract {
         caller.require_auth();
         require_positive_amount(amount)?;
         let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
         if escrow.recipient != caller {
             return Err(Error::Unauthorized);
         }
@@ -756,6 +729,7 @@ impl EscrowContract {
     pub fn claim(env: Env, caller: Address, id: u64) -> Result<i128, Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
         if escrow.recipient != caller {
             return Err(Error::Unauthorized);
         }
@@ -953,6 +927,7 @@ impl EscrowContract {
         signatures: Vec<OverrideSignature>,
     ) -> Result<(), Error> {
         let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
         if escrow.override_signers.is_empty() || escrow.override_threshold == 0 {
             return Err(Error::Unauthorized);
         }
@@ -1064,6 +1039,7 @@ impl EscrowContract {
     pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
         if escrow.sender != caller {
             return Err(Error::Unauthorized);
         }
@@ -1109,6 +1085,7 @@ impl EscrowContract {
     pub fn refund_timelock(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
         if escrow.sender != caller {
             return Err(Error::Unauthorized);
         }
@@ -1154,6 +1131,15 @@ impl EscrowContract {
     /// has been reached — this is the pre-fulfillment dispute exit.
     pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
+        // A milestone escrow has to settle its remaining balance through the
+        // milestone-aware path, which refunds only the un-disbursed remainder
+        // and freezes the outstanding milestones. Routing `cancel` here keeps
+        // the familiar entrypoint usable without risking a whole-balance
+        // transfer after a partial payout.
+        if env.storage().persistent().has(&DataKey::Milestones(id)) {
+            Self::cancel_milestones_inner(&env, &caller, id)?;
+            return Ok(());
+        }
         let mut escrow = load_escrow(&env, id)?;
         if escrow.sender != caller && escrow.arbiter != caller {
             return Err(Error::Unauthorized);
@@ -1166,9 +1152,29 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
-        Self::transfer_all(&env, &escrow, &escrow.sender);
-        for a in escrow.assets.iter() {
-            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
+        // Refund only what has not already been paid out. A partial release is
+        // impossible on the generic paths (they settle the whole balance), but
+        // computing the remainder here keeps `cancel` honest if that changes.
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        if remaining > 0 {
+            for a in escrow.assets.iter() {
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                if return_amount > 0 {
+                    token::TokenClient::new(&env, &a.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &return_amount,
+                    );
+                    events::transfer_executed(
+                        &env,
+                        &escrow.sender,
+                        &escrow.sender,
+                        &a.asset,
+                        return_amount,
+                    );
+                }
+            }
         }
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
@@ -1187,6 +1193,7 @@ impl EscrowContract {
     pub fn reclaim(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
         // Only the sender may reclaim post-grace.
         if escrow.sender != caller {
             return Err(Error::Unauthorized);
@@ -1286,21 +1293,18 @@ impl EscrowContract {
                 index: i as u32,
                 description: spec.description.clone(),
                 release_bps: spec.release_bps,
-                released: false,
+                status: MilestoneStatus::Pending,
             });
         }
         let set = MilestoneSet {
             milestones: items,
             released_amount: 0,
+            cancelled: false,
         };
         env.storage()
             .persistent()
             .set(&DataKey::Milestones(id), &set);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Milestones(id),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+        bump_milestones(&env, id);
 
         let asset_amounts = vec![
             &env,
@@ -1336,45 +1340,75 @@ impl EscrowContract {
         Ok(id)
     }
 
-    /// Approve and release a single milestone's proportional payout. Only the
-    /// arbiter may approve; a milestone may be released at most once. The final
-    /// milestone pays the dust-free remainder so the full amount is disbursed.
-    pub fn release_milestone(env: Env, caller: Address, id: u64, index: u32) -> Result<(), Error> {
+    /// Approve and release a single milestone's proportional payout.
+    ///
+    /// Only the escrow's `arbiter` may approve. A milestone starts `Pending`;
+    /// approval moves it to `Completed` and pays its share of the escrow to the
+    /// recipient. The final milestone approved pays the dust-free remainder, so
+    /// the full funded amount is always disbursed even when the basis-point
+    /// weights do not divide evenly.
+    ///
+    /// Deterministic refusals (`MilestoneError`, which carries the canonical
+    /// wire codes for the generic failures):
+    /// - a non-arbiter caller gets [`MilestoneError::Unauthorized`];
+    /// - an unknown index, a missing schedule, or a disputed milestone gets
+    ///   [`MilestoneError::InvalidMilestone`];
+    /// - a milestone that was already approved gets
+    ///   [`MilestoneError::MilestoneAlreadyCompleted`];
+    /// - an escrow that is no longer `Funded` gets
+    ///   [`MilestoneError::InvalidState`].
+    pub fn release_milestone(
+        env: Env,
+        caller: Address,
+        id: u64,
+        index: u32,
+    ) -> Result<(), MilestoneError> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
         if escrow.arbiter != caller {
-            return Err(Error::Unauthorized);
-        }
-        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Released) {
-            return Err(Error::InvalidState);
+            return Err(MilestoneError::Unauthorized);
         }
 
         let mut set: MilestoneSet = env
             .storage()
             .persistent()
             .get(&DataKey::Milestones(id))
-            .ok_or(Error::NotFound)?;
+            .ok_or(MilestoneError::NotFound)?;
+        if set.cancelled {
+            return Err(MilestoneError::InvalidState);
+        }
 
-        let mut found_idx: usize = 0;
+        let mut found_idx: u32 = 0;
         let mut target: Option<Milestone> = None;
         for (i, m) in set.milestones.iter().enumerate() {
             if m.index == index {
-                found_idx = i;
+                found_idx = i as u32;
                 target = Some(m.clone());
             }
         }
-        let milestone = target.ok_or(Error::InvalidInput)?;
-        if milestone.released {
-            return Err(Error::InvalidState);
+        // An index that is not on the schedule is an invalid milestone.
+        let milestone = target.ok_or(MilestoneError::InvalidMilestone)?;
+        match milestone.status {
+            MilestoneStatus::Completed => return Err(MilestoneError::MilestoneAlreadyCompleted),
+            // A disputed milestone cannot be approved until it is resolved.
+            MilestoneStatus::Disputed => return Err(MilestoneError::InvalidMilestone),
+            MilestoneStatus::Pending => {}
+        }
+        // Only a live escrow can disburse a milestone payout.
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(MilestoneError::InvalidState);
         }
 
         let total_amount = Self::total_amount(&escrow.assets);
         let mut unreleased: u32 = 0;
         for m in set.milestones.iter() {
-            if !m.released {
+            if m.status != MilestoneStatus::Completed {
                 unreleased = unreleased.saturating_add(1);
             }
         }
+        // Checked arithmetic: `gross` is a floored proportional payout, and the
+        // last outstanding milestone receives the remainder, so rounding dust
+        // is never stranded in the contract.
         let gross = checked_div(
             checked_mul(total_amount, milestone.release_bps as i128)?,
             10_000,
@@ -1382,8 +1416,8 @@ impl EscrowContract {
         let remaining = checked_sub(total_amount, set.released_amount)?;
         let payout = if unreleased == 1 { remaining } else { gross };
 
-        let primary_asset = &escrow.assets.get_unchecked(0).asset;
-        token::TokenClient::new(&env, primary_asset).transfer(
+        let primary_asset = escrow.assets.get_unchecked(0).asset.clone();
+        token::TokenClient::new(&env, &primary_asset).transfer(
             &env.current_contract_address(),
             &escrow.recipient,
             &payout,
@@ -1392,7 +1426,7 @@ impl EscrowContract {
             &env,
             &escrow.sender,
             &escrow.recipient,
-            primary_asset,
+            &primary_asset,
             payout,
         );
 
@@ -1401,15 +1435,20 @@ impl EscrowContract {
             index: milestone.index,
             description: milestone.description,
             release_bps: milestone.release_bps,
-            released: true,
+            status: MilestoneStatus::Completed,
         };
-        set.milestones.set(found_idx as u32, updated);
+        set.milestones.set(found_idx, updated);
         env.storage()
             .persistent()
             .set(&DataKey::Milestones(id), &set);
+        bump_milestones(&env, id);
 
-        let all_released = set.milestones.iter().all(|m| m.released);
+        let all_released = set
+            .milestones
+            .iter()
+            .all(|m| m.status == MilestoneStatus::Completed);
         if all_released {
+            escrow.released_amount = set.released_amount;
             escrow.state = EscrowState::Released;
             store_escrow(&env, id, &escrow);
         }
@@ -1419,6 +1458,228 @@ impl EscrowContract {
             (id, caller, index, payout),
         );
         Ok(())
+    }
+
+    /// Flag a single, still-pending milestone as disputed (arbiter only).
+    ///
+    /// A disputed milestone is frozen: it cannot be approved (releasing its
+    /// share) until the arbiter resolves it back to `Pending`, so a contested
+    /// deliverable can never be paid out accidentally. Disputing an already
+    /// completed milestone is refused with
+    /// [`MilestoneError::MilestoneAlreadyCompleted`]; disputing an unknown
+    /// index, a milestone that is already disputed, or one on a cancelled
+    /// schedule is refused with [`MilestoneError::InvalidMilestone`].
+    pub fn dispute_milestone(
+        env: Env,
+        caller: Address,
+        id: u64,
+        index: u32,
+    ) -> Result<(), MilestoneError> {
+        caller.require_auth();
+        let escrow = load_escrow(&env, id)?;
+        if escrow.arbiter != caller {
+            return Err(MilestoneError::Unauthorized);
+        }
+        let mut set: MilestoneSet = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(MilestoneError::NotFound)?;
+        if set.cancelled {
+            return Err(MilestoneError::InvalidState);
+        }
+
+        let mut found_idx: u32 = 0;
+        let mut target: Option<Milestone> = None;
+        for (i, m) in set.milestones.iter().enumerate() {
+            if m.index == index {
+                found_idx = i as u32;
+                target = Some(m.clone());
+            }
+        }
+        let milestone = target.ok_or(MilestoneError::InvalidMilestone)?;
+        match milestone.status {
+            MilestoneStatus::Completed => return Err(MilestoneError::MilestoneAlreadyCompleted),
+            MilestoneStatus::Disputed => return Err(MilestoneError::InvalidMilestone),
+            MilestoneStatus::Pending => {}
+        }
+        // Only a live escrow can change a milestone's status.
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(MilestoneError::InvalidState);
+        }
+        set.milestones.set(
+            found_idx,
+            Milestone {
+                index: milestone.index,
+                description: milestone.description,
+                release_bps: milestone.release_bps,
+                status: MilestoneStatus::Disputed,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+        bump_milestones(&env, id);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ms_disp")),
+            (id, caller, index),
+        );
+        Ok(())
+    }
+
+    /// Resolve a disputed milestone back to `Pending` (arbiter only) so it can
+    /// be approved again. Resolving a milestone that is not disputed — either
+    /// still `Pending` or already `Completed` — is a deterministic refusal
+    /// ([`MilestoneError::InvalidMilestone`] /
+    /// [`MilestoneError::MilestoneAlreadyCompleted`]).
+    pub fn resolve_milestone(
+        env: Env,
+        caller: Address,
+        id: u64,
+        index: u32,
+    ) -> Result<(), MilestoneError> {
+        caller.require_auth();
+        let escrow = load_escrow(&env, id)?;
+        if escrow.arbiter != caller {
+            return Err(MilestoneError::Unauthorized);
+        }
+        let mut set: MilestoneSet = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(MilestoneError::NotFound)?;
+        if set.cancelled {
+            return Err(MilestoneError::InvalidState);
+        }
+
+        let mut found_idx: u32 = 0;
+        let mut target: Option<Milestone> = None;
+        for (i, m) in set.milestones.iter().enumerate() {
+            if m.index == index {
+                found_idx = i as u32;
+                target = Some(m.clone());
+            }
+        }
+        let milestone = target.ok_or(MilestoneError::InvalidMilestone)?;
+        match milestone.status {
+            MilestoneStatus::Completed => return Err(MilestoneError::MilestoneAlreadyCompleted),
+            MilestoneStatus::Pending => return Err(MilestoneError::InvalidMilestone),
+            MilestoneStatus::Disputed => {}
+        }
+        // Only a live escrow can change a milestone's status.
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(MilestoneError::InvalidState);
+        }
+        set.milestones.set(
+            found_idx,
+            Milestone {
+                index: milestone.index,
+                description: milestone.description,
+                release_bps: milestone.release_bps,
+                status: MilestoneStatus::Pending,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+        bump_milestones(&env, id);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ms_res")),
+            (id, caller, index),
+        );
+        Ok(())
+    }
+
+    /// Cancel the remaining unreleased milestones and refund that portion to
+    /// the sender.
+    ///
+    /// This is the milestone-aware exit: milestones already approved keep their
+    /// payouts, while every still-`Pending` or `Disputed` milestone is frozen
+    /// and the funds it would have unlocked are returned to the sender. Either
+    /// party (sender or arbiter) may call it while the escrow is `Funded` (or
+    /// `Expired`), mirroring [`Self::cancel`]. The generic whole-balance
+    /// settlement paths are refused for milestone escrows so a partial payout
+    /// can never be double-spent.
+    ///
+    /// Returns the amount refunded this call.
+    pub fn cancel_remaining_milestones(env: Env, caller: Address, id: u64) -> Result<i128, Error> {
+        caller.require_auth();
+        Self::cancel_milestones_inner(&env, &caller, id)
+    }
+
+    /// Shared implementation behind [`Self::cancel_remaining_milestones`] and
+    /// the milestone branch of [`Self::cancel`]. The caller's authorization is
+    /// established once by the entrypoint; this helper only does the state
+    /// transition and the refund, so a routed `cancel` never requires the same
+    /// address to authorize twice.
+    fn cancel_milestones_inner(env: &Env, caller: &Address, id: u64) -> Result<i128, Error> {
+        let mut escrow = load_escrow(env, id)?;
+        if escrow.sender != *caller && escrow.arbiter != *caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut set: MilestoneSet = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(id))
+            .ok_or(Error::NotFound)?;
+        // Check the idempotency guard before the state guard so a second
+        // cancellation reports the precise reason rather than a generic state
+        // refusal.
+        if set.cancelled {
+            return Err(Error::AlreadyExists);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+
+        // Only the un-disbursed remainder is refundable; payouts already made
+        // to the recipient are final.
+        let remaining = checked_sub(escrow.funded_amount, set.released_amount)?;
+        set.cancelled = true;
+        let mut updated: Vec<Milestone> = Vec::new(env);
+        for m in set.milestones.iter() {
+            let mut m = m.clone();
+            if m.status == MilestoneStatus::Pending {
+                m.status = MilestoneStatus::Disputed;
+            }
+            updated.push_back(m);
+        }
+        set.milestones = updated;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestones(id), &set);
+        bump_milestones(env, id);
+
+        if remaining > 0 {
+            for a in escrow.assets.iter() {
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                if return_amount > 0 {
+                    token::TokenClient::new(env, &a.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &return_amount,
+                    );
+                    events::transfer_executed(
+                        env,
+                        &escrow.sender,
+                        &escrow.sender,
+                        &a.asset,
+                        return_amount,
+                    );
+                }
+            }
+        }
+        escrow.state = EscrowState::Refunded;
+        store_escrow(env, id, &escrow);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ms_can")),
+            (id, caller.clone(), remaining),
+        );
+        Ok(remaining)
     }
 
     /// Read the milestone state for an escrow.
@@ -1498,6 +1759,20 @@ impl EscrowContract {
             total += a.amount;
         }
         total
+    }
+
+    /// Refuse a generic whole-balance settlement path on a milestone escrow.
+    ///
+    /// Milestone escrows settle only through [`Self::release_milestone`]
+    /// (per-milestone payout) and [`Self::cancel_remaining_milestones`] (refund
+    /// of the unreleased remainder). Every generic path transfers whole asset
+    /// amounts, which would double-pay milestones already released, so all of
+    /// them are refused with [`Error::InvalidState`].
+    fn reject_milestone_settlement(env: &Env, id: u64) -> Result<(), Error> {
+        if env.storage().persistent().has(&DataKey::Milestones(id)) {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
     }
 
     /// Timestamp the refund window closes at (`0` = never). Refunds open at
