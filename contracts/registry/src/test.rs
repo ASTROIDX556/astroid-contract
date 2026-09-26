@@ -1,8 +1,13 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{DataKey, RegistryContract, RegistryContractClient, RegistryRole};
-use astroid_shared::constants::{MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT};
+use crate::{
+    DataKey, RegistryContract, RegistryContractClient, RegistryRole, UpgradeAction,
+    UpgradeAuditRecord,
+};
+use astroid_shared::constants::{
+    MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
+};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use soroban_sdk::testutils::{storage::Persistent as _, Address as _, AuthorizedFunction, Ledger};
@@ -20,6 +25,17 @@ fn assert_event(env: &Env, variant: &str) {
         .iter()
         .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
+
+/// Count canonical `ContractEvent` emissions of the given variant symbol so
+/// tests can also assert that an event did *not* fire.
+fn count_events(env: &Env, variant: &str) -> usize {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_contract_id, topics, _data)| topics.contains(want))
+        .count()
 }
 
 fn setup() -> (Env, RegistryContractClient<'static>, Address) {
@@ -507,6 +523,32 @@ fn rejected_registration_emits_no_version_event() {
         .all()
         .iter()
         .any(|(_id, topics, _data)| topics.contains(want_topic)));
+}
+
+#[test]
+fn register_version_rejects_downgrades_and_repeats() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2);
+
+    // The version table is monotonic per kind: the admin escape hatch may
+    // never lower or repeat the latest version, mirroring the propose/commit
+    // flow's downgrade protection (Issue #304).
+    let addr = Address::generate(&env);
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &2, &addr),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr),
+        Err(Ok(Error::InvalidState))
+    );
+    // Strictly newer versions still land.
+    let v3 = Address::generate(&env);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3);
+    assert_eq!(client.get_latest(&ModuleKind::Wallet), v3);
 }
 
 #[test]
@@ -1415,4 +1457,611 @@ fn batch_extends_ttl_exactly_like_lookup() {
     // `lookup` on the policy record produces the same extension.
     client.lookup(&org, &ModuleKind::Policy);
     assert_eq!(ttl(ModuleKind::Policy), PERSISTENT_BUMP_AMOUNT);
+}
+
+// --- version upgrade validation (Issue #304) ---
+
+/// Bundled addresses for an org with a delegated module upgrader, so the
+/// upgrade-validation tests can exercise the whole authorization matrix.
+struct UpgradeFlow {
+    env: Env,
+    client: RegistryContractClient<'static>,
+    admin: Address,
+    owner: Address,
+    upgrader: Address,
+    stranger: Address,
+}
+
+fn setup_upgrade_flow(org: &str) -> UpgradeFlow {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    let upgrader = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let org = String::from_str(&env, org);
+    client.register_org(&admin, &org, &owner);
+    client.grant_role(&owner, &org, &upgrader, &RegistryRole::ModuleUpgrader);
+    UpgradeFlow {
+        env,
+        client,
+        admin,
+        owner,
+        upgrader,
+        stranger,
+    }
+}
+
+fn upgrade_args(
+    h: &UpgradeFlow,
+    version: u32,
+    seed: u8,
+) -> (String, ModuleKind, u32, BytesN<32>, Address) {
+    (
+        String::from_str(&h.env, "acme"),
+        ModuleKind::Wallet,
+        version,
+        hash(&h.env, seed),
+        Address::generate(&h.env),
+    )
+}
+
+#[test]
+fn propose_and_commit_a_valid_upgrade() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    let pending = h.client.get_upgrade_proposal(&kind).unwrap();
+    assert_eq!(pending.version, 1);
+    assert_eq!(pending.wasm_hash, wasm);
+    assert_eq!(pending.address, addr);
+    assert_eq!(pending.proposer, h.owner);
+    assert!(pending.expires_at > h.env.ledger().timestamp());
+
+    let (committed_version, committed_addr) = h.client.commit_upgrade(&h.admin, &kind);
+    assert_eq!(
+        (committed_version, committed_addr.clone()),
+        (version, addr.clone())
+    );
+    // The version table and the wasm approval both advanced.
+    assert_eq!(h.client.get_version(&kind, &1), addr);
+    assert_eq!(h.client.get_latest(&kind), addr);
+    assert!(h.client.is_wasm_approved(&kind, &wasm));
+    // The pending record is consumed.
+    assert_eq!(h.client.get_upgrade_proposal(&kind), None);
+
+    assert_event(&h.env, "UpgradeProposed");
+    assert_event(&h.env, "UpgradeCommitted");
+}
+
+#[test]
+fn stranger_and_delegated_non_upgrader_cannot_propose() {
+    let h = setup_upgrade_flow("acme");
+    let policy_manager = Address::generate(&h.env);
+    h.client.grant_role(
+        &h.owner,
+        &String::from_str(&h.env, "acme"),
+        &policy_manager,
+        &RegistryRole::PolicyManager,
+    );
+
+    // A stranger targeting an unknown org learns only NotFound.
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &h.stranger,
+            &String::from_str(&h.env, "ghost"),
+            &kind,
+            &version,
+            &wasm,
+            &addr
+        ),
+        Err(Ok(Error::NotFound))
+    );
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    let _ = (&org, &version, &wasm, &addr);
+    // A stranger on a real org is Unauthorized.
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.stranger, &org, &kind, &version, &wasm, &addr),
+        Err(Ok(Error::Unauthorized))
+    );
+    // A delegated role that cannot manage modules is Unauthorized too.
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&policy_manager, &org, &kind, &version, &wasm, &addr),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.get_upgrade_proposal(&kind), None);
+    let events_after_failures = count_events(&h.env, "UpgradeProposed");
+    assert_eq!(events_after_failures, 0);
+}
+
+#[test]
+fn org_owner_module_upgrader_and_admin_can_propose() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.upgrader, &org, &kind, &version, &wasm, &addr);
+    assert!(h.client.get_upgrade_proposal(&kind).is_some());
+    h.client.reject_upgrade(&h.admin, &kind);
+
+    // The owner may propose the next slot.
+    let (org2, kind2, v2, wasm2, addr2) = upgrade_args(&h, 2, 2);
+    h.client
+        .propose_upgrade(&h.owner, &org2, &kind2, &v2, &wasm2, &addr2);
+    assert!(h.client.get_upgrade_proposal(&kind2).is_some());
+    h.client.reject_upgrade(&h.admin, &kind2);
+
+    // The admin may propose directly.
+    let (org3, kind3, v3, wasm3, addr3) = upgrade_args(&h, 3, 3);
+    h.client
+        .propose_upgrade(&h.admin, &org3, &kind3, &v3, &wasm3, &addr3);
+    assert!(h.client.get_upgrade_proposal(&kind3).is_some());
+}
+
+#[test]
+fn zero_version_proposal_fails() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, _, wasm, addr) = upgrade_args(&h, 1, 1);
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.owner, &org, &kind, &0, &wasm, &addr),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn zero_wasm_hash_proposal_fails() {
+    let h = setup_upgrade_flow("acme");
+    let org = String::from_str(&h.env, "acme");
+    let zero = BytesN::from_array(&h.env, &[0u8; 32]);
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &h.owner,
+            &org,
+            &ModuleKind::Wallet,
+            &1,
+            &zero,
+            &Address::generate(&h.env)
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    // add_approved_wasm applies the same format gate.
+    assert_eq!(
+        h.client
+            .try_add_approved_wasm(&h.admin, &ModuleKind::Wallet, &zero),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn downgrade_proposal_fails() {
+    let h = setup_upgrade_flow("acme");
+    // Commit v2 first.
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 2, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    h.client.commit_upgrade(&h.admin, &kind);
+
+    // Proposing v2 again (equal) is a downgrade.
+    let (_, _, _, wasm_eq, addr_eq) = upgrade_args(&h, 2, 5);
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.owner, &org, &kind, &2, &wasm_eq, &addr_eq),
+        Err(Ok(Error::InvalidState))
+    );
+    // Proposing v1 (lower) is a downgrade.
+    let (_, _, _, wasm_lo, addr_lo) = upgrade_args(&h, 1, 6);
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.owner, &org, &kind, &1, &wasm_lo, &addr_lo),
+        Err(Ok(Error::InvalidState))
+    );
+}
+
+#[test]
+fn duplicate_proposal_fails_until_resolved() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    let (_, _, _, wasm2, addr2) = upgrade_args(&h, 2, 2);
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.owner, &org, &kind, &2, &wasm2, &addr2),
+        Err(Ok(Error::InvalidState))
+    );
+    // After rejection the slot is free again.
+    h.client.reject_upgrade(&h.owner, &kind);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &2, &wasm2, &addr2);
+    assert!(h.client.get_upgrade_proposal(&kind).is_some());
+}
+
+#[test]
+fn proposing_an_already_approved_hash_fails() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client.add_approved_wasm(&h.admin, &kind, &wasm);
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn commit_is_admin_gated() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    assert_eq!(
+        h.client.try_commit_upgrade(&h.owner, &kind),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The admin can still commit afterwards.
+    h.client.commit_upgrade(&h.admin, &kind);
+    assert_eq!(h.client.get_latest(&kind), addr);
+}
+
+#[test]
+fn commit_without_proposal_fails() {
+    let h = setup_upgrade_flow("acme");
+    assert_eq!(
+        h.client.try_commit_upgrade(&h.admin, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn expired_proposal_cannot_be_committed() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    let expires_at = h.client.get_upgrade_proposal(&kind).unwrap().expires_at;
+
+    // Advance past expiry, leaving a one-second margin.
+    h.env.ledger().set_timestamp(expires_at + 1);
+    assert_eq!(
+        h.client.try_commit_upgrade(&h.admin, &kind),
+        Err(Ok(Error::NotFound))
+    );
+    // The refused commit reverted atomically, so the stale record itself is
+    // untouched — but it stays refuseable on every retry.
+    let stale = h.client.get_upgrade_proposal(&kind).unwrap();
+    assert_eq!(stale.version, 1);
+    assert_eq!(
+        h.client.try_commit_upgrade(&h.admin, &kind),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn stale_proposal_cannot_shadow_a_committed_version() {
+    let h = setup_upgrade_flow("acme");
+    // Proposal A: version 2.
+    let (org, kind, _, wasm, addr) = upgrade_args(&h, 2, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &2, &wasm, &addr);
+    // While A is pending, version 3 is committed through a rejected-then
+    // re-proposed path: reject A, commit v3, re-propose A → downgrade now.
+    h.client.reject_upgrade(&h.owner, &kind);
+    let (_, _, _, wasm3, addr3) = upgrade_args(&h, 3, 3);
+    h.client
+        .propose_upgrade(&h.admin, &org, &kind, &3, &wasm3, &addr3);
+    h.client.commit_upgrade(&h.admin, &kind);
+    assert_eq!(h.client.get_latest(&kind), addr3);
+
+    // The stale v2 proposal is gone; re-proposing it is refused as a downgrade.
+    assert_eq!(h.client.get_upgrade_proposal(&kind), None);
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.owner, &org, &kind, &2, &wasm, &addr),
+        Err(Ok(Error::InvalidState))
+    );
+}
+
+#[test]
+fn conflicting_approval_blocked_while_proposal_pending() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    // Approving a different hash while the proposal is open is refused.
+    let other = hash(&h.env, 9);
+    assert_eq!(
+        h.client.try_add_approved_wasm(&h.admin, &kind, &other),
+        Err(Ok(Error::InvalidState))
+    );
+    // Approving the proposed hash itself is allowed (it is what commit does).
+    h.client.add_approved_wasm(&h.admin, &kind, &wasm);
+    // Commit still works.
+    h.client.commit_upgrade(&h.admin, &kind);
+    assert_eq!(h.client.get_latest(&kind), addr);
+}
+
+#[test]
+fn reject_requires_proposer_admin_or_org_owner() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.upgrader, &org, &kind, &version, &wasm, &addr);
+    let proposal = h.client.get_upgrade_proposal(&kind).unwrap();
+
+    // A stranger cannot reject.
+    assert_eq!(
+        h.client.try_reject_upgrade(&h.stranger, &kind),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The org owner (not the proposer) can reject.
+    h.client.reject_upgrade(&h.owner, &kind);
+    assert_eq!(h.client.get_upgrade_proposal(&kind), None);
+    assert_event(&h.env, "UpgradeRejected");
+    assert_eq!(proposal.proposer, h.upgrader);
+
+    // Rejecting an empty slot is NotFound, not a silent no-op.
+    assert_eq!(
+        h.client.try_reject_upgrade(&h.admin, &kind),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn proposer_can_withdraw_their_own_proposal() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.upgrader, &org, &kind, &version, &wasm, &addr);
+    h.client.reject_upgrade(&h.upgrader, &kind);
+    assert_eq!(h.client.get_upgrade_proposal(&kind), None);
+    assert_event(&h.env, "UpgradeRejected");
+}
+
+// ---------------------------------------------------------------------------
+// Version upgrade audit logging (Issue #300)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn audit_log_records_propose_commit_and_reject() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    let before = h.env.ledger().timestamp();
+
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    h.client.commit_upgrade(&h.admin, &kind);
+
+    // The two successful lifecycle actions are recorded newest-first with a
+    // full audit payload: who, what, when.
+    let history = h.client.get_upgrade_history();
+    assert_eq!(history.len(), 2);
+    let commit = &history.get(0).unwrap();
+    assert_eq!(commit.action, UpgradeAction::Committed);
+    assert_eq!(commit.audit.kind, ModuleKind::Wallet);
+    assert_eq!(commit.audit.version, 1);
+    assert_eq!(commit.audit.wasm_hash, wasm);
+    assert_eq!(commit.audit.org, org);
+    assert_eq!(commit.audit.actor, h.admin);
+    assert!(commit.audit.recorded_at >= before);
+    let propose = &history.get(1).unwrap();
+    assert_eq!(propose.action, UpgradeAction::Proposed);
+    assert_eq!(propose.audit.actor, h.owner);
+    assert_eq!(propose.audit.version, 1);
+
+    // A rejection is logged too.
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 2, 2);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    h.client.reject_upgrade(&h.owner, &kind);
+    let history = h.client.get_upgrade_history();
+    assert_eq!(history.len(), 4);
+    assert_eq!(history.get(0).unwrap().action, UpgradeAction::Rejected);
+    assert_eq!(history.get(0).unwrap().audit.actor, h.owner);
+    assert_eq!(history.get(1).unwrap().action, UpgradeAction::Proposed);
+    assert_eq!(h.client.get_upgrade_history_len(), 4);
+}
+
+#[test]
+fn audit_log_is_immutable_and_retained_in_instance_storage() {
+    let h = setup_upgrade_flow("acme");
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    h.client.commit_upgrade(&h.admin, &kind);
+    let before = h.client.get_upgrade_history();
+
+    // The audit log lives in instance storage: it survives without any
+    // per-entry TTL bump, and reading it does not mutate what is stored.
+    let snapshot = h.env.as_contract(&h.client.address, || {
+        h.env
+            .storage()
+            .instance()
+            .get::<_, Vec<UpgradeAuditRecord>>(&DataKey::UpgradeAuditLog)
+            .expect("audit log stored in instance storage")
+    });
+    assert_eq!(snapshot.len(), before.len());
+    assert_eq!(snapshot.get(0).unwrap(), before.get(0).unwrap());
+
+    // Later lifecycle actions prepend (the log is newest first) and the
+    // earlier entries are never rewritten — they shift down by exactly the
+    // number of new entries, byte for byte.
+    let (org, kind, version, wasm, addr) = upgrade_args(&h, 2, 2);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    h.client.reject_upgrade(&h.owner, &kind);
+    let after = h.client.get_upgrade_history();
+    assert_eq!(after.len(), before.len() + 2);
+    assert_eq!(after.get(0).unwrap().action, UpgradeAction::Rejected);
+    assert_eq!(after.get(1).unwrap().action, UpgradeAction::Proposed);
+    for i in 0..before.len() as u32 {
+        assert_eq!(after.get(i + 2).unwrap(), before.get(i).unwrap());
+    }
+}
+
+#[test]
+fn refused_upgrades_leave_no_audit_entries() {
+    let h = setup_upgrade_flow("acme");
+    let kind = ModuleKind::Wallet;
+    let (org, _, version, wasm, addr) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+    h.client.commit_upgrade(&h.admin, &kind);
+    assert_eq!(h.client.get_upgrade_history_len(), 2);
+
+    // Soroban invocations are atomic: a refused call has every storage write
+    // and event rolled back, so no on-revert "attempt" entry could ever be
+    // observed on-chain. Verify the refusals below leave the trail untouched.
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &stranger,
+            &org,
+            &kind,
+            &2,
+            &hash(&h.env, 7),
+            &Address::generate(&h.env)
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Identical-WASM edge case from Issue #300: re-proposing already-approved
+    // bytecode is refused...
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.owner, &org, &kind, &2, &wasm, &Address::generate(&h.env)),
+        Err(Ok(Error::InvalidInput))
+    );
+    // ...and so is a downgrade.
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &h.owner,
+            &org,
+            &kind,
+            &1,
+            &hash(&h.env, 5),
+            &Address::generate(&h.env)
+        ),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(h.client.get_upgrade_history_len(), 2);
+    assert_eq!(
+        h.client.get_upgrade_history().get(0).unwrap().action,
+        UpgradeAction::Committed
+    );
+    // The kind is still free for the next, honest proposal.
+    assert_eq!(h.client.get_upgrade_proposal(&kind), None);
+}
+
+#[test]
+fn audit_log_rings_out_the_oldest_entries_at_the_cap() {
+    let h = setup_upgrade_flow("acme");
+
+    // Fill the ring buffer with propose→commit pairs (audit entries grow by
+    // two per cycle) and confirm the cap is respected, oldest dropped first.
+    for v in 1..=(MAX_UPGRADE_AUDIT_ENTRIES / 2 + 2) {
+        let (org, kind, version, wasm, addr) = upgrade_args(&h, v, (v % 251) as u8);
+        h.client
+            .propose_upgrade(&h.owner, &org, &kind, &version, &wasm, &addr);
+        h.client.commit_upgrade(&h.admin, &kind);
+    }
+    assert_eq!(
+        h.client.get_upgrade_history_len(),
+        MAX_UPGRADE_AUDIT_ENTRIES
+    );
+
+    // The most recent commit is still present; the earliest proposals are
+    // gone, proving the buffer rings instead of growing unbounded.
+    let history = h.client.get_upgrade_history();
+    assert_eq!(history.get(0).unwrap().action, UpgradeAction::Committed);
+    assert_eq!(
+        history.get(0).unwrap().audit.version,
+        MAX_UPGRADE_AUDIT_ENTRIES / 2 + 2
+    );
+    assert_eq!(history.get(1).unwrap().action, UpgradeAction::Proposed);
+    assert_eq!(
+        history.get(1).unwrap().audit.version,
+        MAX_UPGRADE_AUDIT_ENTRIES / 2 + 2
+    );
+    let oldest = history.get(MAX_UPGRADE_AUDIT_ENTRIES - 1).unwrap();
+    assert_eq!(oldest.action, UpgradeAction::Proposed);
+    assert_eq!(oldest.audit.version, 3);
+    // Versions 1 and 2's entries were the first things evicted.
+    assert!(!history
+        .iter()
+        .any(|r| r.audit.version <= 2 || r.action == UpgradeAction::Rejected));
+}
+
+#[test]
+fn audit_log_ring_buffer_ordering_holds_after_rejections() {
+    let h = setup_upgrade_flow("acme");
+    let kind = ModuleKind::Wallet;
+
+    // Propose → reject, then propose → commit: the log stays newest-first
+    // across a mixed sequence of lifecycle actions.
+    let (org, _, v1, w1, a1) = upgrade_args(&h, 1, 1);
+    h.client
+        .propose_upgrade(&h.owner, &org, &kind, &v1, &w1, &a1);
+    h.client.reject_upgrade(&h.owner, &kind);
+
+    let (org2, _, v2, w2, a2) = upgrade_args(&h, 2, 2);
+    h.client
+        .propose_upgrade(&h.owner, &org2, &kind, &v2, &w2, &a2);
+    h.client.commit_upgrade(&h.admin, &kind);
+
+    let history = h.client.get_upgrade_history();
+    assert_eq!(history.len(), 4);
+    assert_eq!(history.get(0).unwrap().action, UpgradeAction::Committed);
+    assert_eq!(history.get(0).unwrap().audit.version, 2);
+    assert_eq!(history.get(1).unwrap().action, UpgradeAction::Proposed);
+    assert_eq!(history.get(1).unwrap().audit.version, 2);
+    assert_eq!(history.get(2).unwrap().action, UpgradeAction::Rejected);
+    assert_eq!(history.get(2).unwrap().audit.version, 1);
+    assert_eq!(history.get(3).unwrap().action, UpgradeAction::Proposed);
+    assert_eq!(history.get(3).unwrap().audit.version, 1);
+    assert_eq!(h.client.get_upgrade_history_len(), 4);
+}
+
+#[test]
+fn unauthorized_and_ghost_org_proposals_are_refused_without_a_trace() {
+    let h = setup_upgrade_flow("acme");
+    let kind = ModuleKind::Wallet;
+    let (org, _, version, wasm, addr) = upgrade_args(&h, 1, 1);
+
+    // A stranger (not admin/owner/upgrader) on a real org is Unauthorized.
+    assert_eq!(
+        h.client
+            .try_propose_upgrade(&h.stranger, &org, &kind, &version, &wasm, &addr),
+        Err(Ok(Error::Unauthorized))
+    );
+    // A stranger on an unknown org learns only NotFound.
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &h.stranger,
+            &String::from_str(&h.env, "ghost"),
+            &kind,
+            &version,
+            &wasm,
+            &addr
+        ),
+        Err(Ok(Error::NotFound))
+    );
+    // Admin-gated commit with no proposal: NotFound.
+    assert_eq!(
+        h.client.try_commit_upgrade(&h.admin, &kind),
+        Err(Ok(Error::NotFound))
+    );
+    // Every refusal above reverted atomically: no audit entries, no events.
+    assert_eq!(h.client.get_upgrade_history_len(), 0);
+    assert_eq!(count_events(&h.env, "UpgradeProposed"), 0);
+    assert_eq!(count_events(&h.env, "UpgradeCommitted"), 0);
+    assert_eq!(count_events(&h.env, "UpgradeRejected"), 0);
+}
+
+#[test]
+fn audit_log_is_empty_before_any_upgrade_activity() {
+    let h = setup_upgrade_flow("acme");
+    assert_eq!(h.client.get_upgrade_history_len(), 0);
+    assert_eq!(h.client.get_upgrade_history().len(), 0);
 }

@@ -5,7 +5,24 @@
 //! every contract validates inputs identically.
 
 use crate::errors::Error;
-use soroban_sdk::{Env, String};
+use soroban_sdk::{BytesN, Env, String};
+
+/// Require a syntactically valid Wasm hash.
+///
+/// A Wasm code hash on Stellar is the 32-byte SHA-256 of the deployed Wasm
+/// blob. The [`BytesN<32>`] parameter pins the width — a shorter payload can
+/// never decode into it — so what remains to check here is the degenerate
+/// value: the all-zero hash is refused because no real contract code hashes to
+/// zeros, and accepting it would let a proposal launder a meaningless hash
+/// into the approval table. Reports [`Error::InvalidInput`] — the shared
+/// error table is already at the 50-case spec limit, so no dedicated variant
+/// can be added.
+pub fn require_valid_wasm_hash(env: &Env, hash: &BytesN<32>) -> Result<(), Error> {
+    if hash == &BytesN::from_array(env, &[0u8; 32]) {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
 
 /// Require a strictly positive amount (typical for transfers / deposits).
 pub fn require_positive_amount(amount: i128) -> Result<(), Error> {
