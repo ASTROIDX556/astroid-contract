@@ -88,7 +88,9 @@ use astroid_shared::errors::{BudgetError, Error};
 use astroid_shared::events::ContractEvent;
 use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_rem, checked_sub};
 use astroid_shared::types::ResourceState;
-use astroid_shared::validation::{require_non_empty, require_positive_amount};
+use astroid_shared::validation::{
+    require_non_empty, require_non_negative_amount, require_positive_amount,
+};
 use astroid_shared::{constants, events};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
@@ -205,6 +207,12 @@ impl BudgetContract {
         )
     }
     /// Extended allocation with deficit support (Issue #35).
+    ///
+    /// `allow_deficit` requires a period that actually recurs — `Daily`,
+    /// `Weekly` or `Monthly`. It is rejected for [`Period::None`] and for
+    /// [`Period::Custom`], because a `Custom` budget has no interval until
+    /// `set_recurrence` supplies one, so it has no next window for the
+    /// overspend to be carried into and no way to repay it.
     pub fn allocate_with_deficit(
         env: Env,
         owner: Address,
@@ -279,8 +287,25 @@ impl BudgetContract {
         if expires_at != 0 && (expires_at <= now || expires_at <= start_at) {
             return Err(Error::InvalidInput);
         }
-        // Deficit carryforward only makes sense with a recurring period.
-        if allow_deficit && period == Period::None {
+        // Deficit carryforward only makes sense with a recurring period: the
+        // overspend has to land in a *next* window to be repaid out of, and
+        // `window_transition` is the only place that records it. So the test is
+        // "does this budget recur?", asked through the same `window_of` the
+        // state machine uses, not a match on `Period` alone.
+        //
+        // `Period::Custom` is the case that matters. Until `set_recurrence`
+        // supplies an interval a `Custom` budget stores `period_seconds == 0`,
+        // which makes it exactly as non-recurring as `Period::None` — yet
+        // admitting it here let the first overspend run away. With no window to
+        // roll over, `window_transition` returns before reaching its deficit
+        // branch, so `deficit_amount` stayed 0 while `spent` ran past the
+        // limit. `consume` grants the overspend on `allow_deficit &&
+        // deficit_amount == 0`, so that stayed true forever: every further
+        // `consume` was permitted and `remaining` fell without bound, with no
+        // deficit ever booked to repay. Creation always stores
+        // `period_seconds: 0`, so the interval argument is 0 here by
+        // construction.
+        if allow_deficit && Self::window_of(period, 0).is_none() {
             return Err(Error::InvalidInput);
         }
         let key = DataKey::Budget(budget_id.clone());
@@ -653,11 +678,12 @@ impl BudgetContract {
         Ok(budget)
     }
     /// Limits and rollover caps are non-negative (0 is a valid, closed budget).
+    ///
+    /// Delegates to the shared guard so "non-negative" means the same thing
+    /// here as in the policy contract, and so both return [`Error::InvalidAmount`]
+    /// for the same input.
     fn require_valid_limit(limit: i128) -> Result<(), Error> {
-        if limit < 0 {
-            return Err(Error::InvalidAmount);
-        }
-        Ok(())
+        require_non_negative_amount(limit)
     }
     /// Archiving is terminal: no administrative change may revive a budget.
     fn require_not_archived(budget: &Budget) -> Result<(), Error> {
@@ -685,20 +711,27 @@ impl BudgetContract {
         }
     }
 
-    /// The window length implied by a budget's period, or `None` when the
+    /// The window length implied by a period/interval pair, or `None` when the
     /// budget does not recur (one-shot, or a `Custom` period with no interval
     /// configured yet).
-    fn window_of(budget: &Budget) -> Option<u64> {
-        match budget.period {
+    ///
+    /// Takes its cadence as arguments rather than a whole [`Budget`] so that
+    /// creation-time validation can ask the *same* question the state machine
+    /// asks at runtime — see [`Self::allocate_at`], which rejects a deficit
+    /// policy on any period this returns `None` for. Deriving the guard from one
+    /// predicate is what keeps "recurring enough to carry a deficit" from
+    /// drifting away from "recurring enough for `window_transition` to fire".
+    fn window_of(period: Period, period_seconds: u64) -> Option<u64> {
+        match period {
             Period::None => None,
             Period::Daily => Some(constants::SECONDS_PER_DAY),
             Period::Weekly => Some(constants::SECONDS_PER_WEEK),
             Period::Monthly => Some(constants::SECONDS_PER_MONTH),
             Period::Custom => {
-                if budget.period_seconds == 0 {
+                if period_seconds == 0 {
                     None
                 } else {
-                    Some(budget.period_seconds)
+                    Some(period_seconds)
                 }
             }
         }
@@ -773,7 +806,7 @@ impl BudgetContract {
     /// Returns `Ok(false)` for non-recurring budgets (`Period::None`, or a
     /// `Custom` period without an interval): their window never lapses.
     fn is_window_expired(env: &Env, budget: &Budget) -> Result<bool, Error> {
-        let window = match Self::window_of(budget) {
+        let window = match Self::window_of(budget.period, budget.period_seconds) {
             Some(w) => w,
             None => return Ok(false),
         };
@@ -818,7 +851,7 @@ impl BudgetContract {
             }
             return Err(Error::BudgetExpired);
         }
-        let window = match Self::window_of(budget) {
+        let window = match Self::window_of(budget.period, budget.period_seconds) {
             Some(w) => w,
             None => return Ok(()),
         };
