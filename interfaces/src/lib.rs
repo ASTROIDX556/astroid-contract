@@ -24,6 +24,7 @@
 //! | [`BudgetInterface`]        | `astroid-budget`         | `BudgetClient`       |
 //! | [`TreasuryInterface`]      | `astroid-treasury`       | `TreasuryClient`     |
 //! | [`MultisigInterface`]      | `astroid-multisig`       | `MultisigClient`     |
+//! | [`ProposalInterface`]      | `astroid-proposal`       | `ProposalClient`     |
 //! | [`UpgradeableInterface`]   | all eight contracts      | `UpgradeableClient`  |
 //!
 //! Every fallible method returns the canonical [`Error`] so a cross-contract
@@ -32,7 +33,13 @@
 //! this table at compile time (trait bounds) and at runtime (every deployed
 //! contract answers through the shared client).
 
+pub mod proposal;
 pub mod upgrade;
+
+pub use proposal::{ProposalClient, ProposalInterface, ProposalState};
+
+#[cfg(test)]
+mod test;
 
 use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
