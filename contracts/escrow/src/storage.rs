@@ -77,6 +77,37 @@ pub struct Escrow {
     pub override_nonce: u64,
 }
 
+/// A single milestone within a milestone-based escrow. `release_bps` is the
+/// proportion of the total escrow amount (in basis points, `10_000` = 100%)
+/// that is disbursed to the recipient when this milestone is approved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub index: u32,
+    pub description: String,
+    pub release_bps: u32,
+    pub released: bool,
+}
+
+/// Input describing a milestone when a milestone escrow is created. The
+/// contract assigns the ordered `index` on submission.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSpec {
+    pub description: String,
+    pub release_bps: u32,
+}
+
+/// Aggregate milestone state for an escrow: the ordered milestones plus the
+/// total amount already disbursed. Keeping the running total alongside the
+/// milestones lets the final approval pay the exact, dust-free remainder.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSet {
+    pub milestones: Vec<Milestone>,
+    pub released_amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -114,6 +145,28 @@ pub fn store_escrow(env: &Env, id: u64, escrow: &Escrow) {
 pub fn bump_escrow(env: &Env, id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::Escrow(id),
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+/// Whether `id` was created with a milestone schedule. Used to block the
+/// single-shot `release` path on milestone escrows so settlement stays phased.
+pub fn has_milestones(env: &Env, id: u64) -> bool {
+    env.storage().persistent().has(&DataKey::Milestones(id))
+}
+
+pub fn load_milestones(env: &Env, id: u64) -> Result<MilestoneSet, Error> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Milestones(id))
+        .ok_or(Error::NotFound)
+}
+
+pub fn store_milestones(env: &Env, id: u64, set: &MilestoneSet) {
+    env.storage().persistent().set(&DataKey::Milestones(id), set);
+    env.storage().persistent().extend_ttl(
+        &DataKey::Milestones(id),
         PERSISTENT_LIFETIME_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );

@@ -49,6 +49,26 @@ funder ──► create(sender, recipient, arbiter, assets[], deadline, memo,
   detailing the escrow id, recipient and every asset transferred, on both the
   arbiter and signature-override release paths.
 
+## Milestone-based release
+
+`deposit_with_milestones(sender, recipient, arbiter, asset, amount, deadline,
+  memo, milestones[])` funds a single-asset escrow against an ordered list of
+basis-point-weighted milestones (`MilestoneSpec { description, release_bps }`)
+whose weights must sum to exactly `10_000` (100%).
+
+- The arbiter approves one milestone at a time with
+  `release_milestone(arbiter, id, index)`, which disburses that milestone's
+  proportional share and marks it released.
+- Each milestone may be approved **at most once** (a repeat approval fails with
+  `InvalidState`) and an out-of-range `index` fails with `InvalidInput`.
+- The final milestone pays the exact remainder rather than its floored gross,
+  so the disbursed amounts always sum to the funded amount with no dust left in
+  custody.
+- The escrow's own `released_amount` tracks the milestone total, so
+  `refund` / `reclaim` / `cancel` only ever return the still-held remainder.
+- Plain `release` is refused on a milestone escrow (`InvalidState`); settlement
+  must go through the phased approvals.
+
 ## Use-cases
 
 - Milestone payments between ON-CHAIN purchased services.

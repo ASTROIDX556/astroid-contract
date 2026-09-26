@@ -687,6 +687,108 @@ fn plain_release_blocked_on_milestone_escrow() {
 }
 
 #[test]
+fn milestone_invalid_index_rejected() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 5_000),
+        milestone_spec(&h.env, "build", 5_000),
+    ];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+
+    // There is no milestone at index 9: the approval must be refused and no
+    // funds may move or be marked complete.
+    let res = h.client.try_release_milestone(&h.arbiter, &id, &9);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+    let set = h.client.milestones(&id);
+    assert_eq!(set.released_amount, 0);
+}
+
+#[test]
+fn milestone_dust_free_exact_distribution() {
+    // Amount deliberately not divisible by the basis-point weights: the earlier
+    // milestones floor their proportional gross, and the final milestone pays
+    // the exact remainder so the sum is the full amount with no dust left
+    // locked in the contract.
+    let h = setup(1_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 3_333),
+        milestone_spec(&h.env, "b", 3_333),
+        milestone_spec(&h.env, "c", 3_334),
+    ];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &1_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 333);
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 666);
+    h.client.release_milestone(&h.arbiter, &id, &2);
+
+    // 333 + 333 + 334 == 1_000: the whole escrow is disbursed, nothing remains.
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 1_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.milestones(&id).released_amount, 1_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+#[test]
+fn milestone_partial_release_tracks_escrow_and_returns_only_remainder_on_cancel() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 4_000),
+        milestone_spec(&h.env, "build", 6_000),
+    ];
+    let id = h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &10_000,
+        &(START + 86_400),
+        &String::from_str(&h.env, "p"),
+        &specs,
+    );
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    // The escrow's own released_amount mirrors the milestone total so the
+    // remaining balance is tracked correctly.
+    let escrow = h.client.get(&id);
+    assert_eq!(escrow.released_amount, 4_000);
+    assert_eq!(escrow.state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 6_000);
+
+    // Cancelling before the deadline returns only the still-held remainder,
+    // never the funds already disbursed to the recipient.
+    h.client.cancel(&h.arbiter, &id);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+}
+
+#[test]
 fn timelock_cliff_rejects_early_withdraw_and_claims_post_maturity() {
     let h = setup(10_000, 0);
     let unlock_time = START + 1_000;

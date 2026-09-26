@@ -84,14 +84,14 @@
 pub mod storage;
 
 pub use storage::{
-    bump_escrow, get_count, increment_count, load_escrow, store_escrow, DataKey, Escrow,
-    EscrowState, ReleaseSchedule, ReleaseType,
+    bump_escrow, get_count, has_milestones, increment_count, load_escrow, load_milestones,
+    store_escrow, store_milestones, DataKey, Escrow, EscrowState, Milestone, MilestoneSet,
+    MilestoneSpec, ReleaseSchedule, ReleaseType,
 };
 
 use astroid_interfaces::UpgradeableInterface;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events::{self, ContractEvent};
@@ -176,35 +176,6 @@ pub fn calculate_claimable_amount(escrow: &Escrow, current_time: u64) -> Result<
 pub struct OverrideSignature {
     pub public_key: BytesN<32>,
     pub signature: BytesN<64>,
-}
-
-/// A single milestone within a milestone-based escrow. `release_bps` is the
-/// proportion of the total escrow amount (in basis points, 10_000 = 100%) that
-/// is disbursed to the recipient when this milestone is approved.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Milestone {
-    pub index: u32,
-    pub description: String,
-    pub release_bps: u32,
-    pub released: bool,
-}
-
-/// Input describing a milestone when the escrow is created.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MilestoneSpec {
-    pub description: String,
-    pub release_bps: u32,
-}
-
-/// Aggregate milestone state for an escrow: the ordered milestones and the total
-/// amount disbursed so far (used to compute the final, dust-free payout).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MilestoneSet {
-    pub milestones: Vec<Milestone>,
-    pub released_amount: i128,
 }
 
 #[contract]
@@ -735,7 +706,7 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.storage().persistent().has(&DataKey::Milestones(id)) {
+        if has_milestones(&env, id) {
             return Err(Error::InvalidState);
         }
         // Issue #238 — time-lock validation. A schedule-backed escrow can only
@@ -1014,9 +985,29 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
-        Self::transfer_all(&env, &escrow, &escrow.sender);
-        for a in escrow.assets.iter() {
-            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
+        // Return only what is still held: if milestones were already approved,
+        // those funds have been disbursed to the recipient and must not be
+        // returned (nor can they be — they are no longer in custody).
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        if remaining > 0 {
+            for a in escrow.assets.iter() {
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                if return_amount > 0 {
+                    token::TokenClient::new(&env, &a.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &return_amount,
+                    );
+                    events::transfer_executed(
+                        &env,
+                        &escrow.sender,
+                        &escrow.sender,
+                        &a.asset,
+                        return_amount,
+                    );
+                }
+            }
         }
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
@@ -1140,14 +1131,7 @@ impl EscrowContract {
             milestones: items,
             released_amount: 0,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Milestones(id), &set);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Milestones(id),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+        store_milestones(&env, id, &set);
 
         let asset_amounts = vec![
             &env,
@@ -1196,11 +1180,7 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
-        let mut set: MilestoneSet = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Milestones(id))
-            .ok_or(Error::NotFound)?;
+        let mut set: MilestoneSet = load_milestones(&env, id)?;
 
         let mut found_idx: usize = 0;
         let mut target: Option<Milestone> = None;
@@ -1251,15 +1231,17 @@ impl EscrowContract {
             released: true,
         };
         set.milestones.set(found_idx as u32, updated);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Milestones(id), &set);
 
+        // Keep the escrow's own `released_amount` in lock-step with the
+        // milestone total so `refund` / `reclaim` / `claim` compute the correct
+        // remaining balance and can never over-refund already-disbursed funds.
+        escrow.released_amount = checked_add(escrow.released_amount, payout)?;
         let all_released = set.milestones.iter().all(|m| m.released);
         if all_released {
             escrow.state = EscrowState::Released;
-            store_escrow(&env, id, &escrow);
         }
+        store_escrow(&env, id, &escrow);
+        store_milestones(&env, id, &set);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("ms_rel")),
@@ -1270,10 +1252,7 @@ impl EscrowContract {
 
     /// Read the milestone state for an escrow.
     pub fn milestones(env: Env, id: u64) -> Result<MilestoneSet, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Milestones(id))
-            .ok_or(Error::NotFound)
+        load_milestones(&env, id)
     }
 
     // --- views ---
