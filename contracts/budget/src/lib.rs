@@ -633,11 +633,16 @@ impl BudgetContract {
         let periods = (elapsed / window) as i128;
 
         // The current period's remainder, plus one full base limit for every
-        // further period that came and went entirely untouched.
+        // further period that came and went entirely untouched. `leftover`
+        // already accounts for any credit carried into this window because the
+        // period's capacity is `limit + rollover_credit`, so it is the base for
+        // the next period's credit. Re-adding the old credit here would count
+        // it a second time and let an agent that spent its whole rolled-over
+        // allowance bank another period's worth of unearned capacity.
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         let leftover = checked_sub(capacity, budget.spent)?;
         if budget.rollover_enabled {
-            let mut credit = checked_add(budget.rollover_credit, leftover)?;
+            let mut credit = leftover;
             if periods > 1 {
                 let idle = checked_sub(periods, 1)?;
                 credit = Self::accrue_idle_periods(credit, budget, idle)?;
