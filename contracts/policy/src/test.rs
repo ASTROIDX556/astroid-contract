@@ -660,10 +660,10 @@ fn allowance_over_limit_rejected_with_exceeded() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &1_000, &0);
 
     let over = p.try_check_allowance(&String::from_str(&env, "mt"), &asset, &1_001);
-    assert_eq!(over, Err(Ok(Error::PolicyAllowanceExceeded)));
+    assert_eq!(over, Err(Ok(Error::AllowanceExceeded)));
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &1_001),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 }
 
@@ -689,7 +689,7 @@ fn allowance_cumulative_consumption_blocks_after_limit() {
     // 401 would exceed the cumulative limit.
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &401),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // A fresh 300 transfer still fits.
     assert!(p
@@ -716,7 +716,7 @@ fn multi_token_allowances_are_independent_per_asset() {
         .is_ok());
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &xlm, &recip, &101),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // An asset with no configured allowance is unrestricted.
     let eth = Address::generate(&env);
@@ -784,7 +784,7 @@ fn allowance_remove_restores_unlimited() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &100, &0);
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &200),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 
     p.remove_allowance(&owner, &String::from_str(&env, "mt"), &asset);
