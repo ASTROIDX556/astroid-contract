@@ -1213,7 +1213,7 @@ impl PolicyContract {
     /// (0 = the allowance would be fully consumed, which is permitted). An
     /// unset allowance is unrestricted. Returns
     /// [`Error::AllowanceExceeded`] when the spend would breach the
-    /// allowance.
+    /// allowance, or [`Error::AllowanceExpired`] when the envelope has lapsed.
     pub fn check_allowance(
         env: Env,
         policy_id: String,
@@ -1566,7 +1566,11 @@ impl PolicyContract {
         let now = env.ledger().timestamp();
         if allowance.expires_at != 0 && now >= allowance.expires_at {
             events_policy_violation(env, policy_id, "allowance_expired");
-            return Err(Error::PolicyDenied);
+            // A lapsed envelope is not a rule denial: the operator's remedy is
+            // to renew it, not to loosen the policy. `Error::AllowanceExpired`
+            // keeps that distinct from `PolicyDenied` and from
+            // `AllowanceExceeded`.
+            return Err(Error::AllowanceExpired);
         }
         settle_window(&mut allowance, now)?;
         // Negative when the limit was lowered below what is already spent, in

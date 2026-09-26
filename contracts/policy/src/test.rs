@@ -736,11 +736,12 @@ fn allowance_expires_at_past_blocks_spend() {
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
 
-    // Expires in the past => every spend denied, even below the limit.
+    // Expires in the past => every spend refused, even below the limit, and the
+    // refusal names the lapse rather than passing it off as a rule denial.
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &1_000, &500);
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &1),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::AllowanceExpired))
     );
 }
 
@@ -2503,9 +2504,11 @@ fn expired_rate_limit_stays_denied_after_a_reset() {
     p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &WINDOW, &(START + 150));
 
     env.ledger().set_timestamp(START + 150);
+    // A window reset must not resurrect a lapsed envelope: the refusal names
+    // the expiry rather than being passed off as a rule denial.
     assert_eq!(
         p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&asset, 1)]),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::AllowanceExpired))
     );
 }
 
