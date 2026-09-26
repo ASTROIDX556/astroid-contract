@@ -2095,3 +2095,199 @@ fn release_reports_the_same_remaining_as_the_view() {
     // limit 1_000 - deficit 500 - spent 100
     assert_eq!(after_release, 400);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #236: deterministic validation for amount allocations and period
+// eligibility.
+//
+// The zero/negative amount guards already existed, but the two creation
+// entrypoints that reach `allocate_at` without a `limit` of their own were not
+// exercised, and the deficit-carryforward guard tested only `Period::None` —
+// not `Period::Custom`, which is equally non-recurring until `set_recurrence`
+// supplies an interval.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deficit_is_rejected_on_every_non_recurring_period() {
+    let h = setup();
+    // `window_of` returns `None` for both, and `allocate_at` now asks that same
+    // predicate, so neither can be admitted with a deficit policy.
+    for (name, period) in [("none", Period::None), ("custom", Period::Custom)] {
+        let res = h.client.try_allocate_with_deficit(
+            &h.owner,
+            &id(&h.env, name),
+            &1_000,
+            &period,
+            &false,
+            &true, // allow_deficit
+            &0,
+        );
+        assert_eq!(res, Err(Ok(Error::InvalidInput)), "period {:?}", period);
+        // Nothing was written by the rejection.
+        let res = h.client.try_get(&id(&h.env, name));
+        assert_eq!(res, Err(Ok(Error::NotFound)), "period {:?}", period);
+    }
+}
+
+#[test]
+fn deficit_remains_available_on_every_recurring_period() {
+    let h = setup();
+    // The other side of the guard: rejecting `Custom` must not take the fixed
+    // cadences with it.
+    for (name, period, window) in [
+        ("daily", Period::Daily, 86_400u64),
+        ("weekly", Period::Weekly, 604_800),
+        ("monthly", Period::Monthly, 2_592_000),
+    ] {
+        let bid = id(&h.env, name);
+        h.client
+            .allocate_with_deficit(&h.owner, &bid, &1_000, &period, &false, &true, &0);
+        // The first overspend is admitted; the deficit is only booked once the
+        // window actually turns over, so the ledger has to reach the boundary.
+        assert_eq!(
+            h.client.consume(&h.owner, &bid, &1_200),
+            -200,
+            "{:?}",
+            period
+        );
+        // Anchored on the stored window rather than a fixed timestamp, since
+        // each iteration allocates at the ledger's current time.
+        let start = h.client.get(&bid).window_start;
+        h.env.ledger().set_timestamp(start + window);
+        h.client.rollover(&h.owner, &bid);
+        let b: Budget = h.client.get(&bid);
+        assert_eq!(b.deficit_amount, 200, "period {:?}", period);
+        assert_eq!(b.spent, 0, "period {:?}", period);
+        // The deficit is repaid out of the next period's capacity.
+        assert_eq!(h.client.remaining(&bid), 800, "period {:?}", period);
+    }
+}
+
+#[test]
+fn a_custom_period_budget_cannot_accrue_an_unrepayable_deficit() {
+    let h = setup();
+    let bid = id(&h.env, "eng");
+    // A `Custom` budget with no interval never rolls over, so an admitted
+    // deficit would have no window to be repaid from: `window_transition`
+    // returns before its deficit branch, leaving `deficit_amount` at 0 while
+    // `spent` runs past the limit, and `consume` keeps granting the overspend
+    // on `allow_deficit && deficit_amount == 0`. Rejecting the combination is
+    // what stops `remaining` from falling without bound.
+    let res = h.client.try_allocate_with_deficit(
+        &h.owner,
+        &bid,
+        &1_000,
+        &Period::Custom,
+        &false,
+        &true,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    // A `Custom` budget without a deficit policy is still creatable and still
+    // recurs once `set_recurrence` supplies an interval.
+    allocate(&h, "custom", 1_000, Period::Custom, false);
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "custom"),
+        &Period::Custom,
+        &3_600,
+        &false,
+        &0,
+        &0,
+    );
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "custom"), &1_000), 0);
+    h.env.ledger().set_timestamp(1_000 + 3_600);
+    assert_eq!(h.client.remaining(&id(&h.env, "custom")), 1_000);
+}
+
+#[test]
+fn negative_limits_are_rejected_on_every_creation_entrypoint() {
+    let h = setup();
+    let res = h.client.try_allocate_with_deficit(
+        &h.owner,
+        &id(&h.env, "a"),
+        &-1,
+        &Period::Weekly,
+        &false,
+        &true,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+
+    let res = h.client.try_allocate_scheduled(
+        &h.owner,
+        &id(&h.env, "b"),
+        &-1,
+        &Period::None,
+        &false,
+        &2_000,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+
+    // The scheduled entrypoint's own period overlap rule still applies, and is
+    // checked independently of the amount.
+    let res = h.client.try_allocate_scheduled(
+        &h.owner,
+        &id(&h.env, "c"),
+        &1_000,
+        &Period::None,
+        &false,
+        &2_000,
+        &2_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+
+    for bid in ["a", "b", "c"] {
+        let res = h.client.try_get(&id(&h.env, bid));
+        assert_eq!(res, Err(Ok(Error::NotFound)), "budget {} created", bid);
+    }
+}
+
+#[test]
+fn negative_and_zero_caps_and_limits_are_rejected_consistently() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, false);
+    let token = Address::generate(&h.env);
+
+    // `rollover_cap`, like `rollover_max_bps`, is non-negative: a negative cap
+    // would make `apply_cap` clamp credit to a negative bound.
+    let res = h.client.try_set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Daily,
+        &0,
+        &true,
+        &-1, // rollover_cap
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+    // 0 is the documented "uncapped" sentinel and stays valid.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Daily,
+        &0,
+        &true,
+        &0,
+        &0,
+    );
+
+    // A zero limit is a valid, closed budget — it rejects spends rather than
+    // failing to be created.
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &0, &3_600);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    // A zero limit with no window is the one-shot form; still closed, still
+    // creatable.
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &0, &0);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+}
