@@ -14,6 +14,8 @@
 //! - [`math`]       — checked `i128`/`u64` arithmetic and balance validation
 //!   (`SafeAdd`/`SafeSub`/`SafeMul`/`SafeDiv`, `validate_sufficient_balance`,
 //!   `SafeBalance`; never wraps, returns deterministic [`Error`]s).
+//! - [`token`]      — overflow-safe `token::TokenClient` transfer wrappers that
+//!   return deterministic [`Error`]s instead of trapping.
 //! - [`validation`] — small guard helpers (positive amounts, time windows, ...).
 //! - [`constants`] — protocol-wide constants (time units, storage TTLs, limits).
 
@@ -22,6 +24,7 @@ pub mod errors;
 pub mod events;
 pub mod math;
 pub mod telemetry;
+pub mod token;
 pub mod types;
 pub mod validation;
 
