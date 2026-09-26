@@ -104,3 +104,60 @@ pub enum Error {
     /// deposits deliberately stay open so recovery funding can still arrive.
     TreasuryPaused = 85,
 }
+
+/// Budget spend errors, kept separate from the protocol-wide error enum so
+/// budget-specific timing errors do not exceed Soroban's 50-variant limit.
+/// Existing codes match [`Error`] exactly; code 45 is the new scheduled-start
+/// denial.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BudgetError {
+    NotFound = 1,
+    Unauthorized = 3,
+    InvalidInput = 4,
+    Overflow = 11,
+    InvalidAmount = 12,
+    BudgetExceeded = 40,
+    BudgetFrozen = 41,
+    BudgetArchived = 42,
+    AssetNotAuthorized = 43,
+    BudgetExpired = 44,
+    BudgetNotActive = 45,
+}
+
+impl From<Error> for BudgetError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::NotFound => Self::NotFound,
+            Error::Unauthorized => Self::Unauthorized,
+            Error::InvalidInput => Self::InvalidInput,
+            Error::Overflow => Self::Overflow,
+            Error::InvalidAmount => Self::InvalidAmount,
+            Error::BudgetExceeded => Self::BudgetExceeded,
+            Error::BudgetFrozen => Self::BudgetFrozen,
+            Error::BudgetArchived => Self::BudgetArchived,
+            Error::AssetNotAuthorized => Self::AssetNotAuthorized,
+            Error::BudgetExpired => Self::BudgetExpired,
+            Error::InvalidState => Self::InvalidInput,
+            _ => Self::InvalidInput,
+        }
+    }
+}
+
+impl From<BudgetError> for Error {
+    fn from(error: BudgetError) -> Self {
+        match error {
+            BudgetError::NotFound => Self::NotFound,
+            BudgetError::Unauthorized => Self::Unauthorized,
+            BudgetError::InvalidInput => Self::InvalidInput,
+            BudgetError::Overflow => Self::Overflow,
+            BudgetError::InvalidAmount => Self::InvalidAmount,
+            BudgetError::BudgetExceeded => Self::BudgetExceeded,
+            BudgetError::BudgetFrozen => Self::BudgetFrozen,
+            BudgetError::BudgetArchived => Self::BudgetArchived,
+            BudgetError::AssetNotAuthorized => Self::AssetNotAuthorized,
+            BudgetError::BudgetExpired | BudgetError::BudgetNotActive => Self::BudgetExpired,
+        }
+    }
+}
