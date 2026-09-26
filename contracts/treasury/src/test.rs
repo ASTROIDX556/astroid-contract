@@ -951,3 +951,217 @@ fn set_guardian_rotates_pause_authority() {
     h.client.unpause(&h.multisig);
     assert!(!h.client.is_paused());
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic error codes
+//
+// The treasury holds the protocol's working capital, so a refusal has to say
+// which of the several distinct problems it was: a caller that is not the
+// admin, an asset that was never whitelisted, an allowance that is spent or
+// expired, or a balance that simply is not there.
+// ---------------------------------------------------------------------------
+
+/// A treasury that was never initialized, with no asset wired.
+fn uninitialized() -> (Env, TreasuryContractClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &id);
+    (env, client)
+}
+
+#[test]
+fn uninitialized_treasury_reports_not_initialized_on_every_entry_point() {
+    let (env, client) = uninitialized();
+    let admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let stranger = Address::generate(&env);
+
+    // `load` used to unwrap, so each of these trapped the whole invocation with
+    // an opaque host error instead of a code the caller could act on.
+    assert_eq!(client.try_get(), Err(Ok(Error::NotInitialized)));
+    assert_eq!(client.try_guardian(), Err(Ok(Error::NotInitialized)));
+    assert_eq!(
+        client.try_add_approved_asset(&admin, &asset),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_deposit(&admin, &asset, &1),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_withdraw(&admin, &asset, &stranger, &1),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(client.try_pause(&admin), Err(Ok(Error::NotInitialized)));
+
+    // "Not paused" must stay a readable question even with no record on file.
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn initialize_twice_is_already_initialized() {
+    let (env, client) = uninitialized();
+    let admin = Address::generate(&env);
+    client.initialize(&String::from_str(&env, "acme"), &admin);
+    let other = Address::generate(&env);
+
+    // A refused re-initialization must not reassign the admin.
+    assert_eq!(
+        client.try_initialize(&String::from_str(&env, "other"), &other),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+    assert_eq!(client.get().admin, admin);
+    assert_eq!(client.get().org, String::from_str(&env, "acme"));
+}
+
+#[test]
+fn non_positive_amounts_are_invalid_amount_on_the_treasury() {
+    let h = setup("acme", 1_000);
+    let recipient = Address::generate(&h.env);
+
+    // The amount guard is its own diagnosis, shared by every value path here.
+    for amount in [0, -1] {
+        assert_eq!(
+            h.client.try_deposit(&h.admin, &h.asset, &amount),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            h.client
+                .try_withdraw(&h.admin, &h.asset, &recipient, &amount),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            h.client
+                .try_set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &amount, &0),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+    // Nothing moved in either direction.
+    assert_eq!(token_balance(&h, &h.client.address), 0);
+    assert_eq!(h.client.balance(&h.asset), 0);
+}
+
+#[test]
+fn withdrawal_beyond_custody_reports_insufficient_funds() {
+    let h = setup("acme", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // One unit past the recorded holding is refused, and the holding is intact.
+    assert_eq!(
+        h.client
+            .try_withdraw(&h.admin, &h.asset, &recipient, &1_001),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    assert_eq!(h.client.balance(&h.asset), 1_000);
+    assert_eq!(token_balance(&h, &recipient), 0);
+
+    // Draining to exactly zero is allowed; only the next unit fails.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &1_000);
+    assert_eq!(h.client.balance(&h.asset), 0);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1),
+        Err(Ok(Error::InsufficientFunds))
+    );
+}
+
+#[test]
+fn exhausted_and_expired_allowances_have_their_own_codes() {
+    let h = setup("acme", 1_000);
+    let recipient = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    // `expires_at == 0` means the ceiling never lapses.
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &0);
+
+    // Spending the whole cap is fine; the next request is over the limit, which
+    // is a different diagnosis from the treasury itself being short.
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    assert_eq!(token_balance(&h, &recipient), 100);
+
+    // A lapsed ceiling is reported as expiry, never as exhaustion — the two
+    // call for different responses from whoever holds the mandate.
+    h.client
+        .set_allowance(&h.admin, &h.admin, &recipient, &h.asset, &100, &1);
+    h.env.ledger().set_timestamp(2);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1),
+        Err(Ok(Error::AllowanceExpired))
+    );
+
+    // A self-directed allowance would gate nothing.
+    assert_eq!(
+        h.client
+            .try_set_allowance(&h.admin, &recipient, &recipient, &h.asset, &10, &0),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn non_admin_spends_are_unauthorized() {
+    let h = setup("acme", 1_000);
+    let recipient = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // The treasury records exactly one admin; a stranger is not the multisig or
+    // the guardian either, so nothing rescues the call.
+    assert_eq!(
+        h.client.try_withdraw(&stranger, &h.asset, &recipient, &1),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.try_pause(&stranger), Err(Ok(Error::Unauthorized)));
+    assert_eq!(
+        h.client
+            .try_set_allowance(&stranger, &stranger, &recipient, &h.asset, &10, &0),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.balance(&h.asset), 1_000);
+    assert_eq!(token_balance(&h, &recipient), 0);
+}
+
+#[test]
+fn batch_payments_reject_malformed_input_before_any_leg_runs() {
+    let h = setup("acme", 1_000);
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+
+    // An empty batch is malformed input, not a successful no-op.
+    let empty: Vec<Payment> = Vec::new(&h.env);
+    assert_eq!(
+        h.client.try_batch_transfer(&h.admin, &h.asset, &empty),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // One leg past the cap is refused on size alone, before any amount check.
+    let mut over: Vec<Payment> = Vec::new(&h.env);
+    for _ in 0..=MAX_BATCH_PAYMENTS {
+        over.push_back(payment(&a, 1));
+    }
+    assert_eq!(
+        h.client.try_batch_transfer(&h.admin, &h.asset, &over),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(token_balance(&h, &a), 0);
+
+    // A batch whose total exceeds custody is refused as exhaustion, even though
+    // every individual leg is well formed.
+    let mut big: Vec<Payment> = Vec::new(&h.env);
+    big.push_back(payment(&a, 600));
+    big.push_back(payment(&b, 600));
+    assert_eq!(
+        h.client.try_batch_transfer(&h.admin, &h.asset, &big),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    assert_eq!(token_balance(&h, &a), 0);
+    assert_eq!(token_balance(&h, &b), 0);
+    assert_eq!(h.client.balance(&h.asset), 1_000);
+}

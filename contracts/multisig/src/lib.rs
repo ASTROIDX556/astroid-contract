@@ -309,8 +309,14 @@ impl MultiSigContract {
         let mut signers = Self::signers(&env)?;
         let threshold = Self::threshold(&env)?;
         let idx = Self::index_of(&signers, &signer)?;
-        let remaining_total = Self::total_weight(&signers)? - signers.get(idx).unwrap().weight;
-        if remaining_total < threshold {
+        // Subtract through the checked helper: the signer is known to be in the
+        // set, but an unchecked `u32` subtraction would abort the invocation
+        // rather than report a code if the invariant were ever broken.
+        let remaining_total = checked_sub(
+            Self::total_weight(&signers)? as i128,
+            signers.get(idx).unwrap().weight as i128,
+        )?;
+        if remaining_total < threshold as i128 {
             return Err(Error::InvalidThreshold);
         }
         signers.remove(idx);

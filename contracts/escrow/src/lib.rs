@@ -684,7 +684,7 @@ impl EscrowContract {
             ) {
                 calculate_claimable_amount(&escrow, now)?
             } else {
-                if now < escrow.deadline + escrow.grace_period {
+                if now < Self::grace_end(&escrow)? {
                     return Err(Error::TimeLockActive);
                 }
                 checked_sub(escrow.funded_amount, escrow.released_amount)?
@@ -724,7 +724,7 @@ impl EscrowContract {
             );
             Ok(claimable)
         } else if matches!(escrow.state, EscrowState::Created) {
-            if now < escrow.deadline + escrow.grace_period {
+            if now < Self::grace_end(&escrow)? {
                 return Err(Error::TimeLockActive);
             }
             escrow.state = EscrowState::Released;
@@ -802,7 +802,7 @@ impl EscrowContract {
                 return Err(Error::TimeLockActive);
             }
         }
-        if now >= escrow.deadline + escrow.grace_period {
+        if now >= Self::grace_end(&escrow)? {
             // Past the grace window the arbiter can no longer release. We do NOT
             // persist an `Expired` transition here: returning `Err` rolls back every
             // storage write, so the marker is set through the permissionless `expire`
@@ -926,7 +926,7 @@ impl EscrowContract {
         if !matches!(escrow.state, EscrowState::Funded) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
             // The grace window is still open — the arbiter may still release, so the
             // escrow cannot be marked expired yet.
             return Err(Error::InvalidState);
@@ -959,7 +959,7 @@ impl EscrowContract {
             // Before the fulfillment deadline the escrow is still live.
             return Err(Error::TimeLockActive);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
             // During the grace window the counterparty may still fulfill, so funds
             // may not yet be reclaimed via refund. Use `reclaim` after grace expiry.
             return Err(Error::GraceActive);
@@ -1003,7 +1003,7 @@ impl EscrowContract {
         ) {
             return Err(Error::InvalidState);
         }
-        if env.ledger().timestamp() < escrow.deadline + escrow.grace_period {
+        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
             return Err(Error::TimeLockActive);
         }
         Self::require_refund_window_open(&env, &escrow)?;
@@ -1084,7 +1084,7 @@ impl EscrowContract {
             return Err(Error::TimeLockActive);
         }
         // The grace window must have fully elapsed without fulfillment.
-        let grace_end = checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64;
+        let grace_end = Self::grace_end(&escrow)?;
         if env.ledger().timestamp() < grace_end {
             return Err(Error::GraceActive);
         }
@@ -1338,7 +1338,7 @@ impl EscrowContract {
             return Ok(false);
         }
         let now = env.ledger().timestamp();
-        if now < escrow.deadline + escrow.grace_period {
+        if now < Self::grace_end(&escrow)? {
             return Ok(false);
         }
         Ok(Self::require_refund_window_open(&env, &escrow).is_ok())
@@ -1398,6 +1398,17 @@ impl EscrowContract {
             .deadline
             .saturating_add(escrow.grace_period)
             .saturating_add(escrow.refund_window)
+    }
+
+    /// The instant the grace period ends, i.e. when the escrow becomes
+    /// fulfillable / refundable.
+    ///
+    /// `grace_period` is caller-supplied and unbounded, so the sum is computed
+    /// through the checked helper: with `overflow-checks` on even in release, a
+    /// raw `deadline + grace_period` would abort the invocation (and silently
+    /// wrap in Wasm) instead of reporting [`Error::Overflow`].
+    fn grace_end(escrow: &Escrow) -> Result<u64, Error> {
+        Ok(checked_add(escrow.deadline as i128, escrow.grace_period as i128)? as u64)
     }
 
     /// Refuse a reclaim once a bounded refund window has elapsed, so an

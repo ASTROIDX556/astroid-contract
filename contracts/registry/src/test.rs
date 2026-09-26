@@ -1004,3 +1004,261 @@ fn batch_extends_ttl_exactly_like_lookup() {
     client.lookup(&org, &ModuleKind::Policy);
     assert_eq!(ttl(ModuleKind::Policy), PERSISTENT_BUMP_AMOUNT);
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic error codes
+//
+// Every failure below must surface as a specific `Error` variant, never as a
+// generic code and never as a host trap, so an off-chain consumer can branch on
+// it. The three groups mirror the classes the protocol promises to keep
+// distinct: out-of-bounds / invalid input, unauthorized callers, and frozen
+// (lifecycle) refusals.
+// ---------------------------------------------------------------------------
+
+/// A registry that was registered but never `initialize`d, so the guards that
+/// read instance storage report `NotInitialized` instead of panicking.
+fn uninitialized() -> (Env, RegistryContractClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &contract_id);
+    (env, client)
+}
+
+#[test]
+fn uninitialized_registry_reports_not_initialized() {
+    let (env, client) = uninitialized();
+    let admin = Address::generate(&env);
+    let org = String::from_str(&env, "acme");
+
+    assert_eq!(client.try_get_admin(), Err(Ok(Error::NotInitialized)));
+    assert_eq!(
+        client.try_register_org(&admin, &org, &Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_deprecate_module(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_admin(&admin, &Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn out_of_bounds_lookups_report_not_found() {
+    let (env, client, _admin) = setup();
+    let ghost = String::from_str(&env, "ghost");
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&_admin, &org, &owner);
+
+    // A key that was never written must not read as a default value.
+    assert_eq!(client.try_get_org_owner(&ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        client.try_get_module_address(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_verify_owner(&ghost, &owner),
+        Err(Ok(Error::NotFound))
+    );
+    // No version has been registered, and version 0 can never be registered.
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_latest(&ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn empty_org_slug_is_rejected_as_invalid_input() {
+    let (env, client, admin) = setup();
+    // An empty string is a valid `String` but not a valid org identifier; it
+    // must be refused with `InvalidInput` rather than stored.
+    let res = client.try_register_org(
+        &admin,
+        &String::from_str(&env, ""),
+        &Address::generate(&env),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        client.try_get_org_owner(&String::from_str(&env, "")),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn unknown_org_is_not_found_for_every_owner_gated_call() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let ghost = String::from_str(&env, "ghost");
+    let new_owner = Address::generate(&env);
+
+    // A real owner naming an organization that does not exist gets `NotFound`,
+    // not a permission failure — the two are different diagnoses.
+    assert_eq!(
+        client.try_set_org_owner(&owner, &ghost, &new_owner),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_register_module(
+            &owner,
+            &ghost,
+            &ModuleKind::Wallet,
+            &Address::generate(&env)
+        ),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_remove_module(&owner, &ghost, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(client.try_freeze(&owner, &ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        client.try_unfreeze(&owner, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn unauthorized_callers_are_refused_by_the_protocol_admin() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let intruder = Address::generate(&env);
+    let intruder_org = String::from_str(&env, "evil");
+    client.register_org(&admin, &intruder_org, &intruder);
+
+    // A stranger must never seize the protocol admin, approve Wasm, or record a
+    // version, even while holding ownership of an organization of their own.
+    assert_eq!(
+        client.try_set_admin(&intruder, &intruder),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_add_approved_wasm(&intruder, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_remove_approved_wasm(&intruder, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_register_version(&intruder, &ModuleKind::Wallet, &1, &Address::generate(&env)),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The admin is unchanged.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn freeze_and_unfreeze_require_the_owner_or_admin() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let intruder = Address::generate(&env);
+
+    assert_eq!(
+        client.try_freeze(&intruder, &org),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.freeze(&owner, &org);
+    assert_eq!(
+        client.try_unfreeze(&intruder, &org),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Only the owner or the protocol admin may lift the breaker.
+    client.unfreeze(&owner, &org);
+    client.freeze(&admin, &org);
+    client.unfreeze(&admin, &org);
+}
+
+#[test]
+fn frozen_registry_refuses_every_organization_scoped_write() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.freeze(&owner, &org);
+
+    // Every write that would change routing for this org must report the single
+    // dedicated `RegistryFrozen` code — never a generic `Unauthorized`.
+    for res in [
+        client.try_register_module(&owner, &org, &ModuleKind::Policy, &Address::generate(&env)),
+        client.try_remove_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_set_org_owner(&owner, &org, &Address::generate(&env)),
+        client.try_deprecate_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_reactivate_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_register_org(&admin, &String::from_str(&env, "other"), &owner),
+        client.try_grant_role(
+            &owner,
+            &org,
+            &Address::generate(&env),
+            &RegistryRole::PolicyManager,
+        ),
+    ] {
+        assert_eq!(res, Err(Ok(Error::RegistryFrozen)));
+    }
+
+    // Routing is frozen too, so a live module reports the same dedicated code
+    // rather than being served; the legacy getter stays open for recovery.
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::RegistryFrozen))
+    );
+    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
+    client.unfreeze(&owner, &org);
+    client.register_module(&owner, &org, &ModuleKind::Policy, &Address::generate(&env));
+}
+
+#[test]
+fn deprecated_module_reports_module_deprecated_not_not_found() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    // Deprecation is protocol-admin gated; the org owner is refused.
+    assert_eq!(
+        client.try_deprecate_module(&owner, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
+
+    // The record still exists for the legacy getter, but routing must report the
+    // dedicated deprecation code so callers can distinguish it from a missing
+    // module.
+    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::ModuleDeprecated))
+    );
+    // A module that was never registered is `NotFound`, not deprecated.
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Policy),
+        Err(Ok(Error::NotFound))
+    );
+    // Reactivating restores routing and clears the code.
+    client.reactivate_module(&admin, &org, &ModuleKind::Wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn unapproved_wasm_cannot_be_removed() {
+    let (env, client, admin) = setup();
+    // Revoking a hash that was never approved is `NotFound`, not a silent no-op.
+    let res = client.try_remove_approved_wasm(&admin, &ModuleKind::Wallet, &hash(&env, 7));
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}

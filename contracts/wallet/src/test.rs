@@ -3,12 +3,13 @@ extern crate std;
 
 use crate::access::Role;
 use crate::{BatchAction, BatchReceipt, ContractCall, WalletContract, WalletContractClient};
+use astroid_shared::constants::MAX_BATCH_CALLS;
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, testutils::Events, token, Address, Env, IntoVal, String,
-    Symbol, Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, testutils::Events, token, vec, Address,
+    Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
@@ -870,6 +871,22 @@ mod batch_stubs {
     enum PolicyKey {
         /// Approved value cap for a policy envelope id.
         Cap(String),
+        /// A specific error code the stub refuses every check with.
+        DenyWith(String),
+    }
+
+    /// The policy failures this stub can be told to produce, chosen by numeric
+    /// code so a test can assert a cross-contract code survives verbatim.
+    fn denial_for(code: u32) -> Option<Error> {
+        match code {
+            22 => Some(Error::EmergencyLock),
+            24 => Some(Error::AssetNotAuthorized),
+            26 => Some(Error::PolicyAllowanceExceeded),
+            // A code from an unrelated subsystem, to prove the wallet surfaces a
+            // callee's code rather than re-interpreting it as its own.
+            30 => Some(Error::RegistryFrozen),
+            _ => None,
+        }
     }
 
     /// A configurable policy stub: every envelope id has a cap, and any check for
@@ -879,6 +896,14 @@ mod batch_stubs {
 
     #[contractimpl]
     impl TestPolicy {
+        /// Refuse every check on `policy_id` with the given error code, so a
+        /// test can pin a specific policy failure rather than a generic denial.
+        pub fn set_denial(env: Env, policy_id: String, code: u32) {
+            env.storage()
+                .persistent()
+                .set(&PolicyKey::DenyWith(policy_id), &code);
+        }
+
         /// Set the approved value cap for `policy_id`.
         pub fn set_cap(env: Env, policy_id: String, cap: i128) {
             env.storage()
@@ -898,10 +923,18 @@ mod batch_stubs {
             let cap: i128 = env
                 .storage()
                 .persistent()
-                .get(&PolicyKey::Cap(policy_id))
+                .get(&PolicyKey::Cap(policy_id.clone()))
                 .unwrap_or(0);
             if amount > cap {
                 return Err(Error::PolicyDenied);
+            }
+            if let Some(code) = env
+                .storage()
+                .persistent()
+                .get(&PolicyKey::DenyWith(policy_id))
+                .and_then(denial_for)
+            {
+                return Err(code);
             }
             Ok(())
         }
@@ -1365,4 +1398,334 @@ fn validated_batch_frozen_wallet_rejected() {
     ));
     let res = h.client.try_batch_execute_validated(&owner, &id, &actions);
     assert_eq!(res, Err(Ok(Error::WalletFrozen)));
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic error codes
+//
+// The wallet moves real value, so every refusal must carry a code that tells an
+// agent *why* the transfer did not happen. The three groups below are the
+// distinctions the protocol relies on: out-of-bounds / invalid input,
+// unauthorized callers, and exhausted balances.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn initialize_twice_is_already_initialized() {
+    let h = setup();
+    let other = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_initialize(&other),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+    // The recorded admin is untouched by the refused call.
+    assert_eq!(h.client.get_guardian(), h.admin);
+}
+
+#[test]
+fn uninitialized_wallet_reports_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, WalletContract);
+    let client = WalletContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    assert_eq!(client.try_get_guardian(), Err(Ok(Error::NotInitialized)));
+    assert_eq!(
+        client.try_create_wallet(&owner),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_budget(&admin, &Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn out_of_bounds_wallet_ids_report_not_found() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let stranger = Address::generate(&h.env);
+    let ghost = id + 1_000;
+
+    // The value-moving paths must report the missing wallet, not fall through
+    // to a balance check and report the wrong reason.
+    assert_eq!(
+        h.client.try_deposit(&ghost, &owner, &h.token, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client
+            .try_transfer(&owner, &ghost, &stranger, &h.token, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_withdraw(&owner, &ghost, &h.token, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_unfreeze(&owner, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_unpause(&owner, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_has_role(&ghost, &owner, &Role::Agent),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn non_positive_amounts_are_invalid_amount_everywhere() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let to = Address::generate(&h.env);
+
+    // `deposit` and `withdraw` carry the same guard as `transfer`; each must
+    // report `InvalidAmount` rather than a generic input error.
+    for amount in [0, -1] {
+        assert_eq!(
+            h.client.try_deposit(&id, &owner, &h.token, &amount),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            h.client.try_transfer(&owner, &id, &to, &h.token, &amount),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            h.client.try_withdraw(&owner, &id, &h.token, &amount),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+    // Nothing moved.
+    assert_eq!(h.client.balance(&id, &h.token), 0);
+}
+
+#[test]
+fn exhausted_balance_reports_insufficient_funds_on_both_outbound_paths() {
+    let h = setup();
+    let (owner, id) = funded_wallet(&h, 100);
+    let to = Address::generate(&h.env);
+
+    // `withdraw` shares the `debit` guard with `transfer`, and both must name
+    // the exhaustion explicitly.
+    assert_eq!(
+        h.client.try_transfer(&owner, &id, &to, &h.token, &101),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    assert_eq!(
+        h.client.try_withdraw(&owner, &id, &h.token, &101),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    // The balance is untouched and the recipient received nothing.
+    assert_eq!(h.client.balance(&id, &h.token), 100);
+    assert_eq!(token_balance(&h, &to), 0);
+
+    // Draining to exactly zero is allowed; only the next unit fails.
+    h.client.withdraw(&owner, &id, &h.token, &100);
+    assert_eq!(h.client.balance(&id, &h.token), 0);
+    assert_eq!(
+        h.client.try_withdraw(&owner, &id, &h.token, &1),
+        Err(Ok(Error::InsufficientFunds))
+    );
+}
+
+#[test]
+fn a_callees_specific_policy_code_survives_every_outbound_path() {
+    let h = setup();
+    let policy = h.env.register_contract(None, TestPolicy);
+    h.client.set_policy(&h.admin, &policy);
+    let (id, owner, agent) = funded_agent_wallet(&h, 5_000);
+    let stub = TestPolicyClient::new(&h.env, &policy);
+    // A cap above every amount below, so the specific denial is what fires.
+    stub.set_cap(&String::from_str(&h.env, "active"), &1_000);
+
+    // Each of these is a different diagnosis an agent may have to act on. If
+    // the wallet collapsed them into one generic policy error, the distinctions
+    // the policy layer makes would be lost on the way out.
+    for (code, expected) in [
+        (22, Error::EmergencyLock),
+        (24, Error::AssetNotAuthorized),
+        (26, Error::PolicyAllowanceExceeded),
+        (30, Error::RegistryFrozen),
+    ] {
+        stub.set_denial(&String::from_str(&h.env, "active"), &code);
+        assert_eq!(
+            h.client
+                .try_transfer(&agent, &id, &Address::generate(&h.env), &h.token, &1),
+            Err(Ok(expected))
+        );
+        assert_eq!(
+            h.client.try_withdraw(&owner, &id, &h.token, &1),
+            Err(Ok(expected))
+        );
+
+        let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+        actions.push_back(validated_action(
+            &h.env,
+            &h.token,
+            &h.contract_id,
+            &Address::generate(&h.env),
+            1,
+            "active",
+            "",
+        ));
+        assert_eq!(
+            h.client.try_batch_execute_validated(&agent, &id, &actions),
+            Err(Ok(expected))
+        );
+    }
+    // Every refusal above was a veto, not a movement.
+    assert_eq!(h.client.balance(&id, &h.token), 5_000);
+}
+
+#[test]
+fn unauthorized_callers_are_refused_on_lifecycle_and_config() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let stranger = Address::generate(&h.env);
+
+    // The bypass flag disables the policy gate, so only the protocol admin may
+    // ever set it.
+    assert_eq!(
+        h.client.try_set_policy_bypass(&stranger, &id, &true),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Only the protocol admin may repoint the batch budget gate.
+    assert_eq!(
+        h.client
+            .try_set_budget(&stranger, &Address::generate(&h.env)),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Lifecycle transitions away from a frozen/paused wallet stay with the owner.
+    h.client.freeze(&owner, &id);
+    assert_eq!(
+        h.client.try_unfreeze(&stranger, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_unpause(&stranger, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_archive(&stranger, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn redundant_state_transitions_report_invalid_state() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    // Unfreezing an active wallet and unpausing an active wallet are distinct
+    // diagnoses from a permission failure, and neither is a silent no-op.
+    assert_eq!(
+        h.client.try_unfreeze(&owner, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_unpause(&owner, &id),
+        Err(Ok(Error::InvalidState))
+    );
+
+    h.client.pause(&owner, &id);
+    assert_eq!(
+        h.client.try_pause(&owner, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    h.client.unpause(&owner, &id);
+    // Archiving twice reports the terminal state rather than succeeding.
+    h.client.archive(&owner, &id);
+    assert_eq!(
+        h.client.try_archive(&owner, &id),
+        Err(Ok(Error::WalletArchived))
+    );
+    assert_eq!(
+        h.client.try_freeze(&owner, &id),
+        Err(Ok(Error::WalletArchived))
+    );
+}
+
+/// A `transfer` sub-call from the wallet to `to`, used to build batch actions.
+fn transfer_call(h: &Harness, to: &Address, amount: i128) -> ContractCall {
+    ContractCall {
+        contract_addr: h.token.clone(),
+        fn_name: symbol_short!("transfer"),
+        args: vec![
+            &h.env,
+            h.client.address.clone().into_val(&h.env),
+            to.clone().into_val(&h.env),
+            amount.into_val(&h.env),
+        ],
+    }
+}
+
+/// A single batch action moving `amount` of the harness token to `to`, with no
+/// policy or budget envelope attached.
+fn action(h: &Harness, to: &Address, amount: i128) -> BatchAction {
+    BatchAction {
+        call: transfer_call(h, to, amount),
+        policy_id: String::from_str(&h.env, ""),
+        budget_id: String::from_str(&h.env, ""),
+        asset: h.token.clone(),
+        recipient: to.clone(),
+        amount,
+    }
+}
+
+#[test]
+fn oversized_batch_is_rejected_before_any_action_runs() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 100);
+    h.client.deposit(&id, &owner, &h.token, &100);
+    let to = Address::generate(&h.env);
+
+    // One action past the cap is refused with the dedicated input code...
+    let mut over: Vec<BatchAction> = Vec::new(&h.env);
+    for _ in 0..=MAX_BATCH_CALLS {
+        over.push_back(action(&h, &to, 1));
+    }
+    assert_eq!(
+        h.client.try_batch_execute_validated(&owner, &id, &over),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(h.client.balance(&id, &h.token), 100);
+    assert_eq!(token_balance(&h, &to), 0);
+
+    // ...while exactly at the cap the batch is accepted, which pins the bound.
+    let mut at_cap: Vec<BatchAction> = Vec::new(&h.env);
+    for _ in 0..MAX_BATCH_CALLS {
+        at_cap.push_back(action(&h, &to, 1));
+    }
+    let receipt = h.client.batch_execute_validated(&owner, &id, &at_cap);
+    assert_eq!(receipt.executed, MAX_BATCH_CALLS);
+    assert_eq!(receipt.total_amount, MAX_BATCH_CALLS as i128);
+    assert_eq!(token_balance(&h, &to), MAX_BATCH_CALLS as i128);
+}
+
+#[test]
+fn batch_action_amounts_must_be_positive() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let to = Address::generate(&h.env);
+
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(action(&h, &to, 1));
+    actions.push_back(action(&h, &to, 0));
+    assert_eq!(
+        h.client.try_batch_execute_validated(&owner, &id, &actions),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // The valid first action was rolled back with the invalid second one.
+    assert_eq!(token_balance(&h, &to), 0);
 }

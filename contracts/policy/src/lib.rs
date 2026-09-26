@@ -172,7 +172,11 @@ fn evaluate_node(
             Ok(false)
         }
         RuleOp::Not => {
-            if node.children_start + 1 != node.children_end {
+            // Widen before adding: a caller-supplied node may carry
+            // `children_start == u32::MAX`, and `overflow-checks` is on even in
+            // release, so the unchecked add would abort the whole invocation
+            // instead of reporting the malformed node.
+            if node.children_start as u64 + 1 != node.children_end as u64 {
                 return Err(Error::InvalidInput);
             }
             let result = evaluate_node(env, tree, node.children_start, payload, remaining)?;
@@ -806,7 +810,7 @@ impl PolicyContract {
     /// (0 = the allowance would be fully consumed, which is permitted). An
     /// unset allowance is unrestricted. Returns
     /// [`Error::PolicyAllowanceExceeded`] when the spend would breach the
-    /// allowance.
+    /// allowance, or [`Error::AllowanceExpired`] when the envelope has lapsed.
     pub fn check_allowance(
         env: Env,
         policy_id: String,
@@ -821,7 +825,11 @@ impl PolicyContract {
         }
         if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
             events_policy_violation(&env, &policy_id, "allowance_expired");
-            return Err(Error::PolicyDenied);
+            // A lapsed envelope is not a rule denial: the operator's remedy is
+            // to renew it, not to loosen the policy. `Error::AllowanceExpired`
+            // keeps that distinct from `PolicyDenied` and from
+            // `PolicyAllowanceExceeded`.
+            return Err(Error::AllowanceExpired);
         }
         let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
         if amount > headroom_after_spend {
@@ -832,8 +840,9 @@ impl PolicyContract {
     }
 
     /// Atomically consume `amount` against the `(policy_id, asset)` allowance.
-    /// Returns `Ok(())` when the allowance was decremented, or
-    /// [`Error::PolicyAllowanceExceeded`] when it would be breached.
+    /// Returns `Ok(())` when the allowance was decremented,
+    /// [`Error::PolicyAllowanceExceeded`] when it would be breached, or
+    /// [`Error::AllowanceExpired`] when the envelope has lapsed.
     pub fn update_allowance(
         env: Env,
         caller: Address,
@@ -849,7 +858,7 @@ impl PolicyContract {
             return Ok(());
         }
         if allowance.expires_at != 0 && env.ledger().timestamp() >= allowance.expires_at {
-            return Err(Error::PolicyDenied);
+            return Err(Error::AllowanceExpired);
         }
         let headroom_after_spend = checked_sub(allowance.limit, allowance.spent)?;
         if amount > headroom_after_spend {

@@ -15,4 +15,6 @@
 #[cfg(test)]
 pub mod e2e_agent_spending;
 #[cfg(test)]
+pub mod error_codes;
+#[cfg(test)]
 pub mod registry_batch;

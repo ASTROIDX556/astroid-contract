@@ -1095,3 +1095,229 @@ fn per_asset_spend_past_max_returns_overflow() {
     // The spend was not recorded.
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic error codes
+//
+// A budget is a spending envelope, so the code has to distinguish "this asset
+// was never authorized on this envelope" from "the envelope is out of room"
+// from "the envelope is frozen" from "the envelope has lapsed". Collapsing any
+// two of those would leave a caller unable to tell a fixable configuration
+// problem from a genuinely exhausted allocation.
+// ---------------------------------------------------------------------------
+
+/// A budget owned by the harness, with `limit` and no period.
+fn budget(h: &Harness, name: &str, limit: i128) -> String {
+    let budget_id = id(&h.env, name);
+    h.client
+        .allocate(&h.owner, &budget_id, &limit, &Period::None, &false, &0);
+    budget_id
+}
+
+#[test]
+fn unknown_budget_ids_are_not_found() {
+    let h = setup();
+    let ghost = id(&h.env, "ghost");
+    let token = Address::generate(&h.env);
+
+    assert_eq!(h.client.try_get(&ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(h.client.try_remaining(&ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        h.client.try_reset(&h.owner, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &ghost, &token, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn empty_budget_id_is_invalid_input() {
+    let h = setup();
+    let blank = String::from_str(&h.env, "");
+    assert_eq!(
+        h.client
+            .try_allocate(&h.owner, &blank, &100, &Period::None, &false, &0),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn negative_limits_are_invalid_amounts() {
+    let h = setup();
+    // `allocate` and `set_budget_limit` share the non-negative guard, and a
+    // negative ceiling is a different mistake from a malformed id.
+    assert_eq!(
+        h.client
+            .try_allocate(&h.owner, &id(&h.env, "eng"), &-1, &Period::None, &false, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    let b = budget(&h, "ops", 100);
+    let token = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_set_budget_limit(&h.owner, &b, &token, &-1, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn deficit_without_a_recurring_period_is_invalid_input() {
+    let h = setup();
+    // A deficit has nothing to carry into a one-shot envelope, so this is a
+    // configuration error rather than an allocation that happens to be odd.
+    assert_eq!(
+        h.client.try_allocate_with_deficit(
+            &h.owner,
+            &id(&h.env, "eng"),
+            &1_000,
+            &Period::None,
+            &false,
+            &true,
+            &0
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn duplicate_allocation_is_already_exists() {
+    let h = setup();
+    let b = budget(&h, "eng", 100);
+    // Reusing an id must not silently reset the envelope.
+    assert_eq!(
+        h.client
+            .try_allocate(&h.owner, &b, &999, &Period::None, &false, &0),
+        Err(Ok(Error::AlreadyExists))
+    );
+    assert_eq!(h.client.get(&b).limit, 100);
+}
+
+#[test]
+fn spend_on_an_unauthorized_asset_is_not_authorized() {
+    let h = setup();
+    let b = budget(&h, "eng", 1_000);
+    let approved = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &b, &approved, &1_000, &0);
+
+    // The envelope is funded and active; this asset simply is not on it. That
+    // is a wiring problem, not an exhausted budget.
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &b, &stranger, &1),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    assert_eq!(h.client.remaining(&b), 1_000);
+}
+
+#[test]
+fn exhausted_envelope_reports_budget_exceeded() {
+    let h = setup();
+    let b = budget(&h, "eng", 1_000);
+    let token = Address::generate(&h.env);
+    h.client.set_budget_limit(&h.owner, &b, &token, &1_000, &0);
+
+    h.client
+        .check_and_record_spend(&h.owner, &b, &token, &1_000);
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &b, &token, &1),
+        Err(Ok(Error::BudgetExceeded))
+    );
+    // The refusal did not record the overspend.
+    assert_eq!(h.client.asset_remaining(&b, &token), 0);
+
+    // Exhausting the envelope says nothing about the owning budget's own total.
+    let other = Address::generate(&h.env);
+    h.client.set_budget_limit(&h.owner, &b, &other, &100, &0);
+    assert_eq!(h.client.asset_remaining(&b, &other), 100);
+}
+
+#[test]
+fn frozen_archived_and_lapsed_envelopes_have_distinct_codes() {
+    let h = setup();
+    let token = Address::generate(&h.env);
+
+    let frozen = budget(&h, "frozen", 1_000);
+    h.client
+        .set_budget_limit(&h.owner, &frozen, &token, &1_000, &0);
+    h.client.freeze(&h.owner, &frozen);
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &frozen, &token, &1),
+        Err(Ok(Error::BudgetFrozen))
+    );
+    // Unfreezing a frozen envelope is a real transition; unfreezing an active
+    // one is not, and must say so.
+    h.client.unfreeze(&h.owner, &frozen);
+    assert_eq!(
+        h.client.try_unfreeze(&h.owner, &frozen),
+        Err(Ok(Error::InvalidState))
+    );
+
+    let archived = budget(&h, "archived", 1_000);
+    h.client
+        .set_budget_limit(&h.owner, &archived, &token, &1_000, &0);
+    h.client.freeze(&h.owner, &archived);
+    h.client.archive(&h.owner, &archived);
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &archived, &token, &1),
+        Err(Ok(Error::BudgetArchived))
+    );
+    // Re-freezing an archived envelope reports the terminal state.
+    assert_eq!(
+        h.client.try_freeze(&h.owner, &archived),
+        Err(Ok(Error::BudgetArchived))
+    );
+
+    // A lapsed envelope reports expiry, not exhaustion: the remaining balance
+    // was never spendable in the first place, and reviving it is the fix.
+    let lapsed = id(&h.env, "lapsed");
+    h.client
+        .allocate(&h.owner, &lapsed, &1_000, &Period::None, &false, &1_500);
+    h.env.ledger().set_timestamp(2_000);
+    assert_eq!(
+        h.client.try_reset(&h.owner, &lapsed),
+        Err(Ok(Error::BudgetExpired))
+    );
+    // Clearing a lapsed envelope's history is what `reset` is for, so the
+    // expiry guard has to fire before it writes anything.
+    assert_eq!(h.client.get(&lapsed).spent, 0);
+}
+
+#[test]
+fn spending_someone_elses_budget_is_unauthorized() {
+    let h = setup();
+    let b = budget(&h, "eng", 1_000);
+    let token = Address::generate(&h.env);
+    h.client.set_budget_limit(&h.owner, &b, &token, &1_000, &0);
+    let stranger = Address::generate(&h.env);
+
+    // An id that exists but is not the caller's is a permission failure, not a
+    // missing one — the distinction tells an agent to stop, not to re-provision.
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&stranger, &b, &token, &1),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_set_budget_limit(&stranger, &b, &token, &1, &0),
+        Err(Ok(Error::Unauthorized))
+    );
+    let dest = budget(&h, "dest", 100);
+    assert_eq!(
+        h.client.try_transfer_allocation(&stranger, &b, &dest, &1),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Moving between the caller's own envelopes is a different diagnosis.
+    assert_eq!(
+        h.client.try_transfer_allocation(&h.owner, &b, &b, &1),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(h.client.remaining(&b), 1_000);
+}

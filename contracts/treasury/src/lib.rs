@@ -476,7 +476,7 @@ impl TreasuryContract {
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         // Inbound routing is validated too: an unapproved token contract is
         // never invoked, not even to pull funds in.
@@ -617,7 +617,7 @@ impl TreasuryContract {
         require_positive_amount(amount)?;
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
@@ -729,7 +729,7 @@ impl TreasuryContract {
         }
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         if t.admin != caller {
             return Err(Error::Unauthorized);
@@ -803,14 +803,18 @@ impl TreasuryContract {
     // --- views ---
 
     /// Whether the emergency circuit breaker is currently engaged.
+    ///
+    /// An uninitialized treasury has no breaker to engage, so this reports
+    /// `false` rather than failing. Use [`Self::get`] when the caller needs to
+    /// distinguish "not paused" from "not initialized".
     pub fn is_paused(env: Env) -> bool {
-        Self::load(&env).paused
+        Self::load(&env).map(|t| t.paused).unwrap_or(false)
     }
 
     /// The address currently authorized to pause / unpause this treasury
     /// (alongside the multisig).
-    pub fn guardian(env: Env) -> Address {
-        Self::load(&env).guardian
+    pub fn guardian(env: Env) -> Result<Address, Error> {
+        Ok(Self::load(&env)?.guardian)
     }
 
     /// Initialize a milestone-based disbursement.
@@ -922,7 +926,9 @@ impl TreasuryContract {
         Ok(())
     }
 
-    pub fn get(env: Env) -> Treasury {
+    /// The full treasury record. [`Error::NotInitialized`] before
+    /// [`Self::initialize`].
+    pub fn get(env: Env) -> Result<Treasury, Error> {
         Self::load(&env)
     }
 
@@ -967,11 +973,16 @@ impl TreasuryContract {
 
     // --- internals ---
 
-    fn load(env: &Env) -> Treasury {
+    /// Read the treasury record.
+    ///
+    /// Returns [`Error::NotInitialized`] when [`Self::initialize`] has not run,
+    /// so every entry point reports a deterministic code instead of trapping
+    /// the whole invocation with an opaque host error.
+    fn load(env: &Env) -> Result<Treasury, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Treasury)
-            .expect("treasury not initialized")
+            .ok_or(Error::NotInitialized)
     }
 
     fn store(env: &Env, t: &Treasury) {
@@ -982,7 +993,7 @@ impl TreasuryContract {
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         if t.admin != *caller {
             return Err(Error::Unauthorized);
         }
@@ -1050,7 +1061,7 @@ impl TreasuryContract {
     }
 
     fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         match &t.multisig {
             Some(multisig) if multisig == caller => {
                 caller.require_auth();
@@ -1064,7 +1075,7 @@ impl TreasuryContract {
     /// recorded guardian or the organization's multisig, verified against
     /// instance storage before `require_auth` is demanded.
     fn require_guardian(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         let is_multisig = matches!(&t.multisig, Some(multisig) if multisig == caller);
         if t.guardian != *caller && !is_multisig {
             return Err(Error::Unauthorized);
@@ -1080,7 +1091,7 @@ impl TreasuryContract {
     /// it, and is never called on inbound paths: deposits must keep working
     /// during a pause so recovery funding can arrive.
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::load(env).paused {
+        if Self::load(env)?.paused {
             return Err(Error::TreasuryPaused);
         }
         Ok(())

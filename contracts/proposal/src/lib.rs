@@ -473,8 +473,13 @@ impl ProposalContract {
         ) {
             return Err(Error::InvalidProposalState);
         }
+        // `grace_period` is caller-supplied and unbounded, so the window is
+        // summed through the checked helper: with `overflow-checks` on even in
+        // release, a raw `created_at + grace_period` would abort the invocation
+        // (and silently wrap in Wasm) instead of reporting `Error::Overflow`.
         if proposal.grace_period != 0
-            && env.ledger().timestamp() > proposal.created_at + proposal.grace_period
+            && env.ledger().timestamp()
+                > checked_add(proposal.created_at as i128, proposal.grace_period as i128)? as u64
         {
             return Err(Error::CancellationWindowClosed);
         }

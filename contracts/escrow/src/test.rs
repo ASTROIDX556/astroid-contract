@@ -8,6 +8,7 @@ use soroban_sdk::{
     token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
+use astroid_shared::constants::{MAX_ESCROW_ASSETS, MAX_SIGNERS};
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 
@@ -1720,4 +1721,527 @@ fn create_rejects_non_positive_amounts_and_non_future_expiry() {
     );
     assert_eq!(balances(&h), (5_000, 0, 0));
     assert_eq!(h.client.try_get(&1), Err(Ok(Error::NotFound)));
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic error codes
+//
+// Escrow holds a sender's funds against a deadline, so the code has to separate
+// "you are not the party entitled to do this" from "it is too early" from "that
+// window has closed" from "there is nothing left". Several of those look alike
+// from the outside and call for opposite responses.
+// ---------------------------------------------------------------------------
+
+/// An override signer key, distinct for each `byte`.
+fn signer(env: &Env, byte: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[byte; 32])
+}
+
+#[test]
+fn unknown_escrow_ids_are_not_found() {
+    let h = setup(1_000, 1_000);
+    let ghost = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &vec![
+            &h.env,
+            AssetAmount {
+                asset: h.asset_a.clone(),
+                amount: 100,
+            },
+        ],
+        &(START + 10_000),
+        &GRACE,
+        &String::from_str(&h.env, ""),
+        &Vec::new(&h.env),
+        &0,
+    ) + 1_000;
+
+    assert_eq!(h.client.try_get(&ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        h.client.try_fund(&h.sender, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_reclaim(&h.sender, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &ghost, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn escrow_creation_rejects_malformed_configuration() {
+    let h = setup(1_000, 1_000);
+    let memo = String::from_str(&h.env, "");
+    let none: Vec<BytesN<32>> = Vec::new(&h.env);
+    let one: Vec<AssetAmount> = vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 100,
+        },
+    ];
+
+    // Paying yourself is a configuration mistake, not a permission failure.
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.sender,
+            &h.arbiter,
+            &one,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &none,
+            &0
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    // A deadline already in the past can never be met.
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &one,
+            &START,
+            &GRACE,
+            &memo,
+            &none,
+            &0
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    // An escrow with nothing in it, or with nothing to release, is meaningless.
+    let empty: Vec<AssetAmount> = Vec::new(&h.env);
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &empty,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &none,
+            &0
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    // A non-positive leg is a malformed amount.
+    let zero: Vec<AssetAmount> = vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 0,
+        },
+    ];
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &zero,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &none,
+            &0
+        ),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // The same asset listed twice would double-count the funding.
+    let dup: Vec<AssetAmount> = vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 100,
+        },
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 50,
+        },
+    ];
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &dup,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &none,
+            &0
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn override_signer_sets_have_their_own_codes() {
+    let h = setup(1_000, 1_000);
+    let memo = String::from_str(&h.env, "");
+    let one: Vec<AssetAmount> = vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 100,
+        },
+    ];
+    let none: Vec<BytesN<32>> = Vec::new(&h.env);
+    let three: Vec<BytesN<32>> = vec![
+        &h.env,
+        signer(&h.env, 1),
+        signer(&h.env, 2),
+        signer(&h.env, 3),
+    ];
+
+    // A threshold with no signers is contradictory...
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &one,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &none,
+            &2
+        ),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    // ...as is a threshold no signer set can ever reach.
+    for threshold in [0, 4] {
+        assert_eq!(
+            h.client.try_create(
+                &h.sender,
+                &h.recipient,
+                &h.arbiter,
+                &one,
+                &(START + 10_000),
+                &GRACE,
+                &memo,
+                &three,
+                &threshold
+            ),
+            Err(Ok(Error::InvalidThreshold))
+        );
+    }
+    // Repeated signers are malformed input: one key must not be able to satisfy
+    // a threshold of several, but that is not a threshold-range mistake either.
+    let dup: Vec<BytesN<32>> = vec![&h.env, signer(&h.env, 1), signer(&h.env, 1)];
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &one,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &dup,
+            &2
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    // An asset list past the cap is its own diagnosis too.
+    let mut many_assets: Vec<AssetAmount> = Vec::new(&h.env);
+    for i in 0..=MAX_ESCROW_ASSETS {
+        many_assets.push_back(AssetAmount {
+            asset: Address::generate(&h.env),
+            amount: 1 + i as i128,
+        });
+    }
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &many_assets,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &none,
+            &0
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // The cap is its own diagnosis, not a threshold problem.
+    let mut many: Vec<BytesN<32>> = Vec::new(&h.env);
+    for i in 0..=MAX_SIGNERS {
+        many.push_back(BytesN::from_array(&h.env, &[i as u8 + 1; 32]));
+    }
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &one,
+            &(START + 10_000),
+            &GRACE,
+            &memo,
+            &many,
+            &1
+        ),
+        Err(Ok(Error::TooManySigners))
+    );
+}
+
+#[test]
+fn only_the_named_parties_may_act_on_an_escrow() {
+    let h = setup(1_000, 1_000);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &vec![
+            &h.env,
+            AssetAmount {
+                asset: h.asset_a.clone(),
+                amount: 100,
+            },
+        ],
+        &(START + 10_000),
+        &GRACE,
+        &String::from_str(&h.env, ""),
+        &Vec::new(&h.env),
+        &0,
+    );
+    // `create` funds in the same call, so a second `fund` finds nothing to do.
+    assert_eq!(
+        h.client.try_fund(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // A stranger is neither the recipient, the sender, nor the arbiter.
+    assert_eq!(
+        h.client.try_withdraw(&stranger, &id, &1),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_claim(&stranger, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_reclaim(&stranger, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_release(&stranger, &id, &100),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The escrowed value is untouched by any of it.
+    assert_eq!(h.client.get(&id).released_amount, 0);
+}
+
+#[test]
+fn too_early_is_distinct_from_wrong_party() {
+    let h = setup(1_000, 1_000);
+    let assets = vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 100,
+        },
+    ];
+    // A cliff-locked escrow has a real time lock to be too early for.
+    let locked = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &assets,
+        &(START + 10_000),
+        &String::from_str(&h.env, ""),
+    );
+    // A plain escrow's arbiter may release at once, but a sender may not
+    // reclaim until the deadline has passed.
+    let plain = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &assets,
+        &(START + 10_000),
+        &GRACE,
+        &String::from_str(&h.env, ""),
+        &Vec::new(&h.env),
+        &0,
+    );
+
+    // Right party, wrong moment: a time lock, not a permission failure.
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &locked),
+        Err(Ok(Error::TimeLockActive))
+    );
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &locked, &100),
+        Err(Ok(Error::TimeLockActive))
+    );
+    assert_eq!(
+        h.client.try_reclaim(&h.sender, &plain),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // Past the deadline but inside the grace period: the funds are unreachable
+    // to everyone, and that is its own code.
+    h.env.ledger().set_timestamp(START + 10_001);
+    assert_eq!(
+        h.client.try_reclaim(&h.sender, &plain),
+        Err(Ok(Error::GraceActive))
+    );
+    // The arbiter can still release inside the grace window.
+    h.client.release(&h.arbiter, &plain, &100);
+
+    // Once the grace window closes, the arbiter's right is gone and the sender's
+    // refund is the only route left. That is a closed window, not a time lock.
+    let late = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &assets,
+        &(START + 30_000),
+        &GRACE,
+        &String::from_str(&h.env, ""),
+        &Vec::new(&h.env),
+        &0,
+    );
+    h.env.ledger().set_timestamp(START + 30_000 + GRACE);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &late, &100),
+        Err(Ok(Error::EscrowExpired))
+    );
+    h.client.reclaim(&h.sender, &late);
+}
+
+#[test]
+fn withdrawal_beyond_the_vested_amount_reports_insufficient_funds() {
+    let h = setup(1_000, 1_000);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &vec![
+            &h.env,
+            AssetAmount {
+                asset: h.asset_a.clone(),
+                amount: 100,
+            },
+        ],
+        &(START + 10_000),
+        &String::from_str(&h.env, ""),
+    );
+    h.env.ledger().set_timestamp(START + 10_000);
+
+    // The whole escrow has vested, so one unit past it is exhaustion.
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &101),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    assert_eq!(h.client.get(&id).released_amount, 0);
+
+    // A partial withdrawal leaves the rest claimable, and the exhausted half is
+    // reported against what is left rather than the original total.
+    h.client.withdraw(&h.recipient, &id, &60);
+    assert_eq!(h.client.get(&id).released_amount, 60);
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &41),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    // A zero-value withdrawal is malformed, not an exhausted balance.
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Draining the remainder closes the escrow, after which the state — not the
+    // balance — is what refuses further withdrawals.
+    h.client.withdraw(&h.recipient, &id, &40);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &1),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+}
+
+#[test]
+fn reclaim_after_the_grace_window_returns_the_funds_once() {
+    let h = setup(1_000, 1_000);
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &vec![
+            &h.env,
+            AssetAmount {
+                asset: h.asset_a.clone(),
+                amount: 100,
+            },
+        ],
+        &(START + 10_000),
+        &GRACE,
+        &String::from_str(&h.env, ""),
+        &Vec::new(&h.env),
+        &0,
+    );
+    let sac = token::TokenClient::new(&h.env, &h.asset_a);
+    let before = sac.balance(&h.sender);
+    h.env.ledger().set_timestamp(START + 10_000 + GRACE);
+
+    h.client.reclaim(&h.sender, &id);
+    assert_eq!(sac.balance(&h.sender), before + 100);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    // The window has closed: a second reclaim is a state problem, not a grant.
+    assert_eq!(
+        h.client.try_reclaim(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    // And the recipient cannot now claim what the sender recovered.
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+}
+#[test]
+fn dbg_escrow() {
+    let h = setup(1_000, 1_000);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &vec![
+            &h.env,
+            AssetAmount {
+                asset: h.asset_a.clone(),
+                amount: 100,
+            },
+        ],
+        &(START + 10_000),
+        &String::from_str(&h.env, ""),
+    );
+    std::println!("id={} esc={:?}", id, h.client.get(&id));
+    h.env.ledger().set_timestamp(START + 10_000);
+    std::println!(
+        "now={} res={:?}",
+        h.env.ledger().timestamp(),
+        h.client.try_withdraw(&h.recipient, &id, &101)
+    );
+    std::println!(
+        "calc={:?}",
+        crate::calculate_claimable_amount(&h.client.get(&id), START + 10_000)
+    );
 }
