@@ -1800,3 +1800,117 @@ fn only_the_owner_can_manage_the_blacklist() {
         Err(Ok(Error::Unauthorized))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #247: Enhanced Composite Rule Evaluation Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn composite_multi_condition_rules_evaluation_and_denial_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let allowed_recip = Address::generate(&env);
+    let blocked_recip = Address::generate(&env);
+
+    // Tree layout: AND(MaxAmount(500), AllowedRecipient(allowed_recip), AllowedAsset(asset))
+    // Root [0] AND (children 1..4)
+    // [1] MaxAmount(500)
+    // [2] AllowedRecipient(allowed_recip)
+    // [3] AllowedAsset(asset)
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 4,
+    });
+    tree.push_back(leaf_amount(RuleOp::MaxAmount, 500, &env));
+    tree.push_back(leaf_addr(
+        RuleOp::AllowedRecipient,
+        allowed_recip.clone(),
+        &env,
+    ));
+    tree.push_back(leaf_addr(RuleOp::AllowedAsset, asset.clone(), &env));
+
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    // 1. Passing transaction payload
+    let valid_payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: allowed_recip.clone(),
+        amount: 400,
+    };
+    assert_eq!(
+        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &valid_payload),
+        Ok(Ok(true))
+    );
+    assert!(p
+        .try_check_transfer(&String::from_str(&env, "cr"), &asset, &allowed_recip, &400)
+        .is_ok());
+
+    // 2. Failing transaction payload (amount > 500)
+    let invalid_amount_payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: allowed_recip.clone(),
+        amount: 600,
+    };
+    assert_eq!(
+        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &invalid_amount_payload),
+        Ok(Ok(false))
+    );
+    let res = p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &allowed_recip, &600);
+    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
+    assert_event(&env, "PolicyViolation");
+
+    // 3. Failing transaction payload (wrong recipient)
+    let invalid_recip_payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: blocked_recip.clone(),
+        amount: 200,
+    };
+    assert_eq!(
+        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &invalid_recip_payload),
+        Ok(Ok(false))
+    );
+    let res2 = p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &blocked_recip, &200);
+    assert_eq!(res2, Err(Ok(Error::PolicyDenied)));
+}
+
+#[test]
+fn composite_fails_closed_on_invalid_tree_structure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Out-of-bounds children indices fail closed
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 5,
+        children_end: 10,
+    });
+    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
+
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip.clone(),
+        amount: 100,
+    };
+    assert_eq!(
+        p.try_evaluate_composite_rule(&String::from_str(&env, "cr"), &payload),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::InvalidInput))
+    );
+}
