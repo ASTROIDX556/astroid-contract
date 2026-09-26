@@ -429,15 +429,19 @@ impl RegistryContract {
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
         let vkey = DataKey::Version(kind, version);
-        env.storage().persistent().set(&vkey, &address);
-        Self::bump(&env, &vkey);
+        ensure!(
+            !env.storage().persistent().has(&vkey),
+            Error::AlreadyExists
+        );
 
         let lkey = DataKey::LatestVersion(kind);
         let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
-        if version > latest {
-            env.storage().persistent().set(&lkey, &version);
-            Self::bump(&env, &lkey);
-        }
+        ensure!(version > latest, Error::InvalidInput);
+
+        env.storage().persistent().set(&vkey, &address);
+        Self::bump(&env, &vkey);
+        env.storage().persistent().set(&lkey, &version);
+        Self::bump(&env, &lkey);
         env.events().publish(
             (
                 symbol_short!("version"),
