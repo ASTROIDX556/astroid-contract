@@ -38,6 +38,12 @@ pub const GOVERNANCE_GRACE_PERIOD: u64 = SECONDS_PER_WEEK;
 /// Upper bound on how many eligible approvers a proposal may declare.
 pub const MAX_APPROVERS: u32 = 32;
 
+/// Share (as a percentage) of a proposal's approver allow-list that must have
+/// voted before its tally may execute — the protocol's configured quorum.
+/// Applied with integer scaling only (`ceil(approvers * percent / 100)`), so
+/// no floating-point arithmetic ever reaches a contract.
+pub const PROPOSAL_QUORUM_PERCENT: u32 = 50;
+
 /// Upper bound on how many prerequisite proposals one proposal may depend on.
 /// Every prerequisite is read once when the dependent proposal executes, so
 /// this caps the storage reads a single execution can incur.

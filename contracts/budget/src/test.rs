@@ -416,7 +416,7 @@ fn assert_event(env: &Env, variant: &str) {
         .events()
         .all()
         .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(&want));
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
@@ -488,6 +488,70 @@ fn windows_do_not_drift_when_transitions_land_mid_period() {
     assert_eq!(
         h.client.get(&id(&h.env, "eng")).window_start,
         1_000 + 2 * DAY
+    );
+}
+
+#[test]
+fn consecutive_rollovers_do_not_double_count_credit() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+
+    // Week 1 goes by entirely unspent, so the whole base allowance carries as
+    // credit and the week-2 capacity is 1_000 + 1_000 = 2_000.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_000);
+
+    // Spend that entire rolled-over capacity during week 2.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &2_000), 0);
+
+    // Nothing is left to carry, so week 3 must fall back to the base limit.
+    // Re-adding the prior credit on the transition would leave a phantom 1_000
+    // in `rollover_credit` and hand the agent an unearned second allowance.
+    h.env.ledger().set_timestamp(1_000 + 2 * WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 0);
+    assert_eq!(b.spent, 0);
+}
+
+#[test]
+fn consecutive_rollovers_carry_only_the_unspent_remainder() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+
+    // Week 1 idle -> credit 1_000, so week 2 starts with a 2_000 capacity.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_000);
+
+    // Spend 1_500 of it, leaving 500 to carry into week 3.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_500), 500);
+
+    h.env.ledger().set_timestamp(1_000 + 2 * WEEK);
+    // Capacity is base 1_000 + remaining 500 = 1_500, not 2_500.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_500);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 500);
+}
+
+#[test]
+fn multi_period_jump_settles_remnant_and_idle_periods_once() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+
+    // Settle week 1 first so a non-zero credit is already in force.
+    h.env.ledger().set_timestamp(1_000 + WEEK);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 2_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).window_start, 1_000 + WEEK);
+
+    // Jump three more whole weeks untouched. Week 2 contributes its unspent
+    // 2_000 capacity; weeks 3 and 4 each contribute a full base limit (1_000).
+    h.env.ledger().set_timestamp(1_000 + 4 * WEEK);
+    // The check itself settles the jump; `get` then reflects the new state.
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 5_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_credit, 4_000);
+    // The window is still anchored to the original weekly boundary.
+    assert_eq!(
+        h.client.get(&id(&h.env, "eng")).window_start,
+        1_000 + 4 * WEEK
     );
 }
 

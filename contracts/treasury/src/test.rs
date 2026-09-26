@@ -1028,14 +1028,14 @@ fn mock_token(h: &Harness, decimals: u32, fee: i128, funded: i128) -> Address {
 
 #[test]
 fn deposits_withdrawals_and_portfolio_across_tokens_with_different_decimals() {
-    let h = setup("vault", 1_000_0000000); // SAC: 7 decimals
+    let h = setup("vault", 10_000_000_000); // SAC: 7 decimals
     let usdc6 = mock_token(&h, 6, 0, 5_000_000);
     let wbtc8 = mock_token(&h, 8, 0, 3_0000_0000);
     h.client.add_approved_asset(&h.admin, &usdc6);
     h.client.add_approved_asset(&h.admin, &wbtc8);
     let recipient = Address::generate(&h.env);
 
-    h.client.deposit(&h.admin, &h.asset, &1_000_0000000);
+    h.client.deposit(&h.admin, &h.asset, &10_000_000_000);
     h.client.deposit(&h.admin, &usdc6, &5_000_000);
     h.client.deposit(&h.admin, &wbtc8, &2_0000_0000);
 
@@ -1053,7 +1053,7 @@ fn deposits_withdrawals_and_portfolio_across_tokens_with_different_decimals() {
     let sac = portfolio.get(0).unwrap();
     assert_eq!(
         (sac.decimals, sac.balance, sac.recorded),
-        (7, 1_000_0000000, 1_000_0000000)
+        (7, 10_000_000_000, 10_000_000_000)
     );
     let usdc = portfolio.get(1).unwrap();
     assert_eq!(usdc.asset, usdc6);
@@ -1070,6 +1070,23 @@ fn deposits_withdrawals_and_portfolio_across_tokens_with_different_decimals() {
         MockTokenClient::new(&h.env, &usdc6).balance(&recipient),
         1_500_000
     );
+}
+
+#[test]
+fn get_all_balances_reports_every_approved_token() {
+    let h = setup("vault", 1_000);
+    let funded = mock_token(&h, 6, 0, 500);
+    let empty = mock_token(&h, 8, 0, 0);
+    h.client.add_approved_asset(&h.admin, &funded);
+    h.client.add_approved_asset(&h.admin, &empty);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &funded, &500);
+
+    let balances = h.client.get_all_balances();
+    assert_eq!(balances.len(), 3);
+    assert_eq!(balances.get(0).unwrap(), (h.asset.clone(), 1_000));
+    assert_eq!(balances.get(1).unwrap(), (funded, 500));
+    assert_eq!(balances.get(2).unwrap(), (empty, 0));
 }
 
 #[test]
