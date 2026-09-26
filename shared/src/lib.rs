@@ -11,8 +11,9 @@
 //! - [`events`]     — helpers that publish the standardized cross-cutting events
 //!   the Astroid backend subscribes to.
 //! - [`types`]      — `#[contracttype]` values reused by multiple contracts.
-//! - [`math`]       — checked `i128` arithmetic and balance validation
-//!   (`validate_sufficient_balance`, `SafeBalance`; never wraps, returns errors).
+//! - [`math`]       — checked `i128`/`u64` arithmetic and balance validation
+//!   (`SafeAdd`/`SafeSub`/`SafeMul`/`SafeDiv`, `validate_sufficient_balance`,
+//!   `SafeBalance`; never wraps, returns deterministic [`Error`]s).
 //! - [`validation`] — small guard helpers (positive amounts, time windows, ...).
 //! - [`constants`] — protocol-wide constants (time units, storage TTLs, limits).
 
