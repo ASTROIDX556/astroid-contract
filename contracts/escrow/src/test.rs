@@ -3,9 +3,10 @@ extern crate std;
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     testutils::{
-        Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger, MockAuth, MockAuthInvoke,
+        Address as _, AuthorizedFunction, AuthorizedInvocation, Events, Ledger, MockAuth,
+        MockAuthInvoke,
     },
-    token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
+    token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use astroid_shared::constants::{MAX_ESCROW_ASSETS, MAX_SIGNERS};
@@ -28,16 +29,21 @@ struct Harness<'a> {
     sender: Address,
     recipient: Address,
     arbiter: Address,
+    admin: Address,
 }
 
-fn setup(funded_a: i128, funded_b: i128) -> Harness<'static> {
+/// Register the contract with an admin but an **empty** token whitelist, so a
+/// test can drive the approval flow itself. `setup` approves both harness
+/// tokens instead, which is what the rest of the suite assumes.
+fn setup_unapproved(funded_a: i128, funded_b: i128) -> Harness<'static> {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = START);
 
     let id = env.register_contract(None, EscrowContract);
     let client = EscrowContractClient::new(&env, &id);
-    client.initialize();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
 
     let token_admin_a = Address::generate(&env);
     let asset_a = env
@@ -66,7 +72,17 @@ fn setup(funded_a: i128, funded_b: i128) -> Harness<'static> {
         sender,
         recipient,
         arbiter,
+        admin,
     }
+}
+
+fn setup(funded_a: i128, funded_b: i128) -> Harness<'static> {
+    let h = setup_unapproved(funded_a, funded_b);
+    // The whitelist approves nothing by default, so the suite approves the two
+    // harness tokens up front.
+    h.client.approve_token(&h.admin, &h.asset_a);
+    h.client.approve_token(&h.admin, &h.asset_b);
+    h
 }
 
 fn balance(h: &Harness, asset: &Address, who: &Address) -> i128 {
@@ -1790,4 +1806,343 @@ fn mutual_consent_cancel_and_post_grace_reclaim() {
     h.client.cancel(&h.arbiter, &id);
     assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #233: token whitelist
+// ---------------------------------------------------------------------------
+
+/// Assert an event carrying the given `(category, action)` tuple topic.
+fn assert_event_topics(env: &Env, category: Symbol, action: Symbol) {
+    let want_category: Val = category.into_val(env);
+    let want_action: Val = action.into_val(env);
+    let found =
+        env.events().all().iter().any(|(_id, topics, _data)| {
+            topics.contains(want_category) && topics.contains(want_action)
+        });
+    assert!(found, "expected a matching event to be emitted");
+}
+
+/// The whitelist approves nothing out of the box, so an unapproved token is
+/// refused with the canonical asset-not-approved code and no value moves.
+#[test]
+fn unapproved_token_is_refused_by_every_creation_path() {
+    let h = setup_unapproved(10_000, 5_000);
+    let assets = one_asset(&h, 1_000);
+    let memo = String::from_str(&h.env, "spam");
+
+    // create
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &assets,
+            &(START + 1_000),
+            &0,
+            &memo,
+            &no_signers(&h),
+            &0,
+        ),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    // create_timelock
+    assert_eq!(
+        h.client.try_create_timelock(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &assets,
+            &(START + 1_000),
+            &memo,
+        ),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    // initialize_timelock
+    assert_eq!(
+        h.client.try_initialize_timelock(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &assets,
+            &(START + 1_000),
+            &0,
+            &memo,
+        ),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    // create_scheduled
+    assert_eq!(
+        h.client.try_create_scheduled(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &assets,
+            &ReleaseSchedule::none(),
+            &(START + 1_000),
+            &memo,
+        ),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    // deposit_with_milestones
+    assert_eq!(
+        h.client.try_deposit_with_milestones(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &h.asset_a,
+            &1_000,
+            &(START + 1_000),
+            &memo,
+            &vec![&h.env, milestone_spec(&h.env, "m", 10_000)],
+        ),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+
+    // Nothing was escrowed and no token moved into custody.
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.approved_tokens().len(), 0);
+}
+
+/// One unapproved asset in an otherwise valid list refuses the whole escrow,
+/// so a spam token cannot ride in alongside legitimate ones.
+#[test]
+fn a_single_unapproved_asset_refuses_a_multi_token_escrow() {
+    let h = setup_unapproved(10_000, 5_000);
+    h.client.approve_token(&h.admin, &h.asset_a);
+
+    let assets = vec![
+        &h.env,
+        AssetAmount {
+            asset: h.asset_a.clone(),
+            amount: 1_000,
+        },
+        AssetAmount {
+            asset: h.asset_b.clone(),
+            amount: 500,
+        },
+    ];
+    assert_eq!(
+        h.client.try_create(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &assets,
+            &(START + 1_000),
+            &0,
+            &String::from_str(&h.env, "mixed"),
+            &no_signers(&h),
+            &0,
+        ),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    // Neither token moved: the refusal happens before any transfer.
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 0);
+
+    // Approving the second token makes the same escrow succeed.
+    h.client.approve_token(&h.admin, &h.asset_b);
+    let id = create(&h, &assets, START + 1_000, 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 1_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 500);
+}
+
+/// A multi-token escrow releases every listed token in one settlement.
+#[test]
+fn whitelisted_multi_token_escrow_releases_every_asset() {
+    let h = setup(10_000, 5_000);
+    let id = create(&h, &two_assets(&h, 4_000, 2_000), START + 1_000, 0);
+
+    h.client.release(&h.arbiter, &id, &6_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.recipient), 2_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 0);
+}
+
+/// ...and refunds every listed token back to the sender after the deadline.
+#[test]
+fn whitelisted_multi_token_escrow_refunds_every_asset() {
+    let h = setup(10_000, 5_000);
+    let id = create(&h, &two_assets(&h, 4_000, 2_000), START + 1_000, 0);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 2_000);
+    h.client.refund(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 10_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 0);
+}
+
+/// Revoking a token stops new escrows but must never strand funds already in
+/// custody: the holder can still settle or reclaim.
+#[test]
+fn revocation_does_not_strand_an_existing_escrow() {
+    let h = setup(10_000, 5_000);
+    let id = create(&h, &two_assets(&h, 4_000, 2_000), START + 1_000, 0);
+
+    h.client.revoke_token(&h.admin, &h.asset_b);
+    assert!(!h.client.is_token_approved(&h.asset_b));
+
+    // Release still works for an escrow that already holds the revoked token.
+    h.client.release(&h.arbiter, &id, &6_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_b, &h.recipient), 2_000);
+}
+
+/// The same guarantee on the refund path.
+#[test]
+fn revocation_does_not_strand_a_refundable_escrow() {
+    let h = setup(10_000, 5_000);
+    let id = create(&h, &two_assets(&h, 4_000, 2_000), START + 1_000, 0);
+
+    h.client.revoke_token(&h.admin, &h.asset_a);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 2_000);
+    h.client.refund(&h.sender, &id);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 10_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.sender), 5_000);
+}
+
+/// `fund` re-checks the whitelist, so a token revoked between initializing an
+/// escrow and funding it is refused at the moment value would enter custody.
+#[test]
+fn funding_rechecks_a_token_revoked_after_initialization() {
+    let h = setup(10_000, 5_000);
+    let id = h.client.initialize_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &two_assets(&h, 4_000, 2_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "late"),
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Created);
+
+    h.client.revoke_token(&h.admin, &h.asset_b);
+    assert_eq!(
+        h.client.try_fund(&h.sender, &id),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 0);
+
+    // Re-approving lets the same escrow be funded.
+    h.client.approve_token(&h.admin, &h.asset_b);
+    h.client.fund(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 4_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 2_000);
+}
+
+/// Only the admin recorded at initialize may change the whitelist.
+#[test]
+fn only_the_admin_may_manage_the_whitelist() {
+    let h = setup_unapproved(1_000, 0);
+    let stranger = Address::generate(&h.env);
+
+    assert_eq!(h.client.admin(), h.admin);
+    assert_eq!(
+        h.client.try_approve_token(&stranger, &h.asset_a),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(!h.client.is_token_approved(&h.asset_a));
+
+    h.client.approve_token(&h.admin, &h.asset_a);
+    assert_eq!(
+        h.client.try_revoke_token(&stranger, &h.asset_a),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(h.client.is_token_approved(&h.asset_a));
+}
+
+/// Re-approving or revoking an absent token is refused rather than silently
+/// absorbed, so a re-run governance script cannot mistake a no-op for a change.
+#[test]
+fn whitelist_changes_are_idempotency_checked() {
+    let h = setup_unapproved(1_000, 0);
+    h.client.approve_token(&h.admin, &h.asset_a);
+    assert_eq!(
+        h.client.try_approve_token(&h.admin, &h.asset_a),
+        Err(Ok(Error::AlreadyExists))
+    );
+    assert_eq!(
+        h.client.try_revoke_token(&h.admin, &h.asset_b),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+/// The enumerable list tracks approvals and revocations, in approval order.
+#[test]
+fn approved_tokens_enumerates_in_approval_order() {
+    let h = setup_unapproved(1_000, 1_000);
+    assert_eq!(h.client.approved_tokens(), Vec::new(&h.env));
+
+    h.client.approve_token(&h.admin, &h.asset_b);
+    h.client.approve_token(&h.admin, &h.asset_a);
+    assert_eq!(
+        h.client.approved_tokens(),
+        vec![&h.env, h.asset_b.clone(), h.asset_a.clone()]
+    );
+
+    h.client.revoke_token(&h.admin, &h.asset_b);
+    assert_eq!(h.client.approved_tokens(), vec![&h.env, h.asset_a.clone()]);
+    assert!(!h.client.is_token_approved(&h.asset_b));
+}
+
+/// The whitelist is capped so the enumerable list cannot grow without bound.
+#[test]
+fn the_whitelist_is_capped() {
+    let h = setup_unapproved(0, 0);
+    for _ in 0..crate::MAX_ESCROW_TOKENS {
+        let token = Address::generate(&h.env);
+        h.client.approve_token(&h.admin, &token);
+    }
+    assert_eq!(h.client.approved_tokens().len(), crate::MAX_ESCROW_TOKENS);
+
+    let overflow = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_approve_token(&h.admin, &overflow),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert!(!h.client.is_token_approved(&overflow));
+}
+
+/// A token approval publishes an event so indexers can follow the whitelist.
+#[test]
+fn whitelist_changes_emit_events() {
+    let h = setup_unapproved(1_000, 0);
+    let before = h.env.events().all().len();
+
+    h.client.approve_token(&h.admin, &h.asset_a);
+    assert_eq!(h.env.events().all().len(), before + 1);
+    assert_event_topics(
+        &h.env,
+        Symbol::new(&h.env, "escrow"),
+        Symbol::new(&h.env, "tok_add"),
+    );
+
+    h.client.revoke_token(&h.admin, &h.asset_a);
+    assert_eq!(h.env.events().all().len(), before + 2);
+    assert_event_topics(
+        &h.env,
+        Symbol::new(&h.env, "escrow"),
+        Symbol::new(&h.env, "tok_rm"),
+    );
+}
+
+/// `initialize` is still one-shot, so the admin cannot be replaced by
+/// re-initializing with a different address.
+#[test]
+fn initialize_is_one_shot() {
+    let h = setup(0, 0);
+    let other = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_initialize(&other),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+    assert_eq!(h.client.admin(), h.admin);
 }
