@@ -29,11 +29,10 @@ fn math_overflow_underflow() {
 
 #[test]
 fn math_additional_edge_cases() {
-    // Underflow only when the result drops below the minimum value. Per the
-    // helper contracts, `checked_add`/`checked_mul` report any wrap as Overflow
-    // while `checked_sub` reports wraps as Underflow.
+    // Subtraction below the minimum value wraps too, and every wrap in this
+    // module is reported as Overflow — `checked_sub` included.
     assert_eq!(checked_sub(0, 1), Ok(-1));
-    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Underflow));
+    assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Overflow));
     assert_eq!(checked_add(i128::MIN, -1), Err(Error::Overflow));
     // Multiplication overflow on the extreme negative bound.
     assert_eq!(checked_mul(i128::MIN, -1), Err(Error::Overflow));

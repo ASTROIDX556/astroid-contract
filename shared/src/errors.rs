@@ -7,7 +7,12 @@
 
 use soroban_sdk::contracterror;
 
-#[contracterror]
+// `export = false`: the spec XDR for an error enum is limited to 50 cases
+// (`ScSpecUdtErrorEnumV0.cases: VecM<_, 50>`), while the workspace references
+// more than 50 distinct codes, so spec generation would not compile. Only the
+// optional `contractspecv0` metadata section is skipped — every code, its
+// name and its numeric value are unaffected.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
@@ -45,16 +50,11 @@ pub enum Error {
     BudgetExpired = 44,
 
     // --- Wallet (50-59) ---
-    // --- Wallet (50-53) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
     ReserveViolation = 54,
-    WalletFrozen = 25,
-    WalletArchived = 26,
-    WalletPaused = 27,
-    InvalidState = 28,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
@@ -88,23 +88,12 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-89) ---
-    ConditionNotMet = 80,
-    EscrowNotFunded = 81,
-    EscrowExpired = 82,
-    InvalidCondition = 83,
-    TimeLockActive = 84,
-    EscrowNotExpired = 85,
-    EscrowAlreadySettled = 86,
-    EscrowExpired = 46,
-    TimeLockActive = 47,
-    // --- Escrow (80-81) ---
-    // --- Escrow (80-82) ---
+    // --- Escrow & treasury allowances (80-86) ---
     EscrowExpired = 80,
     TimeLockActive = 81,
     GraceActive = 82,
-
-    // --- Treasury allowances (83-85) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
+    EscrowNotExpired = 85,
+    EscrowAlreadySettled = 86,
 }
