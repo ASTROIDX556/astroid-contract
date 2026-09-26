@@ -264,3 +264,90 @@ impl From<BudgetError> for Error {
         }
     }
 }
+
+/// Milestone-approval errors, kept separate from the protocol-wide [`Error`]
+/// enum so the escrow's milestone state machine can report dedicated,
+/// deterministic codes without pushing the canonical table past Soroban's
+/// 50-variant ceiling (the same reason [`BudgetError`] exists).
+///
+/// Codes that already belong to the canonical table are mirrored here with
+/// their exact wire value, so a milestone refusal that is really a generic
+/// failure — an unknown escrow, a non-arbiter approving, a terminal escrow —
+/// still decodes to the number an off-chain consumer already knows. Only
+/// [`MilestoneError::InvalidMilestone`] (86) and
+/// [`MilestoneError::MilestoneAlreadyCompleted`] (87) extend the escrow band
+/// (80-82); `86`/`87` are the next free slots and are never reused.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum MilestoneError {
+    /// The referenced escrow does not exist, or the escrow has no milestone
+    /// schedule (agent passed a plain escrow to a milestone entrypoint).
+    NotFound = 1,
+    /// A caller without milestone-review rights attempted an approval, a
+    /// dispute or a resolution.
+    Unauthorized = 3,
+    /// A malformed milestone request (e.g. an unknown index in a call that
+    /// does not reach the state machine).
+    InvalidInput = 4,
+    /// Checked arithmetic on milestone amounts overflowed or divided by zero.
+    Overflow = 11,
+    /// A milestone payout amount was not strictly positive.
+    InvalidAmount = 12,
+    /// The escrow is not in a state that permits this milestone transition
+    /// (for example it has already been refunded, or the whole schedule was
+    /// cancelled).
+    InvalidState = 53,
+    /// INVALID_MILESTONE: the requested milestone does not exist on the escrow,
+    /// the index was not found, or the milestone is currently disputed and
+    /// cannot be approved.
+    InvalidMilestone = 86,
+    /// MILESTONE_ALREADY_COMPLETED: the milestone has already been approved and
+    /// paid out; it cannot be approved a second time.
+    MilestoneAlreadyCompleted = 87,
+}
+
+impl MilestoneError {
+    /// The `u32` code this variant carries on the wire, identical to the value
+    /// an off-chain consumer reads from a failed transaction.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Every code the milestone-specific [`MilestoneError`] table can report, in
+/// declaration order. Kept as a literal so a renumber or a reissued slot is
+/// caught by `milestone_error_codes_are_frozen` rather than passing silently.
+pub const MILESTONE_ERROR_CODES: [u32; 8] = [1, 3, 4, 11, 12, 53, 86, 87];
+
+impl From<Error> for MilestoneError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::NotFound => Self::NotFound,
+            Error::Unauthorized => Self::Unauthorized,
+            Error::InvalidInput => Self::InvalidInput,
+            Error::Overflow => Self::Overflow,
+            Error::InvalidAmount => Self::InvalidAmount,
+            Error::InvalidState => Self::InvalidState,
+            _ => Self::InvalidInput,
+        }
+    }
+}
+
+impl From<MilestoneError> for Error {
+    fn from(error: MilestoneError) -> Self {
+        match error {
+            MilestoneError::NotFound => Self::NotFound,
+            MilestoneError::Unauthorized => Self::Unauthorized,
+            MilestoneError::InvalidInput => Self::InvalidInput,
+            MilestoneError::Overflow => Self::Overflow,
+            MilestoneError::InvalidAmount => Self::InvalidAmount,
+            MilestoneError::InvalidState => Self::InvalidState,
+            // The two milestone-specific codes have no canonical equivalent, so
+            // they collapse onto the closest generic failure when a caller asks
+            // for the protocol-wide error.
+            MilestoneError::InvalidMilestone => Self::InvalidInput,
+            MilestoneError::MilestoneAlreadyCompleted => Self::InvalidState,
+        }
+    }
+}
