@@ -67,6 +67,42 @@
 //! than cached, so the verdict is a pure function of on-chain state and every
 //! node agrees on it.
 //!
+//! ## Quorum and majority
+//!
+//! A bare approval threshold can be gamed — `threshold = 1` on a ten-person
+//! allow-list would execute on a single signature — so `execute` re-validates
+//! the tally against two further bars before anything fires:
+//!
+//! * **Quorum (participation).** At least [`PROPOSAL_QUORUM_PERCENT`]% of the
+//!   approver allow-list must have voted. The requirement is computed with
+//!   integer scaling only — `ceil(approvers * percent / 100)`, never
+//!   floating point — and rounded *up* so a partial vote can never round the
+//!   bar away.
+//! * **Majority (the vote itself).** The approvals must form a *strict*
+//!   majority of the allow-list: `approvals > approvers / 2`. An exact tie is
+//!   not a majority.
+//!
+//! The proposal's own configured `threshold` is re-checked as well — behind
+//! the `Approved` state gate, which already guarantees it — as defence in
+//! depth against a tally that somehow slipped below the bar it declared.
+//!
+//! Every shortfall reports the protocol-wide [`Error::ThresholdNotMet`]: a
+//! missed quorum *is* a missed threshold (the participation bar was not
+//! crossed), and the shared error enum already sits at the Stellar spec's
+//! 50-case cap for contract errors, so there is no room for a dedicated
+//! quorum code.
+//!
+//! ```text
+//! approvals < threshold              ──▶ ProposalNotApproved (state gate)
+//! approvals < quorum(allow-list)     ──▶ Error::ThresholdNotMet
+//! approvals <= allow-list / 2 (tie)  ──▶ Error::ThresholdNotMet
+//! otherwise                          ──▶ timelock / dependency gates, then run
+//! ```
+//!
+//! All three bars are re-derived from the stored record on every call rather
+//! than cached, so the verdict is a pure function of on-chain state and every
+//! node agrees on it.
+//!
 //! ## Dependency chaining
 //!
 //! A proposal may declare prerequisite proposals it depends on. `execute` then
