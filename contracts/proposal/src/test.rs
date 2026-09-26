@@ -616,8 +616,8 @@ fn test_cancellation_grace_window() {
 // The deadline is read from `env.ledger().timestamp()` at the moment of each
 // call, so the tests drive the deterministic ledger forward with
 // `env.ledger().with_mut` — sequence and timestamp together, exactly as the
-// host fixes them for a real invocation — and assert that stale votes settle
-// expiry while other rejected transitions return `ProposalExpired`.
+// host fixes them for a real invocation — and assert that every interaction
+// settles expiry without applying its requested transition.
 // ---------------------------------------------------------------------------
 
 /// Advance the mock ledger to `sequence` / `timestamp`.
@@ -633,9 +633,9 @@ fn expired_proposal_cannot_be_rejected() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);
     advance(&h, 6, 6_000);
-    let res = h.client.try_reject(&h.approvers[0], &id);
-    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
+    h.client.reject(&h.approvers[0], &id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert!(emitted(&h.env, "expired"));
 }
 
 #[test]
@@ -643,9 +643,9 @@ fn expired_proposal_cannot_be_cancelled() {
     let h = setup(3);
     let id = create(&h, 2, 5_000);
     advance(&h, 6, 6_000);
-    let res = h.client.try_cancel(&h.proposer, &id);
-    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
+    h.client.cancel(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert!(emitted(&h.env, "expired"));
 }
 
 #[test]
@@ -657,10 +657,9 @@ fn expired_proposal_cannot_be_executed() {
     assert_eq!(h.client.state(&id), ProposalState::Approved);
 
     advance(&h, 6, 6_000);
-    let res = h.client.try_execute(&h.proposer, &id);
-    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
-    // The stale approval never turned into an execution.
+    h.client.execute(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert!(emitted(&h.env, "expired"));
 }
 
 #[test]
@@ -671,11 +670,9 @@ fn expired_proposal_cannot_be_failed() {
     h.client.approve(&h.approvers[1], &id);
 
     advance(&h, 6, 6_000);
-    // The deadline, not the proposer, is what ended it; the next state query
-    // settles the terminal expiry transition.
-    let res = h.client.try_fail(&h.proposer, &id);
-    assert_eq!(res, Err(Ok(Error::ProposalExpired)));
+    h.client.fail(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert!(emitted(&h.env, "expired"));
 }
 
 #[test]
@@ -705,34 +702,20 @@ fn ledger_timeline_blocks_every_stale_transition() {
     assert_eq!(h.client.state(&id), ProposalState::Pending);
 
     // Milestone 2 — ledger 6, past the deadline: votes are not recorded and
-    // other live transitions are refused with the dedicated expired code.
+    // every interaction settles the same terminal state.
     advance(&h, 6, 5_001);
     assert_eq!(h.client.approve(&h.approvers[1], &id), 1);
-    assert_eq!(
-        h.client.try_reject(&h.approvers[1], &id),
-        Err(Ok(Error::ProposalExpired))
-    );
-    assert_eq!(
-        h.client.try_cancel(&h.proposer, &id),
-        Err(Ok(Error::ProposalExpired))
-    );
-    assert_eq!(
-        h.client.try_execute(&h.proposer, &id),
-        Err(Ok(Error::ProposalExpired))
-    );
-    assert_eq!(
-        h.client.try_fail(&h.proposer, &id),
-        Err(Ok(Error::ProposalExpired))
-    );
-    // The state query materializes expiry; the stale ballot was not recorded.
+    h.client.reject(&h.approvers[1], &id);
+    h.client.cancel(&h.proposer, &id);
+    h.client.execute(&h.proposer, &id);
+    h.client.fail(&h.proposer, &id);
+    // Stale operations are no-ops; the vote count remains unchanged.
     assert_eq!(h.client.state(&id), ProposalState::Expired);
     assert_eq!(h.client.get(&id).approvals, 1);
+    assert!(emitted(&h.env, "expired"));
 
-    // Milestone 3 — the transition already settled during the state query.
-    assert_eq!(
-        h.client.try_expire(&id),
-        Err(Ok(Error::InvalidProposalState))
-    );
+    // Explicit expiry is idempotent after another interaction settled it.
+    assert_eq!(h.client.try_expire(&id), Ok(Ok(())));
 }
 
 #[test]
@@ -818,11 +801,7 @@ fn stale_prerequisite_blocks_the_dependent_chain() {
     advance(&h, 6, 6_000);
     // The prerequisite is stale: it can neither execute nor be approved, so
     // the dependent proposal stays blocked rather than inheriting a stale step.
-    assert_eq!(
-        h.client.try_execute(&h.proposer, &first),
-        Err(Ok(Error::ProposalExpired))
-    );
-    h.client.expire(&first);
+    h.client.execute(&h.proposer, &first);
     assert_eq!(h.client.state(&first), ProposalState::Expired);
 
     // Approving the dependent is unaffected by its prerequisite's expiry ...
@@ -1103,11 +1082,8 @@ fn expiry_gate_wins_over_the_timelock_gate() {
     );
 
     advance(&h, 3, 1_500); // deadline reached, delay still running
-    assert_eq!(
-        h.client.try_execute(&h.proposer, &id),
-        Err(Ok(Error::ProposalExpired))
-    );
-    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 
 #[test]
