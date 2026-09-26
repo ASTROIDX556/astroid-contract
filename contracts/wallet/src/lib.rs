@@ -558,12 +558,14 @@ impl WalletContract {
 
             if !action.policy_id.is_empty() {
                 let policy_addr = policy.as_ref().ok_or(Error::InvalidInput)?;
-                PolicyClient::new(&env, policy_addr).check_transfer(
+                Self::require_policy_check(
+                    &env,
+                    policy_addr,
                     &action.policy_id,
                     &action.asset,
                     &action.recipient,
-                    &action.amount,
-                );
+                    action.amount,
+                )?;
             }
 
             if !action.budget_id.is_empty() {
@@ -737,14 +739,34 @@ impl WalletContract {
         }
         let policy = Self::get_policy(env.clone());
         if let Some(policy_addr) = policy {
-            PolicyClient::new(env, &policy_addr).check_transfer(
+            Self::require_policy_check(
+                env,
+                &policy_addr,
                 &String::from_str(env, "active"),
                 asset,
                 recipient,
-                &amount,
-            );
+                amount,
+            )?;
         }
         Ok(())
+    }
+
+    /// Map policy denials and cross-contract invocation failures to one stable
+    /// wallet-facing error. Only a successful policy response authorizes spend.
+    fn require_policy_check(
+        env: &Env,
+        policy_addr: &Address,
+        policy_id: &String,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        match PolicyClient::new(env, policy_addr)
+            .try_check_transfer(policy_id, asset, recipient, &amount)
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(Error::PolicyDenied),
+        }
     }
 
     fn load_wallet(env: &Env, id: u64) -> Result<WalletData, Error> {
