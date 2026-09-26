@@ -1353,3 +1353,210 @@ fn threshold_voting_exact_boundary_transitions_state() {
     assert!(proposal.executed);
     assert_eq!(proposal.approval_weight, 5);
 }
+
+// ---------------------------------------------------------------------------
+// Weighted approval: cumulative-weight evaluation against the threshold
+// ---------------------------------------------------------------------------
+
+/// The canonical weighted example: A=50, B=30, C=30 with threshold 80. A
+/// single signer is short; any two distinct signers reach the threshold.
+#[test]
+fn weighted_quorum_matches_issue_example() {
+    let h = setup(&[50, 30, 30], 80);
+
+    // Proposer A (50) alone is below the threshold.
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.get_approval_weight(&id), 50);
+    assert_eq!(h.client.get_total_weight(), 110);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // B (30) tips the cumulative weight to exactly 80; quorum is met.
+    let running = h.client.approve(&h.signers[1], &id);
+    assert_eq!(running, 80);
+    assert_eq!(h.client.get_approval_weight(&id), 80);
+    h.client.execute(&h.signers[2], &id);
+    assert!(h.client.get_proposal(&id).executed);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 80);
+}
+
+/// Two light signers (30 + 30) can meet quorum without the heavy signer, and
+/// the heavy signer can still tip a sub-quorum pair over the line.
+#[test]
+fn weighted_quorum_can_form_without_the_heavy_signer() {
+    let h = setup(&[50, 30, 30], 80);
+    let id = h.client.propose(
+        &h.signers[1],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+
+    // B alone (30) is short; healthiest two-light pairing still needs A.
+    assert_eq!(h.client.approve(&h.signers[2], &id), 60);
+    assert_eq!(
+        h.client.try_execute(&h.signers[1], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // A adds 50 -> 110 >= 80, so the proposal executes.
+    assert_eq!(h.client.approve(&h.signers[0], &id), 110);
+    h.client.execute(&h.signers[1], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+/// The read-only `get_approval_weight` view mirrors the weight the execution
+/// path enforces, and reports `NotFound` for an unknown proposal.
+#[test]
+fn approval_weight_view_evaluates_against_threshold() {
+    let h = setup(&[4, 3, 3], 7);
+
+    assert_eq!(
+        h.client.try_get_approval_weight(&99),
+        Err(Ok(Error::NotFound))
+    );
+
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.get_approval_weight(&id), 4);
+    assert!(h.client.get_approval_weight(&id) < h.client.get_threshold());
+
+    h.client.approve(&h.signers[1], &id);
+    assert_eq!(h.client.get_approval_weight(&id), 7);
+    assert_eq!(h.client.get_approval_weight(&id), h.client.get_threshold());
+
+    h.client.execute(&h.signers[2], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+/// A signer that has already voted cannot stack its own weight, so a single
+/// key can never reach quorum alone no matter how often it is listed.
+#[test]
+fn duplicate_ballots_never_stack_weight_towards_quorum() {
+    let h = setup(&[6, 5, 4], 12);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.get_approval_weight(&id), 6);
+
+    // Re-approving the proposer is rejected and does not move the total.
+    assert_eq!(
+        h.client.try_approve(&h.signers[0], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.get_approval_weight(&id), 6);
+
+    // A second signer (5) still leaves it below the 12 threshold.
+    assert_eq!(h.client.approve(&h.signers[1], &id), 11);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // Only a third distinct signer reaches quorum.
+    assert_eq!(h.client.approve(&h.signers[2], &id), 15);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+/// Quorum is recomputed against the live signer set: removing a signer after
+/// it approved drops its weight, so a formerly-quorate proposal can fall back
+/// below threshold.
+#[test]
+fn removed_approver_weight_no_longer_counts_towards_quorum() {
+    let h = setup(&[5, 5, 5], 10);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    h.client.approve(&h.signers[1], &id);
+    assert_eq!(h.client.get_approval_weight(&id), 10);
+
+    // Remove signers[1] (weight 5): total drops to 10, still equal to threshold.
+    let removal = h
+        .client
+        .propose_signer_removal(&h.signers[0], &h.signers[1]);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &removal);
+
+    // Its approval no longer contributes, so only signers[0]'s 5 remains.
+    assert_eq!(h.client.get_approval_weight(&id), 5);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+}
+
+/// Execution is refused until the cumulative weight reaches the threshold;
+/// the boundary case (exactly equal) is accepted.
+#[test]
+fn quorum_evaluation_tracks_each_additional_vote() {
+    let h = setup(&[2, 2, 2, 2], 6);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+
+    assert_eq!(h.client.get_approval_weight(&id), 2);
+    assert_eq!(h.client.approve(&h.signers[1], &id), 4);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // Third distinct vote lands exactly on the threshold.
+    assert_eq!(h.client.approve(&h.signers[2], &id), 6);
+    h.client.execute(&h.signers[3], &id);
+    assert!(h.client.get_proposal(&id).executed);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 6);
+}
+
+/// Non-signers cannot contribute weight, and a removed signer cannot approve.
+#[test]
+fn only_live_signers_contribute_weight() {
+    let h = setup(&[4, 4, 4], 8);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+
+    assert_eq!(
+        h.client.try_approve(&stranger, &id),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(h.client.get_approval_weight(&id), 4);
+
+    // Remove signers[1], then it can no longer approve or contribute.
+    let removal = h
+        .client
+        .propose_signer_removal(&h.signers[0], &h.signers[1]);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &removal);
+    assert_eq!(
+        h.client.try_approve(&h.signers[1], &id),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(h.client.get_approval_weight(&id), 4);
+}
+
