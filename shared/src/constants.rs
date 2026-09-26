@@ -67,3 +67,8 @@ pub const MAX_PAUSE_DURATION: u64 = SECONDS_PER_MONTH;
 /// Minimum number of ledgers that must pass before a pending multisig
 /// threshold change can be finalized (~1 day on Stellar).
 pub const THRESHOLD_CHANGE_DELAY_LEDGERS: u32 = DAY_IN_LEDGERS;
+
+/// Number of basis points that make up 100%. Protocol percentages (e.g. the
+/// budget contract's maximum rollover percentage) are carried as integer
+/// basis points (1 bp = 0.01%) so cap arithmetic stays in whole numbers.
+pub const BPS_DENOMINATOR: i128 = 10_000;
