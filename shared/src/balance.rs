@@ -909,7 +909,7 @@ mod tests {
     fn reconcile_missing_is_mismatch_unless_zero() {
         let env = Env::default();
         let mut a = new_map(&env);
-        let mut b = new_map(&env);
+        let b = new_map(&env);
         let x = addr(&env);
         checked_add_balance(&env, &mut a, x.clone(), 10).unwrap();
         // b missing x (treated as 0) -> mismatch
