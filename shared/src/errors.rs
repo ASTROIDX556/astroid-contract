@@ -25,6 +25,12 @@
 
 use soroban_sdk::contracterror;
 
+// `export = false`: the spec XDR for an error enum is limited to 50 cases
+// (`ScSpecUdtErrorEnumV0.cases: VecM<_, 50>`), while the workspace references
+// more than 50 distinct codes, so spec generation would not compile. Only the
+// optional `contractspecv0` metadata section is skipped — every code, its
+// name and its numeric value are unaffected.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {

@@ -13,6 +13,12 @@
 //! internal proposals through an approve → execute flow with an optional
 //! per-proposal time lock and a global emergency lock.
 //!
+//! Every approval weight is accumulated with checked arithmetic and every
+//! quorum decision is taken through a single threshold verification helper, so
+//! neither an overflowing weight sum nor a duplicate approval can manufacture
+//! a quorum; signer lookups reuse the already-loaded signer set instead of
+//! re-reading storage.
+//!
 //! [`MultiSigContract::execute_batch`] additionally supports bundling multiple
 //! discrete contract calls into one transaction: each contributing signer's
 //! signature is verified (by the Soroban host) over the exact batch payload
@@ -210,9 +216,11 @@ impl MultiSigContract {
                 return Err(Error::InsufficientWeight);
             }
         }
+        // Validate the signer set itself before deriving quorum rules from it:
+        // duplicated addresses would make any threshold meaningless.
+        Self::assert_unique(&signers)?;
         let total = Self::total_weight(&signers)?;
         Self::validate_threshold(threshold, total)?;
-        Self::assert_unique(&signers)?;
 
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage()
@@ -524,7 +532,9 @@ impl MultiSigContract {
         unlock_at: u64,
     ) -> Result<u64, Error> {
         Self::require_not_locked(&env)?;
-        Self::require_signer(&env, &proposer)?;
+        // Authorization and the proposer's voting weight come from one read of
+        // the signer set (`require_signer` + `weight_of` read it twice before).
+        let proposer_weight = Self::require_signer_weight(&env, &proposer)?;
 
         let mut count: u64 = env
             .storage()
@@ -534,7 +544,6 @@ impl MultiSigContract {
         count = checked_add(count as i128, 1)? as u64;
         let id = count;
 
-        let proposer_weight = Self::weight_of(&env, &proposer)?;
         let proposal = MsProposal {
             proposer: proposer.clone(),
             action,
@@ -568,11 +577,20 @@ impl MultiSigContract {
     /// weight.
     pub fn approve(env: Env, caller: Address, proposal_id: u64) -> Result<u32, Error> {
         Self::require_not_locked(&env)?;
-        Self::require_signer(&env, &caller)?;
+        // Authorization and signer membership are resolved from a single read of
+        // the signer set (gas: one lookup instead of two). The caller's own
+        // weight is not consumed here: `live_approval_weight` recomputes the
+        // running total from the current signer set and the approval flags, so a
+        // re-weighted signer is credited at their current weight.
+        Self::require_signer_weight(&env, &caller)?;
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
         if proposal.executed {
             return Err(Error::InvalidProposalState);
         }
+        // Reject duplicate signers: an approval is recorded once per
+        // (proposal, signer) pair and the flag is only written once every
+        // check below has passed, so a repeated approval can never stack its
+        // weight twice.
         let akey = DataKey::Approval(proposal_id, caller.clone());
         if env.storage().persistent().get(&akey).unwrap_or(false) {
             return Err(Error::AlreadySigned);
@@ -610,9 +628,9 @@ impl MultiSigContract {
         let threshold = Self::threshold(&env)?;
         let weight = Self::live_approval_weight(&env, proposal_id)?;
         proposal.approval_weight = weight;
-        if weight < threshold {
-            return Err(Error::InsufficientWeight);
-        }
+        // Same quorum verification helper as the batch flow; the proposal flow
+        // reports its own shortfall code.
+        Self::require_quorum(weight, threshold, Error::InsufficientWeight)?;
         if proposal.unlock_at != 0 {
             require_time_reached(&env, proposal.unlock_at)?;
         }
@@ -692,9 +710,9 @@ impl MultiSigContract {
         // voting weight.
         let payload = Self::batch_payload(&env, nonce, &calls);
         let weight = Self::accumulate_weight(&env, &signers, &caller, &approvers, &payload)?;
-        if weight < threshold {
-            return Err(Error::ThresholdNotMet);
-        }
+        // Same quorum verification helper as the proposal flow; batches report
+        // their dedicated shortfall code.
+        Self::require_quorum(weight, threshold, Error::ThresholdNotMet)?;
 
         env.storage()
             .instance()
@@ -785,7 +803,7 @@ impl MultiSigContract {
         let mut i = 0;
         while i < len {
             let w = signers.get(i).unwrap().weight;
-            total = checked_add(total, w as i128)?;
+            total = Self::add_weight(total, w)?;
             i += 1;
         }
         Self::to_weight(total)
@@ -799,13 +817,59 @@ impl MultiSigContract {
         Ok(total as u32)
     }
 
-    fn weight_of(env: &Env, who: &Address) -> Result<u32, Error> {
-        let signers = Self::signers(env)?;
+    /// Resolve `who` against an already-loaded signer set and return its
+    /// voting weight. A single in-memory pass: no storage is touched, so a
+    /// caller that already holds the set never reads it twice.
+    fn weight_in(signers: &Vec<SignerWeight>, who: &Address) -> Result<u32, Error> {
         signers
             .iter()
             .find(|s| &s.address == who)
             .map(|s| s.weight)
             .ok_or(Error::NotASigner)
+    }
+
+    /// Voting weight of `who`, or [`Error::NotASigner`] when unregistered. The
+    /// single instance read lives here so no caller repeats the lookup logic.
+    fn weight_of(env: &Env, who: &Address) -> Result<u32, Error> {
+        let signers = Self::signers(env)?;
+        Self::weight_in(&signers, who)
+    }
+
+    /// Authorize `caller` and resolve its voting weight from a *single* read of
+    /// the signer set. Fuses `require_signer` + `weight_of`, which each
+    /// performed their own instance-storage read of the same key.
+    fn require_signer_weight(env: &Env, caller: &Address) -> Result<u32, Error> {
+        caller.require_auth();
+        let signers = Self::signers(env)?;
+        Self::weight_in(&signers, caller)
+    }
+
+    /// Checked accumulation of a signer weight into a running approval total.
+    /// The sum is computed in `i128` and narrowed by [`Self::to_weight`], so an
+    /// overflowing weight sum surfaces as [`Error::Overflow`] instead of
+    /// truncating into a smaller value that could wrongly satisfy the
+    /// threshold.
+    fn add_weight(total: i128, weight: u32) -> Result<i128, Error> {
+        checked_add(total, weight as i128)
+    }
+
+    /// Quorum verification helper: validate a signer weight sum against the
+    /// configured threshold.
+    ///
+    /// `sum` is built exclusively through [`Self::add_weight`], i.e. it is
+    /// wrap-free by construction; a sum below `threshold` is rejected with
+    /// `shortfall`, the caller's own shortfall code ([`Error::InsufficientWeight`]
+    /// for proposal approvals, [`Error::ThresholdNotMet`] for batches), so
+    /// every quorum decision in the contract is taken in exactly one place.
+    ///
+    /// Named distinctly from the public
+    /// [`MultisigInterface::verify_threshold`] signature-set entry point: that
+    /// one takes `Env` and a payload, this one takes an already-accumulated sum.
+    fn require_quorum(sum: u32, threshold: u32, shortfall: Error) -> Result<(), Error> {
+        if sum < threshold {
+            return Err(shortfall);
+        }
+        Ok(())
     }
 
     /// Sum the current weight of every current signer that approved
@@ -820,7 +884,7 @@ impl MultiSigContract {
                 .get(&DataKey::Approval(proposal_id, s.address.clone()))
                 .unwrap_or(false);
             if approved {
-                total = checked_add(total, s.weight as i128)?;
+                total = Self::add_weight(total, s.weight)?;
             }
         }
         Self::to_weight(total)
@@ -885,27 +949,22 @@ impl MultiSigContract {
         signatories: &Vec<Address>,
         args: &Vec<Val>,
     ) -> Result<u32, Error> {
-        let caller_weight = signers
-            .iter()
-            .find(|s| &s.address == caller)
-            .map(|s| s.weight)
-            .ok_or(Error::NotASigner)?;
+        let caller_weight = Self::weight_in(signers, caller)?;
         caller.require_auth_for_args(args.clone());
         let mut total: i128 = caller_weight as i128;
         let mut seen = Vec::new(env);
         seen.push_back(caller.clone());
         for who in signatories.iter() {
-            let weight = signers
-                .iter()
-                .find(|s| s.address == who)
-                .map(|s| s.weight)
-                .ok_or(Error::NotASigner)?;
+            // Deduplicate before resolving the weight: an address already in
+            // `seen` was validated on an earlier pass, so the lookup would be a
+            // no-op that can never fail.
             if seen.contains(&who) {
                 continue;
             }
+            let weight = Self::weight_in(signers, &who)?;
             seen.push_back(who.clone());
             who.require_auth_for_args(args.clone());
-            total = checked_add(total, weight as i128)?;
+            total = Self::add_weight(total, weight)?;
         }
         Self::to_weight(total)
     }
@@ -988,7 +1047,8 @@ impl MultiSigContract {
                 if *weight == 0 {
                     return Err(Error::InvalidSignerWeight);
                 }
-                let current = Self::weight_of(env, signer)?;
+                // `signers` is already loaded above — do not read it again.
+                let current = Self::weight_in(&signers, signer)?;
                 let new_total = checked_add(checked_sub(total, current as i128)?, *weight as i128)?;
                 Self::to_weight(new_total)?;
                 if new_total < threshold as i128 {
@@ -1012,7 +1072,7 @@ impl MultiSigContract {
                 Ok(())
             }
             GovernanceChange::RemoveSigner(signer) => {
-                let removed = Self::weight_of(env, signer)?;
+                let removed = Self::weight_in(&signers, signer)?;
                 if checked_sub(total, removed as i128)? < threshold as i128 {
                     return Err(Error::InvalidThreshold);
                 }
