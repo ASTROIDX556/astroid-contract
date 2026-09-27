@@ -61,37 +61,60 @@
 //! [`Error::TreasuryPaused`] code so off-chain monitors can distinguish "we
 //! paused on purpose" from a generic state failure.
 //!
-//! ## Registry-verified callers and reentrancy (Issue #308)
+//! ## Authorization
 //!
-//! The treasury's movement endpoints (`deposit`, `withdraw`,
-//! `batch_transfer`, `release_next_milestone`) are reachable by any Soroban
-//! contract that can submit an invocation, so a hostile contract could try to
-//! re-enter them mid-flight or to move value while impersonating a module.
-//! Two defenses close those holes:
+//! Every function that can move value or rewire the treasury is gated on a
+//! `require_auth`, and the gate is a single shared helper per role so the set
+//! of authorized entry points can be audited in one place rather than
+//! re-derived per function:
 //!
-//! ```text
-//! paused? frozen? active? role? registry-verified? reentrancy lock? assets move
-//! ```
+//! - [`Self::require_admin`] — the recorded `admin`, for `initialize`-time
+//!   configuration, allowances, budgets, the asset whitelist, and all three
+//!   outbound paths (`withdraw`, `batch_transfer`, `release_next_milestone`).
+//! - [`Self::require_multisig`] — the organization multisig, for the frozen
+//!   circuit breaker alone.
+//! - [`Self::require_guardian`] — the guardian (or the multisig), for the
+//!   `paused` breaker alone.
+//! - `from.require_auth()` — the depositor, on the one inbound path.
 //!
-//! 1. **Registry verification.** The organization wires its registry address
-//!    with [`TreasuryContract::set_registry`] and registers the expected
-//!    module addresses there. When a movement arrives *from a contract
-//!    address*, the treasury resolves `(org, kind)` in the registry and
-//!    refuses any caller other than the recorded module with the dedicated
-//!    [`Error::UnverifiedCaller`] code. `withdraw` / `batch_transfer` /
-//!    `release_next_milestone` verify their admin against
-//!    [`ModuleKind::Treasury`], `deposit` verifies a contract depositor
-//!    against [`ModuleKind::Wallet`] — an organization's funding wallets stay
-//!    first-class depositors — while ordinary (account) callers keep passing
-//!    straight through to the pre-existing role checks. Unregistered module
-//!    kinds fail closed. Setting a registry is optional for backward
-//!    compatibility; once it is set, contract callers can never bypass it.
-//! 2. **Reentrancy lock.** Every value path takes [`TreasuryContract::lock`]
-//!    — an instance-storage boolean flip — for the duration of the external
-//!    calls, checked *before* any token moves. A re-entered call of any kind
-//!    finds the lock engaged and fails with [`Error::InvalidState`], and
-//!    because the flip happens in instance storage it is reverted by the host
-//!    when the outer call aborts.
+//! An emergency role is never also an admin: neither the multisig nor the
+//! guardian can pay out, approve an asset, or rewire the treasury, and an
+//! allowance never confers authority — it only lowers a ceiling for a caller
+//! that is already authorized.
+//!
+//! A role check is never sufficient on its own. Each helper compares the caller
+//! against storage and *then* demands the caller's signature, so knowing an
+//! address is not enough to act as it, and a signature is not a substitute for
+//! being the right party. `initialize` demands the admin's signature for the
+//! same reason: it is the moment the admin is chosen, so before it the contract
+//! has no recorded owner to check against and the signature is the only thing
+//! standing between a fresh deployment and a claim by whoever calls first.
+//!
+//! Outflows additionally hold a reentrancy guard for the duration of the
+//! transfer. The guard is taken before any state is advanced and released on
+//! the way out; if the invocation reverts first the host rolls the write back,
+//! so a failed spend can never leave the treasury locked against later ones.
+//!
+//! ## Multi-token accounting
+//!
+//! The treasury custodies any number of approved Soroban token contracts side
+//! by side (up to [`MAX_TREASURY_ASSETS`]). Each asset keeps its own
+//! [`Holding`] record and the approved set is enumerable, so
+//! [`TreasuryContract::portfolio`] reports every asset's live custody balance,
+//! recorded balance and `decimals` in one call. Amounts are always in the
+//! token's own base units; the treasury never normalizes across decimals.
+//!
+//! Token contracts are not trusted to move exactly what they are asked to:
+//!
+//! - `deposit` credits the amount that *actually arrived* (the custody balance
+//!   delta), so a fee-on-transfer token cannot inflate the books, and a
+//!   transfer that delivers nothing is rejected with [`Error::InvalidAmount`].
+//! - Every outflow checks the live custody balance first
+//!   ([`Error::InsufficientFunds`] instead of a token-level panic) and then
+//!   verifies the balance fell by exactly the amount paid, reverting with
+//!   [`Error::InvalidState`] otherwise.
+//!
+//! All token math goes through the shared checked helpers.
 //!
 //! Functions: `initialize`, `set_policy`, `set_budget`, `set_multisig`,
 //! `set_registry`, `set_guardian`, `add_approved_asset`,
@@ -99,24 +122,27 @@
 //! `deposit`, `withdraw`, `batch_transfer`, `allocate_budget`,
 //! `set_allowance`, `remove_allowance`, `allowance`,
 //! `init_milestone_disbursement`, `release_next_milestone`, `get`, `holding`,
-//! `is_paused`, `guardian`, `registry`, `is_approved_asset`,
-//! `approved_asset_count`.
+//! `is_paused`, `guardian`, `is_approved_asset`, `approved_asset_count`,
+//! `approved_assets`, `portfolio`.
 
-use astroid_interfaces::{PolicyClient, RegistryClient};
+use astroid_interfaces::{PolicyClient, TreasuryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::{checked_add, checked_sub};
-use astroid_shared::types::{ModuleKind, Payment, ResourceState};
+use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
+use astroid_shared::types::{Payment, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
 
-const MAX_BALANCE_ASSETS: u32 = 32;
+/// Maximum number of token contracts a treasury may have approved at once.
+/// Bounds every per-asset iteration (e.g. [`TreasuryContract::portfolio`]).
+pub const MAX_TREASURY_ASSETS: u32 = 32;
+const MAX_BALANCE_ASSETS: u32 = MAX_TREASURY_ASSETS;
 
 /// Stored treasury record.
 #[contracttype]
@@ -171,7 +197,9 @@ pub struct MilestoneDisbursement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holding {
     pub asset: Address,
+    /// Cumulative amount deposited for this asset.
     pub total_in: i128,
+    /// Cumulative amount withdrawn for this asset.
     pub total_out: i128,
     /// Budget envelope backing this asset, if any.
     pub budget_id: Option<String>,
@@ -182,6 +210,22 @@ pub struct Holding {
 pub struct AssetBalance {
     pub asset: Address,
     pub balance: i128,
+}
+
+/// One approved asset's position, as reported by
+/// [`TreasuryContract::portfolio`]. All amounts are in the token's base units.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetPosition {
+    pub asset: Address,
+    /// The token contract's own `decimals()`.
+    pub decimals: u32,
+    /// Live balance held by the treasury contract on the token ledger.
+    pub balance: i128,
+    /// Balance according to the treasury's internal accounting.
+    pub recorded: i128,
+    /// Cumulative amount paid out of the treasury in this asset.
+    pub total_out: i128,
 }
 
 /// Composite key identifying a withdrawal allowance scoped to a specific agent
@@ -219,6 +263,12 @@ enum DataKey {
     ApprovedAsset(Address),
     /// Number of currently approved assets (instance).
     ApprovedAssetCount,
+    /// Enumerable list of currently approved assets (instance).
+    ApprovedAssetList,
+    /// Recorded per-asset custody balance backing the structured deposit and
+    /// withdrawal events (persistent).
+    AssetBalance(Address),
+    ReentrancyLock,
     /// Emergency circuit breaker freeze flag (persistent).
     Frozen,
     Milestone(u64),
@@ -231,44 +281,6 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
-    // --- registry-gated upgrades ---
-
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
-    pub fn set_upgrade_authority(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        admin: soroban_sdk::Address,
-        registry: soroban_sdk::Address,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
-    }
-
-    /// Read the recorded upgrade authority.
-    pub fn get_upgrade_authority(
-        env: soroban_sdk::Env,
-    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::get_authority(&env)
-    }
-
-    /// Replace this contract's code with `wasm_hash`.
-    ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for [`ModuleKind::Treasury`] in the registry. Any
-    /// other outcome leaves the contract running its current code.
-    pub fn upgrade(
-        env: soroban_sdk::Env,
-        caller: soroban_sdk::Address,
-        wasm_hash: soroban_sdk::BytesN<32>,
-    ) -> Result<(), astroid_shared::errors::Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Treasury,
-            wasm_hash,
-        )
-    }
     /// Create a treasury for `org`, gated on the admin's signature.
     ///
     /// The circuit breaker starts disengaged (`paused == false`), no registry
@@ -280,6 +292,14 @@ impl TreasuryContract {
         if env.storage().instance().has(&DataKey::Treasury) {
             return Err(Error::AlreadyInitialized);
         }
+        // Initialization decides who owns the treasury and who may later move
+        // every asset it custodies, so the admin's signature is what makes the
+        // function safe to expose at all: without it, anyone who can reach a
+        // freshly deployed contract could record themselves as admin and lock
+        // the deployer out. Demanded before anything is written, and after the
+        // re-initialization guard so a second attempt still reports
+        // `AlreadyInitialized` rather than an auth failure.
+        admin.require_auth();
         require_non_empty(&org)?;
         env.storage().instance().set(
             &DataKey::Treasury,
@@ -369,6 +389,12 @@ impl TreasuryContract {
         if env.storage().persistent().get(&key).unwrap_or(false) {
             return Err(Error::AlreadyExists);
         }
+        let mut list = Self::approved_list(&env);
+        if list.len() >= MAX_TREASURY_ASSETS {
+            return Err(Error::InvalidInput);
+        }
+        list.push_back(asset.clone());
+        Self::store_approved_list(&env, &list);
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(
             &key,
@@ -393,6 +419,11 @@ impl TreasuryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
+        let mut list = Self::approved_list(&env);
+        if let Some(i) = list.first_index_of(&asset) {
+            list.remove(i);
+            Self::store_approved_list(&env, &list);
+        }
         let count = Self::approved_count(&env).saturating_sub(1);
         Self::store_approved_count(&env, count);
         Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_rm"));
@@ -530,17 +561,17 @@ impl TreasuryContract {
     }
 
     /// Deposit assets into the treasury (any funder may authorize). Moves real
-    /// SAC tokens from `from` into the treasury's custody, then credits the
-    /// internal per-asset accounting.
+    /// tokens from `from` into the treasury's custody, then credits the
+    /// internal per-asset accounting with the amount that actually arrived.
     ///
-    /// A contract depositor is verified against the registry's `Wallet` record
-    /// for the treasury's organization (an organization's funding wallets stay
-    /// first-class depositors); account depositors are unrestricted. The
-    /// reentrancy lock spans the token transfer.
+    /// The custody balance is measured before and after the transfer, so a
+    /// token that delivers less than `amount` (e.g. fee-on-transfer) is only
+    /// credited what it delivered; one that delivers nothing, or claims to
+    /// deliver more than was sent, is rejected.
     pub fn deposit(env: Env, from: Address, asset: Address, amount: i128) -> Result<(), Error> {
         require_positive_amount(amount)?;
         from.require_auth();
-        let t = Self::load(&env);
+        let t = Self::load(&env)?;
         Self::require_active(&t)?;
         // Inbound routing is validated too: an unapproved token contract is
         // never invoked, not even to pull funds in.
@@ -550,18 +581,36 @@ impl TreasuryContract {
         // external token call.
         Self::require_verified_caller(&env, &t, &from, ModuleKind::Wallet)?;
         Self::lock(&env)?;
+        // Pull tokens into the contract's own custody and measure the delta.
+        let token_client = token::TokenClient::new(&env, &asset);
+        let custody = env.current_contract_address();
+        let before = token_client.balance(&custody);
+        token_client.transfer(&from, &custody, &amount);
+        let received = checked_sub(token_client.balance(&custody), before)?;
+        if received <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if received > amount {
+            return Err(Error::InvalidState);
+        }
         let mut h = Self::load_holding(&env, &asset);
-        h.total_in = checked_add(h.total_in, amount)?;
+        h.total_in = checked_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
+        let balance = checked_add(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
-            (asset.clone(), amount),
+            (asset.clone(), received),
         );
-        // Pull tokens into the contract's own custody.
-        token::TokenClient::new(&env, &asset).transfer(
-            &from,
-            &env.current_contract_address(),
-            &amount,
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryDeposited {
+                org: t.org.clone(),
+                from: from.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
+            },
         );
         Self::unlock(&env);
         Ok(())
@@ -681,12 +730,10 @@ impl TreasuryContract {
         require_positive_amount(amount)?;
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        // Single audited authorization point for every outbound movement: the
+        // caller must be the recorded admin and must sign for it.
+        let t = Self::require_admin(&env, &caller)?;
         Self::require_active(&t)?;
-        if t.admin != caller {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
 
         // 1. Routing validation — refuse to invoke a token contract the
         //    organization has not approved, before any gate is consulted.
@@ -754,12 +801,10 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
+        let balance = checked_sub(Self::asset_balance_internal(&env, &asset), amount)?;
+        Self::store_asset_balance(&env, &asset, balance);
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
-        token::TokenClient::new(&env, &asset).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
+        Self::transfer_out(&env, &asset, &to, amount)?;
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         events::publish(
             &env,
@@ -768,6 +813,16 @@ impl TreasuryContract {
                 to: to.clone(),
                 asset: asset.clone(),
                 amount,
+            },
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryWithdrawn {
+                org: t.org.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
             },
         );
         Self::unlock(&env);
@@ -801,12 +856,10 @@ impl TreasuryContract {
         }
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env);
+        // Same single audited authorization point as `withdraw`: admin identity
+        // plus the caller's own signature.
+        let t = Self::require_admin(&env, &caller)?;
         Self::require_active(&t)?;
-        if t.admin != caller {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
 
         // 1. Validate every leg and accumulate the payout with checked math, so
         //    a malformed or overflowing batch is rejected before anything moves.
@@ -856,8 +909,16 @@ impl TreasuryContract {
 
         let token_client = token::TokenClient::new(&env, &asset);
         let custody = env.current_contract_address();
+        let before = token_client.balance(&custody);
+        if before < total {
+            return Err(Error::InsufficientFunds);
+        }
         for payment in payments.iter() {
             token_client.transfer(&custody, &payment.recipient, &payment.amount);
+        }
+        // The token must have debited exactly the batch total from custody.
+        if checked_sub(before, token_client.balance(&custody))? != total {
+            return Err(Error::InvalidState);
         }
 
         // A single summary event keeps the log concise; the per-recipient moves
@@ -882,15 +943,10 @@ impl TreasuryContract {
 
     // --- views ---
 
-    /// Whether the emergency circuit breaker is currently engaged.
-    pub fn is_paused(env: Env) -> bool {
-        Self::load(&env).paused
-    }
-
     /// The address currently authorized to pause / unpause this treasury
     /// (alongside the multisig).
-    pub fn guardian(env: Env) -> Address {
-        Self::load(&env).guardian
+    pub fn guardian(env: Env) -> Result<Address, Error> {
+        Ok(Self::load(&env)?.guardian)
     }
 
     /// The registry used to verify contract callers, if one is wired.
@@ -909,15 +965,20 @@ impl TreasuryContract {
     ) -> Result<u64, Error> {
         let _t = Self::require_admin(&env, &caller)?;
         require_positive_amount(total_amount)?;
+        Self::require_approved_asset(&env, &asset)?;
         if milestones == 0 {
             return Err(Error::InvalidInput);
         }
 
-        let amount_per_milestone = total_amount / (milestones as i128);
+        let amount_per_milestone = checked_div(total_amount, milestones as i128)?;
+        // Fewer base units than milestones would schedule zero-value payouts.
+        if amount_per_milestone == 0 {
+            return Err(Error::InvalidAmount);
+        }
 
         let count_key = DataKey::MilestoneCount;
-        let mut count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
-        count += 1;
+        let count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
+        let count = count.checked_add(1).ok_or(Error::Overflow)?;
 
         let disbursement = MilestoneDisbursement {
             total_amount,
@@ -957,6 +1018,9 @@ impl TreasuryContract {
     ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         let t = Self::require_admin(&env, &caller)?;
+        // Take the same reentrancy guard the other two outflows take, before
+        // the disbursement counter is advanced and the payout is made.
+        Self::lock(&env)?;
         let key = DataKey::Milestone(milestone_id);
         let mut d: MilestoneDisbursement = env
             .storage()
@@ -968,18 +1032,17 @@ impl TreasuryContract {
             return Err(Error::InvalidState);
         }
 
+        Self::require_approved_asset(&env, &d.asset)?;
+
         let mut amount = d.amount_per_milestone;
-        if d.disbursed == d.milestones - 1 {
-            let disbursed_so_far = d.amount_per_milestone * (d.milestones - 1) as i128;
-            amount = d.total_amount - disbursed_so_far;
+        let last = d.milestones - 1; // milestones > 0, checked at init
+        if d.disbursed == last {
+            // The final payout absorbs the rounding remainder.
+            let disbursed_so_far = checked_mul(d.amount_per_milestone, last as i128)?;
+            amount = checked_sub(d.total_amount, disbursed_so_far)?;
         }
 
-        // Issue #308 — verify the caller before the ledger is touched, then
-        // hold the reentrancy lock across the budget call and the transfer.
-        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
-        Self::lock(&env)?;
-
-        d.disbursed += 1;
+        d.disbursed = d.disbursed.checked_add(1).ok_or(Error::Overflow)?;
         env.storage().persistent().set(&key, &d);
         env.storage().persistent().extend_ttl(
             &key,
@@ -1001,11 +1064,7 @@ impl TreasuryContract {
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &d.asset, &holding);
 
-        token::TokenClient::new(&env, &d.asset).transfer(
-            &env.current_contract_address(),
-            &d.to,
-            &amount,
-        );
+        Self::transfer_out(&env, &d.asset, &d.to, amount)?;
         env.events().publish(
             (symbol_short!("milestone"), symbol_short!("disbursed")),
             (milestone_id, d.disbursed, amount),
@@ -1014,16 +1073,14 @@ impl TreasuryContract {
         Ok(())
     }
 
-    pub fn get(env: Env) -> Treasury {
+    /// The full treasury record. [`Error::NotInitialized`] before
+    /// [`Self::initialize`].
+    pub fn get(env: Env) -> Result<Treasury, Error> {
         Self::load(&env)
     }
 
     pub fn holding(env: Env, asset: Address) -> Holding {
         Self::load_holding(&env, &asset)
-    }
-
-    pub fn balance(env: Env, asset: Address) -> Result<i128, Error> {
-        Self::read_token_balance(&env, &asset)
     }
 
     pub fn balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error> {
@@ -1047,9 +1104,13 @@ impl TreasuryContract {
         Ok(report)
     }
 
-    /// Whether `asset` is currently approved for routing.
-    pub fn is_approved_asset(env: Env, asset: Address) -> bool {
-        Self::is_asset_approved(&env, &asset)
+    /// Live balances for every approved token, bounded by `MAX_TREASURY_ASSETS`.
+    pub fn get_all_balances(env: Env) -> Result<Vec<(Address, i128)>, Error> {
+        let mut report = Vec::new(&env);
+        for asset in Self::approved_list(&env).iter() {
+            report.push_back((asset.clone(), Self::read_token_balance(&env, &asset)?));
+        }
+        Ok(report)
     }
 
     /// Number of token contracts currently on the whitelist.
@@ -1057,13 +1118,43 @@ impl TreasuryContract {
         Self::approved_count(&env)
     }
 
+    /// Every token contract currently on the whitelist, in approval order.
+    pub fn approved_assets(env: Env) -> Vec<Address> {
+        Self::approved_list(&env)
+    }
+
+    /// Position of every approved asset: live custody balance, recorded
+    /// balance, cumulative outflow and the token's `decimals`. Bounded by
+    /// [`MAX_TREASURY_ASSETS`]. Assets never deposited report zero balances.
+    pub fn portfolio(env: Env) -> Vec<AssetPosition> {
+        let custody = env.current_contract_address();
+        let mut report = Vec::new(&env);
+        for asset in Self::approved_list(&env).iter() {
+            let token_client = token::TokenClient::new(&env, &asset);
+            let holding = Self::load_holding(&env, &asset);
+            report.push_back(AssetPosition {
+                decimals: token_client.decimals(),
+                balance: token_client.balance(&custody),
+                recorded: holding.total_in,
+                total_out: holding.total_out,
+                asset,
+            });
+        }
+        report
+    }
+
     // --- internals ---
 
-    fn load(env: &Env) -> Treasury {
+    /// Read the treasury record.
+    ///
+    /// Returns [`Error::NotInitialized`] when [`Self::initialize`] has not run,
+    /// so every entry point reports a deterministic code instead of trapping
+    /// the whole invocation with an opaque host error.
+    fn load(env: &Env) -> Result<Treasury, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Treasury)
-            .expect("treasury not initialized")
+            .ok_or(Error::NotInitialized)
     }
 
     fn store(env: &Env, t: &Treasury) {
@@ -1074,7 +1165,7 @@ impl TreasuryContract {
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         if t.admin != *caller {
             return Err(Error::Unauthorized);
         }
@@ -1111,11 +1202,62 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Pay `amount` of `asset` out of custody to `to`, checking the live
+    /// custody balance first and verifying afterwards that it fell by exactly
+    /// `amount`.
+    fn transfer_out(env: &Env, asset: &Address, to: &Address, amount: i128) -> Result<(), Error> {
+        let token_client = token::TokenClient::new(env, asset);
+        let custody = env.current_contract_address();
+        let before = token_client.balance(&custody);
+        if before < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        token_client.transfer(&custody, to, &amount);
+        if checked_sub(before, token_client.balance(&custody))? != amount {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn approved_list(env: &Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedAssetList)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn store_approved_list(env: &Env, list: &Vec<Address>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovedAssetList, list);
+    }
+
     fn approved_count(env: &Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::ApprovedAssetCount)
             .unwrap_or(0)
+    }
+
+    /// Current recorded balance for `asset` (0 when the asset never moved).
+    fn asset_balance_internal(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBalance(asset.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Persist the per-asset balance used by the structured deposit and
+    /// withdrawal events so the resulting balance never has to be recomputed
+    /// from the flow totals at emission time.
+    fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
+        let key = DataKey::AssetBalance(asset.clone());
+        env.storage().persistent().set(&key, &balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn store_approved_count(env: &Env, count: u32) {
@@ -1142,7 +1284,7 @@ impl TreasuryContract {
     }
 
     fn require_multisig(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         match &t.multisig {
             Some(multisig) if multisig == caller => {
                 caller.require_auth();
@@ -1156,7 +1298,7 @@ impl TreasuryContract {
     /// recorded guardian or the organization's multisig, verified against
     /// instance storage before `require_auth` is demanded.
     fn require_guardian(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env);
+        let t = Self::load(env)?;
         let is_multisig = matches!(&t.multisig, Some(multisig) if multisig == caller);
         if t.guardian != *caller && !is_multisig {
             return Err(Error::Unauthorized);
@@ -1172,7 +1314,7 @@ impl TreasuryContract {
     /// it, and is never called on inbound paths: deposits must keep working
     /// during a pause so recovery funding can arrive.
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::load(env).paused {
+        if Self::load(env)?.paused {
             return Err(Error::TreasuryPaused);
         }
         Ok(())
@@ -1187,6 +1329,9 @@ impl TreasuryContract {
         if frozen {
             return Err(Error::InvalidState);
         }
+        // Deliberately does not touch `DataKey::ReentrancyLock`: freezing is a
+        // state predicate, and clearing the guard here would let a caller that
+        // had already taken it release it mid-operation.
         Ok(())
     }
 
@@ -1215,9 +1360,13 @@ impl TreasuryContract {
         if Self::load(env).reentrancy_lock {
             return Err(Error::InvalidState);
         }
-        let mut t = Self::load(env);
-        t.reentrancy_lock = true;
-        Self::store(env, &t);
+        // Hold the guard for the remainder of the invocation. It is released by
+        // `unlock` on the way out; if the invocation instead returns an error
+        // before reaching that point, the host rolls the write back, so the
+        // guard can never be left engaged.
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
         Ok(())
     }
 
@@ -1309,6 +1458,69 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared read surface, exposed through `TreasuryInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl TreasuryInterface for TreasuryContract {
+    fn balance(env: Env, asset: Address) -> Result<i128, Error> {
+        Self::read_token_balance(&env, &asset)
+    }
+
+    /// Whether `asset` is currently approved for routing.
+    fn is_approved_asset(env: Env, asset: Address) -> bool {
+        Self::is_asset_approved(&env, &asset)
+    }
+
+    /// Whether the emergency circuit breaker is currently engaged.
+    ///
+    /// An uninitialized treasury has no breaker to engage, so this reports
+    /// `false` rather than failing. Use [`TreasuryContract::get`] when the
+    /// caller needs to distinguish "not paused" from "not initialized".
+    fn is_paused(env: Env) -> bool {
+        Self::load(&env).map(|t| t.paused).unwrap_or(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for TreasuryContract {
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Treasury` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Treasury,
+            wasm_hash,
+        )
     }
 }
 

@@ -1,10 +1,14 @@
 use astroid_shared::errors::Error;
+use astroid_shared::types::AssetAmount;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    Address, BytesN, Env, IntoVal, String, Symbol, Val,
+    vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
-use crate::{PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload};
+use crate::{
+    PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload,
+    MAX_POLICY_RULES,
+};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -16,6 +20,22 @@ fn assert_event(env: &Env, variant: &str) {
         .iter()
         .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
+
+/// Assert that no canonical `ContractEvent` with the given variant was
+/// published during the test.
+fn assert_no_event(env: &Env, variant: &str) {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    let found = env
+        .events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want));
+    assert!(
+        !found,
+        "expected no ContractEvent::{} to be emitted",
+        variant
+    );
 }
 
 fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
@@ -641,10 +661,10 @@ fn allowance_over_limit_rejected_with_exceeded() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &1_000, &0);
 
     let over = p.try_check_allowance(&String::from_str(&env, "mt"), &asset, &1_001);
-    assert_eq!(over, Err(Ok(Error::PolicyAllowanceExceeded)));
+    assert_eq!(over, Err(Ok(Error::AllowanceExceeded)));
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &1_001),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 }
 
@@ -670,7 +690,7 @@ fn allowance_cumulative_consumption_blocks_after_limit() {
     // 401 would exceed the cumulative limit.
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &401),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // A fresh 300 transfer still fits.
     assert!(p
@@ -697,7 +717,7 @@ fn multi_token_allowances_are_independent_per_asset() {
         .is_ok());
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &xlm, &recip, &101),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
     // An asset with no configured allowance is unrestricted.
     let eth = Address::generate(&env);
@@ -716,11 +736,12 @@ fn allowance_expires_at_past_blocks_spend() {
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
 
-    // Expires in the past => every spend denied, even below the limit.
+    // Expires in the past => every spend refused, even below the limit, and the
+    // refusal names the lapse rather than passing it off as a rule denial.
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &1_000, &500);
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &1),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::AllowanceExpired))
     );
 }
 
@@ -765,7 +786,7 @@ fn allowance_remove_restores_unlimited() {
     p.set_allowance(&owner, &String::from_str(&env, "mt"), &asset, &100, &0);
     assert_eq!(
         p.try_check_transfer(&String::from_str(&env, "mt"), &asset, &recip, &200),
-        Err(Ok(Error::PolicyAllowanceExceeded))
+        Err(Ok(Error::AllowanceExceeded))
     );
 
     p.remove_allowance(&owner, &String::from_str(&env, "mt"), &asset);
@@ -1798,5 +1819,1614 @@ fn only_the_owner_can_manage_the_blacklist() {
     assert_eq!(
         p.try_remove_asset_blacklist(&stranger, &pid, &asset),
         Err(Ok(Error::Unauthorized))
+    );
+}
+
+// --- Multi-asset spending requests (Issue #237) ---
+
+fn entry(asset: &Address, amount: i128) -> AssetAmount {
+    AssetAmount {
+        asset: asset.clone(),
+        amount,
+    }
+}
+
+fn spent(env: &Env, p: &PolicyContractClient, asset: &Address) -> i128 {
+    p.get_allowance(&String::from_str(env, "mt"), asset).spent
+}
+
+#[test]
+fn multi_asset_amount_at_limit_passes_and_one_over_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (a, b) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &a, &1_000, &0);
+    p.set_allowance(&owner, &pid, &b, &1_000, &0);
+
+    // limit + 1 is rejected and records nothing.
+    assert_eq!(
+        p.try_record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&b, 1_001)]),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    assert_eq!(spent(&env, &p, &b), 0);
+
+    // Exactly the limit is permitted and consumes the allowance fully.
+    p.record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&a, 1_000)]);
+    assert_eq!(spent(&env, &p, &a), 1_000);
+    assert_eq!(p.try_check_allowance(&pid, &a, &0), Ok(Ok(0)));
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&a, 1)]),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+}
+
+#[test]
+fn zero_and_negative_amounts_are_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
+
+    for bad in [0i128, -1, i128::MIN] {
+        assert_eq!(
+            p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&asset, bad)]),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            p.try_record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&asset, bad)]),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            p.try_check_transfer(&pid, &asset, &recip, &bad),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            p.try_update_allowance(&owner, &pid, &asset, &bad),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+    // A negative entry cannot offset a positive one for the same asset.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 1_500), entry(&asset, -600)]
+        ),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(spent(&env, &p, &asset), 0);
+}
+
+#[test]
+fn multi_asset_unlisted_asset_is_rejected_and_nothing_recorded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (known, unknown) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_asset_whitelist_enabled(&owner, &pid, &true);
+    p.add_asset_to_whitelist(&owner, &pid, &known);
+    p.set_allowance(&owner, &pid, &known, &1_000, &0);
+
+    assert_eq!(
+        p.try_record_multi_asset_spend(
+            &owner,
+            &pid,
+            &recip,
+            &vec![&env, entry(&known, 100), entry(&unknown, 1)]
+        ),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    assert_eq!(spent(&env, &p, &known), 0);
+}
+
+#[test]
+fn multi_asset_both_within_limits_records_both() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (xlm, usdc) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &xlm, &1_000, &0);
+    p.set_allowance(&owner, &pid, &usdc, &500, &0);
+
+    let req = vec![&env, entry(&xlm, 700), entry(&usdc, 500)];
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &req),
+        Ok(Ok(()))
+    );
+    // Checking is read-only.
+    assert_eq!(spent(&env, &p, &xlm), 0);
+    p.record_multi_asset_spend(&owner, &pid, &recip, &req);
+    assert_eq!(spent(&env, &p, &xlm), 700);
+    assert_eq!(spent(&env, &p, &usdc), 500);
+}
+
+#[test]
+fn multi_asset_one_over_limit_rejects_whole_request() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (xlm, usdc) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &xlm, &1_000, &0);
+    p.set_allowance(&owner, &pid, &usdc, &500, &0);
+
+    // The passing asset comes first in the request and still records nothing.
+    for req in [
+        vec![&env, entry(&xlm, 700), entry(&usdc, 501)],
+        vec![&env, entry(&usdc, 501), entry(&xlm, 700)],
+    ] {
+        assert_eq!(
+            p.try_record_multi_asset_spend(&owner, &pid, &recip, &req),
+            Err(Ok(Error::AllowanceExceeded))
+        );
+        assert_eq!(spent(&env, &p, &xlm), 0);
+        assert_eq!(spent(&env, &p, &usdc), 0);
+    }
+}
+
+#[test]
+fn duplicate_entries_are_aggregated_before_checking() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
+
+    // 600 + 500 = 1_100 > 1_000, although each entry fits on its own.
+    assert_eq!(
+        p.try_record_multi_asset_spend(
+            &owner,
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 600), entry(&asset, 500)]
+        ),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    assert_eq!(spent(&env, &p, &asset), 0);
+
+    // Within the limit the entries are recorded once, as their sum.
+    p.record_multi_asset_spend(
+        &owner,
+        &pid,
+        &recip,
+        &vec![&env, entry(&asset, 300), entry(&asset, 200)],
+    );
+    assert_eq!(spent(&env, &p, &asset), 500);
+}
+
+#[test]
+fn duplicate_entries_cannot_split_past_the_per_transfer_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    // `setup` registers "max_txn" with max_amount = 1_000_000.
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 600_000), entry(&asset, 400_001)]
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&asset, 600_000), entry(&asset, 400_000)]
+        ),
+        Ok(Ok(()))
+    );
+}
+
+#[test]
+fn amounts_near_i128_max_fail_without_panicking() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let (a, b) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+
+    // Per-asset totals that do not fit an i128.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&a, i128::MAX), entry(&a, 1)]
+        ),
+        Err(Ok(Error::Overflow))
+    );
+    // i128::MAX of two *different* assets is fine: amounts are never summed
+    // across assets.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&a, i128::MAX), entry(&b, i128::MAX)]
+        ),
+        Ok(Ok(()))
+    );
+
+    // Cumulative spend right up to an i128::MAX limit, then one more unit.
+    p.set_allowance(&owner, &pid, &a, &i128::MAX, &0);
+    p.record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&a, i128::MAX - 1)]);
+    p.update_allowance(&owner, &pid, &a, &1);
+    assert_eq!(spent(&env, &p, &a), i128::MAX);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &a, &1),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    assert_eq!(
+        p.try_check_transfer(&pid, &a, &recip, &i128::MAX),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+
+    // Lowering a limit below what was spent leaves negative headroom, which
+    // rejects every positive amount.
+    p.set_allowance(&owner, &pid, &a, &10, &0);
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&a, 1)]),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+}
+
+#[test]
+fn assets_with_different_decimals_keep_independent_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    // 1 XLM (7 decimals) and 5 USDC (6 decimals), in base units.
+    let (xlm, usdc) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &xlm, &10_000_000, &0);
+    p.set_allowance(&owner, &pid, &usdc, &5_000_000, &0);
+
+    // 9 USDC exceeds the USDC limit even though it is below the XLM limit.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&usdc, 9_000_000)]),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    // Both limits fully used in one request: the combined 15_000_000 base
+    // units are never compared with either limit.
+    p.record_multi_asset_spend(
+        &owner,
+        &pid,
+        &recip,
+        &vec![&env, entry(&xlm, 10_000_000), entry(&usdc, 5_000_000)],
+    );
+    assert_eq!(spent(&env, &p, &xlm), 10_000_000);
+    assert_eq!(spent(&env, &p, &usdc), 5_000_000);
+    for asset in [&xlm, &usdc] {
+        assert_eq!(
+            p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(asset, 1)]),
+            Err(Ok(Error::AllowanceExceeded))
+        );
+    }
+}
+
+#[test]
+fn empty_or_oversized_requests_are_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &Vec::new(&env)),
+        Err(Ok(Error::InvalidInput))
+    );
+    let mut ten = Vec::new(&env);
+    for _ in 0..10 {
+        ten.push_back(entry(&asset, 1));
+    }
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &ten),
+        Ok(Ok(()))
+    );
+    ten.push_back(entry(&asset, 1));
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &ten),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_asset_request_runs_the_policy_gates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let only = Address::generate(&env);
+    let other = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let p = PolicyContractClient::new(&env, &id);
+    p.initialize();
+    let pid = String::from_str(&env, "single");
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[3; 32]),
+        &0,
+        &None,
+        &Some(only.clone()),
+        &0,
+    );
+
+    // An asset outside `allowed_asset` sinks the whole request.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &pid,
+            &recip,
+            &vec![&env, entry(&only, 1), entry(&other, 1)]
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Recipient blocklist is evaluated before any asset.
+    p.add_to_blocklist(&owner, &pid, &recip);
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&only, 1)]),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+    // Unknown policy.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(
+            &String::from_str(&env, "nope"),
+            &recip,
+            &vec![&env, entry(&only, 1)]
+        ),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn only_the_owner_can_record_spend() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
+
+    // A non-owner cannot burn the owner's allowance through either path.
+    assert_eq!(
+        p.try_record_multi_asset_spend(&stranger, &pid, &recip, &vec![&env, entry(&asset, 1_000)]),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_update_allowance(&stranger, &pid, &asset, &1_000),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(spent(&env, &p, &asset), 0);
+    assert_eq!(
+        p.try_set_recurring_allowance(&stranger, &pid, &asset, &1, &60, &0),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn recording_spend_requires_the_callers_signature() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    // Drop the blanket auth mock: the owner has not signed this call.
+    env.set_auths(&[]);
+    let r = p.try_record_multi_asset_spend(
+        &owner,
+        &String::from_str(&env, "mt"),
+        &Address::generate(&env),
+        &vec![&env, entry(&asset, 1)],
+    );
+    // A host auth failure, not a contract error code.
+    assert!(matches!(r, Err(Err(_))));
+}
+
+// --- Rate-limited (recurring) allowances (Issue #237) ---
+
+const START: u64 = 1_000;
+const WINDOW: u64 = 100;
+
+/// A policy with a 1_000-per-100s rate limit on `asset`, configured at
+/// ledger time `START`.
+fn rate_setup<'a>(env: &'a Env, owner: &Address, asset: &Address) -> PolicyContractClient<'a> {
+    env.ledger().set_timestamp(START);
+    let p = allowance_setup(env, owner);
+    p.set_recurring_allowance(
+        owner,
+        &String::from_str(env, "mt"),
+        asset,
+        &1_000,
+        &WINDOW,
+        &0,
+    );
+    p
+}
+
+#[test]
+fn rate_limit_first_spend_and_accumulation_within_a_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!(
+        (a.spent, a.window_seconds, a.window_start),
+        (0, WINDOW, START)
+    );
+    // First-ever spend.
+    p.update_allowance(&owner, &pid, &asset, &400);
+    env.ledger().set_timestamp(START + 50);
+    p.update_allowance(&owner, &pid, &asset, &600);
+    assert_eq!(spent(&env, &p, &asset), 1_000);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+}
+
+#[test]
+fn rate_limit_spend_at_period_end_minus_one_counts_in_current_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(START + WINDOW - 1);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &1),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (1_000, START));
+}
+
+#[test]
+fn rate_limit_spend_exactly_at_period_end_opens_a_new_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(START + WINDOW);
+    assert_eq!(p.try_check_allowance(&pid, &asset, &1_000), Ok(Ok(0)));
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1_000).is_ok());
+    p.record_multi_asset_spend(&owner, &pid, &recip, &vec![&env, entry(&asset, 250)]);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (250, START + WINDOW));
+}
+
+#[test]
+fn rate_limit_resets_after_several_periods_without_carry_over() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    // Five whole periods and part of a sixth.
+    env.ledger().set_timestamp(START + 5 * WINDOW + 37);
+    // The view already reflects the current window, anchored on a boundary.
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (0, START + 5 * WINDOW));
+    // Idle periods do not accrue: the limit is still 1_000, not 5_000.
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1_001),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    // The persisted window stays on the boundary schedule (no drift to `now`).
+    env.ledger().set_timestamp(START + 6 * WINDOW);
+    p.update_allowance(&owner, &pid, &asset, &1);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (1, START + 6 * WINDOW));
+}
+
+#[test]
+fn zero_window_allowance_never_resets() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &0, &0);
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(u64::MAX);
+    assert_eq!(spent(&env, &p, &asset), 1_000);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+}
+
+#[test]
+fn ledger_time_before_window_start_keeps_current_usage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(START - 1);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (1_000, START));
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &1),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+}
+
+#[test]
+fn rate_limit_window_far_in_the_future_does_not_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    env.ledger().set_timestamp(START);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &(u64::MAX / 2), &0);
+
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    env.ledger().set_timestamp(u64::MAX);
+    // (u64::MAX - START) / (u64::MAX / 2) = 1 whole window elapsed.
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!((a.spent, a.window_start), (0, START + u64::MAX / 2));
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+}
+
+#[test]
+fn reconfiguring_the_window_keeps_spend_and_reanchors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &asset);
+    let pid = String::from_str(&env, "mt");
+
+    p.update_allowance(&owner, &pid, &asset, &700);
+    env.ledger().set_timestamp(START + 50);
+    // Changing the window re-anchors it at "now"; the 700 already spent stays.
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &200, &0);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!(
+        (a.spent, a.window_seconds, a.window_start),
+        (700, 200, START + 50)
+    );
+    env.ledger().set_timestamp(START + 50 + 199);
+    assert_eq!(
+        p.try_update_allowance(&owner, &pid, &asset, &301),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    // set_allowance only touches the limit and expiry: the window survives.
+    p.set_allowance(&owner, &pid, &asset, &2_000, &0);
+    let a = p.get_allowance(&pid, &asset);
+    assert_eq!(
+        (a.limit, a.window_seconds, a.window_start),
+        (2_000, 200, START + 50)
+    );
+    env.ledger().set_timestamp(START + 50 + 200);
+    assert_eq!(spent(&env, &p, &asset), 0);
+}
+
+#[test]
+fn multi_asset_request_resets_each_asset_on_its_own_schedule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (hourly, cumulative) = (Address::generate(&env), Address::generate(&env));
+    let recip = Address::generate(&env);
+    let p = rate_setup(&env, &owner, &hourly);
+    let pid = String::from_str(&env, "mt");
+    p.set_allowance(&owner, &pid, &cumulative, &1_000, &0);
+
+    let both = vec![&env, entry(&hourly, 1_000), entry(&cumulative, 600)];
+    p.record_multi_asset_spend(&owner, &pid, &recip, &both);
+    env.ledger().set_timestamp(START + WINDOW);
+    // The rate-limited asset reset; the cumulative one did not, so the whole
+    // request is refused and the reset is not persisted by a failed request.
+    assert_eq!(
+        p.try_record_multi_asset_spend(&owner, &pid, &recip, &both),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    assert_eq!(spent(&env, &p, &cumulative), 600);
+    p.record_multi_asset_spend(
+        &owner,
+        &pid,
+        &recip,
+        &vec![&env, entry(&hourly, 1_000), entry(&cumulative, 400)],
+    );
+    assert_eq!(spent(&env, &p, &hourly), 1_000);
+    assert_eq!(spent(&env, &p, &cumulative), 1_000);
+}
+
+#[test]
+fn expired_rate_limit_stays_denied_after_a_reset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+    let owner = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let pid = String::from_str(&env, "mt");
+    p.set_recurring_allowance(&owner, &pid, &asset, &1_000, &WINDOW, &(START + 150));
+
+    env.ledger().set_timestamp(START + 150);
+    // A window reset must not resurrect a lapsed envelope: the refusal names
+    // the expiry rather than being passed off as a rule denial.
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &vec![&env, entry(&asset, 1)]),
+        Err(Ok(Error::AllowanceExpired))
+    );
+}
+
+// --- Multi-rule composition (rule stack) tests ---
+//
+// A policy may stack several independent rule trees. All of them must pass for
+// `check_transfer` to authorize a transaction: the evaluation short-circuits on
+// the first failing rule with `Error::PolicyDenied`.
+
+/// A chain of 15 nested `Not` nodes — structurally valid (so registration
+/// accepts it) but deeper than `MAX_RULE_DEPTH`, so evaluating it fails with
+/// [`Error::InvalidInput`]. Used to prove the stack short-circuits before it
+/// reaches a later, un-evaluable rule.
+fn deep_chain_tree(env: &Env) -> RuleTree {
+    let mut tree = soroban_sdk::Vec::new(env);
+    for i in 0..15u32 {
+        tree.push_back(RuleNode {
+            op: RuleOp::Not,
+            value_i128: 0,
+            value_address: Address::generate(env),
+            children_start: i + 1,
+            children_end: i + 2,
+        });
+    }
+    tree.push_back(RuleNode {
+        op: RuleOp::MaxAmount,
+        value_i128: i128::MAX,
+        value_address: Address::generate(env),
+        children_start: 0,
+        children_end: 0,
+    });
+    tree
+}
+
+#[test]
+fn multi_rule_recipient_and_amount_both_must_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // Compound policy: allow-listed recipient AND max amount 500.
+    assert_eq!(
+        p.add_policy_rule(
+            &owner,
+            &pid,
+            &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env)
+        ),
+        1
+    );
+    assert_eq!(
+        p.add_policy_rule(
+            &owner,
+            &pid,
+            &single_amount_tree(RuleOp::MaxAmount, 500, &env)
+        ),
+        2
+    );
+    assert_eq!(p.get_policy_rules(&pid).len(), 2);
+
+    // Recipient whitelisted and amount within the cap: authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &500).is_ok());
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &1).is_ok());
+}
+
+#[test]
+fn multi_rule_whitelisted_recipient_failure_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Amount is fine, but the recipient is not on the whitelist: one failing
+    // rule is enough to deny the whole evaluation.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_amount_limit_failure_denies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Recipient is whitelisted, but the amount breaches the cap.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &501),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_is_conjunctive_across_three_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // recipient + amount + asset: every rule must pass.
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedAsset, asset.clone(), &env),
+    );
+    assert_eq!(p.get_policy_rules(&pid).len(), 3);
+
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &500).is_ok());
+
+    let other_asset = Address::generate(&env);
+    assert_eq!(
+        p.try_check_transfer(&pid, &other_asset, &vendor, &500),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_empty_stack_is_permissive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // No rules registered: nothing to enforce, every transfer is authorized.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recip, &1_000_000)
+        .is_ok());
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip,
+        amount: 1,
+    };
+    assert_eq!(p.try_evaluate_policy_rules(&pid, &payload), Ok(Ok(true)));
+}
+
+#[test]
+fn multi_rule_remove_retires_a_single_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+
+    // Over the cap while both rules are active.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Retire the amount rule (index 1); the recipient rule stays in force.
+    p.remove_policy_rule(&owner, &pid, &1);
+    assert_eq!(p.get_policy_rules(&pid).len(), 1);
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &600).is_ok());
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn multi_rule_remove_bounds_and_missing_stack_fail() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    // No stack yet.
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &0),
+        Err(Ok(Error::NotFound))
+    );
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 1, &env),
+    );
+    // Out-of-range index is rejected instead of panicking.
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &5),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &u32::MAX),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    p.remove_policy_rule(&owner, &pid, &0);
+    // The key is dropped with its last rule.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert_eq!(
+        p.try_remove_policy_rule(&owner, &pid, &0),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        p.try_clear_policy_rules(&owner, &pid),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn multi_rule_only_the_owner_can_manage_the_stack() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    let tree = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+    assert_eq!(
+        p.try_add_policy_rule(&stranger, &pid, &tree),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_remove_policy_rule(&stranger, &pid, &0),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_clear_policy_rules(&stranger, &pid),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // The owner's own stack is untouched by the rejected attempts.
+    p.add_policy_rule(&owner, &pid, &tree);
+    assert_eq!(p.get_policy_rules(&pid).len(), 1);
+}
+
+#[test]
+fn multi_rule_rejects_empty_and_malformed_trees() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    // Empty tree.
+    let empty = soroban_sdk::Vec::new(&env);
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &empty),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // AND with an empty child range.
+    let mut no_children = soroban_sdk::Vec::new(&env);
+    no_children.push_back(RuleNode {
+        op: RuleOp::And,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 1,
+    });
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &no_children),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // AND whose child range runs past the end of the tree.
+    let mut out_of_bounds = soroban_sdk::Vec::new(&env);
+    out_of_bounds.push_back(RuleNode {
+        op: RuleOp::Or,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 9,
+    });
+    out_of_bounds.push_back(leaf_amount(RuleOp::MaxAmount, 1, &env));
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &out_of_bounds),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // NOT with more than one child.
+    let mut two_children = soroban_sdk::Vec::new(&env);
+    two_children.push_back(RuleNode {
+        op: RuleOp::Not,
+        value_i128: 0,
+        value_address: Address::generate(&env),
+        children_start: 1,
+        children_end: 3,
+    });
+    two_children.push_back(leaf_amount(RuleOp::MaxAmount, 1, &env));
+    two_children.push_back(leaf_amount(RuleOp::MaxAmount, 2, &env));
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &two_children),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // Nothing was stored by any of the rejected registrations.
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+}
+
+#[test]
+fn multi_rule_stack_is_bounded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+
+    for i in 0..MAX_POLICY_RULES {
+        let tree = single_amount_tree(RuleOp::MaxAmount, i as i128, &env);
+        assert_eq!(p.add_policy_rule(&owner, &pid, &tree), i + 1);
+    }
+    assert_eq!(p.get_policy_rules(&pid).len(), MAX_POLICY_RULES);
+
+    // The stack cannot grow past the gas-safety bound.
+    let overflow = single_amount_tree(RuleOp::MaxAmount, i128::MAX, &env);
+    assert_eq!(
+        p.try_add_policy_rule(&owner, &pid, &overflow),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_rule_clear_restores_permissive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    p.clear_policy_rules(&owner, &pid);
+    assert_eq!(p.get_policy_rules(&pid).len(), 0);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &100).is_ok());
+}
+
+#[test]
+fn multi_rule_denial_emits_policy_violation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+
+    let _ = p.try_check_transfer(&pid, &asset, &recip, &100);
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn multi_rule_stacks_with_the_single_composite_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+
+    // The single composite tree caps the amount at 100 …
+    let tree = single_amount_tree(RuleOp::MaxAmount, 100, &env);
+    p.set_composite_rule(&owner, &pid, &tree);
+    // … while the stack additionally whitelists the vendor.
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, vendor.clone(), &env),
+    );
+
+    // Composite tree denies the oversized transfer.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &200),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Stack denies the unlisted recipient.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &50),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Both layers pass for the whitelisted vendor inside the cap.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &50).is_ok());
+}
+
+#[test]
+fn multi_rule_short_circuits_on_first_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "cr");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recip.clone(),
+        amount: 100,
+    };
+
+    // A rule deeper than the recursion guard cannot be evaluated at all.
+    let deep = deep_chain_tree(&env);
+    let deny = single_amount_tree(RuleOp::MaxAmount, 10, &env);
+
+    // [failing rule, deep rule]: the first rule denies and the loop stops
+    // before it ever reaches the un-evaluable second rule.
+    p.add_policy_rule(&owner, &pid, &deny);
+    p.add_policy_rule(&owner, &pid, &deep);
+    assert_eq!(p.try_evaluate_policy_rules(&pid, &payload), Ok(Ok(false)));
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // [deep rule, failing rule]: with the order swapped the depth guard trips
+    // first, proving evaluation really does run in stack order.
+    p.clear_policy_rules(&owner, &pid);
+    p.add_policy_rule(&owner, &pid, &deep);
+    p.add_policy_rule(&owner, &pid, &deny);
+    assert_eq!(
+        p.try_evaluate_policy_rules(&pid, &payload),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multi_rule_stack_is_scoped_to_its_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let other = String::from_str(&env, "other");
+    p.register_policy(
+        &owner,
+        &other,
+        &BytesN::from_array(&env, &[7; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    p.add_policy_rule(
+        &owner,
+        &String::from_str(&env, "cr"),
+        &single_amount_tree(RuleOp::MaxAmount, 10, &env),
+    );
+
+    // The strict rule is enforced only on its own policy; the sibling stays
+    // permissive.
+    assert_eq!(
+        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(p.get_policy_rules(&other).len(), 0);
+    assert!(p.try_check_transfer(&other, &asset, &recip, &100).is_ok());
+}
+
+// --- Recipient whitelist (Issue #63) tests ---
+//
+// A policy owns a dynamic directory of approved destinations. While whitelist
+// mode is active only listed recipients may be targeted, an empty directory
+// fails closed, and a miss is rejected with `Error::PolicyDenied`.
+
+/// Register a policy with no scalar gates so only the recipient whitelist gate
+/// decides the outcome.
+fn whitelist_setup<'a>(env: &'a Env, owner: &Address, policy_id: &str) -> PolicyContractClient<'a> {
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(env, &id);
+    client.initialize();
+    client.register_policy(
+        owner,
+        &String::from_str(env, policy_id),
+        &BytesN::from_array(env, &[5; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    client
+}
+
+#[test]
+fn whitelist_allows_listed_and_blocks_unlisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl");
+    let pid = String::from_str(&env, "wl");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    p.add_recipient_to_whitelist(&owner, &pid, &b);
+
+    // Listed destinations pass.
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+    assert!(p.try_check_transfer(&pid, &asset, &b, &1).is_ok());
+    // An unlisted destination is denied with the policy denial code.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn empty_whitelist_denies_all_recipients() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_empty");
+    let pid = String::from_str(&env, "wl_empty");
+    let asset = Address::generate(&env);
+    let anyone = Address::generate(&env);
+
+    // Mode active with no entries — fail closed, every destination denied.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &anyone, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn whitelist_removal_blocks_previously_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_rem");
+    let pid = String::from_str(&env, "wl_rem");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+
+    p.remove_recipient_from_whitelist(&owner, &pid, &a);
+    // The previously approved destination is untrusted again.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &a, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn whitelist_disabled_allows_any_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_off");
+    let pid = String::from_str(&env, "wl_off");
+    let asset = Address::generate(&env);
+    let anyone = Address::generate(&env);
+
+    // Default state: the gate is not enforced and any destination passes.
+    assert!(p.try_check_transfer(&pid, &asset, &anyone, &1).is_ok());
+    // Enforcing then relaxing the mode reopens the gate without losing the
+    // staged directory.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.set_recipient_whitelist_enabled(&owner, &pid, &false);
+    assert!(p.try_check_transfer(&pid, &asset, &anyone, &1).is_ok());
+    assert!(!p.is_recipient_whitelisted(&pid, &anyone));
+}
+
+#[test]
+fn non_owner_cannot_manage_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_auth");
+    let pid = String::from_str(&env, "wl_auth");
+    let target = Address::generate(&env);
+
+    assert_eq!(
+        p.try_set_recipient_whitelist_enabled(&intruder, &pid, &true),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_add_recipient_to_whitelist(&intruder, &pid, &target),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&intruder, &pid, &target),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The rejected attempts left the directory untouched.
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+}
+
+#[test]
+fn duplicate_and_missing_recipient_whitelist_ops_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_dup");
+    let pid = String::from_str(&env, "wl_dup");
+    let target = Address::generate(&env);
+
+    // Listing an address twice is rejected …
+    p.add_recipient_to_whitelist(&owner, &pid, &target);
+    assert_eq!(
+        p.try_add_recipient_to_whitelist(&owner, &pid, &target),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // … and so is removing an address that was never listed.
+    let other = Address::generate(&env);
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&owner, &pid, &other),
+        Err(Ok(Error::NotFound))
+    );
+    p.remove_recipient_from_whitelist(&owner, &pid, &target);
+    assert_eq!(
+        p.try_remove_recipient_from_whitelist(&owner, &pid, &target),
+        Err(Ok(Error::NotFound))
+    );
+    // The last removal also drops the index, so the directory reads empty.
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+}
+
+#[test]
+fn whitelist_denial_emits_policy_violation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_evt");
+    let pid = String::from_str(&env, "wl_evt");
+    let asset = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    let _ = p.try_check_transfer(&pid, &asset, &stranger, &1);
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn whitelist_ok_path_records_no_violation_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_ok");
+    let pid = String::from_str(&env, "wl_ok");
+    let asset = Address::generate(&env);
+    let listed = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &listed);
+
+    // The gate enforces the directory but records nothing while the transfer
+    // is authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &listed, &1).is_ok());
+    assert_no_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn recipient_whitelist_is_scoped_per_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_a");
+    let pid_a = String::from_str(&env, "wl_a");
+    let pid_b = String::from_str(&env, "wl_b");
+    p.register_policy(
+        &owner,
+        &pid_b,
+        &BytesN::from_array(&env, &[6; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+    );
+    let asset = Address::generate(&env);
+    let vendor = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid_a, &true);
+    p.add_recipient_to_whitelist(&owner, &pid_a, &vendor);
+
+    // The directory belongs to policy A only.
+    assert!(p.is_recipient_whitelisted(&pid_a, &vendor));
+    assert!(!p.is_recipient_whitelisted(&pid_b, &vendor));
+    assert_eq!(p.get_recipient_whitelist(&pid_b).len(), 0);
+
+    // Policy B enforces an empty directory of its own, so the very same
+    // destination stays untrusted there.
+    p.set_recipient_whitelist_enabled(&owner, &pid_b, &true);
+    assert!(p.try_check_transfer(&pid_a, &asset, &vendor, &1).is_ok());
+    assert_eq!(
+        p.try_check_transfer(&pid_b, &asset, &vendor, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn recipient_whitelist_queries_reflect_edits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_q");
+    let pid = String::from_str(&env, "wl_q");
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.get_recipient_whitelist(&pid).is_empty());
+
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+    p.add_recipient_to_whitelist(&owner, &pid, &b);
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.is_recipient_whitelisted(&pid, &b));
+
+    let listed = p.get_recipient_whitelist(&pid);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.get(0), Some(a.clone()));
+    assert_eq!(listed.get(1), Some(b.clone()));
+
+    p.remove_recipient_from_whitelist(&owner, &pid, &a);
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    let listed = p.get_recipient_whitelist(&pid);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.get(0), Some(b));
+}
+
+#[test]
+fn evaluate_recipient_whitelist_entry_point() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_eval");
+    let pid = String::from_str(&env, "wl_eval");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payload = TransactionPayload {
+        asset: asset.clone(),
+        recipient: recipient.clone(),
+        amount: 1,
+    };
+
+    // Mode off: the entry point is permissive.
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Ok(Ok(()))
+    );
+
+    // Mode on with an empty directory: every destination is denied.
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Listing the destination clears the evaluation.
+    p.add_recipient_to_whitelist(&owner, &pid, &recipient);
+    assert_eq!(
+        p.try_evaluate_recipient_whitelist(&pid, &payload),
+        Ok(Ok(()))
+    );
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn blocklisted_recipient_stays_denied_while_whitelisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_blk");
+    let pid = String::from_str(&env, "wl_blk");
+    let asset = Address::generate(&env);
+    let bad = Address::generate(&env);
+
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &bad);
+    assert!(p.try_check_transfer(&pid, &asset, &bad, &1).is_ok());
+
+    // The blocklist runs first: listing an address never resurrects a blocked
+    // destination.
+    p.add_to_blocklist(&owner, &pid, &bad);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &bad, &1),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+}
+
+#[test]
+fn whitelist_and_scalar_gates_are_conjunctive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_mix");
+    let pid = String::from_str(&env, "wl_mix");
+    let asset = Address::generate(&env);
+    let vendor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    // Tighten the scalar cap to 100 alongside the whitelist gate.
+    p.rotate_policy(&owner, &pid, &BytesN::from_array(&env, &[5; 32]), &100);
+    p.set_recipient_whitelist_enabled(&owner, &pid, &true);
+    p.add_recipient_to_whitelist(&owner, &pid, &vendor);
+
+    // Listed and within the cap: authorized.
+    assert!(p.try_check_transfer(&pid, &asset, &vendor, &100).is_ok());
+    // Listed but over the cap: still denied by the scalar gate.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &vendor, &101),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Within the cap but unlisted: denied by the whitelist gate.
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &stranger, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn short_form_whitelist_api_manages_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = whitelist_setup(&env, &owner, "wl_short");
+    let pid = String::from_str(&env, "wl_short");
+    let asset = Address::generate(&env);
+    let a = Address::generate(&env);
+
+    // The concise management API drives the same storage as the explicit
+    // recipient-named functions.
+    p.set_whitelist_enabled(&owner, &pid, &true);
+    p.add_whitelist(&owner, &pid, &a);
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.try_check_transfer(&pid, &asset, &a, &1).is_ok());
+
+    p.remove_whitelist(&owner, &pid, &a);
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &a, &1),
+        Err(Ok(Error::PolicyDenied))
     );
 }

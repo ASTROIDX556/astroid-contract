@@ -185,6 +185,17 @@
                     },
                     {
                       "key": {
+                        "symbol": "rollover_max_bps"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 0
+                        }
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "spent"
                       },
                       "val": {
