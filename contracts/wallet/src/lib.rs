@@ -100,8 +100,8 @@ use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::{checked_add, SafeAdd, SafeSub};
-use astroid_shared::types::ModuleId;
-use astroid_shared::types::{ModuleKind, ResourceState};
+pub use astroid_shared::types::WalletData;
+use astroid_shared::types::{ModuleId, ModuleKind, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
@@ -178,14 +178,6 @@ pub struct VelocityLimit {
 pub struct VelocityUsage {
     pub bucket: u64,
     pub spent: soroban_sdk::Vec<i128>,
-}
-
-/// Stored wallet record. `owner` controls the wallet; `state` gates operations.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WalletData {
-    pub owner: Address,
-    pub state: ResourceState,
 }
 
 /// A single sub-call to be executed as part of a batch. `contract_addr` is the
