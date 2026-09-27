@@ -18,10 +18,12 @@
 //!    integrator can never decode a fresh failure as a retired meaning.
 //!
 //! The protocol-wide table deliberately holds more cases than Soroban's
-//! `#[contracterror]` spec admits (`VecM<.., 50>`), so the conversions to
-//! [`soroban_sdk::Error`] are written by hand at the bottom of this file rather
-//! than derived. Contract-specific codes that do not belong in the shared
-//! numeric bands live in their own tables ([`BudgetError`], [`MilestoneError`]).
+//! `#[contracterror]` spec admits (`VecM<.., 50>`), so the enum is annotated
+//! `#[contracterror(export = false)]` to skip only the optional `contractspecv0`
+//! metadata section; every code, its name and its numeric value are unaffected,
+//! and the conversions to [`soroban_sdk::Error`] remain derived. Contract-specific
+//! codes that do not belong in the shared numeric bands live in their own tables
+//! ([`BudgetError`], [`MilestoneError`]).
 
 use soroban_sdk::contracterror;
 

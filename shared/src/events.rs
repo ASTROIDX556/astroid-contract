@@ -96,6 +96,17 @@ pub enum ContractEvent {
     },
     /// A per-asset velocity ceiling was removed from a wallet.
     WalletVelocityLimitCleared { wallet_id: u64, asset: Address },
+    /// A per-wallet rate limit was set. A `window_seconds` of `0` reports that
+    /// the limit was disabled and its usage cleared; a `0` cap means that
+    /// dimension is unlimited.
+    WalletRateLimitSet {
+        wallet_id: u64,
+        max_volume: i128,
+        max_count: u32,
+        window_seconds: u64,
+    },
+    /// A wallet's rate limit was removed.
+    WalletRateLimitCleared { wallet_id: u64 },
     /// The wallet's emergency guardian was (re)designated.
     WalletGuardianChanged { guardian: Address },
     /// A supporting module was wired into the wallet (`module` is e.g.
@@ -294,6 +305,21 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (Symbol::new(env, "WalletVelocityLimitCleared"),),
                 (wallet_id, asset),
             );
+        }
+        ContractEvent::WalletRateLimitSet {
+            wallet_id,
+            max_volume,
+            max_count,
+            window_seconds,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletRateLimitSet"),),
+                (wallet_id, max_volume, max_count, window_seconds),
+            );
+        }
+        ContractEvent::WalletRateLimitCleared { wallet_id } => {
+            env.events()
+                .publish((Symbol::new(env, "WalletRateLimitCleared"),), (wallet_id,));
         }
         ContractEvent::WalletGuardianChanged { guardian } => {
             env.events()
