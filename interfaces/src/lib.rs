@@ -7,9 +7,9 @@
 //!
 //! - The **caller** side (e.g. the Treasury contract) imports the generated
 //!   client to invoke another contract with compile-checked signatures.
-//! - The **callee** side (e.g. the Policy contract) implements the trait inside
-//!   its `#[contractimpl]` block, which guarantees the on-chain function
-//!   signatures match the client exactly.
+//! - On the **callee** side, a contract may implement the trait inside its
+//!   `#[contractimpl]` block or expose matching entrypoints from an existing
+//!   `#[contractimpl]` block.
 //!
 //! This is how Astroid keeps the dependency graph acyclic — `Registry → others`
 //! and `Treasury → {Policy, Budget}` — without any contract crate depending on
@@ -17,13 +17,15 @@
 //!
 //! ## Which contract implements which trait
 //!
-//! | Trait                      | Implemented by           | Generated client     |
+//! | Trait                      | Served by                | Generated client     |
 //! |----------------------------|--------------------------|----------------------|
 //! | [`RegistryInterface`]      | `astroid-registry`       | `RegistryClient`     |
+//! | [`WalletInterface`]        | `astroid-wallet`         | `WalletClient`       |
 //! | [`PolicyInterface`]        | `astroid-policy`         | `PolicyClient`       |
 //! | [`BudgetInterface`]        | `astroid-budget`         | `BudgetClient`       |
 //! | [`TreasuryInterface`]      | `astroid-treasury`       | `TreasuryClient`     |
 //! | [`MultisigInterface`]      | `astroid-multisig`       | `MultisigClient`     |
+//! | [`ProposalInterface`]      | `astroid-proposal`       | `ProposalClient`     |
 //! | [`UpgradeableInterface`]   | all eight contracts      | `UpgradeableClient`  |
 //!
 //! Every fallible method returns the canonical [`Error`] so a cross-contract
@@ -32,16 +34,66 @@
 //! this table at compile time (trait bounds) and at runtime (every deployed
 //! contract answers through the shared client).
 
+pub mod proposal;
 pub mod upgrade;
 
-use astroid_shared::errors::Error;
-use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
+pub use proposal::{ProposalClient, ProposalInterface, ProposalState};
+
+#[cfg(test)]
+mod test;
+
+use astroid_shared::errors::{BudgetError, Error};
+use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind, WalletData};
 use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env, String, Vec};
 
 /// Version of the interface surface declared in this crate. Bump it whenever a
 /// trait gains, loses or changes a method so off-chain clients built against
 /// an older definition can detect the drift.
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
+
+/// Wallet operations and views available to cross-contract callers.
+#[contractclient(name = "WalletClient")]
+pub trait WalletInterface {
+    /// Create a wallet owned by `owner` and return its identifier.
+    fn create_wallet(env: Env, owner: Address) -> Result<u64, Error>;
+
+    /// Deposit `amount` of `asset` from `from` into `wallet_id`.
+    fn deposit(
+        env: Env,
+        wallet_id: u64,
+        from: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error>;
+
+    /// Transfer `amount` of `asset` from `wallet_id` to `to`.
+    fn transfer(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error>;
+
+    /// Withdraw `amount` of `asset` from `wallet_id` to its owner.
+    fn withdraw(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), Error>;
+
+    /// Read a wallet's owner and lifecycle state.
+    fn get_wallet(env: Env, wallet_id: u64) -> Result<WalletData, Error>;
+
+    /// Read the wallet's internal balance for `asset`.
+    fn balance(env: Env, wallet_id: u64, asset: Address) -> i128;
+
+    /// Whether the wallet contract's emergency circuit breaker is engaged.
+    fn is_paused(env: Env) -> bool;
+}
 
 /// Registry lookup surface. The registry is the protocol's source of truth for
 /// where each module/contract lives and who owns it (PRD Doc 7 §Registry).
@@ -86,7 +138,12 @@ pub trait PolicyInterface {
 pub trait BudgetInterface {
     /// Debit `amount` from the budget's remaining allocation. `caller` must be
     /// the authorized consumer (the treasury/owner). Returns the new remaining.
-    fn consume(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error>;
+    fn consume(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        amount: i128,
+    ) -> Result<i128, BudgetError>;
 
     /// Credit `amount` back to the budget (e.g. a refunded or cancelled spend).
     /// `caller` must be the budget owner and `amount` may not exceed what has

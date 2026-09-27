@@ -32,6 +32,7 @@ fn setup<'a>(env: &'a Env, owner: &Address) -> (PolicyContractClient<'a>, Policy
         &None,
         &None,
         &0,
+        &None,
     );
     (managed, PolicyClient::new(env, &id))
 }
@@ -216,6 +217,7 @@ fn rule_stack_composes_with_the_scalar_policy_gates() {
         &None,
         &None,
         &0,
+        &None,
     );
     let iface = PolicyClient::new(&env, &id);
 
