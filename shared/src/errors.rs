@@ -71,6 +71,13 @@ pub enum Error {
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
+    /// CIRCULAR_UPGRADE: a module upgrade would move a module's pointer onto
+    /// the implementation it already runs, or back onto one it has already left
+    /// — closing a loop in the upgrade path instead of advancing it (Issue #249).
+    /// Distinct from [`Error::InvalidInput`] so deployment tooling that walks
+    /// upgrade paths can tell a cycle apart from a malformed request and stop
+    /// walking rather than retrying.
+    CircularUpgrade = 32,
 
     // --- Budget (40-44) ---
     BudgetExceeded = 40,
@@ -158,7 +165,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 51] = [
+    pub const ALL: [Error; 52] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -180,6 +187,7 @@ impl Error {
         // --- Registry (30-39) ---
         Error::RegistryFrozen,
         Error::ModuleDeprecated,
+        Error::CircularUpgrade,
         // --- Budget (40-44) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
