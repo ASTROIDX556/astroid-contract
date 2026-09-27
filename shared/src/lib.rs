@@ -16,9 +16,13 @@
 //!   `SafeBalance`; never wraps, returns deterministic [`Error`]s).
 //! - [`token`]      — overflow-safe `token::TokenClient` transfer wrappers that
 //!   return deterministic [`Error`]s instead of trapping.
+//! - [`balance`]    — multi-currency balance accounting helpers for SAC/XLM:
+//!   `BalanceEntry`, `Map<Address,i128>` checked credit/debit/query, Vec
+//!   deduplication and ledger reconciliation.
 //! - [`validation`] — small guard helpers (positive amounts, time windows, ...).
 //! - [`constants`] — protocol-wide constants (time units, storage TTLs, limits).
 
+pub mod balance;
 pub mod constants;
 pub mod errors;
 pub mod events;

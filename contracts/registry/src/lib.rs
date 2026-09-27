@@ -37,6 +37,41 @@
 //! the emergency freeze, and administering roles themselves — stay with the
 //! recorded org owner and the protocol admin, so no grant can be used to
 //! escalate into ownership or to widen its own reach.
+//!
+//! ## Upgrade paths
+//!
+//! [`RegistryContract::register_version`] publishes immutable `(kind, version)`
+//! records, but a published version is only *reachable* once some organization's
+//! module is moved onto it. [`RegistryContract::upgrade_module`] is that move,
+//! and it never takes an address or a WASM hash from the caller: it resolves
+//! both from the version record itself, so the code a module ends up running is
+//! always code the protocol admin published *and* approved. The validations it
+//! runs before touching the pointer are, in order:
+//!
+//! | Check                                              | Refusal                |
+//!|----------------------------------------------------|------------------------|
+//! | the registry is not frozen                          | `RegistryFrozen`       |
+//! | `caller` holds a role that reaches this `kind`      | `Unauthorized`         |
+//! | the module is already registered                    | `NotFound`             |
+//! | `target_version` is non-zero                        | `InvalidInput`         |
+//! | `target_version` is newer than the module's pin     | `CircularUpgrade`      |
+//! | the target version exists                           | `NotFound`             |
+//! | the target is bound to a WASM hash                  | `InvalidInput`         |
+//! | that hash is still approved for this `kind`         | `Unauthorized`         |
+//! | the target address is a contract                    | `InvalidInput`         |
+//! | the target address is not the one already in use    | `CircularUpgrade`      |
+//!
+//! The pin is a high-water mark and version records are immutable, so a module's
+//! version sequence is strictly increasing: no upgrade can re-enter a version a
+//! module has already left, which is the cycle a rolling deployment must never
+//! make. The address check closes the remaining degenerate case, a "move" onto
+//! the contract the module already runs. Note what this is and is not: the pin
+//! orders the upgrade path, it does not vet the pointer itself.
+//! [`RegistryContract::register_module`] remains the unvalidated path that lets
+//! an owner or delegate route their own organization's module anywhere, behind
+//! the same permission gate as always — resetting the pin is not a new
+//! capability, it just keeps the validated path's ordering honest about the
+//! code the module is actually running.
 
 use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
@@ -67,20 +102,34 @@ enum DataKey {
     /// surface (`lookup`) rejects new interactions with [`Error::ModuleDeprecated`]
     /// while the raw address stays readable for legacy migrations.
     ModuleDeprecated(String, ModuleKind),
+    /// Version pin: (org slug, kind) -> the version the module currently runs.
+    ///
+    /// The high-water mark of that module's upgrade path. Absent for every
+    /// module registered before validated upgrades existed — those read as `0`
+    /// (unpinned) rather than failing, which is what lets an organization
+    /// upgrade a module that predates this key without a migration. Cleared by
+    /// [`RegistryContract::register_module`] and
+    /// [`RegistryContract::remove_module`] together with the record it belongs
+    /// to, because both mean "the previous upgrade path describes code this
+    /// module no longer runs".
+    ModuleVersion(String, ModuleKind),
     /// Delegated role: (org slug, account) -> RegistryRole.
     OrgRole(String, Address),
-    /// Version table: (kind, version) -> contract address (global upgrade map).
+    /// Legacy version table: (kind, version) -> contract address. Superseded by
+    /// [`DataKey::VersionRecord`]; still written by nothing and read only as a
+    /// fallback by [`RegistryContract::read_version`], so entries published
+    /// before the consolidation keep resolving.
     Version(ModuleKind, u32),
+    /// Consolidated version record: (kind, version) -> address + bound WASM
+    /// hash. Replaces the former `Version` + `VersionWasm` pair; `Version` is
+    /// retained as the legacy layout (see [`RegistryContract::read_version`]).
+    VersionRecord(ModuleKind, u32),
     /// Latest known version number for a kind.
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
-    /// WASM hash a registered version is bound to: (kind, version) -> hash.
-    /// Kept beside `Version` rather than folded into it so version records
-    /// written before hashes were bound still decode.
-    VersionWasm(ModuleKind, u32),
 }
 
 /// A delegated administrative role over one organization's registry records.
@@ -122,8 +171,124 @@ impl RegistryRole {
     }
 }
 
+/// Key for a single version lookup in the global upgrade map.
+///
+/// Mirrors [`ModuleId`] for the module-address map. Used by
+/// [`RegistryContract::get_versions_batch`] so a batch can carry several
+/// `(kind, version)` pairs in one invocation while preserving order and
+/// duplicates, just as the module batch does. Keeps the lookup surface
+/// uniform across both maps.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionId {
+    pub kind: ModuleKind,
+    pub version: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade-map lookup helpers — cached, minimal ledger access.
+// ---------------------------------------------------------------------------
+/// Per-invocation cache for the global version upgrade map.
+///
+/// Persistent storage reads dominate gas. When a caller resolves many versions
+/// (e.g. a batch verification or upgrade-path walk) the same
+/// `(kind, version)` is often requested repeatedly. Re-reading it would pay
+/// the ledger cost each time. The cache keeps the first result — including
+/// `None` for a missing key — and serves duplicates by a linear scan over an
+/// in-memory `Vec` bounded by `MAX_REGISTRY_BATCH`, so only comparisons are
+/// paid after the first hit.
+///
+/// Mirrors `VelocityGate` in the wallet contract and `RuleEvaluationContext`
+/// in the policy contract: reuse a ledger record within one invocation
+/// rather than re-reading it.
+struct VersionLookupCache {
+    env: Env,
+    entries: Vec<(ModuleKind, u32, Option<VersionRecord>)>,
+}
+
+impl VersionLookupCache {
+    fn new(env: &Env) -> Self {
+        Self {
+            env: env.clone(),
+            entries: Vec::new(env),
+        }
+    }
+
+    /// Return the cached record for `(kind, version)`, loading it once on a miss
+    /// and extending TTL only when the record exists and only once per distinct
+    /// key in this invocation (matching `get_version` policy).
+    fn get(&mut self, kind: ModuleKind, version: u32) -> Option<VersionRecord> {
+        for i in 0..self.entries.len() {
+            let (k, v, rec) = self.entries.get(i).unwrap();
+            if k == kind && v == version {
+                return rec.clone();
+            }
+        }
+        let rec = RegistryContract::read_version(&self.env, kind, version);
+        self.entries.push_back((kind, version, rec.clone()));
+        rec
+    }
+}
+
 #[contract]
 pub struct RegistryContract;
+
+/// The WASM hash a version is bound to, or the fact that it is not bound to
+/// one.
+///
+/// Modelled as a sum type rather than an `Option` because `#[contracttype]`
+/// cannot encode `Option<BytesN<32>>` — the SDK's `Option` conversion needs an
+/// infallible `From<&T> for ScVal`, and `BytesN` only offers a fallible
+/// `TryFrom`. The distinction is also worth making explicit on-chain: "bound to
+/// this hash" and "published before hashes were bound" are different states,
+/// not the presence or absence of a field.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundHash {
+    /// Bound to this hash, which `get_version_wasm` reports and `verify_version`
+    /// requires to match.
+    Bound(BytesN<32>),
+    /// Published before hashes were bound, so there is no hash to report or
+    /// match — exactly the position such a version occupied when the hash lived
+    /// in a separate entry that was simply absent.
+    Unbound,
+}
+
+/// A registered implementation version: the address it resolves to together
+/// with the WASM hash that address is bound to.
+///
+/// `Version` (address) and `VersionWasm` (hash) used to be two persistent
+/// entries per version. Folding them into one record halves the entries a
+/// populated registry holds for the upgrade map, removes one write from every
+/// [`RegistryContract::register_version`], and lets
+/// [`RegistryContract::verify_version`] answer from a single read where it
+/// previously needed two.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionRecord {
+    /// The implementation this version resolves to.
+    pub address: Address,
+    /// The hash this version is bound to, if any.
+    pub hash: BoundHash,
+}
+
+/// A validated upgrade: where a module is now and where [`RegistryContract::upgrade_module`]
+/// would take it.
+///
+/// Internal, so it is deliberately not a `#[contracttype]`: it never crosses the
+/// contract boundary. The entrypoints return the version number and the address
+/// instead, which is all a caller — or the event log — needs.
+struct UpgradePlan {
+    /// The version the module runs today, or `0` when it was registered by
+    /// address and has never been upgraded.
+    from_version: u32,
+    /// The version being moved onto.
+    to_version: u32,
+    /// The contract that version resolves to.
+    address: Address,
+    /// The approved WASM hash that contract is bound to.
+    hash: BytesN<32>,
+}
 
 // ---------------------------------------------------------------------------
 // Administration & registration (inherent surface).
@@ -219,11 +384,14 @@ impl RegistryContract {
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
         // A (re)registration points at a fresh implementation, so any prior
-        // deprecation flag must not carry over and block the new address.
+        // deprecation flag must not carry over and block the new address, and
+        // the module's version pin starts over: the recorded upgrade path
+        // describes code this module is no longer running.
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
         }
+        Self::clear_module_version(&env, &org, kind);
         astroid_shared::events::publish(
             &env,
             ContractEvent::RegistryModuleUpdated {
@@ -327,11 +495,14 @@ impl RegistryContract {
         env.storage().persistent().remove(&key);
         // Drop the deprecation flag together with the record so a later
         // re-registration starts clean and lookups report NotFound, not
-        // ModuleDeprecated, for a removed module.
+        // ModuleDeprecated, for a removed module. The version pin goes with it:
+        // the removed module's upgrade path is history, and keeping it would
+        // make the re-registered module refuse versions it never ran.
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         if env.storage().persistent().has(&dkey) {
             env.storage().persistent().remove(&dkey);
         }
+        Self::clear_module_version(&env, &org, kind);
         env.events().publish(
             (
                 symbol_short!("module"),
@@ -447,27 +618,34 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
-        // Downgrade protection: the version table is monotonic per kind, so a
-        // registration may never lower or repeat the latest version. Direct
-        // registration is the admin escape hatch and carries the same guard as
-        // the propose/commit flow.
-        let latest: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LatestVersion(kind))
-            .unwrap_or(0);
-        ensure!(version > latest, Error::InvalidState);
-        let vkey = DataKey::Version(kind, version);
-        ensure!(!env.storage().persistent().has(&vkey), Error::AlreadyExists);
+        // A pair is taken if either layout already holds it. The common case is
+        // a single existence check; the legacy key is only consulted when the
+        // consolidated one is free, so a fresh registration still pays one read.
+        ensure!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::VersionRecord(kind, version))
+                && !env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::Version(kind, version)),
+            Error::AlreadyExists
+        );
         ensure!(
             Self::is_wasm_approved(env.clone(), kind, wasm_hash.clone()),
             Error::Unauthorized
         );
-        env.storage().persistent().set(&vkey, &address);
+        // One write for the whole record, where the address and the hash used to
+        // be two separate entries and two writes.
+        let vkey = DataKey::VersionRecord(kind, version);
+        env.storage().persistent().set(
+            &vkey,
+            &VersionRecord {
+                address: address.clone(),
+                hash: BoundHash::Bound(wasm_hash.clone()),
+            },
+        );
         Self::bump(&env, &vkey);
-        let hkey = DataKey::VersionWasm(kind, version);
-        env.storage().persistent().set(&hkey, &wasm_hash);
-        Self::bump(&env, &hkey);
 
         let lkey = DataKey::LatestVersion(kind);
         let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
@@ -772,28 +950,19 @@ impl RegistryContract {
 
     /// Look up a specific implementation version.
     pub fn get_version(env: Env, kind: ModuleKind, version: u32) -> Result<Address, Error> {
-        let key = DataKey::Version(kind, version);
-        let val = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotFound)?;
-        Self::bump(&env, &key);
-        Ok(val)
+        Ok(Self::read_version(&env, kind, version)
+            .ok_or(Error::NotFound)?
+            .address)
     }
 
     /// Read the WASM hash a registered version is bound to. Fails with
     /// [`Error::NotFound`] for an unknown `(kind, version)`, and for a version
     /// registered before hashes were bound (it has no hash to report).
     pub fn get_version_wasm(env: Env, kind: ModuleKind, version: u32) -> Result<BytesN<32>, Error> {
-        let key = DataKey::VersionWasm(kind, version);
-        let val = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotFound)?;
-        Self::bump(&env, &key);
-        Ok(val)
+        match Self::read_version(&env, kind, version).map(|rec| rec.hash) {
+            Some(BoundHash::Bound(hash)) => Ok(hash),
+            _ => Err(Error::NotFound),
+        }
     }
 
     /// Verify that `(kind, version)` is registered, runs exactly `wasm_hash`,
@@ -812,17 +981,145 @@ impl RegistryContract {
         version: u32,
         wasm_hash: BytesN<32>,
     ) -> Result<Address, Error> {
-        let address = Self::get_version(env.clone(), kind, version)?;
-        let bound: Option<BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::VersionWasm(kind, version));
-        ensure!(bound.as_ref() == Some(&wasm_hash), Error::InvalidInput);
+        // One read for the address and its bound hash together; the split
+        // layout needed a second read for the hash.
+        let record = Self::read_version(&env, kind, version).ok_or(Error::NotFound)?;
+        ensure!(
+            matches!(record.hash, BoundHash::Bound(ref bound) if bound == &wasm_hash),
+            Error::InvalidInput
+        );
         ensure!(
             Self::is_wasm_approved(env, kind, wasm_hash),
             Error::Unauthorized
         );
-        Ok(address)
+        Ok(record.address)
+    }
+
+    /// Move `org`'s `kind` module onto the implementation registered at
+    /// `target_version` for that same kind, after checking the whole upgrade
+    /// path. Returns the version the module now runs.
+    ///
+    /// The address and the WASM hash are resolved from the version record, never
+    /// taken from the caller, so there is no way to point a module at a contract
+    /// the protocol admin did not publish for its kind or at code whose hash is
+    /// not approved. See the crate-level "Upgrade paths" section for the full
+    /// order of checks; the short version is:
+    ///
+    /// 1. the registry is not frozen — [`Error::RegistryFrozen`];
+    /// 2. `caller` is signed and may manage this `kind` for `org` —
+    ///    [`Error::Unauthorized`] (or [`Error::NotFound`] for an unknown org);
+    /// 3. the module is already registered — [`Error::NotFound`];
+    /// 4. `target_version` is non-zero — [`Error::InvalidInput`];
+    /// 5. `target_version` is strictly newer than the module's current pin —
+    ///    [`Error::CircularUpgrade`], which is what stops the path from
+    ///    revisiting or reversing;
+    /// 6. the target version exists for this kind — [`Error::NotFound`];
+    /// 7. the target is bound to a WASM hash — [`Error::InvalidInput`] for a
+    ///    version published before hashes were bound, so there is nothing to
+    ///    verify;
+    /// 8. that hash is still approved for this kind — [`Error::Unauthorized`]
+    ///    for code that was never approved or has since been revoked;
+    /// 9. the target address is a contract — [`Error::InvalidInput`], so the
+    ///    module can never be routed to an account;
+    /// 10. the target is not the contract the module already runs —
+    ///     [`Error::CircularUpgrade`].
+    ///
+    /// On success the module pointer moves, the deprecation flag is cleared (the
+    /// module is running a live implementation again) and the pin advances to
+    /// `target_version`. Nothing is written unless every check passes, so a
+    /// refusal leaves the module exactly where it was.
+    ///
+    /// A `0` pin (see [`Self::get_module_version`]) means the module was
+    /// registered by address and has never been upgraded, so it accepts any
+    /// registered version as its first step.
+    pub fn upgrade_module(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        target_version: u32,
+    ) -> Result<u32, Error> {
+        Self::check_frozen(&env)?;
+        require_non_empty(&org)?;
+        caller.require_auth();
+        Self::require_module_permission(&env, &caller, &org, kind)?;
+        let plan = Self::plan_upgrade(&env, &org, kind, target_version)?;
+
+        // Past this line every check has passed; only writes remain.
+        let key = DataKey::Module(org.clone(), kind);
+        env.storage().persistent().set(&key, &plan.address);
+        Self::bump(&env, &key);
+        let vkey = DataKey::ModuleVersion(org.clone(), kind);
+        env.storage().persistent().set(&vkey, &plan.to_version);
+        Self::bump(&env, &vkey);
+        // The module runs a registered implementation again, so a deprecation
+        // flag left by the implementation it just left must not keep the new
+        // address unroutable.
+        let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+        if env.storage().persistent().has(&dkey) {
+            env.storage().persistent().remove(&dkey);
+        }
+
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryModuleUpgraded {
+                org: org.clone(),
+                kind,
+                from_version: plan.from_version,
+                to_version: plan.to_version,
+                address: plan.address.clone(),
+                wasm_hash: plan.hash.clone(),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("module"), symbol_short!("upgrade")),
+            (org, kind, plan.to_version),
+        );
+        Ok(plan.to_version)
+    }
+
+    /// Run every check [`Self::upgrade_module`] would run and return the address
+    /// the module would be moved to, writing nothing.
+    ///
+    /// A keeper, a deployment script or a test can confirm that a target is
+    /// reachable — version published, hash approved, path not circular — before
+    /// asking for the migration. The checks, and the order they fire in, are
+    /// identical to the write path's, so a successful validation predicts a
+    /// successful upgrade (and a refusal carries the same code the upgrade
+    /// would have reported).
+    ///
+    /// Read-only: it moves no pointer and writes no pin, and it needs no auth.
+    /// The one ledger write it may cause is the version record's TTL extension,
+    /// which any read of that record already pays for. It does consult the
+    /// freeze flag, like [`Self::lookup`], so a pre-flight run does not approve
+    /// an upgrade the registry would refuse to record.
+    pub fn validate_upgrade(
+        env: Env,
+        org: String,
+        kind: ModuleKind,
+        target_version: u32,
+    ) -> Result<Address, Error> {
+        Self::check_frozen(&env)?;
+        require_non_empty(&org)?;
+        Ok(Self::plan_upgrade(&env, &org, kind, target_version)?.address)
+    }
+
+    /// The version `org`'s `kind` module is currently pinned to.
+    ///
+    /// `0` means the module is registered by address and has never been moved by
+    /// [`Self::upgrade_module`] — which is the state of every module registered
+    /// before that entrypoint existed, so those need no migration to take part in
+    /// validated upgrades. [`Error::NotFound`] is reserved for "no such module",
+    /// keeping the two apart: `Ok(0)` is a module with an upgrade path ahead of
+    /// it, `NotFound` is not a module at all.
+    pub fn get_module_version(env: Env, org: String, kind: ModuleKind) -> Result<u32, Error> {
+        let key = DataKey::Module(org.clone(), kind);
+        ensure!(env.storage().persistent().has(&key), Error::NotFound);
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::ModuleVersion(org, kind))
+            .unwrap_or(0))
     }
 
     /// Look up the latest implementation address for a kind.
@@ -835,6 +1132,40 @@ impl RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Self::get_version(env, kind, latest)
+    }
+
+    /// Batch counterpart of [`Self::get_version`]: resolve up to
+    /// [`MAX_REGISTRY_BATCH`] version addresses in one invocation.
+    ///
+    /// - `result[i]` answers `ids[i]`; length and order are preserved and
+    ///   duplicate ids are answered at every position.
+    /// - An unregistered id yields `None` instead of failing the batch, so one
+    ///   missing version does not hide the others.
+    /// - A mix of registered and missing ids is handled per entry.
+    /// - An empty `ids` returns an empty list.
+    ///
+    /// Errors: [`Error::InvalidInput`] when more than [`MAX_REGISTRY_BATCH`] ids
+    /// are requested (checked before any storage is read). Read-only: no auth
+    /// is required and the frozen flag is not consulted, matching
+    /// [`Self::get_version`].
+    ///
+    /// Gas optimization: a per-invocation [`VersionLookupCache`] keeps the first
+    /// ledger read for each distinct `(kind, version)` — including `None` for a
+    /// missing key — and serves duplicates from an in-memory `Vec` bounded by
+    /// [`MAX_REGISTRY_BATCH`]. A batch with duplicates therefore pays one
+    /// persistent read and one TTL bump per distinct key, not per entry, while
+    /// preserving order and duplicates exactly like [`Self::get_modules_batch`].
+    pub fn get_versions_batch(
+        env: Env,
+        ids: Vec<VersionId>,
+    ) -> Result<Vec<Option<Address>>, Error> {
+        ensure!(ids.len() <= MAX_REGISTRY_BATCH, Error::InvalidInput);
+        let mut cache = VersionLookupCache::new(&env);
+        let mut results = Vec::new(&env);
+        for vid in ids.iter() {
+            results.push_back(cache.get(vid.kind, vid.version).map(|rec| rec.address));
+        }
+        Ok(results)
     }
 
     /// Read the recorded owner of an organization.
@@ -979,43 +1310,135 @@ impl RegistryContract {
 
     // --- internal helpers ---
 
-    // --- upgrade audit trail (Issue #300) ---
-
-    /// Read the audit log (most recent entry first).
-    fn upgrade_log(env: &Env) -> Vec<UpgradeAuditRecord> {
-        env.storage()
-            .instance()
-            .get(&DataKey::UpgradeAuditLog)
-            .unwrap_or_else(|| vec![env])
-    }
-
-    /// Append `record` to the immutable audit log, newest first, dropping the
-    /// oldest entry once the ring buffer reaches [`MAX_UPGRADE_AUDIT_ENTRIES`].
+    /// Validate the upgrade of `org`'s `kind` module to `target_version` and
+    /// return everything the caller needs to carry it out. Moves nothing, so
+    /// [`Self::validate_upgrade`] and [`Self::upgrade_module`] reach identical
+    /// conclusions and report identical codes.
     ///
-    /// Only called on the success paths of the upgrade lifecycle; a Soroban
-    /// invocation is atomic, so had the surrounding call failed this write
-    /// would be rolled back along with everything else it did.
-    fn append_audit(env: &Env, action: UpgradeAction, audit: &UpgradeAudit) {
-        let mut log = Self::upgrade_log(env);
-        log.push_front(UpgradeAuditRecord {
-            action,
-            audit: audit.clone(),
-        });
-        while log.len() > MAX_UPGRADE_AUDIT_ENTRIES {
-            log.pop_back();
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeAuditLog, &log);
+    /// The target is resolved from the immutable version record rather than from
+    /// the caller's arguments, which is what makes an unverified hash
+    /// unrepresentable here: there is no way to name code the registry has not
+    /// published and approved for this `kind`.
+    fn plan_upgrade(
+        env: &Env,
+        org: &String,
+        kind: ModuleKind,
+        target_version: u32,
+    ) -> Result<UpgradePlan, Error> {
+        // An upgrade moves an existing registration, so there must be one. The
+        // address is read for the "already running this contract" check below,
+        // which makes the extra read pay for itself.
+        let current: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Module(org.clone(), kind))
+            .ok_or(Error::NotFound)?;
+        // Version `0` is never a valid record (`register_version` refuses it), so
+        // it can only be an uninitialized read.
+        ensure!(target_version != 0, Error::InvalidInput);
+
+        // Version ordering. The pin is a high-water mark, so this is the check
+        // that makes an upgrade path acyclic: a module can never re-enter a
+        // version it has already left, and never move backwards onto one. An
+        // unpinned module (0) is at the start of its path, so any version is
+        // forward of it.
+        let from_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ModuleVersion(org.clone(), kind))
+            .unwrap_or(0);
+        ensure!(target_version > from_version, Error::CircularUpgrade);
+
+        // Existence, then integrity: the target must be a published version of
+        // *this* kind, bound to code that is still approved for it.
+        let record = Self::read_version(env, kind, target_version).ok_or(Error::NotFound)?;
+        let hash = match record.hash {
+            BoundHash::Bound(hash) => hash,
+            // A version published before hashes were bound has nothing to
+            // verify, so it cannot be moved onto: the point of this path is that
+            // the code behind a module is known.
+            BoundHash::Unbound => return Err(Error::InvalidInput),
+        };
+        ensure!(
+            Self::is_wasm_approved(env.clone(), kind, hash.clone()),
+            Error::Unauthorized
+        );
+        // A module must be routable, and only a contract can be called. Without
+        // this, a version record naming an account would leave the module
+        // permanently unroutable.
+        ensure!(
+            Self::is_contract_address(&record.address),
+            Error::InvalidInput
+        );
+        // A "move" onto the contract the module already runs is the degenerate
+        // cycle: it changes no code and no routing, so it is refused rather than
+        // silently recorded as progress.
+        ensure!(record.address != current, Error::CircularUpgrade);
+
+        Ok(UpgradePlan {
+            from_version,
+            to_version: target_version,
+            address: record.address,
+            hash,
+        })
     }
 
-    /// Read the pending upgrade proposal for `kind`, if one is stored. The
-    /// only consumer of the raw record besides the upgrade flow itself, so the
-    /// expiry check lives at the flow's commit path rather than here.
-    fn pending_proposal(env: &Env, kind: &ModuleKind) -> Option<UpgradeProposal> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UpgradeProposal(*kind))
+    /// Whether `address` is a contract principal rather than an account.
+    ///
+    /// SDK 21 exposes no `is_contract`, so this reads the type byte off the
+    /// address's canonical strkey encoding: `C` marks a contract ID, `G` an
+    /// ed25519 account. Strkeys are always 56 characters, so anything else is
+    /// treated as not-a-contract. Same check as the treasury's
+    /// `is_contract_address`, kept local so the registry does not depend on a
+    /// member contract.
+    fn is_contract_address(address: &Address) -> bool {
+        let strkey = address.to_string();
+        let mut buf = [0u8; 56];
+        if strkey.len() as usize != buf.len() {
+            return false;
+        }
+        strkey.copy_into_slice(&mut buf);
+        buf[0] == b'C'
+    }
+
+    /// Forget a module's version pin. Called from the two paths that replace or
+    /// remove the registration itself, so a pin can never outlive the record it
+    /// describes. Absent keys are left alone rather than written as `0`, keeping
+    /// the entry table no larger than it needs to be.
+    fn clear_module_version(env: &Env, org: &String, kind: ModuleKind) {
+        let key = DataKey::ModuleVersion(org.clone(), kind);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+        }
+    }
+
+    /// Resolve `(kind, version)` to its record, or `None` when unregistered.
+    ///
+    /// A single read on the current layout. Versions published before the record
+    /// was consolidated stored only their address under [`DataKey::Version`], so
+    /// that key is consulted second and such a version still resolves — with no
+    /// bound hash, which is precisely how it behaved when the hash lived in a
+    /// separate entry that was simply absent. An already-registered version
+    /// therefore keeps answering every query across the layout change.
+    ///
+    /// The fallback is the only extra read in this function, and it costs a miss
+    /// (an absent key deserializes nothing). Entries written after the
+    /// consolidation never reach it.
+    fn read_version(env: &Env, kind: ModuleKind, version: u32) -> Option<VersionRecord> {
+        let key = DataKey::VersionRecord(kind, version);
+        if let Some(record) = env.storage().persistent().get::<_, VersionRecord>(&key) {
+            Self::bump(env, &key);
+            return Some(record);
+        }
+        let legacy = DataKey::Version(kind, version);
+        let address: Option<Address> = env.storage().persistent().get(&legacy);
+        if address.is_some() {
+            Self::bump(env, &legacy);
+        }
+        address.map(|address| VersionRecord {
+            address,
+            hash: BoundHash::Unbound,
+        })
     }
 
     fn check_frozen(env: &Env) -> Result<(), Error> {

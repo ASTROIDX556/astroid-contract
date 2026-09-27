@@ -9,13 +9,12 @@ use soroban_sdk::{
     token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
-use astroid_shared::constants::{MAX_ESCROW_ASSETS, MAX_SIGNERS};
-use astroid_shared::errors::Error;
+use astroid_shared::errors::{Error, MilestoneError};
 use astroid_shared::types::AssetAmount;
 
 use crate::{
-    EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, OverrideSignature,
-    ReleaseSchedule, ReleaseType,
+    EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, MilestoneStatus,
+    OverrideSignature, ReleaseConditionConfig, ReleaseSchedule, ReleaseType,
 };
 
 const START: u64 = 1_000;
@@ -157,6 +156,54 @@ fn milestone_spec(env: &Env, description: &str, bps: u32) -> MilestoneSpec {
         description: String::from_str(env, description),
         release_bps: bps,
     }
+}
+
+/// Build a [`ReleaseConditionConfig`] over `assets` with the
+/// signature-override path disabled and the refund window left unbounded.
+fn release_condition_config(
+    h: &Harness,
+    assets: &Vec<AssetAmount>,
+    participants: &Vec<Address>,
+    threshold: u32,
+    deadline: u64,
+) -> ReleaseConditionConfig {
+    ReleaseConditionConfig {
+        sender: h.sender.clone(),
+        recipient: h.recipient.clone(),
+        arbiter: h.arbiter.clone(),
+        assets: assets.clone(),
+        deadline,
+        grace_period: GRACE,
+        refund_window: 0,
+        memo: String::from_str(&h.env, "multi-party"),
+        override_signers: no_signers(h),
+        override_threshold: 0,
+        participants: participants.clone(),
+        approval_threshold: threshold,
+    }
+}
+
+/// Create + fund a multi-party escrow that pays out only after `threshold`
+/// distinct approvals out of `participants`.
+fn create_multi_party(
+    h: &Harness,
+    assets: &Vec<AssetAmount>,
+    participants: &Vec<Address>,
+    threshold: u32,
+    deadline: u64,
+) -> u64 {
+    let config = release_condition_config(h, assets, participants, threshold, deadline);
+    h.client.create_with_release_condition(&config)
+}
+
+/// `threshold` fresh counterparties standing in for the buyer, seller and
+/// validator-oracle agents of a collaborative settlement.
+fn counterparties(env: &Env, count: u32) -> Vec<Address> {
+    let mut out: Vec<Address> = Vec::new(env);
+    for _ in 0..count {
+        out.push_back(Address::generate(env));
+    }
+    out
 }
 
 // --- Core multi-asset tests ---
@@ -585,6 +632,46 @@ fn override_release_disabled_without_configured_signers() {
 
 // --- Milestone tests ---
 
+/// Deposit a single-asset milestone escrow with the harness defaults.
+fn deposit_milestones(h: &Harness, amount: i128, deadline: u64, specs: &Vec<MilestoneSpec>) -> u64 {
+    h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &amount,
+        &deadline,
+        &String::from_str(&h.env, "project"),
+        specs,
+    )
+}
+
+#[test]
+fn milestone_multi_creation_stores_ordered_schedule() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 2_000),
+        milestone_spec(&h.env, "build", 3_000),
+        milestone_spec(&h.env, "ship", 5_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    let set = h.client.milestones(&id);
+    assert_eq!(set.milestones.len(), 3);
+    assert_eq!(set.released_amount, 0);
+    assert!(!set.cancelled);
+    for (i, expected_bps) in [(0u32, 2_000u32), (1, 3_000), (2, 5_000)] {
+        let m = set.milestones.get(i).unwrap();
+        assert_eq!(m.index, i);
+        assert_eq!(m.release_bps, expected_bps);
+        assert_eq!(m.status, MilestoneStatus::Pending);
+    }
+}
+
 #[test]
 fn milestone_partial_then_full_release() {
     let h = setup(10_000, 0);
@@ -593,22 +680,20 @@ fn milestone_partial_then_full_release() {
         milestone_spec(&h.env, "design", 4_000),
         milestone_spec(&h.env, "build", 6_000),
     ];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "project"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 
     h.client.release_milestone(&h.arbiter, &id, &0);
     let set = h.client.milestones(&id);
-    assert!(set.milestones.get(0).unwrap().released);
+    assert_eq!(
+        set.milestones.get(0).unwrap().status,
+        MilestoneStatus::Completed
+    );
+    assert_eq!(
+        set.milestones.get(1).unwrap().status,
+        MilestoneStatus::Pending
+    );
     assert_eq!(set.released_amount, 4_000);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
@@ -623,21 +708,65 @@ fn milestone_partial_then_full_release() {
 }
 
 #[test]
+fn milestone_sequential_completion_releases_each_share() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 2_000),
+        milestone_spec(&h.env, "b", 3_000),
+        milestone_spec(&h.env, "c", 5_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    let mut paid = 0i128;
+    for index in 0..3u32 {
+        h.client.release_milestone(&h.arbiter, &id, &index);
+        let set = h.client.milestones(&id);
+        assert_eq!(
+            set.milestones.get(index).unwrap().status,
+            MilestoneStatus::Completed
+        );
+        assert_eq!(balance(&h, &h.asset_a, &h.recipient), set.released_amount);
+        assert!(set.released_amount > paid);
+        paid = set.released_amount;
+    }
+    assert_eq!(paid, 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+#[test]
+fn milestone_final_payout_absorbs_rounding_dust() {
+    // 3333 + 3333 + 3334 bps of 10_000 floors to 3333 + 3333 + 3334: the last
+    // approval pays the remainder, so nothing is stranded.
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 3_333),
+        milestone_spec(&h.env, "b", 3_333),
+        milestone_spec(&h.env, "c", 3_334),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(h.client.milestones(&id).released_amount, 3_333);
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(h.client.milestones(&id).released_amount, 6_666);
+    h.client.release_milestone(&h.arbiter, &id, &2);
+    assert_eq!(h.client.milestones(&id).released_amount, 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
 fn milestone_unauthorized_approval_rejected() {
     let h = setup(10_000, 0);
     let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "p"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     let res = h.client.try_release_milestone(&h.sender, &id, &0);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(res, Err(Ok(MilestoneError::Unauthorized)));
+    // The milestone-specific enum still carries the canonical wire code.
+    let wire = soroban_sdk::Error::from(MilestoneError::Unauthorized).get_code();
+    assert_eq!(wire, Error::Unauthorized.code());
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 }
@@ -646,20 +775,30 @@ fn milestone_unauthorized_approval_rejected() {
 fn milestone_double_release_rejected() {
     let h = setup(10_000, 0);
     let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "p"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     h.client.release_milestone(&h.arbiter, &id, &0);
     let res = h.client.try_release_milestone(&h.arbiter, &id, &0);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(res, Err(Ok(MilestoneError::MilestoneAlreadyCompleted)));
+    assert_eq!(
+        soroban_sdk::Error::from(MilestoneError::MilestoneAlreadyCompleted).get_code(),
+        87
+    );
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
+fn milestone_unknown_index_rejected() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+    let res = h.client.try_release_milestone(&h.arbiter, &id, &7);
+    assert_eq!(res, Err(Ok(MilestoneError::InvalidMilestone)));
+    assert_eq!(
+        soroban_sdk::Error::from(MilestoneError::InvalidMilestone).get_code(),
+        86
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 }
 
 #[test]
@@ -688,19 +827,207 @@ fn milestone_bps_must_total_100() {
 fn plain_release_blocked_on_milestone_escrow() {
     let h = setup(10_000, 0);
     let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "p"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     let res = h.client.try_release(&h.arbiter, &id, &10_000);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+}
+
+#[test]
+fn milestone_escrow_refuses_generic_settlement_paths() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    // Beneficiary paths are refused before any schedule math.
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &1_000),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // Reclaim / refund after the grace window are refused too: the milestone
+    // cancel path is the only exit for the unreleased remainder.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200_000);
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_reclaim(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
+
+#[test]
+fn milestone_cancel_refunds_only_remaining() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 4_000),
+        milestone_spec(&h.env, "build", 6_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+
+    let refunded = h.client.cancel_remaining_milestones(&h.sender, &id);
+    assert_eq!(refunded, 6_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+
+    let set = h.client.milestones(&id);
+    assert!(set.cancelled);
+    assert_eq!(
+        set.milestones.get(0).unwrap().status,
+        MilestoneStatus::Completed
+    );
+    assert_eq!(
+        set.milestones.get(1).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+
+    // A cancelled schedule can no longer be approved.
+    assert_eq!(
+        h.client.try_release_milestone(&h.arbiter, &id, &1),
+        Err(Ok(MilestoneError::InvalidState))
+    );
+}
+
+#[test]
+fn milestone_cancel_is_idempotency_guarded() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.cancel_remaining_milestones(&h.sender, &id);
+    let res = h.client.try_cancel_remaining_milestones(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 10_000);
+}
+
+#[test]
+fn milestone_cancel_rejected_for_non_party() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+    let intruder = Address::generate(&h.env);
+    let res = h.client.try_cancel_remaining_milestones(&intruder, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
+
+#[test]
+fn milestone_cancel_reachable_through_cancel_entrypoint() {
+    // `cancel` stays usable on a milestone escrow, but routes through the
+    // milestone-aware path so a partial payout is never double-refunded.
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 4_000),
+        milestone_spec(&h.env, "b", 6_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+    h.client.release_milestone(&h.arbiter, &id, &0);
+
+    h.client.cancel(&h.arbiter, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert!(h.client.milestones(&id).cancelled);
+}
+
+#[test]
+fn milestone_dispute_freezes_and_resolve_reenables() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.dispute_milestone(&h.arbiter, &id, &0);
+    assert_eq!(
+        h.client.milestones(&id).milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+    assert_eq!(
+        h.client.try_release_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::InvalidMilestone))
+    );
+
+    h.client.resolve_milestone(&h.arbiter, &id, &0);
+    assert_eq!(
+        h.client.milestones(&id).milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+}
+
+#[test]
+fn milestone_dispute_and_resolve_are_state_guarded() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    // Resolving something that was never disputed is invalid.
+    assert_eq!(
+        h.client.try_resolve_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::InvalidMilestone))
+    );
+    // A non-arbiter cannot dispute.
+    assert_eq!(
+        h.client.try_dispute_milestone(&h.sender, &id, &0),
+        Err(Ok(MilestoneError::Unauthorized))
+    );
+    // Disputing an unknown index is invalid.
+    assert_eq!(
+        h.client.try_dispute_milestone(&h.arbiter, &id, &9),
+        Err(Ok(MilestoneError::InvalidMilestone))
+    );
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    // A completed milestone can be neither disputed nor resolved.
+    assert_eq!(
+        h.client.try_dispute_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::MilestoneAlreadyCompleted))
+    );
+    assert_eq!(
+        h.client.try_resolve_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::MilestoneAlreadyCompleted))
+    );
+}
+
+#[test]
+fn milestone_zero_weight_approves_without_payout() {
+    // A review/verification milestone can carry zero basis points: it is still
+    // tracked and completed, but moves no funds, and the weighted milestones
+    // still sum to the full amount.
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "kickoff", 0),
+        milestone_spec(&h.env, "delivery", 10_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(h.client.milestones(&id).released_amount, 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+    assert_eq!(
+        h.client.milestones(&id).milestones.get(0).unwrap().status,
+        MilestoneStatus::Completed
+    );
+
+    // The final milestone still pays the dust-free remainder.
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
 }
 
 #[test]
@@ -1334,19 +1661,251 @@ fn linear_release_cannot_exceed_vested_amount() {
     );
 
     // Halfway through the schedule only half has vested (50% of 10,000 =
-    // 5,000), so releasing more than the vested amount is refused.
+    // 5,000). A release settles the escrow in full, so even an amount within
+    // the vested portion is refused while the other half is still locked.
     h.env.ledger().with_mut(|l| l.timestamp = START + 500);
     assert_eq!(h.client.get_vested_amount(&id), 5_000);
     assert_eq!(
         h.client.try_release(&h.arbiter, &id, &10_000),
         Err(Ok(Error::TimelockNotExpired))
     );
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
 
-    // Releasing the vested amount works — the escrow settles in full per the
-    // arbiter's decision, but only once the schedule has vested that much.
+/// While part of a `Linear` schedule is still locked, the arbiter cannot
+/// settle at all — the beneficiary's schedule-gated `withdraw`/`claim` paths
+/// are the only way to reach vested funds mid-vesting (Issue #307).
+#[test]
+fn linear_partial_release_pays_exactly_the_vested_payout() {
+    let h = setup(10_000, 0);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &(START + 2_000),
+        &String::from_str(&h.env, "partial payout"),
+    );
+
+    // Halfway through the schedule only half has vested. A release would
+    // settle the full balance, so it is refused even for an amount within
+    // the vested portion.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_vested_amount(&id), 5_000);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    // The beneficiary draws the vested half through the schedule-gated path.
+    assert_eq!(h.client.claim(&h.recipient, &id), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+
+    // Once everything has vested — and the settlement window is still open —
+    // the arbiter's release settles the remainder exactly once.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
     h.client.release(&h.arbiter, &id, &5_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+/// A full release at maturity settles the escrow exactly once.
+#[test]
+fn linear_full_release_at_maturity_settles_exactly_once() {
+    let h = setup(10_000, 0);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &(START + 2_000),
+        &String::from_str(&h.env, "full payout"),
+    );
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
+    h.client.release(&h.arbiter, &id, &10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+
+    // Releasing (or claiming) again cannot mint a second payout.
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &1),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+/// Cancellation cannot route around the time lock: a scheduled escrow may
+/// only be cancelled while nothing has vested (Issue #307).
+#[test]
+fn cancel_is_refused_once_a_scheduled_escrow_has_vested() {
+    let h = setup(12_000, 0);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &(START + 1_000),
+        &String::from_str(&h.env, "cancellation gate"),
+    );
+
+    // Before the cliff nothing has vested — cancellation is still the
+    // pre-fulfillment dispute exit and stays available to the sender, here
+    // proven on a second, identical escrow.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert!(!h.client.is_unlocked(&id));
+    let pre_id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 1_000),
+        &schedule,
+        &(START + 1_000),
+        &String::from_str(&h.env, "pre-vesting cancel"),
+    );
+    h.client.cancel(&h.sender, &pre_id);
+    assert_eq!(h.client.get(&pre_id).state, EscrowState::Refunded);
+
+    // Past the cliff something has vested: the sender can no longer pull the
+    // funds back out from under the vesting schedule.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert!(h.client.is_unlocked(&id));
+    let res = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    // The arbiter cannot cancel around the lock either.
+    assert_eq!(
+        h.client.try_cancel(&h.arbiter, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+}
+
+/// A matured cliff schedule is locked for good: cancellation is refused at
+/// and after maturity, and the recipient's claim path is what pays out.
+#[test]
+fn cancel_is_refused_after_cliff_maturity() {
+    let h = setup(10_000, 0);
+    let unlock_time = START + 1_000;
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &unlock_time,
+        &String::from_str(&h.env, "cliff cancel gate"),
+    );
+
+    // One second before maturity the lock still holds for cancellation... but
+    // nothing has vested yet, so the sender may still cancel pre-maturity.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time - 1);
+    assert!(!h.client.is_unlocked(&id));
+
+    // At maturity the escrow unlocks; from here the beneficiary claims and
+    // neither party can cancel the escrow away.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert!(h.client.is_unlocked(&id));
+    assert_eq!(
+        h.client.try_cancel(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(h.client.claim(&h.recipient, &id), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+/// Schedule-less escrows keep their pre-existing cancellation behaviour.
+#[test]
+fn plain_escrow_cancellation_still_works_before_the_deadline() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+    assert!(h.client.is_unlocked(&id));
+    h.env.ledger().with_mut(|l| l.timestamp = START + 50);
+    h.client.cancel(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+/// `is_unlocked` mirrors the schedule clock the release paths enforce.
+#[test]
+fn is_unlocked_tracks_schedule_maturity() {
+    let h = setup(10_000, 0);
+
+    let cliff_id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 1_000),
+        &String::from_str(&h.env, "cliff view"),
+    );
+    assert!(!h.client.is_unlocked(&cliff_id));
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
+    assert!(h.client.is_unlocked(&cliff_id));
+
+    // Rewind the clock so the second escrow can be created with a future
+    // schedule.
+    h.env.ledger().with_mut(|l| l.timestamp = START);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START + 100,
+        cliff_time: START + 100,
+        end_time: START + 1_000,
+    };
+    let linear_id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 2_000),
+        &schedule,
+        &(START + 1_000),
+        &String::from_str(&h.env, "linear view"),
+    );
+    // Before the linear start nothing has vested.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 50);
+    assert!(!h.client.is_unlocked(&linear_id));
+    // One second into the schedule something has vested.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 101);
+    assert!(h.client.is_unlocked(&linear_id));
 }
 
 // --- Time-locked release verification (Issue #332) ---
@@ -2280,4 +2839,365 @@ fn initialize_is_one_shot() {
         Err(Ok(Error::AlreadyInitialized))
     );
     assert_eq!(h.client.admin(), h.admin);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #323: multi-party release conditions
+// ---------------------------------------------------------------------------
+
+/// The arbiter's release is refused until `threshold` distinct participants
+/// have signed off, and the funds stay in custody the whole time.
+#[test]
+fn multi_party_release_waits_for_the_approval_threshold() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 3);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+
+    // No sign-off at all: the arbiter cannot pay out.
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    // A partial approval is still not enough.
+    assert_eq!(h.client.approve_release(&parties.get_unchecked(0), &id), 1);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    // The second, distinct sign-off clears the gate.
+    assert_eq!(h.client.approve_release(&parties.get_unchecked(2), &id), 2);
+    h.client.release(&h.arbiter, &id, &5_000);
+
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+    assert_eq!(h.client.get_release_condition(&id).approvals, 2);
+    assert_eq!(
+        h.client.release_approvals(&id),
+        vec![&h.env, parties.get_unchecked(0), parties.get_unchecked(2)]
+    );
+}
+
+/// A party can only be counted once: a repeat approval is refused and never
+/// moves the escrow closer to its threshold.
+#[test]
+fn multi_party_approvals_reject_duplicates_from_the_same_party() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+
+    let buyer = parties.get_unchecked(0);
+    assert_eq!(h.client.approve_release(&buyer, &id), 1);
+    assert_eq!(
+        h.client.try_approve_release(&buyer, &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(
+        h.client.try_approve_release(&buyer, &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.get_release_condition(&id).approvals, 1);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    // Only a genuinely different party can reach the threshold.
+    h.client.approve_release(&parties.get_unchecked(1), &id);
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+}
+
+/// Only the configured counterparties may sign off; the arbiter, the sender and
+/// random outsiders are all rejected.
+#[test]
+fn multi_party_approval_rejects_anyone_outside_the_participant_set() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+
+    for outsider in [&h.arbiter, &h.sender, &h.recipient] {
+        assert_eq!(
+            h.client.try_approve_release(outsider, &id),
+            Err(Ok(Error::NotASigner))
+        );
+    }
+    assert_eq!(h.client.get_release_condition(&id).approvals, 0);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+}
+
+/// The participant authorizes the approval itself: a third party (or nobody at
+/// all) cannot record a sign-off on its behalf, and the recorded authorization
+/// is bound to this `approve_release` invocation.
+#[test]
+fn multi_party_approval_demands_the_participants_own_signature() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 1, START + 10_000);
+    let buyer = parties.get_unchecked(0);
+
+    h.client.approve_release(&buyer, &id);
+    assert_eq!(
+        h.env.auths(),
+        std::vec![(
+            buyer.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    h.client.address.clone(),
+                    Symbol::new(&h.env, "approve_release"),
+                    (buyer.clone(), id).into_val(&h.env),
+                )),
+                sub_invocations: std::vec![],
+            }
+        )]
+    );
+
+    // Drop the blanket mock: naming the participant as `caller` is not enough
+    // for someone else to vote for it.
+    h.env.set_auths(&[]);
+    assert!(matches!(
+        h.client.try_approve_release(&buyer, &id),
+        Err(Err(_))
+    ));
+
+    // A signature from a different account does not stand in either.
+    let relayer = Address::generate(&h.env);
+    assert!(matches!(
+        h.client
+            .mock_auths(&[MockAuth {
+                address: &relayer,
+                invoke: &MockAuthInvoke {
+                    contract: &h.client.address,
+                    fn_name: "approve_release",
+                    args: (buyer.clone(), id).into_val(&h.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_approve_release(&buyer, &id),
+        Err(Err(_))
+    ));
+    assert_eq!(h.client.get_release_condition(&id).approvals, 1);
+}
+
+/// The sign-off never takes effect twice: once the escrow has settled there is
+/// nothing left to approve.
+#[test]
+fn multi_party_approval_is_refused_once_the_escrow_settles() {
+    let h = setup(10_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let released = create_multi_party(&h, &one_asset(&h, 4_000), &parties, 1, START + 10_000);
+    let refunded = create_multi_party(&h, &one_asset(&h, 6_000), &parties, 1, DEADLINE);
+
+    h.client
+        .approve_release(&parties.get_unchecked(0), &released);
+    h.client.release(&h.arbiter, &released, &4_000);
+    assert_eq!(
+        h.client
+            .try_approve_release(&parties.get_unchecked(1), &released),
+        Err(Ok(Error::InvalidState))
+    );
+
+    at(&h, DEADLINE + GRACE);
+    h.client.refund(&h.sender, &refunded);
+    assert_eq!(
+        h.client
+            .try_approve_release(&parties.get_unchecked(0), &refunded),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(h.client.get(&refunded).state, EscrowState::Refunded);
+}
+
+/// A condition must never be able to strand the funder's money: the sender-side
+/// exits stay open while approvals are still outstanding.
+#[test]
+fn multi_party_timeout_refund_overrides_a_pending_condition() {
+    let h = setup(10_000, 0);
+    let parties = counterparties(&h.env, 3);
+    // All three need three approvals out of three, and only one party ever
+    // signs — so no payout is ever possible for any of them.
+    let refunded = create_multi_party(&h, &one_asset(&h, 4_000), &parties, 3, DEADLINE);
+    let reclaimed = create_multi_party(&h, &one_asset(&h, 3_000), &parties, 3, DEADLINE);
+    let cancelled = create_multi_party(&h, &one_asset(&h, 3_000), &parties, 3, DEADLINE);
+    h.client
+        .approve_release(&parties.get_unchecked(0), &refunded);
+    assert_eq!(balances(&h), (0, 0, 10_000));
+
+    // `cancel` is open to either party before the deadline, with no sign-off.
+    h.client.cancel(&h.arbiter, &cancelled);
+    assert_eq!(h.client.get(&cancelled).state, EscrowState::Refunded);
+    assert_eq!(balances(&h), (3_000, 0, 7_000));
+
+    // A refund opens once the grace period has fully elapsed, even with the
+    // sign-off still outstanding.
+    at(&h, DEADLINE + GRACE - 1);
+    assert_eq!(
+        h.client.try_refund(&h.sender, &refunded),
+        Err(Ok(Error::GraceActive))
+    );
+    at(&h, DEADLINE + GRACE);
+    h.client.refund(&h.sender, &refunded);
+    assert_eq!(h.client.get(&refunded).state, EscrowState::Refunded);
+
+    // `reclaim` reaches the same funds post-grace, again with no sign-off.
+    h.client.reclaim(&h.sender, &reclaimed);
+    assert_eq!(h.client.get(&reclaimed).state, EscrowState::Refunded);
+
+    // Every token is back with the funder and the recipient was never paid.
+    assert_eq!(balances(&h), (10_000, 0, 0));
+    assert_eq!(h.client.release_approvals(&refunded).len(), 1);
+    assert_eq!(h.client.release_approvals(&reclaimed).len(), 0);
+    assert_eq!(h.client.release_approvals(&cancelled).len(), 0);
+}
+
+/// The recipient's own claim path is gated too, so an unmet condition cannot be
+/// side-stepped by pulling the funds directly.
+#[test]
+fn multi_party_condition_gates_the_recipients_own_claim() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, DEADLINE);
+
+    // Before the deadline an unscheduled escrow reports the time lock first.
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // Once claiming would otherwise be allowed, the unmet condition is what
+    // stops it.
+    at(&h, DEADLINE + GRACE);
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    h.client.approve_release(&parties.get_unchecked(0), &id);
+    h.client.approve_release(&parties.get_unchecked(1), &id);
+    assert_eq!(h.client.claim(&h.recipient, &id), 5_000);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+}
+
+/// The signature override is an alternative arbiter, not a way around the
+/// condition: valid override signatures alone still do not pay out.
+#[test]
+fn multi_party_condition_gates_the_signature_override() {
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let parties = counterparties(&h.env, 2);
+    let mut config =
+        release_condition_config(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+    config.override_signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
+    config.override_threshold = 2;
+    let id = h.client.create_with_release_condition(&config);
+
+    let nonce = 1u64;
+    let sigs = vec![
+        &h.env,
+        sign_override(&h, &kp1, id, nonce),
+        sign_override(&h, &kp2, id, nonce),
+    ];
+    assert_eq!(
+        h.client.try_override_release(&id, &nonce, &sigs),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    h.client.approve_release(&parties.get_unchecked(0), &id);
+    h.client.approve_release(&parties.get_unchecked(1), &id);
+    h.client.override_release(&id, &nonce, &sigs);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+}
+
+/// A bad participant set is refused before any tokens are pulled, and an empty
+/// set is a plain escrow rather than an error.
+#[test]
+fn create_with_release_condition_rejects_bad_participant_sets() {
+    let h = setup(5_000, 0);
+    let one = counterparties(&h.env, 1);
+    let two = counterparties(&h.env, 2);
+    let deadline = START + 10_000;
+    let try_create = |participants: &Vec<Address>, threshold: u32| {
+        h.client
+            .try_create_with_release_condition(&release_condition_config(
+                &h,
+                &one_asset(&h, 1_000),
+                participants,
+                threshold,
+                deadline,
+            ))
+    };
+
+    // A threshold of zero would mean "releasable immediately".
+    assert_eq!(try_create(&two, 0), Err(Ok(Error::InvalidThreshold)));
+    // More signatures demanded than participants exist.
+    assert_eq!(try_create(&one, 2), Err(Ok(Error::InvalidThreshold)));
+    // No participants but a non-zero threshold is contradictory.
+    assert_eq!(
+        try_create(&Vec::new(&h.env), 1),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    // The same party twice must not count as two votes.
+    let duplicated = vec![&h.env, one.get_unchecked(0), one.get_unchecked(0)];
+    assert_eq!(try_create(&duplicated, 2), Err(Ok(Error::InvalidInput)));
+    // Participant sets are capped for gas safety, like signer sets.
+    let too_many = counterparties(&h.env, astroid_shared::constants::MAX_SIGNERS + 1);
+    assert_eq!(try_create(&too_many, 1), Err(Ok(Error::TooManySigners)));
+
+    // Nothing moved and nothing was written: the funder keeps every token.
+    assert_eq!(balances(&h), (5_000, 0, 0));
+    assert_eq!(h.client.try_get(&1), Err(Ok(Error::NotFound)));
+
+    // The empty set is the documented "no condition" case, and behaves exactly
+    // like a plain escrow.
+    let id = try_create(&Vec::new(&h.env), 0).unwrap().unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(
+        h.client.try_get_release_condition(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_release_approvals(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_approve_release(&one.get_unchecked(0), &id),
+        Err(Ok(Error::NotFound))
+    );
+    h.client.release(&h.arbiter, &id, &1_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 1_000);
+}
+
+/// Escrows created through the plain entrypoints are completely unaffected: they
+/// report no condition and settle without any sign-off.
+#[test]
+fn escrows_without_a_condition_carry_no_release_condition() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), DEADLINE, GRACE);
+
+    assert_eq!(
+        h.client.try_get_release_condition(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_release_approvals(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_approve_release(&h.arbiter, &id),
+        Err(Ok(Error::NotFound))
+    );
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balances(&h), (0, 5_000, 0));
 }
