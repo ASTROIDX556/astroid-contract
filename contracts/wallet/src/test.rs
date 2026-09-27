@@ -2332,3 +2332,341 @@ fn creating_and_freezing_a_wallet_each_report_one_standard_event() {
     );
     assert_no_legacy_wallet_topics(&h2.env, &h2.contract_id);
 }
+
+// --- Sliding-window rate limits (Issue #31) ---
+
+/// A funded agent wallet with a rate limit of `max_volume` / `max_count` per
+/// [`WINDOW`], clock at `T0`. Returns (wallet_id, owner, agent).
+fn rate_wallet(
+    h: &Harness,
+    deposit: i128,
+    max_volume: i128,
+    max_count: u32,
+) -> (u64, Address, Address) {
+    at(h, T0);
+    let (id, owner, agent) = funded_agent_wallet(h, deposit);
+    h.client
+        .set_rate_limit(&owner, &id, &max_volume, &max_count, &WINDOW);
+    (id, owner, agent)
+}
+
+fn rate_usage(h: &Harness, id: u64) -> (i128, u32) {
+    let status = h.client.get_rate_usage(&id);
+    (status.volume, status.count)
+}
+
+#[test]
+fn rate_limit_is_disabled_until_configured() {
+    let h = setup();
+    let (id, _owner, agent) = funded_agent_wallet(&h, 10_000);
+    assert_eq!(h.client.get_rate_limit(&id), None);
+    assert_eq!(pay(&h, &agent, id, 10_000), Ok(()));
+    assert_eq!(rate_usage(&h, id), (0, 0));
+}
+
+#[test]
+fn rate_limit_count_cap_rejects_rapid_transactions() {
+    let h = setup();
+    let (id, _owner, agent) = rate_wallet(&h, 10_000, 0, 3);
+
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    assert_eq!(rate_usage(&h, id), (3, 3));
+
+    // The fourth rapid attempt is refused and consumes nothing.
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::RateLimitExceeded));
+    assert_eq!(rate_usage(&h, id), (3, 3));
+}
+
+#[test]
+fn rate_limit_volume_cap_rejects_and_nothing_moves() {
+    let h = setup();
+    let (id, _owner, agent) = rate_wallet(&h, 10_000, 500, 0);
+
+    assert_eq!(pay(&h, &agent, id, 300), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 300), Err(Error::RateLimitExceeded));
+    assert_eq!(rate_usage(&h, id), (300, 1));
+
+    // A spend that fits exactly is allowed; one unit more is not.
+    assert_eq!(pay(&h, &agent, id, 200), Ok(()));
+    assert_eq!(rate_usage(&h, id), (500, 2));
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::RateLimitExceeded));
+    assert_eq!(h.client.balance(&id, &h.token), 9_500);
+}
+
+#[test]
+fn rate_limit_allowance_returns_as_the_window_slides() {
+    let h = setup();
+    let (id, _owner, agent) = rate_wallet(&h, 10_000, 500, 0);
+    assert_eq!(pay(&h, &agent, id, 500), Ok(()));
+
+    // One second before the spend's bucket leaves the window it is still
+    // counted.
+    at(&h, T0 + WINDOW - 1);
+    assert_eq!(rate_usage(&h, id), (500, 1));
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::RateLimitExceeded));
+
+    // At the boundary the bucket slides out and the full allowance returns.
+    at(&h, T0 + WINDOW);
+    assert_eq!(rate_usage(&h, id), (0, 0));
+    assert_eq!(pay(&h, &agent, id, 500), Ok(()));
+}
+
+#[test]
+fn rate_limit_count_allowance_returns_as_the_window_slides() {
+    let h = setup();
+    let (id, _owner, agent) = rate_wallet(&h, 10_000, 0, 2);
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::RateLimitExceeded));
+
+    at(&h, T0 + WINDOW);
+    assert_eq!(rate_usage(&h, id), (0, 0));
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+}
+
+#[test]
+fn rate_limit_admits_no_double_burst_across_a_boundary() {
+    // A fixed window would allow ~2x the ceiling in two consecutive seconds;
+    // the rolling window does not.
+    let h = setup();
+    let (id, _owner, agent) = rate_wallet(&h, 10_000, 1_000, 0);
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    at(&h, T0 + WINDOW - 1);
+    assert_eq!(pay(&h, &agent, id, 999), Ok(()));
+    at(&h, T0 + WINDOW);
+    // Only the 1 unit from T0 aged out; the 999 from the previous second stays.
+    assert_eq!(rate_usage(&h, id), (999, 1));
+    assert_eq!(pay(&h, &agent, id, 2), Err(Error::RateLimitExceeded));
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+}
+
+#[test]
+fn withdrawals_share_the_rate_window_with_transfers() {
+    let h = setup();
+    let (id, owner, agent) = rate_wallet(&h, 10_000, 1_000, 0);
+    assert_eq!(pay(&h, &agent, id, 700), Ok(()));
+    assert_eq!(
+        h.client.try_withdraw(&owner, &id, &h.token, &301),
+        Err(Ok(Error::RateLimitExceeded))
+    );
+    h.client.withdraw(&owner, &id, &h.token, &300);
+    assert_eq!(rate_usage(&h, id), (1_000, 2));
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::RateLimitExceeded));
+}
+
+#[test]
+fn rate_limits_are_per_wallet() {
+    let h = setup();
+    let (id, _owner, agent) = rate_wallet(&h, 10_000, 500, 0);
+    assert_eq!(pay(&h, &agent, id, 500), Ok(()));
+
+    let (id2, _owner2, agent2) = rate_wallet(&h, 10_000, 500, 0);
+    assert_eq!(pay(&h, &agent2, id2, 500), Ok(()));
+
+    assert_eq!(rate_usage(&h, id), (500, 1));
+    assert_eq!(rate_usage(&h, id2), (500, 1));
+}
+
+#[test]
+fn rate_limit_configuration_is_owner_only() {
+    let h = setup();
+    let (id, owner, agent) = rate_wallet(&h, 10_000, 1_000, 0);
+    assert_eq!(
+        h.client.try_set_rate_limit(&agent, &id, &1, &0, &WINDOW),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_clear_rate_limit(&agent, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    h.client.archive(&owner, &id);
+    assert_eq!(
+        h.client.try_set_rate_limit(&owner, &id, &1, &0, &WINDOW),
+        Err(Ok(Error::WalletArchived))
+    );
+}
+
+#[test]
+fn rate_limit_configuration_is_validated() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    // A negative volume ceiling is malformed.
+    assert_eq!(
+        h.client.try_set_rate_limit(&owner, &id, &-1, &0, &WINDOW),
+        Err(Ok(Error::InvalidInput))
+    );
+    // A window that is not a whole number of buckets is malformed.
+    assert_eq!(
+        h.client
+            .try_set_rate_limit(&owner, &id, &100, &0, &(WINDOW + 1)),
+        Err(Ok(Error::InvalidInput))
+    );
+    // A window shorter than the bucket count cannot be tracked.
+    assert_eq!(
+        h.client.try_set_rate_limit(
+            &owner,
+            &id,
+            &100,
+            &0,
+            &(crate::RATE_LIMIT_BUCKETS as u64 - 1),
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    // A well-formed config round-trips through the view.
+    h.client.set_rate_limit(&owner, &id, &100, &5, &WINDOW);
+    assert_eq!(
+        h.client.get_rate_limit(&id),
+        Some(crate::RateLimitConfig {
+            max_volume: 100,
+            max_count: 5,
+            window_seconds: WINDOW,
+        })
+    );
+}
+
+#[test]
+fn zero_window_disables_rate_limiting() {
+    let h = setup();
+    let (id, owner, agent) = rate_wallet(&h, 10_000, 1, 0);
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+    assert_eq!(pay(&h, &agent, id, 1), Err(Error::RateLimitExceeded));
+
+    // Re-configuring with a zero window turns the limit off and clears usage.
+    h.client.set_rate_limit(&owner, &id, &0, &0, &0);
+    assert_eq!(h.client.get_rate_limit(&id), None);
+    assert_eq!(rate_usage(&h, id), (0, 0));
+    assert_eq!(pay(&h, &agent, id, 5_000), Ok(()));
+}
+
+#[test]
+fn clearing_a_rate_limit_removes_limit_and_usage() {
+    let h = setup();
+    let (id, owner, agent) = rate_wallet(&h, 10_000, 1, 0);
+    assert_eq!(pay(&h, &agent, id, 1), Ok(()));
+
+    h.client.clear_rate_limit(&owner, &id);
+    assert_eq!(h.client.get_rate_limit(&id), None);
+    assert_eq!(rate_usage(&h, id), (0, 0));
+    assert_eq!(pay(&h, &agent, id, 5_000), Ok(()));
+    assert_eq!(
+        h.client.try_clear_rate_limit(&owner, &id),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn rate_limit_charges_each_batch_action() {
+    let h = setup();
+    at(&h, T0);
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let agent = Address::generate(&h.env);
+    h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+    mint(&h, &owner, 10_000);
+    h.client.deposit(&id, &owner, &h.token, &10_000);
+
+    let r1 = Address::generate(&h.env);
+    let r2 = Address::generate(&h.env);
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r1,
+        100,
+        "",
+        "",
+    ));
+    actions.push_back(validated_action(
+        &h.env,
+        &h.token,
+        &h.contract_id,
+        &r2,
+        100,
+        "",
+        "",
+    ));
+
+    // A count cap of 1 refuses a two-action batch before anything moves.
+    h.client.set_rate_limit(&owner, &id, &0, &1, &WINDOW);
+    assert_eq!(
+        h.client.try_batch_execute_validated(&agent, &id, &actions),
+        Err(Ok(Error::RateLimitExceeded))
+    );
+    assert_eq!(rate_usage(&h, id), (0, 0));
+    assert_eq!(h.client.balance(&id, &h.token), 10_000);
+
+    // A volume cap below the batch total refuses it too.
+    h.client.set_rate_limit(&owner, &id, &150, &2, &WINDOW);
+    assert_eq!(
+        h.client.try_batch_execute_validated(&agent, &id, &actions),
+        Err(Ok(Error::RateLimitExceeded))
+    );
+    assert_eq!(rate_usage(&h, id), (0, 0));
+
+    // With both caps satisfied the batch executes and is charged once.
+    h.client.set_rate_limit(&owner, &id, &200, &2, &WINDOW);
+    let receipt = h.client.batch_execute_validated(&agent, &id, &actions);
+    assert_eq!(receipt.executed, 2);
+    assert_eq!(rate_usage(&h, id), (200, 2));
+    // The batch's sub-calls actually moved the tokens to each recipient; the
+    // wallet's internal balance is bookkeeping the batch path does not touch.
+    assert_eq!(token_balance(&h, &r1), 100);
+    assert_eq!(token_balance(&h, &r2), 100);
+    assert_eq!(h.client.balance(&id, &h.token), 10_000);
+}
+
+#[test]
+fn rate_limit_storage_stays_constant_size() {
+    let h = setup();
+    let (id, _owner, agent) = rate_wallet(&h, 100_000, 1_000_000, 0);
+    for i in 0..40u64 {
+        at(&h, T0 + i * BUCKET);
+        assert_eq!(pay(&h, &agent, id, 10), Ok(()));
+    }
+    // After many spends across many buckets there is still exactly one usage
+    // record holding RATE_LIMIT_BUCKETS entries in each dimension.
+    let record: crate::RateUsage = h.env.as_contract(&h.contract_id, || {
+        h.env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::RateLimitUsage(id))
+            .unwrap()
+    });
+    assert_eq!(record.volume.len(), crate::RATE_LIMIT_BUCKETS);
+    assert_eq!(record.count.len(), crate::RATE_LIMIT_BUCKETS);
+    assert_eq!(record.bucket, (T0 + 39 * BUCKET) / BUCKET);
+    // The trailing window holds the last four spends only.
+    assert_eq!(rate_usage(&h, id), (40, 4));
+}
+
+#[test]
+fn rate_limit_configuration_reports_standard_events() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    h.client.set_rate_limit(&owner, &id, &1_000, &5, &WINDOW);
+    assert_event_data(
+        &h.env,
+        "WalletRateLimitSet",
+        1,
+        (id, 1_000i128, 5u32, WINDOW),
+    );
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+
+    h.client.clear_rate_limit(&owner, &id);
+    assert_event_data(&h.env, "WalletRateLimitCleared", 1, (id,));
+    assert_event_data(
+        &h.env,
+        "WalletRateLimitSet",
+        1,
+        (id, 1_000i128, 5u32, WINDOW),
+    );
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+}
