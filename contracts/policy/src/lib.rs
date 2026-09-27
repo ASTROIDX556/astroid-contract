@@ -328,6 +328,29 @@ fn evaluate_node(
     }
 }
 
+/// Strategy for combining multiple policy rules in the policy rules stack.
+///
+/// When a policy has multiple registered rules (via `add_policy_rule`), this
+/// enum determines how they are combined during evaluation.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PolicyCombinationStrategy {
+    /// All rules must pass for the policy to allow the transfer.
+    /// This is the default and most restrictive strategy.
+    All = 0,
+    /// At least one rule must pass for the policy to allow the transfer.
+    /// If no rules are registered, the policy allows the transfer by default.
+    Any = 1,
+}
+
+impl PolicyCombinationStrategy {
+    /// Returns the default combination strategy (All).
+    pub fn default_strategy() -> Self {
+        PolicyCombinationStrategy::All
+    }
+}
+
 /// On-chain representation of a registered policy.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -346,6 +369,8 @@ pub struct Policy {
     pub expires_at: u64,
     /// Whether the policy is currently enabled.
     pub enabled: bool,
+    /// Strategy for combining multiple policy rules (All by default).
+    pub rule_combination_strategy: PolicyCombinationStrategy,
 }
 
 #[contracttype]
@@ -449,6 +474,8 @@ impl PolicyContract {
 
     /// Register a policy. `owner` gates subsequent rotations. Cheap scalar gates
     /// are stored on-chain; the full configuration is hashed for tamper-evidence.
+    /// The `rule_combination_strategy` determines how multiple policy rules are combined
+    /// (All by default for backward compatibility).
     #[allow(clippy::too_many_arguments)]
     pub fn register_policy(
         env: Env,
@@ -459,6 +486,7 @@ impl PolicyContract {
         allowed_recipient: Option<Address>,
         allowed_asset: Option<Address>,
         expires_at: u64,
+        rule_combination_strategy: Option<PolicyCombinationStrategy>,
     ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&policy_id)?;
@@ -477,6 +505,8 @@ impl PolicyContract {
             allowed_asset,
             expires_at,
             enabled: true,
+            rule_combination_strategy: rule_combination_strategy
+                .unwrap_or_else(PolicyCombinationStrategy::default_strategy),
         };
         env.storage()
             .persistent()
@@ -529,6 +559,30 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
+        Ok(())
+    }
+
+    /// Set the rule combination strategy for a policy (owner only).
+    /// This determines how multiple policy rules are combined during evaluation.
+    pub fn set_rule_combination_strategy(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        strategy: PolicyCombinationStrategy,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let mut policy = Self::load(&env, &policy_id)?;
+        if policy.owner != caller {
+            return Err(Error::Unauthorized);
+        }
+        policy.rule_combination_strategy = strategy;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Policy(policy_id.clone()), &policy);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("stratgy")),
+            (policy_id, strategy as u32),
+        );
         Ok(())
     }
 
@@ -1478,10 +1532,11 @@ impl PolicyContract {
 
     /// Evaluate every registered rule against `payload`.
     ///
-    /// Rules are combined conjunctively and walked in stack order; the loop
-    /// returns `Ok(false)` — "denied" — as soon as one rule fails, so later
-    /// rules are never paid for. An empty stack is permissive. Malformed trees
-    /// surface as [`Error::InvalidInput`] (defensive: registration already
+    /// Rules are combined according to the policy's rule_combination_strategy:
+    /// - `All`: All rules must pass (conjunctive, default for backward compatibility)
+    /// - `Any`: At least one rule must pass (disjunctive). An empty stack is permissive.
+    ///
+    /// Malformed trees surface as [`Error::InvalidInput`] (defensive: registration already
     /// validates the shape).
     pub fn evaluate_policy_rules(
         env: Env,
@@ -1489,7 +1544,14 @@ impl PolicyContract {
         payload: TransactionPayload,
     ) -> Result<bool, Error> {
         let mut context = RuleEvaluationContext::default();
-        Self::evaluate_policy_rules_with_context(&env, &policy_id, &payload, &mut context)
+        let policy = Self::load(&env, &policy_id)?;
+        Self::evaluate_policy_rules_with_context(
+            &env,
+            &policy_id,
+            &payload,
+            &mut context,
+            policy.rule_combination_strategy,
+        )
     }
 
     fn evaluate_policy_rules_with_context(
@@ -1497,6 +1559,7 @@ impl PolicyContract {
         policy_id: &String,
         payload: &TransactionPayload,
         context: &mut RuleEvaluationContext,
+        strategy: PolicyCombinationStrategy,
     ) -> Result<bool, Error> {
         let stack: RuleStack = env
             .storage()
@@ -1504,18 +1567,44 @@ impl PolicyContract {
             .get(&DataKey::PolicyRules(policy_id.clone()))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         let count = stack.len();
-        for i in 0..count {
-            // `get` bounds-checks the index; a miss means the stack changed
-            // under us, which storage cannot do mid-invocation — fail closed.
-            let tree = stack.get(i).ok_or(Error::InvalidInput)?;
-            if tree.is_empty() {
-                continue;
+
+        match strategy {
+            PolicyCombinationStrategy::All => {
+                // All rules must pass (existing behavior)
+                for i in 0..count {
+                    // `get` bounds-checks the index; a miss means the stack changed
+                    // under us, which storage cannot do mid-invocation — fail closed.
+                    let tree = stack.get(i).ok_or(Error::InvalidInput)?;
+                    if tree.is_empty() {
+                        continue;
+                    }
+                    if !evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
-            if !evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
-                return Ok(false);
+            PolicyCombinationStrategy::Any => {
+                // At least one rule must pass (new behavior)
+                // If no rules are registered, allow by default
+                if count == 0 {
+                    return Ok(true);
+                }
+                for i in 0..count {
+                    // `get` bounds-checks the index; a miss means the stack changed
+                    // under us, which storage cannot do mid-invocation — fail closed.
+                    let tree = stack.get(i).ok_or(Error::InvalidInput)?;
+                    if tree.is_empty() {
+                        continue;
+                    }
+                    if evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
+                        return Ok(true);
+                    }
+                }
+                // No rules passed
+                Ok(false)
             }
         }
-        Ok(true)
     }
 
     // --- views ---
@@ -1758,10 +1847,16 @@ impl PolicyContract {
             events_policy_violation(env, policy_id, "rule_denied");
             return Err(Error::PolicyDenied);
         }
-        // --- Multi-rule stack: every registered rule must pass ---
-        // The stack short-circuits on the first failing rule, so evaluation
-        // stops (and the transfer is denied) as soon as one rule says no.
-        if !Self::evaluate_policy_rules_with_context(env, policy_id, &payload, rule_context)? {
+        // --- Multi-rule stack: evaluation respects the policy's combination strategy ---
+        // For All strategy: every registered rule must pass (existing behavior)
+        // For Any strategy: at least one rule must pass
+        if !Self::evaluate_policy_rules_with_context(
+            env,
+            policy_id,
+            &payload,
+            rule_context,
+            policy.rule_combination_strategy,
+        )? {
             events_policy_violation(env, policy_id, "rules_denied");
             return Err(Error::PolicyDenied);
         }

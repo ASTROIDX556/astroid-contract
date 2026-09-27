@@ -148,6 +148,7 @@ fn setup() -> Harness<'static> {
         &None,
         &Some(asset.clone()),
         &0u64,
+        &None,
     );
 
     token::StellarAssetClient::new(&env, &asset).mint(&admin, &TREASURY_FUNDS);
