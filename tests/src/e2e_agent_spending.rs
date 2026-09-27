@@ -220,6 +220,7 @@ fn register_active_policy(h: &Harness, max_amount: i128, recipient_only: bool) {
         },
         &Some(h.asset.clone()),
         &0u64,
+        &None,
     );
 }
 

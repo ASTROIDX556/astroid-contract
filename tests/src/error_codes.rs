@@ -150,6 +150,7 @@ fn a_policy_refusal_reaches_the_caller_as_its_canonical_code() {
         &None,
         &None,
         &0,
+        &None,
     );
 
     // Over the ceiling: a policy decision.
