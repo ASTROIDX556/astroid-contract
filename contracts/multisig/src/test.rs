@@ -1280,6 +1280,18 @@ fn verify_threshold_returns_weight_above_threshold() {
 }
 
 #[test]
+fn verify_threshold_accepts_exact_u32_max_without_duplicate_weight() {
+    let h = setup(&[u32::MAX], u32::MAX);
+    let repeated_signer = vec![&h.env, h.signers[0].clone(), h.signers[0].clone()];
+
+    assert_eq!(
+        h.client
+            .verify_threshold(&h.signers[0], &repeated_signer, &payload(&h.env)),
+        u32::MAX
+    );
+}
+
+#[test]
 fn verify_threshold_below_threshold_is_refused() {
     let h = setup(&[3, 2, 1], 5);
     let res = h.client.try_verify_threshold(
