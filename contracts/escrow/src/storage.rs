@@ -130,6 +130,26 @@ pub struct Escrow {
     pub override_nonce: u64,
 }
 
+/// Multi-party release condition attached to an escrow: the parties that may
+/// sign off on paying the recipient, how many of them must do so, and how many
+/// have.
+///
+/// Stored under its own key rather than inside [`Escrow`] so that escrows
+/// without a condition neither pay for the extra fields on every read/write
+/// nor break deserialization of escrows written by an earlier deployment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseCondition {
+    /// Allow-list of counterparties permitted to approve a release.
+    pub participants: Vec<Address>,
+    /// How many distinct participants must approve before funds may move to
+    /// the recipient. Always in `[1, participants.len()]` for a stored
+    /// condition.
+    pub threshold: u32,
+    /// Running count of distinct participants that have approved so far.
+    pub approvals: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -146,6 +166,12 @@ pub enum DataKey {
     ApprovedToken(Address),
     /// Enumerable list of approved tokens, in approval order (instance).
     ApprovedTokenList,
+    /// Multi-party release condition attached to an escrow: the parties that
+    /// may sign off on paying the recipient and how many must do so.
+    ReleaseCondition(u64),
+    /// One key per approving participant, so recording an approval writes a
+    /// single entry instead of rewriting the whole condition.
+    ReleaseApproval(u64, Address),
 }
 
 pub fn get_count(env: &Env) -> u64 {
@@ -189,6 +215,42 @@ pub fn bump_escrow(env: &Env, id: u64) {
 pub fn bump_milestones(env: &Env, id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::Milestones(id),
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+pub fn load_release_condition(env: &Env, id: u64) -> Option<ReleaseCondition> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReleaseCondition(id))
+}
+
+pub fn store_release_condition(env: &Env, id: u64, condition: &ReleaseCondition) {
+    let key = DataKey::ReleaseCondition(id);
+    env.storage().persistent().set(&key, condition);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+/// Whether `who` has already approved release of escrow `id`. False for
+/// escrows that carry no release condition.
+pub fn has_release_approval(env: &Env, id: u64, who: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReleaseApproval(id, who.clone()))
+        .unwrap_or(false)
+}
+
+/// Record `who`'s approval of release of escrow `id`.
+pub fn mark_release_approval(env: &Env, id: u64, who: &Address) {
+    let key = DataKey::ReleaseApproval(id, who.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(
+        &key,
         PERSISTENT_LIFETIME_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );
