@@ -11,12 +11,19 @@
 //! test in `shared/src/test.rs`:
 //!
 //! 1. **Explicit and unique** — every variant carries a hand-written
-//!    discriminant (the `#[contracterror]` expansion rejects implicit ones), and
-//!    no two variants share a code.
+//!    discriminant, and no two variants share a code.
 //! 2. **Non-overlapping domains** — each contract's codes occupy a distinct
 //!    numeric range, so a code can be attributed to exactly one contract.
 //! 3. **Never reused** — a retired code stays empty forever, so a stale
 //!    integrator can never decode a fresh failure as a retired meaning.
+//!
+//! The protocol-wide table deliberately holds more cases than Soroban's
+//! `#[contracterror]` spec admits (`VecM<.., 50>`), so the enum is annotated
+//! `#[contracterror(export = false)]` to skip only the optional `contractspecv0`
+//! metadata section; every code, its name and its numeric value are unaffected,
+//! and the conversions to [`soroban_sdk::Error`] remain derived. Contract-specific
+//! codes that do not belong in the shared numeric bands live in their own tables
+//! ([`BudgetError`], [`MilestoneError`]).
 
 use soroban_sdk::contracterror;
 
@@ -77,11 +84,16 @@ pub enum Error {
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
 
-    // --- Wallet (50-53) ---
+    // --- Wallet (50-54) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    /// RATE_LIMIT_EXCEEDED: an outbound transaction would exceed the wallet's
+    /// configured rate limit (maximum outbound volume and/or transaction count
+    /// within the active sliding window). Nothing moves; the spend may succeed
+    /// once earlier activity ages out of the window.
+    RateLimitExceeded = 54,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
@@ -146,7 +158,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 50] = [
+    pub const ALL: [Error; 51] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -174,11 +186,12 @@ impl Error {
         Error::BudgetArchived,
         Error::AssetNotAuthorized,
         Error::BudgetExpired,
-        // --- Wallet (50-53) ---
+        // --- Wallet (50-54) ---
         Error::WalletFrozen,
         Error::WalletArchived,
         Error::WalletPaused,
         Error::InvalidState,
+        Error::RateLimitExceeded,
         // --- Multisig / approvals (61-69, 90-92) ---
         Error::ThresholdNotMet,
         Error::AlreadySigned,
