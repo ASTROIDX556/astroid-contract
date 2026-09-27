@@ -35,6 +35,30 @@ funder ──► create(sender, recipient, arbiter, assets[], deadline, memo,
   release and refund windows never overlap.
 - `close` (terminal) requires one of the three roles once the escrow is final.
 
+## Time-lock release schedules
+
+Escrows created through `create_timelock`, `create_scheduled` or
+`initialize_timelock` carry a release schedule that is enforced on the ledger
+clock (`env.ledger().timestamp()`) on every value-leaving path:
+
+- `Cliff` schedules unlock 100% at `cliff_time` (= `end_time`); `Linear`
+  schedules vest continuously between `start_time` and `end_time`, with an
+  optional cliff.
+- `withdraw` / `claim` are the beneficiary's partial-payout paths: they pay
+  exactly the amount vested minus already released, and fail with
+  `TimeLockActive` (81) while nothing is claimable.
+- The arbiter's `release` and the signature-override path settle the escrow
+  in full, so they are refused with `TimeLockActive` (81) while the
+  outstanding balance has not fully vested on a `Linear` schedule, and
+  before `cliff_time` on either schedule kind.
+- `cancel` cannot route around the lock either: a scheduled escrow may only
+  be cancelled while nothing has vested.
+- Settlement paths move the remaining custody balance (funded minus released)
+  pro-rata across the assets, so a release following partial withdrawals
+  never over-draws custody.
+- `is_unlocked(id)` reports whether the schedule has matured at the current
+  ledger time so clients need not recompute it off-chain.
+
 ## Invariants
 
 - Caller must be the recorded role for `release` / `refund` / `close`.
