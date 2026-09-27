@@ -9,7 +9,6 @@ use soroban_sdk::{
     token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
-use astroid_shared::constants::{MAX_ESCROW_ASSETS, MAX_SIGNERS};
 use astroid_shared::errors::{Error, MilestoneError};
 use astroid_shared::types::AssetAmount;
 
@@ -1614,19 +1613,251 @@ fn linear_release_cannot_exceed_vested_amount() {
     );
 
     // Halfway through the schedule only half has vested (50% of 10,000 =
-    // 5,000), so releasing more than the vested amount is refused.
+    // 5,000). A release settles the escrow in full, so even an amount within
+    // the vested portion is refused while the other half is still locked.
     h.env.ledger().with_mut(|l| l.timestamp = START + 500);
     assert_eq!(h.client.get_vested_amount(&id), 5_000);
     assert_eq!(
         h.client.try_release(&h.arbiter, &id, &10_000),
         Err(Ok(Error::TimelockNotExpired))
     );
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
 
-    // Releasing the vested amount works — the escrow settles in full per the
-    // arbiter's decision, but only once the schedule has vested that much.
+/// While part of a `Linear` schedule is still locked, the arbiter cannot
+/// settle at all — the beneficiary's schedule-gated `withdraw`/`claim` paths
+/// are the only way to reach vested funds mid-vesting (Issue #307).
+#[test]
+fn linear_partial_release_pays_exactly_the_vested_payout() {
+    let h = setup(10_000, 0);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &(START + 2_000),
+        &String::from_str(&h.env, "partial payout"),
+    );
+
+    // Halfway through the schedule only half has vested. A release would
+    // settle the full balance, so it is refused even for an amount within
+    // the vested portion.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert_eq!(h.client.get_vested_amount(&id), 5_000);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    // The beneficiary draws the vested half through the schedule-gated path.
+    assert_eq!(h.client.claim(&h.recipient, &id), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+
+    // Once everything has vested — and the settlement window is still open —
+    // the arbiter's release settles the remainder exactly once.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
     h.client.release(&h.arbiter, &id, &5_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+/// A full release at maturity settles the escrow exactly once.
+#[test]
+fn linear_full_release_at_maturity_settles_exactly_once() {
+    let h = setup(10_000, 0);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &(START + 2_000),
+        &String::from_str(&h.env, "full payout"),
+    );
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
+    h.client.release(&h.arbiter, &id, &10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+
+    // Releasing (or claiming) again cannot mint a second payout.
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &1),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+/// Cancellation cannot route around the time lock: a scheduled escrow may
+/// only be cancelled while nothing has vested (Issue #307).
+#[test]
+fn cancel_is_refused_once_a_scheduled_escrow_has_vested() {
+    let h = setup(12_000, 0);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START,
+        cliff_time: START + 200,
+        end_time: START + 1_000,
+    };
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &(START + 1_000),
+        &String::from_str(&h.env, "cancellation gate"),
+    );
+
+    // Before the cliff nothing has vested — cancellation is still the
+    // pre-fulfillment dispute exit and stays available to the sender, here
+    // proven on a second, identical escrow.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert!(!h.client.is_unlocked(&id));
+    let pre_id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 1_000),
+        &schedule,
+        &(START + 1_000),
+        &String::from_str(&h.env, "pre-vesting cancel"),
+    );
+    h.client.cancel(&h.sender, &pre_id);
+    assert_eq!(h.client.get(&pre_id).state, EscrowState::Refunded);
+
+    // Past the cliff something has vested: the sender can no longer pull the
+    // funds back out from under the vesting schedule.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    assert!(h.client.is_unlocked(&id));
+    let res = h.client.try_cancel(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    // The arbiter cannot cancel around the lock either.
+    assert_eq!(
+        h.client.try_cancel(&h.arbiter, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+}
+
+/// A matured cliff schedule is locked for good: cancellation is refused at
+/// and after maturity, and the recipient's claim path is what pays out.
+#[test]
+fn cancel_is_refused_after_cliff_maturity() {
+    let h = setup(10_000, 0);
+    let unlock_time = START + 1_000;
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &unlock_time,
+        &String::from_str(&h.env, "cliff cancel gate"),
+    );
+
+    // One second before maturity the lock still holds for cancellation... but
+    // nothing has vested yet, so the sender may still cancel pre-maturity.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time - 1);
+    assert!(!h.client.is_unlocked(&id));
+
+    // At maturity the escrow unlocks; from here the beneficiary claims and
+    // neither party can cancel the escrow away.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert!(h.client.is_unlocked(&id));
+    assert_eq!(
+        h.client.try_cancel(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(h.client.claim(&h.recipient, &id), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+/// Schedule-less escrows keep their pre-existing cancellation behaviour.
+#[test]
+fn plain_escrow_cancellation_still_works_before_the_deadline() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+    assert!(h.client.is_unlocked(&id));
+    h.env.ledger().with_mut(|l| l.timestamp = START + 50);
+    h.client.cancel(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+/// `is_unlocked` mirrors the schedule clock the release paths enforce.
+#[test]
+fn is_unlocked_tracks_schedule_maturity() {
+    let h = setup(10_000, 0);
+
+    let cliff_id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 1_000),
+        &String::from_str(&h.env, "cliff view"),
+    );
+    assert!(!h.client.is_unlocked(&cliff_id));
+    h.env.ledger().with_mut(|l| l.timestamp = START + 1_000);
+    assert!(h.client.is_unlocked(&cliff_id));
+
+    // Rewind the clock so the second escrow can be created with a future
+    // schedule.
+    h.env.ledger().with_mut(|l| l.timestamp = START);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Linear,
+        start_time: START + 100,
+        cliff_time: START + 100,
+        end_time: START + 1_000,
+    };
+    let linear_id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 2_000),
+        &schedule,
+        &(START + 1_000),
+        &String::from_str(&h.env, "linear view"),
+    );
+    // Before the linear start nothing has vested.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 50);
+    assert!(!h.client.is_unlocked(&linear_id));
+    // One second into the schedule something has vested.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 101);
+    assert!(h.client.is_unlocked(&linear_id));
 }
 
 // --- Time-locked release verification (Issue #332) ---
