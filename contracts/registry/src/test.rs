@@ -1747,7 +1747,7 @@ fn versions_batch_reports_missing_versions_as_none_in_place() {
         &[
             (ModuleKind::Wallet, 99), // never registered
             (ModuleKind::Wallet, 1),
-            (ModuleKind::Wallet, 2),  // kind registered, version missing
+            (ModuleKind::Wallet, 2), // kind registered, version missing
         ],
     );
     assert_eq!(result, vec![&env, None, Some(v1), None]);
@@ -2098,4 +2098,3 @@ fn versions_batch_circular_upgrade_paths_do_not_loop() {
         ]
     );
 }
-

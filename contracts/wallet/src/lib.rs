@@ -645,16 +645,17 @@ impl WalletContract {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
-        Self::require_active(&wallet)?;
+        Self::require_active_for_transfer(&wallet)?;
+        // Pre-execution validation: reject invalid recipients before any policy
+        // or balance checks.
+        Self::validate_transfer_recipient(&env, &to)?;
         Self::lock(&env)?;
         // Atomic pre-execution: policy → budget → velocity, before any debit.
         // Resolves Policy/Budget via Registry when configured, so upgrades
         // take effect without re-wiring the wallet. Each fallible step
         // unlocks before returning so a failed spend never leaves the
         // contract locked (even if the host commits storage on Err).
-        if let Err(e) =
-            Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller)
-        {
+        if let Err(e) = Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -691,7 +692,7 @@ impl WalletContract {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
-        Self::require_active(&wallet)?;
+        Self::require_active_for_transfer(&wallet)?;
         Self::lock(&env)?;
         if let Err(e) =
             Self::pre_execute_checks(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
@@ -1001,10 +1002,8 @@ impl WalletContract {
         require_non_empty(&org)?;
         env.storage().instance().set(&DataKey::Org, &org);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("org")),
-            org.clone(),
-        );
+        env.events()
+            .publish((symbol_short!("wallet"), symbol_short!("org")), org.clone());
         Ok(())
     }
 
@@ -1021,7 +1020,9 @@ impl WalletContract {
     ) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
         require_non_empty(&budget_id)?;
-        env.storage().instance().set(&DataKey::DefaultBudgetId, &budget_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultBudgetId, &budget_id);
         Self::bump_instance(&env);
         Ok(())
     }
@@ -1063,15 +1064,13 @@ impl WalletContract {
 
     /// Read the per-asset budget id, if any.
     pub fn get_asset_budget_id(env: Env, asset: Address) -> Option<String> {
-        env.storage().persistent().get(&DataKey::AssetBudgetId(asset))
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBudgetId(asset))
     }
 
     /// Clear a per-asset budget id (admin only).
-    pub fn clear_asset_budget_id(
-        env: Env,
-        caller: Address,
-        asset: Address,
-    ) -> Result<(), Error> {
+    pub fn clear_asset_budget_id(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
         let key = DataKey::AssetBudgetId(asset.clone());
         ensure!(env.storage().persistent().has(&key), Error::NotFound);
@@ -1232,7 +1231,9 @@ impl WalletContract {
     }
 
     fn unlock(env: &Env) {
-        env.storage().instance().set(&DataKey::ReentrancyLock, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &false);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -1256,14 +1257,20 @@ impl WalletContract {
             });
             match RegistryClient::new(env, &reg).try_get_modules_batch(&ids) {
                 Ok(Ok(modules)) => {
-                    let policy = modules
-                        .get(0)
-                        .unwrap()
-                        .and_then(|info| if info.deprecated { None } else { Some(info.address) });
-                    let budget = modules
-                        .get(1)
-                        .unwrap()
-                        .and_then(|info| if info.deprecated { None } else { Some(info.address) });
+                    let policy = modules.get(0).unwrap().and_then(|info| {
+                        if info.deprecated {
+                            None
+                        } else {
+                            Some(info.address)
+                        }
+                    });
+                    let budget = modules.get(1).unwrap().and_then(|info| {
+                        if info.deprecated {
+                            None
+                        } else {
+                            Some(info.address)
+                        }
+                    });
                     return Ok((policy, budget));
                 }
                 Err(Ok(e)) => return Err(e),
@@ -1509,6 +1516,7 @@ impl WalletContract {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn require_active(wallet: &WalletData) -> Result<(), Error> {
         ensure!(wallet.state != ResourceState::Frozen, Error::WalletFrozen);
         ensure!(wallet.state != ResourceState::Paused, Error::WalletPaused);
@@ -1516,6 +1524,35 @@ impl WalletContract {
             wallet.state != ResourceState::Archived,
             Error::WalletArchived
         );
+        Ok(())
+    }
+
+    /// Like `require_active` but returns wallet-state-specific errors for
+    /// non-Active states to give transfer-specific error codes.
+    fn require_active_for_transfer(wallet: &WalletData) -> Result<(), Error> {
+        match wallet.state {
+            ResourceState::Frozen => Err(Error::WalletFrozen),
+            ResourceState::Paused => Err(Error::WalletPaused),
+            ResourceState::Archived => Err(Error::WalletArchived),
+            ResourceState::Active => Ok(()),
+        }
+    }
+
+    /// Validate that the transfer recipient is a valid address (not zero address
+    /// and not the contract itself).
+    fn validate_transfer_recipient(env: &Env, recipient: &Address) -> Result<(), Error> {
+        // Reject zero address (all zeros)
+        let zero_addr = Address::from_string(&String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if recipient == &zero_addr {
+            return Err(Error::InvalidInput);
+        }
+        // Reject self-transfer to the wallet contract
+        if recipient == &env.current_contract_address() {
+            return Err(Error::InvalidInput);
+        }
         Ok(())
     }
 

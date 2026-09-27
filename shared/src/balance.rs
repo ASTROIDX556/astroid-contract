@@ -303,10 +303,7 @@ pub fn aggregate_entries(
 }
 
 /// Lenient deduplication for `Vec<BalanceEntry>` — merges duplicates.
-pub fn dedup_balances(
-    env: &Env,
-    entries: &Vec<BalanceEntry>,
-) -> Result<Map<Address, i128>, Error> {
+pub fn dedup_balances(env: &Env, entries: &Vec<BalanceEntry>) -> Result<Map<Address, i128>, Error> {
     aggregate_entries(env, entries)
 }
 
@@ -360,10 +357,7 @@ pub fn to_asset_amounts(env: &Env, map: &Map<Address, i128>) -> Vec<AssetAmount>
 
 /// Merge `src` into `dst` with checked per-asset addition. Duplicate assets
 /// have their amounts summed; overflow → [`Error::Overflow`].
-pub fn merge_maps(
-    dst: &mut Map<Address, i128>,
-    src: &Map<Address, i128>,
-) -> Result<(), Error> {
+pub fn merge_maps(dst: &mut Map<Address, i128>, src: &Map<Address, i128>) -> Result<(), Error> {
     for (asset, amount) in src.iter() {
         let cur = dst.get(asset.clone()).unwrap_or(0);
         let nxt = checked_balance_add(cur, amount)?;
@@ -377,10 +371,7 @@ pub fn merge_maps(
 
 /// Subtract `src` from `dst` per asset with underflow checks. Any asset where
 /// `dst < src` → [`Error::InsufficientFunds`]. Result zero entries are removed.
-pub fn subtract_maps(
-    dst: &mut Map<Address, i128>,
-    src: &Map<Address, i128>,
-) -> Result<(), Error> {
+pub fn subtract_maps(dst: &mut Map<Address, i128>, src: &Map<Address, i128>) -> Result<(), Error> {
     for (asset, amount) in src.iter() {
         let cur = dst.get(asset.clone()).unwrap_or(0);
         let nxt = checked_balance_sub(cur, amount)?;
@@ -416,9 +407,7 @@ pub fn ledger_delta(internal: i128, external: i128) -> Result<i128, Error> {
     if internal < 0 || external < 0 {
         return Err(Error::InvalidAmount);
     }
-    external
-        .checked_sub(internal)
-        .ok_or(Error::Overflow)
+    external.checked_sub(internal).ok_or(Error::Overflow)
 }
 
 /// Verify a single asset reconciles: the on-chain token balance equals the
@@ -437,10 +426,7 @@ pub fn verify_single_reconciliation(internal: i128, external: i128) -> Result<()
 /// must have equal balances or the call fails with [`Error::InvalidState`]
 /// on the first mismatch. Missing assets are treated as `0`, so a map that
 /// has an asset the other lacks is a mismatch unless that balance is `0`.
-pub fn reconcile_maps(
-    a: &Map<Address, i128>,
-    b: &Map<Address, i128>,
-) -> Result<(), Error> {
+pub fn reconcile_maps(a: &Map<Address, i128>, b: &Map<Address, i128>) -> Result<(), Error> {
     // Check every asset in a.
     for (asset, amount) in a.iter() {
         let other = b.get(asset.clone()).unwrap_or(0);
@@ -550,7 +536,10 @@ mod tests {
             Err(Error::InvalidAmount)
         );
         assert_eq!(get_balance(&m, &a), 0);
-        assert_eq!(add_balance(&env, &mut m, a.clone(), -100), Err(Error::InvalidAmount));
+        assert_eq!(
+            add_balance(&env, &mut m, a.clone(), -100),
+            Err(Error::InvalidAmount)
+        );
     }
 
     #[test]
@@ -639,7 +628,10 @@ mod tests {
         assert_eq!(get_balance(&m, &a), 42);
         assert_eq!(set_balance(&mut m, a.clone(), 0), Ok(0));
         assert!(!contains_asset(&m, &a));
-        assert_eq!(set_balance(&mut m, a.clone(), -1), Err(Error::InvalidAmount));
+        assert_eq!(
+            set_balance(&mut m, a.clone(), -1),
+            Err(Error::InvalidAmount)
+        );
     }
 
     #[test]
@@ -705,10 +697,7 @@ mod tests {
             asset: a.clone(),
             amount: 0,
         });
-        assert_eq!(
-            aggregate_asset_amounts(&env, &v),
-            Err(Error::InvalidAmount)
-        );
+        assert_eq!(aggregate_asset_amounts(&env, &v), Err(Error::InvalidAmount));
         let mut v2 = Vec::new(&env);
         v2.push_back(AssetAmount {
             asset: a.clone(),
@@ -733,10 +722,7 @@ mod tests {
             asset: a.clone(),
             amount: 1,
         });
-        assert_eq!(
-            aggregate_asset_amounts(&env, &v),
-            Err(Error::Overflow)
-        );
+        assert_eq!(aggregate_asset_amounts(&env, &v), Err(Error::Overflow));
     }
 
     #[test]

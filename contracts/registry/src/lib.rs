@@ -177,10 +177,11 @@ impl VersionLookupCache {
         let key = DataKey::Version(kind, version);
         let addr: Option<Address> = self.env.storage().persistent().get(&key);
         if addr.is_some() {
-            self.env
-                .storage()
-                .persistent()
-                .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            self.env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
         }
         self.entries.push_back((kind, version, addr.clone()));
         addr
