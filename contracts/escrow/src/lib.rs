@@ -79,7 +79,13 @@
 //! The time lock is enforced on every value-leaving path, including the
 //! arbiter's `release`: a scheduled escrow cannot be released ahead of its
 //! vesting schedule no matter how much settlement time remains (see
-//! [`EscrowContract::release`]).
+//! [`EscrowContract::release`]). A partial release pays out exactly the
+//! arbiter-approved amount and leaves the unvested remainder in custody,
+//! where the beneficiary reaches it through `withdraw` / `claim` as the
+//! schedule vests (see [`EscrowContract::is_unlocked`]). The lock also
+//! covers cancellation: `cancel` is refused with [`Error::TimeLockActive`]
+//! on a scheduled escrow that has not yet matured, so the schedule cannot be
+//! routed around by refunding early (Issue #307).
 
 pub mod storage;
 
@@ -729,7 +735,8 @@ impl EscrowContract {
             }
             escrow.state = EscrowState::Released;
             store_escrow(&env, id, &escrow);
-            Self::transfer_all(&env, &escrow, &escrow.recipient);
+            let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+            Self::transfer_all(&env, &escrow, &escrow.recipient, remaining)?;
             for a in escrow.assets.iter() {
                 events::transfer_executed(
                     &env,
@@ -775,19 +782,21 @@ impl EscrowContract {
         if env.storage().persistent().has(&DataKey::Milestones(id)) {
             return Err(Error::InvalidState);
         }
-        // Issue #238 — time-lock validation. A schedule-backed escrow can only
-        // be released once its own release schedule has matured, regardless of
-        // how much time is left on the settlement deadline:
+        // Issue #307 — time-lock validation. A schedule-backed escrow can
+        // only be released once its own release schedule has matured,
+        // regardless of how much time is left on the settlement deadline:
         //
-        // - `Cliff` schedules unlock everything at `cliff_time` (= `end_time`),
-        //   so a release before maturity is premature by definition.
+        // - `Cliff` schedules unlock everything at `cliff_time` (=
+        //   `end_time`), so a release before maturity is premature by
+        //   definition.
         // - `Linear` schedules vest continuously between `start_time` and
-        //   `end_time`; nothing has vested before `cliff_time` and any partial
+        //   `end_time`; nothing has vested before `cliff_time` and any
         //   release may not exceed the amount vested at the current ledger
         //   timestamp.
         //
-        // Deterministic error: [`Error::TimeLockActive`] while the lock holds.
-        // Both checks read the ledger clock via `env.ledger().timestamp()`.
+        // Deterministic error: [`Error::TimeLockActive`] while the lock
+        // holds. All checks read the ledger clock via
+        // `env.ledger().timestamp()`.
         let now = env.ledger().timestamp();
         if matches!(escrow.schedule.release_type, ReleaseType::Cliff) {
             if now < escrow.schedule.cliff_time {
@@ -797,8 +806,14 @@ impl EscrowContract {
             if now < escrow.schedule.cliff_time {
                 return Err(Error::TimeLockActive);
             }
+            // Issue #307 — a release settles the escrow in full, so nothing
+            // unvested may ever move through it: the outstanding balance must
+            // have vested at the current ledger timestamp. While part of the
+            // schedule is still locked, the beneficiary's `withdraw` / `claim`
+            // paths are the only way to reach the vested portion.
             let vested = calculate_vested_amount(escrow.funded_amount, &escrow.schedule, now)?;
-            if release_amount > vested {
+            let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+            if remaining > vested {
                 return Err(Error::TimeLockActive);
             }
         }
@@ -809,19 +824,21 @@ impl EscrowContract {
             // entrypoint and the funds are reclaimed via `refund` / `reclaim`.
             return Err(Error::EscrowExpired);
         }
-        let remaining = escrow
-            .funded_amount
-            .checked_sub(escrow.released_amount)
-            .ok_or(Error::Overflow)?;
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         if release_amount > remaining {
             return Err(Error::InvalidAmount);
         }
 
+        // Issue #307 — the release settles the escrow in full: the entire
+        // remaining custody balance moves to the recipient and the escrow
+        // becomes `Released`. The time-lock gates above are what keep unvested
+        // funds from riding along on a partially-vested `Linear` schedule.
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         escrow.released_amount = escrow.funded_amount;
         escrow.state = EscrowState::Released;
         store_escrow(&env, id, &escrow);
         // Move the real tokens out of custody to the recipient.
-        Self::transfer_all(&env, &escrow, &escrow.recipient);
+        Self::transfer_all(&env, &escrow, &escrow.recipient, remaining)?;
         for a in escrow.assets.iter() {
             events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &a.asset, a.amount);
         }
@@ -899,9 +916,10 @@ impl EscrowContract {
         }
 
         escrow.override_nonce = nonce;
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         escrow.state = EscrowState::Released;
         store_escrow(&env, id, &escrow);
-        Self::transfer_all(&env, &escrow, &escrow.recipient);
+        Self::transfer_all(&env, &escrow, &escrow.recipient, remaining)?;
         for a in escrow.assets.iter() {
             events::transfer_executed(&env, &escrow.sender, &escrow.recipient, &a.asset, a.amount);
         }
@@ -1050,8 +1068,24 @@ impl EscrowContract {
         if env.ledger().timestamp() >= escrow.deadline {
             return Err(Error::InvalidState);
         }
+        // Issue #307 — a scheduled escrow may not be cancelled past its own
+        // vesting progress either: once any value has vested (or matured), a
+        // refund-to-sender would bypass the time lock. Deterministic error:
+        // [`Error::TimeLockActive`]. Schedule-less escrows keep the previous
+        // behaviour and may be cancelled freely before the deadline.
+        if !matches!(escrow.schedule.release_type, ReleaseType::None) {
+            let vested = calculate_vested_amount(
+                escrow.funded_amount,
+                &escrow.schedule,
+                env.ledger().timestamp(),
+            )?;
+            if vested > 0 {
+                return Err(Error::TimeLockActive);
+            }
+        }
 
-        Self::transfer_all(&env, &escrow, &escrow.sender);
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        Self::transfer_all(&env, &escrow, &escrow.sender, remaining)?;
         for a in escrow.assets.iter() {
             events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
         }
@@ -1090,9 +1124,10 @@ impl EscrowContract {
         }
         Self::require_refund_window_open(&env, &escrow)?;
 
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
-        Self::transfer_all(&env, &escrow, &escrow.sender);
+        Self::transfer_all(&env, &escrow, &escrow.sender, remaining)?;
         for a in escrow.assets.iter() {
             events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
         }
@@ -1363,15 +1398,46 @@ impl EscrowContract {
         Ok(escrow.schedule)
     }
 
-    /// Move every listed asset amount out of the contract's custody to `to`.
-    fn transfer_all(env: &Env, escrow: &Escrow, to: &Address) {
-        for a in escrow.assets.iter() {
-            token::TokenClient::new(env, &a.asset).transfer(
-                &env.current_contract_address(),
-                to,
-                &a.amount,
-            );
+    /// Whether the escrow's release schedule has matured at the current ledger
+    /// timestamp: `true` for schedule-less escrows once they exist, `true` for
+    /// a `Cliff` schedule at/after `cliff_time`, and `true` for a `Linear`
+    /// schedule once anything has vested. Clients use this to show an unlock
+    /// countdown without recomputing the schedule off-chain.
+    pub fn is_unlocked(env: Env, id: u64) -> Result<bool, Error> {
+        let escrow = load_escrow(&env, id)?;
+        Ok(matches!(escrow.schedule.release_type, ReleaseType::None)
+            || calculate_vested_amount(
+                escrow.funded_amount,
+                &escrow.schedule,
+                env.ledger().timestamp(),
+            )? > 0)
+    }
+
+    /// Move `remaining` out of the contract's custody to `to`, pro-rata
+    /// across the listed assets. Callers compute `remaining` as funded minus
+    /// already released *before* mutating the escrow record, so a settlement
+    /// that follows partial `withdraw` / `claim` payouts moves exactly what
+    /// is still held instead of over-drawing custody (Issue #307).
+    fn transfer_all(
+        env: &Env,
+        escrow: &Escrow,
+        to: &Address,
+        remaining: i128,
+    ) -> Result<(), Error> {
+        if remaining == 0 {
+            return Ok(());
         }
+        for a in escrow.assets.iter() {
+            let send_amount = checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+            if send_amount > 0 {
+                token::TokenClient::new(env, &a.asset).transfer(
+                    &env.current_contract_address(),
+                    to,
+                    &send_amount,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Sum the amounts across every listed asset (single-asset milestone

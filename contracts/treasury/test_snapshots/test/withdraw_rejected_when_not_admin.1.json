@@ -484,18 +484,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "ReentrancyLock"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "bool": false
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "Treasury"
                             }
                           ]
@@ -551,6 +539,20 @@
                             {
                               "key": {
                                 "symbol": "policy"
+                              },
+                              "val": "void"
+                            },
+                            {
+                              "key": {
+                                "symbol": "reentrancy_lock"
+                              },
+                              "val": {
+                                "bool": false
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "registry"
                               },
                               "val": "void"
                             },

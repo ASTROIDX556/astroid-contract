@@ -1009,7 +1009,11 @@ impl PolicyInterface for PolicyContract {
             .has(&DataKey::MerchantBlacklist(recipient.clone()))
         {
             events_policy_violation(&env, &policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
+            // Slot 23 (`PolicyMerchantBlocked`) was retired into this check: a
+            // merchant blacklist is a recipient blacklist, so the deterministic
+            // code is `PolicyRecipientRestricted`; the `merchant_blocked`
+            // violation event above keeps the distinction observable off-chain.
+            return Err(Error::PolicyRecipientRestricted);
         }
         // --- Allowance / amount gates ---
         if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {

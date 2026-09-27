@@ -400,18 +400,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "ReentrancyLock"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "bool": false
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "Treasury"
                             }
                           ]
@@ -473,6 +461,20 @@
                               "val": {
                                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                               }
+                            },
+                            {
+                              "key": {
+                                "symbol": "reentrancy_lock"
+                              },
+                              "val": {
+                                "bool": false
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "registry"
+                              },
+                              "val": "void"
                             },
                             {
                               "key": {

@@ -28,7 +28,10 @@ pub enum Error {
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
-    PolicyMerchantBlocked = 23,
+    // 23 (`PolicyMerchantBlocked`) retired: a merchant blacklist is a recipient
+    // blacklist, so those spends are now reported as `PolicyRecipientRestricted`
+    // (22); the policy contract's `merchant_blocked` violation event keeps the
+    // distinction observable off-chain. The value is never reused.
     PolicyCategoryRestricted = 24,
     // 25 (`AssetNotWhitelisted`) retired: it meant the same thing as
     // `AssetNotAuthorized` (43) and was consolidated into it, freeing a slot
@@ -95,7 +98,7 @@ pub enum Error {
     TimeLockActive = 81,
     GraceActive = 82,
 
-    // --- Treasury (83-85) ---
+    // --- Treasury (83-86) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
     /// The treasury's emergency circuit breaker is engaged
@@ -103,4 +106,13 @@ pub enum Error {
     /// with this code until the guardian or multisig unpauses it. Inbound
     /// deposits deliberately stay open so recovery funding can still arrive.
     TreasuryPaused = 85,
+    /// A cross-contract caller of the treasury is not the module recorded for
+    /// it in the protocol Registry (UNVERIFIED_CALLER). Returned only while a
+    /// registry gate is configured and the caller is a contract address;
+    /// unregistered, hostile contracts can therefore never move treasury
+    /// funds. Account callers keep passing through the ordinary role checks.
+    UnverifiedCaller = 86,
+    // NOTE: the protocol-wide error enum is XDR-spec-bound to at most 50
+    // variants (ScSpecUdtErrorEnumV0.cases). New codes must retire an unused
+    // one first, exactly like slots 23 and 25 above — never grow past 50.
 }

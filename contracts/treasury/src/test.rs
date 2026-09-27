@@ -951,3 +951,212 @@ fn set_guardian_rotates_pause_authority() {
     h.client.unpause(&h.multisig);
     assert!(!h.client.is_paused());
 }
+
+// --- Registry-verified callers and reentrancy lock (Issue #308) ---
+
+use astroid_registry::{RegistryContract, RegistryContractClient};
+use astroid_shared::types::ModuleKind;
+
+const GATED_ORG: &str = "vault-org";
+
+/// Token balance of `who` in `asset`.
+fn gated_balance(h: &GatedHarness, asset: &Address, who: &Address) -> i128 {
+    token::TokenClient::new(&h.env, asset).balance(who)
+}
+
+/// A genuine account-format address (strkey `G...`). Soroban's test address
+/// generator mints contract-format addresses, so the account side of the
+/// gate — which must pass through untouched — needs a real one.
+fn account_address(env: &Env) -> Address {
+    Address::from_string(&String::from_str(
+        env,
+        "GAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSH7S",
+    ))
+}
+
+/// Harness with the real registry deployed and wired into the treasury: the
+/// treasury is registered as the org's Treasury module, an account stands in
+/// for the governance caller (the Multisig record outbound movements
+/// verify), and a funder is registered as the org's Wallet (the record
+/// contract deposits verify). Under `mock_all_auths` every gate below is
+/// exercised at the contract-logic level rather than at the signature level.
+struct GatedHarness<'a> {
+    env: Env,
+    registry: RegistryContractClient<'a>,
+    client: TreasuryContractClient<'a>,
+    /// Governance caller — account-format, recorded as the org's Multisig.
+    admin: Address,
+    /// Funder recorded as the org's Wallet module.
+    funder: Address,
+    asset: Address,
+    org: String,
+}
+
+fn setup_gated(funded: i128) -> GatedHarness<'static> {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = account_address(&env);
+    let multisig = Address::generate(&env);
+    let org = String::from_str(&env, GATED_ORG);
+
+    // Registry — the protocol's source of truth for module addresses.
+    let registry_id = env.register_contract(None, RegistryContract);
+    let registry = RegistryContractClient::new(&env, &registry_id);
+    registry.initialize(&admin);
+    registry.register_org(&admin, &org.clone(), &admin);
+
+    // Treasury — wired to the registry, registered as the org's Treasury.
+    let treasury_id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &treasury_id);
+    client.initialize(&org.clone(), &admin);
+    client.set_multisig(&admin, &multisig);
+    client.set_registry(&admin, &Some(registry_id.clone()));
+    registry.register_module(&admin, &org.clone(), &ModuleKind::Treasury, &treasury_id);
+
+    // The funder: a contract recorded as the org's Wallet module.
+    let funder = env.register_contract(None, RegistryContract);
+    registry.register_module(&admin, &org.clone(), &ModuleKind::Wallet, &funder);
+
+    // A real SAC token, whitelisted and minted to the funder.
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.add_approved_asset(&admin, &asset);
+    if funded > 0 {
+        token::StellarAssetClient::new(&env, &asset).mint(&funder, &funded);
+    }
+
+    GatedHarness {
+        env,
+        registry,
+        client,
+        admin,
+        funder,
+        asset,
+        org,
+    }
+}
+
+/// A hostile, unregistered contract cannot deposit into the treasury: the
+/// deposit gate verifies a contract depositor against the org's Wallet
+/// module record and refuses everything else with `UnverifiedCaller`.
+#[test]
+fn unregistered_contract_depositor_is_refused_on_deposit() {
+    let h = setup_gated(0);
+
+    let hostile = h.env.register_contract(None, RegistryContract);
+    let res = h.client.try_deposit(&hostile, &h.asset, &500);
+    assert_eq!(res, Err(Ok(Error::UnverifiedCaller)));
+    assert_eq!(h.client.holding(&h.asset).total_in, 0);
+    assert_eq!(gated_balance(&h, &h.asset, &h.client.address), 0);
+}
+
+/// A contract registered under a different module kind cannot pose as the
+/// expected module: the registry resolves (org, kind), not just the address.
+#[test]
+fn wrong_module_kind_is_refused_on_deposit() {
+    let h = setup_gated(0);
+
+    // Register the stranger as the org's Proposal module — a legitimate
+    // kind, but not the Wallet kind a deposit requires.
+    let stranger = h.env.register_contract(None, RegistryContract);
+    h.registry
+        .register_module(&h.admin, &h.org.clone(), &ModuleKind::Proposal, &stranger);
+
+    let res = h.client.try_deposit(&stranger, &h.asset, &500);
+    assert_eq!(res, Err(Ok(Error::UnverifiedCaller)));
+    assert_eq!(h.client.holding(&h.asset).total_in, 0);
+}
+
+/// The registered Wallet module stays a first-class depositor: funding flows
+/// from an organization's wallet keep working under the gate.
+#[test]
+fn registered_wallet_module_may_deposit() {
+    let h = setup_gated(500);
+
+    h.client.deposit(&h.funder, &h.asset, &500);
+    assert_eq!(h.client.holding(&h.asset).total_in, 500);
+    assert_eq!(gated_balance(&h, &h.asset, &h.client.address), 500);
+}
+
+/// A frozen registry fails the gate closed: even a fully registered caller
+/// is refused while the registry cannot answer, so nobody can time a
+/// movement to a registry outage.
+#[test]
+fn frozen_registry_fails_caller_verification_closed() {
+    let h = setup_gated(2_000);
+    h.client.deposit(&h.funder, &h.asset, &1_000);
+
+    // The funder is a registered Wallet module and could deposit freely a
+    // moment ago; with the registry frozen its `lookup` can no longer be
+    // answered, so the gate fails closed.
+    h.registry.freeze(&h.admin, &h.org.clone());
+    let res = h.client.try_deposit(&h.funder, &h.asset, &100);
+    assert_eq!(res, Err(Ok(Error::UnverifiedCaller)));
+    assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
+
+    // The account admin's withdraw is refused on the same principle the
+    // moment it is made by a contract caller whose verification fails — the
+    // account passthrough does not extend to unanswerable lookups.
+    h.registry.unfreeze(&h.admin, &h.org.clone());
+    assert!(h.client.try_deposit(&h.funder, &h.asset, &100).is_ok());
+}
+
+/// Account callers are never subject to the registry gate — they keep
+/// passing through the ordinary role checks — so a plain-key admin can still
+/// withdraw with a registry wired.
+#[test]
+fn account_callers_bypass_the_registry_gate() {
+    let h = setup_gated(2_000);
+    h.client.deposit(&h.funder, &h.asset, &1_000);
+
+    h.client
+        .withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &100);
+    assert_eq!(h.client.holding(&h.asset).total_out, 100);
+}
+
+/// Clearing the registry (admin-gated) restores the pre-registry behaviour:
+/// the gate — not some incidental state — is what refused the hostile
+/// contract.
+#[test]
+fn clearing_the_registry_restores_legacy_behaviour() {
+    let h = setup_gated(500);
+
+    let hostile = h.env.register_contract(None, RegistryContract);
+    assert_eq!(
+        h.client.try_deposit(&hostile, &h.asset, &100),
+        Err(Ok(Error::UnverifiedCaller))
+    );
+
+    h.client.set_registry(&h.admin, &None);
+    assert_eq!(h.client.registry(), None);
+
+    // Mint to the hostile contract so the legacy deposit actually pays, then
+    // verify it goes through with the gate cleared.
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&hostile, &100);
+    h.client.deposit(&hostile, &h.asset, &100);
+    assert_eq!(h.client.holding(&h.asset).total_in, 100);
+}
+
+/// The reentrancy lock releases when a movement completes, so a subsequent,
+/// independent movement is never mistaken for a re-entry and the flag never
+/// leaks into observable state between calls.
+#[test]
+fn reentrancy_lock_releases_after_each_movement() {
+    let h = setup_gated(2_000);
+
+    h.client.deposit(&h.funder, &h.asset, &1_000);
+    assert!(!h.client.get().reentrancy_lock);
+
+    h.client
+        .withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &100);
+    assert!(!h.client.get().reentrancy_lock);
+    assert_eq!(h.client.holding(&h.asset).total_out, 100);
+
+    // A second, sequential movement succeeds and leaves the lock released.
+    h.client
+        .withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &100);
+    assert!(!h.client.get().reentrancy_lock);
+    assert_eq!(h.client.holding(&h.asset).total_out, 200);
+}
