@@ -33,7 +33,8 @@
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
 //! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
-//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`.
+//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`,
+//! `set_rate_limit`, `clear_rate_limit`.
 //!
 //! ## Pre-execution policy hook
 //!
@@ -65,6 +66,24 @@
 //! spends revert with the invocation, so they never consume allowance. The
 //! velocity ceiling is independent of the policy bypass: excusing a wallet
 //! from the org policy does not lift its own ceiling.
+//!
+//! ## Sliding-window rate limits
+//!
+//! Velocity ceilings bound one asset's outflow but say nothing about how many
+//! transactions a wallet emits, so a compromised agent can still spray many
+//! small spends, or spread value across several assets, without tripping a
+//! per-asset ceiling. A wallet [`Role::Admin`] can therefore set a per-wallet
+//! rate limit ([`WalletContract::set_rate_limit`]): at most `max_volume` may
+//! leave the wallet and at most `max_count` outbound transactions may be issued
+//! within a rolling window of `window_seconds`, counted across every asset and
+//! across `transfer`, `withdraw` and validated batch actions.
+//!
+//! The window is tracked as [`RATE_LIMIT_BUCKETS`] ledger-time buckets in one
+//! fixed-size record per wallet, overwritten in place, so usage never grows the
+//! ledger footprint. A breach fails with [`Error::RateLimitExceeded`] and
+//! nothing moves; rejected spends revert with the invocation, so they never
+//! consume allowance. Setting `window_seconds == 0` disables the limit, and a
+//! `0` cap means "unlimited" for that dimension.
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
 //! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
@@ -137,6 +156,12 @@ enum DataKey {
     /// (persistent). One fixed-size record per limited (wallet, asset), always
     /// overwritten in place, so usage never grows the ledger footprint.
     VelocityUsage(u64, Address),
+    /// Rate-limit config: wallet id -> RateLimitConfig (persistent). A missing
+    /// entry means rate limiting is off.
+    RateLimit(u64),
+    /// Rolling rate usage: wallet id -> RateUsage (persistent). One fixed-size
+    /// record per limited wallet, always overwritten in place.
+    RateLimitUsage(u64),
 }
 
 /// Number of equal sub-buckets a velocity window is divided into. Spends are
@@ -166,6 +191,51 @@ pub struct VelocityLimit {
 pub struct VelocityUsage {
     pub bucket: u64,
     pub spent: soroban_sdk::Vec<i128>,
+}
+
+/// Number of equal sub-buckets a rate-limit window is divided into. Outbound
+/// activity is bucketed by ledger time; a bucket's volume and transaction count
+/// count against the limit until the bucket slides out of the trailing window.
+pub const RATE_LIMIT_BUCKETS: u32 = 4;
+
+/// A wallet's rate limit: at most `max_volume` may leave the wallet and at most
+/// `max_count` outbound transactions may be issued within the rolling window of
+/// `window_seconds`. A `0` cap means "unlimited" for that dimension;
+/// `window_seconds == 0` disables the limit entirely.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitConfig {
+    /// Ceiling on the total outbound volume inside the window, across every
+    /// asset and path. `0` = unlimited.
+    pub max_volume: i128,
+    /// Ceiling on the number of outbound transactions inside the window. `0` =
+    /// unlimited.
+    pub max_count: u32,
+    /// Window length in seconds; `0` disables the limit. Otherwise a positive
+    /// multiple of [`RATE_LIMIT_BUCKETS`].
+    pub window_seconds: u64,
+}
+
+/// Outbound activity recorded per bucket for one wallet.
+///
+/// `volume[i]` and `count[i]` describe bucket number `bucket - i`, where a
+/// bucket number is `ledger_timestamp / (window_seconds / RATE_LIMIT_BUCKETS)`.
+/// Both vectors always hold exactly [`RATE_LIMIT_BUCKETS`] entries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateUsage {
+    pub bucket: u64,
+    pub volume: soroban_sdk::Vec<i128>,
+    pub count: soroban_sdk::Vec<u32>,
+}
+
+/// Public snapshot of a wallet's outbound activity in the active rate-limit
+/// window: total volume and transaction count.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitStatus {
+    pub volume: i128,
+    pub count: u32,
 }
 
 /// Stored wallet record. `owner` controls the wallet; `state` gates operations.
@@ -587,6 +657,115 @@ impl WalletContract {
         Self::velocity_total(&usage)
     }
 
+    /// Set a wallet's sliding-window rate limit ([`Role::Admin`]): at most
+    /// `max_volume` may leave the wallet and at most `max_count` outbound
+    /// transactions may be issued within any rolling window of
+    /// `window_seconds`, counted across every asset and across `transfer`,
+    /// `withdraw` and validated batch actions. Agents cannot change it.
+    ///
+    /// `max_volume` must not be negative ([`Error::InvalidInput`]), and
+    /// `window_seconds`, when non-zero, must be a positive multiple of
+    /// [`RATE_LIMIT_BUCKETS`] ([`Error::InvalidInput`]). `window_seconds == 0`
+    /// disables the limit; a `0` cap means "unlimited" for that dimension.
+    /// Changing `window_seconds` re-buckets time, so recorded usage restarts
+    /// from zero.
+    pub fn set_rate_limit(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        max_volume: i128,
+        max_count: u32,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
+        ensure!(max_volume >= 0, Error::InvalidInput);
+        let config_key = DataKey::RateLimit(wallet_id);
+        let usage_key = DataKey::RateLimitUsage(wallet_id);
+        if window_seconds == 0 {
+            // Disabling drops both records: an unlimited wallet carries no
+            // usage, so a later re-enable starts from a clean window.
+            env.storage().persistent().remove(&config_key);
+            env.storage().persistent().remove(&usage_key);
+        } else {
+            let buckets = RATE_LIMIT_BUCKETS as u64;
+            ensure!(
+                window_seconds >= buckets && window_seconds % buckets == 0,
+                Error::InvalidInput
+            );
+            let previous: Option<RateLimitConfig> = env.storage().persistent().get(&config_key);
+            if previous.map(|previous| previous.window_seconds) != Some(window_seconds) {
+                env.storage().persistent().remove(&usage_key);
+            }
+            let config = RateLimitConfig {
+                max_volume,
+                max_count,
+                window_seconds,
+            };
+            env.storage().persistent().set(&config_key, &config);
+            Self::bump_persistent(&env, &config_key);
+        }
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("ratelimit")),
+            (wallet_id, max_volume, max_count, window_seconds),
+        );
+        Ok(())
+    }
+
+    /// Remove a wallet's rate limit ([`Role::Admin`]), deleting its usage record
+    /// too. [`Error::NotFound`] when none is set.
+    pub fn clear_rate_limit(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        let config_key = DataKey::RateLimit(wallet_id);
+        ensure!(env.storage().persistent().has(&config_key), Error::NotFound);
+        env.storage().persistent().remove(&config_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RateLimitUsage(wallet_id));
+        env.events().publish(
+            (symbol_short!("wallet"), symbol_short!("ratelimit")),
+            (wallet_id, "cleared"),
+        );
+        Ok(())
+    }
+
+    /// Read a wallet's rate-limit config, if any.
+    pub fn get_rate_limit(env: Env, wallet_id: u64) -> Option<RateLimitConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateLimit(wallet_id))
+    }
+
+    /// Volume and transaction count that have left the wallet within the
+    /// current rolling rate-limit window (`(0, 0)` when no limit is set).
+    pub fn get_rate_usage(env: Env, wallet_id: u64) -> Result<RateLimitStatus, Error> {
+        let config: RateLimitConfig = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::RateLimit(wallet_id))
+        {
+            Some(config) => config,
+            None => {
+                return Ok(RateLimitStatus {
+                    volume: 0,
+                    count: 0,
+                })
+            }
+        };
+        if config.window_seconds == 0 {
+            return Ok(RateLimitStatus {
+                volume: 0,
+                count: 0,
+            });
+        }
+        let usage = Self::rolled_rate_usage(&env, wallet_id, &config);
+        let (volume, count) = Self::rate_totals(&usage)?;
+        Ok(RateLimitStatus { volume, count })
+    }
+
     /// Fund a wallet: pulls `amount` of `asset` from `from` into custody and
     /// credits the wallet's internal balance. Requires `from` authorization.
     pub fn deposit(
@@ -642,6 +821,7 @@ impl WalletContract {
         // for moving too much too fast. Recorded here, before the debit; any
         // later failure reverts the invocation and the recorded usage with it.
         Self::enforce_velocity(&env, wallet_id, &asset, amount)?;
+        Self::enforce_rate_limit(&env, wallet_id, amount, 1)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -671,6 +851,7 @@ impl WalletContract {
         // Pre-execution policy check — withdrawals are outbound movements too.
         Self::require_policy_allows(&env, wallet_id, &asset, &wallet.owner, amount)?;
         Self::enforce_velocity(&env, wallet_id, &asset, amount)?;
+        Self::enforce_rate_limit(&env, wallet_id, amount, 1)?;
         Self::debit(&env, wallet_id, &asset, amount)?;
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
@@ -831,6 +1012,11 @@ impl WalletContract {
                 );
             }
         }
+
+        // Charge the whole batch's value and action count to the rate-limit
+        // window as one event, before any value moves; a later failure reverts
+        // the invocation and the recording with it.
+        Self::enforce_rate_limit(&env, wallet_id, total_amount, actions.len())?;
 
         // Record the window usage validated above before any value moves; a
         // later failure reverts the invocation and the recording with it.
@@ -1098,6 +1284,108 @@ impl WalletContract {
             total = total.safe_add(amount)?;
         }
         Ok(total)
+    }
+
+    /// Rate-limit hook, applied to every outbound movement after the velocity
+    /// check. With no limit configured for `wallet_id` it is a no-op. Otherwise
+    /// it rejects with [`Error::RateLimitExceeded`] when the trailing window's
+    /// volume plus `amount`, or its transaction count plus `count`, would
+    /// exceed the configured caps, and records the charge in the current bucket
+    /// when it fits.
+    fn enforce_rate_limit(
+        env: &Env,
+        wallet_id: u64,
+        amount: i128,
+        count: u32,
+    ) -> Result<(), Error> {
+        let config: RateLimitConfig = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::RateLimit(wallet_id))
+        {
+            Some(config) => config,
+            None => return Ok(()),
+        };
+        if config.window_seconds == 0 {
+            return Ok(());
+        }
+        let key = DataKey::RateLimitUsage(wallet_id);
+        let mut usage = Self::rolled_rate_usage(env, wallet_id, &config);
+        let (total_volume, total_count) = Self::rate_totals(&usage)?;
+
+        let new_count = total_count.checked_add(count).ok_or(Error::Overflow)?;
+        if config.max_count != 0 && new_count > config.max_count {
+            return Err(Error::RateLimitExceeded);
+        }
+        let new_volume = total_volume.safe_add(amount)?;
+        if config.max_volume != 0 && new_volume > config.max_volume {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        let bucket_volume = usage.volume.get(0).unwrap_or(0).safe_add(amount)?;
+        let bucket_count = usage
+            .count
+            .get(0)
+            .unwrap_or(0)
+            .checked_add(count)
+            .ok_or(Error::Overflow)?;
+        usage.volume.set(0, bucket_volume);
+        usage.count.set(0, bucket_count);
+        env.storage().persistent().set(&key, &usage);
+        Self::bump_persistent(env, &key);
+        Ok(())
+    }
+
+    /// Load the rate usage record aged to the current ledger time: buckets that
+    /// slid out of the window are dropped and bucket 0 is the current one. If
+    /// the ledger clock reads earlier than the recorded bucket, nothing is aged
+    /// out, so a clock anomaly can never free allowance.
+    fn rolled_rate_usage(env: &Env, wallet_id: u64, config: &RateLimitConfig) -> RateUsage {
+        let bucket_seconds = config.window_seconds / RATE_LIMIT_BUCKETS as u64;
+        let now_bucket = env.ledger().timestamp() / bucket_seconds;
+        let stored: Option<RateUsage> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RateLimitUsage(wallet_id));
+        let mut volume = soroban_sdk::Vec::new(env);
+        let mut count = soroban_sdk::Vec::new(env);
+        for _ in 0..RATE_LIMIT_BUCKETS {
+            volume.push_back(0i128);
+            count.push_back(0u32);
+        }
+        let bucket = match stored {
+            None => now_bucket,
+            Some(usage) => {
+                let bucket = now_bucket.max(usage.bucket);
+                let shift = bucket - usage.bucket;
+                for i in 0..RATE_LIMIT_BUCKETS {
+                    let target = i as u64 + shift;
+                    if target < RATE_LIMIT_BUCKETS as u64 {
+                        volume.set(target as u32, usage.volume.get(i).unwrap_or(0));
+                        count.set(target as u32, usage.count.get(i).unwrap_or(0));
+                    }
+                }
+                bucket
+            }
+        };
+        RateUsage {
+            bucket,
+            volume,
+            count,
+        }
+    }
+
+    /// Sum the per-bucket volume and transaction count of a rolled usage record.
+    fn rate_totals(usage: &RateUsage) -> Result<(i128, u32), Error> {
+        let mut total_volume: i128 = 0;
+        let mut total_count: u32 = 0;
+        for amount in usage.volume.iter() {
+            total_volume = total_volume.safe_add(amount)?;
+        }
+        for count in usage.count.iter() {
+            total_count = total_count.checked_add(count).ok_or(Error::Overflow)?;
+        }
+        Ok((total_volume, total_count))
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {

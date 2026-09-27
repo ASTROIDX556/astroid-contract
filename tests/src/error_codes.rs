@@ -29,13 +29,13 @@ use astroid_wallet::WalletContract;
 /// Written out literally rather than derived from [`Error::ALL`], because the
 /// point of this test is to catch the table being renumbered — deriving it
 /// would make that failure impossible to observe.
-const ALL_CODES: [u32; 50] = [
+const ALL_CODES: [u32; 51] = [
     1, 2, 3, 4, 5, 6, // generic / lifecycle
     10, 11, 12, // value / arithmetic
     20, 21, 22, 23, 24, 27, // policy
     30, 31, // registry
     40, 41, 42, 43, 44, // budget
-    50, 51, 52, 53, // wallet
+    50, 51, 52, 53, 54, // wallet
     61, 62, 63, 64, 66, 67, 68, 69, 90, 91, 92, // multisig / approvals
     71, 72, 73, 74, 75, 78, 79, // proposal
     80, 81, 82, // escrow
@@ -59,7 +59,7 @@ fn code_of<T: std::fmt::Debug, C: std::fmt::Debug>(
 }
 
 #[test]
-fn the_canonical_table_is_exactly_the_fifty_declared_codes() {
+fn the_canonical_table_is_exactly_the_fifty_one_declared_codes() {
     assert_eq!(ALL_CODES.len(), Error::ALL.len());
     for (i, expected) in ALL_CODES.iter().enumerate() {
         assert_eq!(
