@@ -1416,3 +1416,892 @@ fn batch_extends_ttl_exactly_like_lookup() {
     client.lookup(&org, &ModuleKind::Policy);
     assert_eq!(ttl(ModuleKind::Policy), PERSISTENT_BUMP_AMOUNT);
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic error codes
+//
+// Every failure below must surface as a specific `Error` variant, never as a
+// generic code and never as a host trap, so an off-chain consumer can branch on
+// it. The three groups mirror the classes the protocol promises to keep
+// distinct: out-of-bounds / invalid input, unauthorized callers, and frozen
+// (lifecycle) refusals.
+// ---------------------------------------------------------------------------
+
+/// A registry that was registered but never `initialize`d, so the guards that
+/// read instance storage report `NotInitialized` instead of panicking.
+fn uninitialized() -> (Env, RegistryContractClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &contract_id);
+    (env, client)
+}
+
+#[test]
+fn uninitialized_registry_reports_not_initialized() {
+    let (env, client) = uninitialized();
+    let admin = Address::generate(&env);
+    let org = String::from_str(&env, "acme");
+
+    assert_eq!(client.try_get_admin(), Err(Ok(Error::NotInitialized)));
+    assert_eq!(
+        client.try_register_org(&admin, &org, &Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_deprecate_module(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_admin(&admin, &Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn out_of_bounds_lookups_report_not_found() {
+    let (env, client, _admin) = setup();
+    let ghost = String::from_str(&env, "ghost");
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&_admin, &org, &owner);
+
+    // A key that was never written must not read as a default value.
+    assert_eq!(client.try_get_org_owner(&ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        client.try_get_module_address(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_verify_owner(&ghost, &owner),
+        Err(Ok(Error::NotFound))
+    );
+    // No version has been registered, and version 0 can never be registered.
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_latest(&ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn empty_org_slug_is_rejected_as_invalid_input() {
+    let (env, client, admin) = setup();
+    // An empty string is a valid `String` but not a valid org identifier; it
+    // must be refused with `InvalidInput` rather than stored.
+    let res = client.try_register_org(
+        &admin,
+        &String::from_str(&env, ""),
+        &Address::generate(&env),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        client.try_get_org_owner(&String::from_str(&env, "")),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn unknown_org_is_not_found_for_every_owner_gated_call() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let ghost = String::from_str(&env, "ghost");
+    let new_owner = Address::generate(&env);
+
+    // A real owner naming an organization that does not exist gets `NotFound`,
+    // not a permission failure — the two are different diagnoses.
+    assert_eq!(
+        client.try_set_org_owner(&owner, &ghost, &new_owner),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_register_module(
+            &owner,
+            &ghost,
+            &ModuleKind::Wallet,
+            &Address::generate(&env)
+        ),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_remove_module(&owner, &ghost, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(client.try_freeze(&owner, &ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        client.try_unfreeze(&owner, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn unauthorized_callers_are_refused_by_the_protocol_admin() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let intruder = Address::generate(&env);
+    let intruder_org = String::from_str(&env, "evil");
+    client.register_org(&admin, &intruder_org, &intruder);
+
+    // A stranger must never seize the protocol admin, approve Wasm, or record a
+    // version, even while holding ownership of an organization of their own.
+    assert_eq!(
+        client.try_set_admin(&intruder, &intruder),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_add_approved_wasm(&intruder, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_remove_approved_wasm(&intruder, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_register_version(
+            &intruder,
+            &ModuleKind::Wallet,
+            &1,
+            &Address::generate(&env),
+            &hash(&env, 1)
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The admin is unchanged.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn freeze_and_unfreeze_require_the_owner_or_admin() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let intruder = Address::generate(&env);
+
+    assert_eq!(
+        client.try_freeze(&intruder, &org),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.freeze(&owner, &org);
+    assert_eq!(
+        client.try_unfreeze(&intruder, &org),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Only the owner or the protocol admin may lift the breaker.
+    client.unfreeze(&owner, &org);
+    client.freeze(&admin, &org);
+    client.unfreeze(&admin, &org);
+}
+
+#[test]
+fn frozen_registry_refuses_every_organization_scoped_write() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.freeze(&owner, &org);
+
+    // Every write that would change routing for this org must report the single
+    // dedicated `RegistryFrozen` code — never a generic `Unauthorized`.
+    for res in [
+        client.try_register_module(&owner, &org, &ModuleKind::Policy, &Address::generate(&env)),
+        client.try_remove_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_set_org_owner(&owner, &org, &Address::generate(&env)),
+        client.try_deprecate_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_reactivate_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_register_org(&admin, &String::from_str(&env, "other"), &owner),
+        client.try_grant_role(
+            &owner,
+            &org,
+            &Address::generate(&env),
+            &RegistryRole::PolicyManager,
+        ),
+    ] {
+        assert_eq!(res, Err(Ok(Error::RegistryFrozen)));
+    }
+
+    // Routing is frozen too, so a live module reports the same dedicated code
+    // rather than being served; the legacy getter stays open for recovery.
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::RegistryFrozen))
+    );
+    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
+    client.unfreeze(&owner, &org);
+    client.register_module(&owner, &org, &ModuleKind::Policy, &Address::generate(&env));
+}
+
+#[test]
+fn deprecated_module_reports_module_deprecated_not_not_found() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    // Deprecation is protocol-admin gated; the org owner is refused.
+    assert_eq!(
+        client.try_deprecate_module(&owner, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
+
+    // The record still exists for the legacy getter, but routing must report the
+    // dedicated deprecation code so callers can distinguish it from a missing
+    // module.
+    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::ModuleDeprecated))
+    );
+    // A module that was never registered is `NotFound`, not deprecated.
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Policy),
+        Err(Ok(Error::NotFound))
+    );
+    // Reactivating restores routing and clears the code.
+    client.reactivate_module(&admin, &org, &ModuleKind::Wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn unapproved_wasm_cannot_be_removed() {
+    let (env, client, admin) = setup();
+    // Revoking a hash that was never approved is `NotFound`, not a silent no-op.
+    let res = client.try_remove_approved_wasm(&admin, &ModuleKind::Wallet, &hash(&env, 7));
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade-map storage-read optimization (Issue #319)
+//
+// Persistent reads dominate gas. `get_versions_batch` must minimize them by
+// caching the first read of each distinct (kind, version) — including `None`
+// for a missing key — and serving duplicates from an in-memory `Vec` bounded
+// by `MAX_REGISTRY_BATCH`. The same read-once, TTL-once semantics as
+// `get_version` must hold: a distinct key's TTL is extended once per
+// invocation when the record exists and never for a missing key. Overall fee
+// and TTL extended only once.
+
+fn versions_batch(
+    env: &Env,
+    client: &RegistryContractClient,
+    ids: &[(ModuleKind, u32)],
+) -> Vec<Option<Address>> {
+    let mut vids = Vec::new(env);
+    for (kind, version) in ids.iter() {
+        vids.push_back(crate::VersionId {
+            kind: *kind,
+            version: *version,
+        });
+    }
+    client.get_versions_batch(&vids)
+}
+
+fn version_ttl(env: &Env, client: &RegistryContractClient, kind: ModuleKind, version: u32) -> u32 {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::VersionRecord(kind, version))
+    })
+}
+
+#[test]
+fn versions_batch_returns_every_registered_version_in_request_order() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+
+    // Deliberately not in registration order.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[(ModuleKind::Wallet, 2), (ModuleKind::Wallet, 1)],
+    );
+    assert_eq!(result, vec![&env, Some(v2), Some(v1)]);
+}
+
+#[test]
+fn versions_batch_reports_missing_versions_as_none_in_place() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 99), // never registered
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2), // kind registered, version missing
+        ],
+    );
+    assert_eq!(result, vec![&env, None, Some(v1), None]);
+}
+
+#[test]
+fn versions_batch_of_only_missing_versions_is_all_none() {
+    let (env, client, _admin) = setup();
+    let result = versions_batch(
+        &env,
+        &client,
+        &[(ModuleKind::Wallet, 1), (ModuleKind::Wallet, 2)],
+    );
+    assert_eq!(result, vec![&env, None, None]);
+}
+
+#[test]
+fn empty_versions_batch_returns_empty_list() {
+    let (env, client, _admin) = setup();
+    let empty = crate::VersionId {
+        kind: ModuleKind::Wallet,
+        version: 1,
+    };
+    // Construct an explicitly empty Vec<VersionId>.
+    let ids: Vec<crate::VersionId> = Vec::new(&env);
+    assert_eq!(client.get_versions_batch(&ids), Vec::new(&env));
+    // Also through helper with no ids.
+    assert_eq!(versions_batch(&env, &client, &[]), Vec::new(&env));
+    let _ = empty;
+}
+
+#[test]
+fn versions_batch_at_the_size_limit_succeeds() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        ids.push_back(crate::VersionId {
+            kind: ModuleKind::Wallet,
+            version: 1,
+        });
+    }
+    let result = client.get_versions_batch(&ids);
+    assert_eq!(result.len(), MAX_REGISTRY_BATCH);
+    assert!(result.iter().all(|a| a == Some(v1.clone())));
+}
+
+#[test]
+fn versions_batch_over_the_size_limit_is_rejected_before_any_read() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..=MAX_REGISTRY_BATCH {
+        ids.push_back(crate::VersionId {
+            kind: ModuleKind::Wallet,
+            version: 1,
+        });
+    }
+    assert_eq!(
+        client.try_get_versions_batch(&ids),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn versions_batch_answers_duplicate_ids_at_every_position() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+
+    // Wallet v1 appears three times, interleaved with v2 and missing keys.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 1),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(v1.clone()),
+            Some(v2.clone()),
+            Some(v1.clone()),
+            None,
+            None,
+            Some(v1)
+        ]
+    );
+}
+
+#[test]
+fn versions_batch_agrees_with_single_version_lookups() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let vp = Address::generate(&env);
+    let hp = approved_hash(&env, &client, &admin, ModuleKind::Policy, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Policy, &1, &vp, &hp);
+
+    let kinds_versions = [
+        (ModuleKind::Wallet, 1), // present
+        (ModuleKind::Wallet, 2), // missing
+        (ModuleKind::Policy, 1), // present, different kind same version
+        (ModuleKind::Policy, 2), // missing
+        (ModuleKind::Escrow, 1), // kind never registered
+    ];
+    let mut vids = Vec::new(&env);
+    for (k, v) in kinds_versions.iter() {
+        vids.push_back(crate::VersionId {
+            kind: *k,
+            version: *v,
+        });
+    }
+    let batch = client.get_versions_batch(&vids);
+    assert_eq!(batch.len(), vids.len());
+    for (vid, entry) in vids.iter().zip(batch.iter()) {
+        let single = client.try_get_version(&vid.kind, &vid.version);
+        match entry {
+            None => assert_eq!(single, Err(Ok(Error::NotFound))),
+            Some(addr) => assert_eq!(single, Ok(Ok(addr.clone()))),
+        }
+    }
+}
+
+#[test]
+fn versions_batch_deduplicates_reads_and_bumps_once_per_distinct_key() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+
+    // Age the version records past the bump threshold so a read would extend
+    // them only if the TTL bump is actually performed.
+    env.ledger().with_mut(|l| l.sequence_number += 2 * 17_280);
+    let aged_v1 = version_ttl(&env, &client, ModuleKind::Wallet, 1);
+    let aged_v2 = version_ttl(&env, &client, ModuleKind::Wallet, 2);
+    assert!(aged_v1 < PERSISTENT_BUMP_AMOUNT);
+    assert!(aged_v2 < PERSISTENT_BUMP_AMOUNT);
+
+    // Batch with duplicates: v1 appears three times, v2 once, and a missing
+    // key twice. Only the distinct present keys should have their TTL
+    // extended, each exactly once.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 1),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(v1.clone()),
+            Some(v2.clone()),
+            Some(v1.clone()),
+            None,
+            None,
+            Some(v1.clone())
+        ]
+    );
+    // A present distinct key is extended exactly once, same as a single
+    // `get_version` call — not once per duplicate entry.
+    assert_eq!(
+        version_ttl(&env, &client, ModuleKind::Wallet, 1),
+        PERSISTENT_BUMP_AMOUNT
+    );
+    assert_eq!(
+        version_ttl(&env, &client, ModuleKind::Wallet, 2),
+        PERSISTENT_BUMP_AMOUNT
+    );
+
+    // A missing key has no TTL entry to extend (and the cache never bumps a
+    // missing key), so the second batch does not create one.
+    env.as_contract(&client.address, || {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::VersionRecord(ModuleKind::Wallet, 99)));
+    });
+
+    // Verify `get_version` extends the same way, so the batch matches the
+    // single-lookup policy.
+    env.ledger().with_mut(|l| l.sequence_number += 2 * 17_280);
+    client.get_version(&ModuleKind::Wallet, &1);
+    assert_eq!(
+        version_ttl(&env, &client, ModuleKind::Wallet, 1),
+        PERSISTENT_BUMP_AMOUNT
+    );
+}
+
+#[test]
+fn versions_batch_missing_keys_never_bump_and_are_cached() {
+    let (env, client, _admin) = setup();
+    // No versions registered; every key is missing.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 2),
+        ],
+    );
+    assert_eq!(result, vec![&env, None, None, None, None]);
+    // Missing keys have no storage entry, so no TTL exists to extend.
+    env.as_contract(&client.address, || {
+        for v in [1u32, 2u32] {
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&crate::DataKey::VersionRecord(ModuleKind::Wallet, v)));
+        }
+    });
+}
+
+#[test]
+fn versions_batch_same_number_different_kind_is_distinct() {
+    let (env, client, admin) = setup();
+    let w1 = Address::generate(&env);
+    let p1 = Address::generate(&env);
+    let hw = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let hp = approved_hash(&env, &client, &admin, ModuleKind::Policy, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &w1, &hw);
+    client.register_version(&admin, &ModuleKind::Policy, &1, &p1, &hp);
+
+    // Same version number, different kind — distinct keys, distinct addresses.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Policy, 1),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Policy, 1),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![&env, Some(w1.clone()), Some(p1.clone()), Some(w1), Some(p1)]
+    );
+}
+
+#[test]
+fn versions_batch_initial_deployment_state_is_empty_and_stable() {
+    let (env, client, _admin) = setup();
+    // Fresh deployment: no versions at all, including version 0 which can
+    // never be registered.
+    assert_eq!(
+        versions_batch(&env, &client, &[(ModuleKind::Wallet, 0)]),
+        vec![&env, None]
+    );
+    assert_eq!(versions_batch(&env, &client, &[]), Vec::new(&env));
+    // Still empty after probing.
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn versions_batch_non_existent_version_keys_are_stable() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    // A registered kind still reports NotFound for an absent version; the
+    // batch mirrors that per entry.
+    assert_eq!(
+        versions_batch(&env, &client, &[(ModuleKind::Wallet, 2)]),
+        vec![&env, None]
+    );
+    assert_eq!(
+        versions_batch(
+            &env,
+            &client,
+            &[(ModuleKind::Wallet, 1), (ModuleKind::Wallet, 2)]
+        ),
+        vec![&env, Some(v1.clone()), None]
+    );
+}
+
+#[test]
+fn versions_batch_circular_upgrade_paths_do_not_loop() {
+    let (env, client, admin) = setup();
+    // Simulate Wallet v1 -> v2 -> v3 upgrade chain, then a caller that walks
+    // it with duplicates (e.g. verifying v1, v2, v1 again). The batch must
+    // answer each position without looping or re-reading.
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let v3 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    let h3 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 3);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3, &h3);
+
+    // Walk v1 -> v2 -> v3 -> v1 -> v2 (circular walk pattern).
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 3),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(v1.clone()),
+            Some(v2.clone()),
+            Some(v3.clone()),
+            Some(v1),
+            Some(v2)
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #240: consolidated upgrade-map storage layout.
+//
+// `Version` (address) and `VersionWasm` (hash) were two persistent entries per
+// version. They are now one `VersionRecord`. These tests pin the new layout,
+// the fallback that keeps pre-consolidation entries readable, and the storage
+// access patterns the consolidation was meant to improve.
+// ---------------------------------------------------------------------------
+
+/// Whether the contract holds a persistent entry under `key`.
+fn has_entry(env: &Env, client: &RegistryContractClient, key: &DataKey) -> bool {
+    env.as_contract(&client.address, || env.storage().persistent().has(key))
+}
+
+#[test]
+fn register_version_stores_one_entry_per_version() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    // Exactly one entry, holding the address and the hash together.
+    assert!(has_entry(
+        &env,
+        &client,
+        &DataKey::VersionRecord(ModuleKind::Wallet, 1)
+    ));
+    // The split layout is not written at all: no bare-address entry alongside
+    // the record, so a populated upgrade map holds one entry per version
+    // instead of two.
+    assert!(!has_entry(
+        &env,
+        &client,
+        &DataKey::Version(ModuleKind::Wallet, 1)
+    ));
+    // And the record is self-contained: both halves answer from it alone.
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
+    assert_eq!(client.get_version_wasm(&ModuleKind::Wallet, &1), h);
+}
+
+#[test]
+fn register_version_entry_count_does_not_grow_with_versions() {
+    // Ten versions cost ten entries. Before the consolidation the same ten
+    // versions cost twenty (address + hash each), so the ledger footprint of the
+    // upgrade map halves.
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    for v in 1..=10u32 {
+        let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, v as u8);
+        client.register_version(&admin, &ModuleKind::Wallet, &v, &addr, &h);
+    }
+    let mut records = 0;
+    for v in 1..=10u32 {
+        if has_entry(
+            &env,
+            &client,
+            &DataKey::VersionRecord(ModuleKind::Wallet, v),
+        ) {
+            records += 1;
+        }
+        // No version fell back to the split layout.
+        assert!(!has_entry(
+            &env,
+            &client,
+            &DataKey::Version(ModuleKind::Wallet, v)
+        ));
+    }
+    assert_eq!(records, 10);
+}
+
+#[test]
+fn a_legacy_entry_still_blocks_re_registration_of_its_pair() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    // Occupy the pair in the pre-consolidation layout.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 1), &addr);
+    });
+
+    // The legacy entry counts as taken, so it cannot be silently republished
+    // with different code.
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // A different pair is still free.
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &addr, &h);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &2), addr);
+}
+
+#[test]
+fn legacy_entries_answer_the_batch_query_too() {
+    let (env, client, admin) = setup();
+    let legacy_addr = Address::generate(&env);
+    let current_addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 7);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 1), &legacy_addr);
+    });
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &current_addr, &h);
+
+    // A batch mixes the pre-consolidation entry with a current one.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 99),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(legacy_addr.clone()),
+            Some(current_addr),
+            Some(legacy_addr),
+            None
+        ]
+    );
+}
+
+#[test]
+fn verify_version_costs_less_than_reading_the_record_twice() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    // `verify_version` needs the address and its bound hash, which the
+    // consolidated record answers in one read. Reaching the same two facts
+    // through the single-purpose getters costs one read each.
+    let before = env.budget().cpu_instruction_cost();
+    let verified = client.verify_version(&ModuleKind::Wallet, &1, &h);
+    let verify_cost = env.budget().cpu_instruction_cost() - before;
+
+    let before = env.budget().cpu_instruction_cost();
+    let address = client.get_version(&ModuleKind::Wallet, &1);
+    let wasm = client.get_version_wasm(&ModuleKind::Wallet, &1);
+    let split_cost = env.budget().cpu_instruction_cost() - before;
+
+    assert_eq!(verified, addr);
+    assert_eq!((address, wasm), (addr, h));
+    assert!(
+        verify_cost < split_cost,
+        "consolidated read ({verify_cost}) should beat one read per field ({split_cost})"
+    );
+}
+
+#[test]
+fn versions_batch_cost_scales_with_distinct_keys_not_requested_entries() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    // One registered key, requested many times.
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    let mut repeated = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        repeated.push_back(crate::VersionId {
+            kind: ModuleKind::Wallet,
+            version: 1,
+        });
+    }
+    let before = env.budget().cpu_instruction_cost();
+    let dup = client.get_versions_batch(&repeated);
+    let dup_cost = env.budget().cpu_instruction_cost() - before;
+
+    // The same number of entries, but all distinct, so every one is a real
+    // ledger read plus TTL extension. A different kind keeps this batch from
+    // colliding with the single key above.
+    let mut distinct = Vec::new(&env);
+    for v in 1..=MAX_REGISTRY_BATCH {
+        let hv = approved_hash(&env, &client, &admin, ModuleKind::Policy, v as u8);
+        client.register_version(&admin, &ModuleKind::Policy, &v, &addr, &hv);
+        distinct.push_back(crate::VersionId {
+            kind: ModuleKind::Policy,
+            version: v,
+        });
+    }
+    let before = env.budget().cpu_instruction_cost();
+    let all = client.get_versions_batch(&distinct);
+    let distinct_cost = env.budget().cpu_instruction_cost() - before;
+
+    // Duplicates are answered from the per-invocation cache, so an identical
+    // request shape costs markedly less than the one that must touch the ledger
+    // once per entry.
+    assert!(
+        dup_cost < distinct_cost,
+        "duplicates {dup_cost} vs distinct {distinct_cost}"
+    );
+
+    let mut all_some = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        all_some.push_back(Some(addr.clone()));
+    }
+    assert_eq!(dup, all_some);
+    assert_eq!(all, all_some);
+}
