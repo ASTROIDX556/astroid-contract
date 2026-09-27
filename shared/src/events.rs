@@ -54,6 +54,72 @@ pub enum ContractEvent {
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
     WalletStateChanged { wallet_id: u64, state: Symbol },
+    /// Value was deposited into a wallet's internal balance.
+    ///
+    /// Distinct from [`ContractEvent::TransferExecuted`]: that reports the token
+    /// leg (custody in, recipient out), this attributes it to the wallet it
+    /// credited.
+    WalletFunded {
+        wallet_id: u64,
+        from: Address,
+        asset: Address,
+        amount: i128,
+    },
+    /// Value left a wallet for its owner.
+    WalletWithdrawn {
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    },
+    /// A spend cleared the wallet's policy gate. Emitted only on the passing
+    /// path: a denial reverts the invocation, so the policy contract's own
+    /// [`ContractEvent::PolicyViolation`] is what reports a refusal, and this
+    /// event is the record that the gate was consulted and allowed the spend.
+    WalletPolicyChecked {
+        wallet_id: u64,
+        asset: Address,
+        amount: i128,
+    },
+    /// The wallet's policy gate was wired to a policy contract.
+    WalletPolicyConfigured { policy: Address },
+    /// The wallet's policy gate was removed; subsequent spends run ungated.
+    WalletPolicyCleared,
+    /// A wallet was granted or revoked an exemption from the policy gate.
+    WalletPolicyBypassChanged { wallet_id: u64, bypass: bool },
+    /// A per-asset velocity ceiling was set on a wallet.
+    WalletVelocityLimitSet {
+        wallet_id: u64,
+        asset: Address,
+        max_amount: i128,
+        window_seconds: u64,
+    },
+    /// A per-asset velocity ceiling was removed from a wallet.
+    WalletVelocityLimitCleared { wallet_id: u64, asset: Address },
+    /// The wallet's emergency guardian was (re)designated.
+    WalletGuardianChanged { guardian: Address },
+    /// A supporting module was wired into the wallet (`module` is e.g.
+    /// `budget`/`registry`), replacing any previous address.
+    WalletModuleWired { module: Symbol, address: Address },
+    /// A per-asset budget envelope was bound to the wallet.
+    WalletAssetBudgetSet { asset: Address, budget_id: String },
+    /// A role on a wallet changed. `role` is the role granted, and is `None` on
+    /// a revocation, where the account simply holds nothing.
+    WalletRoleChanged {
+        wallet_id: u64,
+        account: Address,
+        role: Option<Symbol>,
+        action: Symbol,
+    },
+    /// A batch passed policy, velocity and budget validation and was executed
+    /// atomically. One event for the whole batch, so the log stays concise;
+    /// the individual token transfers remain visible as SAC events.
+    WalletBatchValidated {
+        wallet_id: u64,
+        executed: u32,
+        total_amount: i128,
+        budget_remaining: i128,
+    },
     /// Value moved out of a contract to a recipient.
     TransferExecuted {
         from: Address,
@@ -166,6 +232,105 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (wallet_id, state),
             );
         }
+        ContractEvent::WalletFunded {
+            wallet_id,
+            from,
+            asset,
+            amount,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletFunded"),),
+                (wallet_id, from, asset, amount),
+            );
+        }
+        ContractEvent::WalletWithdrawn {
+            wallet_id,
+            to,
+            asset,
+            amount,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletWithdrawn"),),
+                (wallet_id, to, asset, amount),
+            );
+        }
+        ContractEvent::WalletPolicyChecked {
+            wallet_id,
+            asset,
+            amount,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletPolicyChecked"),),
+                (wallet_id, asset, amount),
+            );
+        }
+        ContractEvent::WalletPolicyConfigured { policy } => {
+            env.events()
+                .publish((Symbol::new(env, "WalletPolicyConfigured"),), (policy,));
+        }
+        ContractEvent::WalletPolicyCleared => {
+            env.events()
+                .publish((Symbol::new(env, "WalletPolicyCleared"),), ());
+        }
+        ContractEvent::WalletPolicyBypassChanged { wallet_id, bypass } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletPolicyBypassChanged"),),
+                (wallet_id, bypass),
+            );
+        }
+        ContractEvent::WalletVelocityLimitSet {
+            wallet_id,
+            asset,
+            max_amount,
+            window_seconds,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletVelocityLimitSet"),),
+                (wallet_id, asset, max_amount, window_seconds),
+            );
+        }
+        ContractEvent::WalletVelocityLimitCleared { wallet_id, asset } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletVelocityLimitCleared"),),
+                (wallet_id, asset),
+            );
+        }
+        ContractEvent::WalletGuardianChanged { guardian } => {
+            env.events()
+                .publish((Symbol::new(env, "WalletGuardianChanged"),), (guardian,));
+        }
+        ContractEvent::WalletModuleWired { module, address } => {
+            env.events()
+                .publish((Symbol::new(env, "WalletModuleWired"),), (module, address));
+        }
+        ContractEvent::WalletAssetBudgetSet { asset, budget_id } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletAssetBudgetSet"),),
+                (asset, budget_id),
+            );
+        }
+        ContractEvent::WalletRoleChanged {
+            wallet_id,
+            account,
+            role,
+            action,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletRoleChanged"),),
+                (wallet_id, account, role, action),
+            );
+        }
+        ContractEvent::WalletBatchValidated {
+            wallet_id,
+            executed,
+            total_amount,
+            budget_remaining,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "WalletBatchValidated"),),
+                (wallet_id, executed, total_amount, budget_remaining),
+            );
+        }
         ContractEvent::TransferExecuted {
             from,
             to,
@@ -272,18 +437,6 @@ pub fn publish(env: &Env, event: ContractEvent) {
     }
 }
 
-/// `WalletCreated` — topic `("wallet", "created")`.
-pub fn wallet_created(env: &Env, wallet_id: u64, owner: &Address) {
-    let topics = (symbol_short!("wallet"), symbol_short!("created"));
-    env.events().publish(topics, (wallet_id, owner.clone()));
-}
-
-/// `WalletFrozen` — topic `("wallet", "frozen")`.
-pub fn wallet_frozen(env: &Env, wallet_id: u64, by: &Address) {
-    let topics = (symbol_short!("wallet"), symbol_short!("frozen"));
-    env.events().publish(topics, (wallet_id, by.clone()));
-}
-
 /// `TransferExecuted` — topic `("transfer", "executed")`.
 pub fn transfer_executed(env: &Env, from: &Address, to: &Address, asset: &Address, amount: i128) {
     let topics = (symbol_short!("transfer"), symbol_short!("executed"));
@@ -348,20 +501,4 @@ pub fn reason(env: &Env, name: &str) -> Symbol {
 pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
     let topics = (symbol_short!("wallet"), symbol_short!("batch"));
     env.events().publish(topics, (wallet_id, call_count));
-}
-
-/// `WalletBatchValidated` — topic `("wallet", "batch_validated")`. Published by
-/// the wallet after a policy- and budget-validated batch run completes.
-pub fn wallet_batch_validated(
-    env: &Env,
-    wallet_id: u64,
-    executed: u32,
-    total_amount: i128,
-    budget_remaining: i128,
-) {
-    let topics = (symbol_short!("wallet"), Symbol::new(env, "batch_validated"));
-    env.events().publish(
-        topics,
-        (wallet_id, executed, total_amount, budget_remaining),
-    );
 }

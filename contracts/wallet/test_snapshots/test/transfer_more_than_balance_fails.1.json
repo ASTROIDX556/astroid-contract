@@ -976,36 +976,6 @@
           "v0": {
             "topics": [
               {
-                "symbol": "wallet"
-              },
-              {
-                "symbol": "created"
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "u64": 1
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
-        "type_": "contract",
-        "body": {
-          "v0": {
-            "topics": [
-              {
                 "symbol": "WalletCreated"
               }
             ],
@@ -1279,16 +1249,16 @@
           "v0": {
             "topics": [
               {
-                "symbol": "wallet"
-              },
-              {
-                "symbol": "deposit"
+                "symbol": "WalletFunded"
               }
             ],
             "data": {
               "vec": [
                 {
                   "u64": 1
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
                   "address": "CCABDO7UZXYE4W6GVSEGSNNZTKSLFQGKXXQTH6OX7M7GKZ4Z6CUJNGZN"
