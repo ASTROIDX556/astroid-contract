@@ -1711,7 +1711,7 @@ fn version_ttl(env: &Env, client: &RegistryContractClient, kind: ModuleKind, ver
     env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .get_ttl(&crate::DataKey::Version(kind, version))
+            .get_ttl(&crate::DataKey::VersionRecord(kind, version))
     })
 }
 
@@ -1952,7 +1952,7 @@ fn versions_batch_deduplicates_reads_and_bumps_once_per_distinct_key() {
         assert!(!env
             .storage()
             .persistent()
-            .has(&crate::DataKey::Version(ModuleKind::Wallet, 99)));
+            .has(&crate::DataKey::VersionRecord(ModuleKind::Wallet, 99)));
     });
 
     // Verify `get_version` extends the same way, so the batch matches the
@@ -1986,7 +1986,7 @@ fn versions_batch_missing_keys_never_bump_and_are_cached() {
             assert!(!env
                 .storage()
                 .persistent()
-                .has(&crate::DataKey::Version(ModuleKind::Wallet, v)));
+                .has(&crate::DataKey::VersionRecord(ModuleKind::Wallet, v)));
         }
     });
 }
@@ -2097,4 +2097,211 @@ fn versions_batch_circular_upgrade_paths_do_not_loop() {
             Some(v2)
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #240: consolidated upgrade-map storage layout.
+//
+// `Version` (address) and `VersionWasm` (hash) were two persistent entries per
+// version. They are now one `VersionRecord`. These tests pin the new layout,
+// the fallback that keeps pre-consolidation entries readable, and the storage
+// access patterns the consolidation was meant to improve.
+// ---------------------------------------------------------------------------
+
+/// Whether the contract holds a persistent entry under `key`.
+fn has_entry(env: &Env, client: &RegistryContractClient, key: &DataKey) -> bool {
+    env.as_contract(&client.address, || env.storage().persistent().has(key))
+}
+
+#[test]
+fn register_version_stores_one_entry_per_version() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    // Exactly one entry, holding the address and the hash together.
+    assert!(has_entry(
+        &env,
+        &client,
+        &DataKey::VersionRecord(ModuleKind::Wallet, 1)
+    ));
+    // The split layout is not written at all: no bare-address entry alongside
+    // the record, so a populated upgrade map holds one entry per version
+    // instead of two.
+    assert!(!has_entry(
+        &env,
+        &client,
+        &DataKey::Version(ModuleKind::Wallet, 1)
+    ));
+    // And the record is self-contained: both halves answer from it alone.
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
+    assert_eq!(client.get_version_wasm(&ModuleKind::Wallet, &1), h);
+}
+
+#[test]
+fn register_version_entry_count_does_not_grow_with_versions() {
+    // Ten versions cost ten entries. Before the consolidation the same ten
+    // versions cost twenty (address + hash each), so the ledger footprint of the
+    // upgrade map halves.
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    for v in 1..=10u32 {
+        let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, v as u8);
+        client.register_version(&admin, &ModuleKind::Wallet, &v, &addr, &h);
+    }
+    let mut records = 0;
+    for v in 1..=10u32 {
+        if has_entry(
+            &env,
+            &client,
+            &DataKey::VersionRecord(ModuleKind::Wallet, v),
+        ) {
+            records += 1;
+        }
+        // No version fell back to the split layout.
+        assert!(!has_entry(
+            &env,
+            &client,
+            &DataKey::Version(ModuleKind::Wallet, v)
+        ));
+    }
+    assert_eq!(records, 10);
+}
+
+#[test]
+fn a_legacy_entry_still_blocks_re_registration_of_its_pair() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    // Occupy the pair in the pre-consolidation layout.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 1), &addr);
+    });
+
+    // The legacy entry counts as taken, so it cannot be silently republished
+    // with different code.
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // A different pair is still free.
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &addr, &h);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &2), addr);
+}
+
+#[test]
+fn legacy_entries_answer_the_batch_query_too() {
+    let (env, client, admin) = setup();
+    let legacy_addr = Address::generate(&env);
+    let current_addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 7);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 1), &legacy_addr);
+    });
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &current_addr, &h);
+
+    // A batch mixes the pre-consolidation entry with a current one.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 99),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(legacy_addr.clone()),
+            Some(current_addr),
+            Some(legacy_addr),
+            None
+        ]
+    );
+}
+
+#[test]
+fn verify_version_costs_less_than_reading_the_record_twice() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    // `verify_version` needs the address and its bound hash, which the
+    // consolidated record answers in one read. Reaching the same two facts
+    // through the single-purpose getters costs one read each.
+    let before = env.budget().cpu_instruction_cost();
+    let verified = client.verify_version(&ModuleKind::Wallet, &1, &h);
+    let verify_cost = env.budget().cpu_instruction_cost() - before;
+
+    let before = env.budget().cpu_instruction_cost();
+    let address = client.get_version(&ModuleKind::Wallet, &1);
+    let wasm = client.get_version_wasm(&ModuleKind::Wallet, &1);
+    let split_cost = env.budget().cpu_instruction_cost() - before;
+
+    assert_eq!(verified, addr);
+    assert_eq!((address, wasm), (addr, h));
+    assert!(
+        verify_cost < split_cost,
+        "consolidated read ({verify_cost}) should beat one read per field ({split_cost})"
+    );
+}
+
+#[test]
+fn versions_batch_cost_scales_with_distinct_keys_not_requested_entries() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    // One registered key, requested many times.
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    let mut repeated = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        repeated.push_back(crate::VersionId {
+            kind: ModuleKind::Wallet,
+            version: 1,
+        });
+    }
+    let before = env.budget().cpu_instruction_cost();
+    let dup = client.get_versions_batch(&repeated);
+    let dup_cost = env.budget().cpu_instruction_cost() - before;
+
+    // The same number of entries, but all distinct, so every one is a real
+    // ledger read plus TTL extension. A different kind keeps this batch from
+    // colliding with the single key above.
+    let mut distinct = Vec::new(&env);
+    for v in 1..=MAX_REGISTRY_BATCH {
+        let hv = approved_hash(&env, &client, &admin, ModuleKind::Policy, v as u8);
+        client.register_version(&admin, &ModuleKind::Policy, &v, &addr, &hv);
+        distinct.push_back(crate::VersionId {
+            kind: ModuleKind::Policy,
+            version: v,
+        });
+    }
+    let before = env.budget().cpu_instruction_cost();
+    let all = client.get_versions_batch(&distinct);
+    let distinct_cost = env.budget().cpu_instruction_cost() - before;
+
+    // Duplicates are answered from the per-invocation cache, so an identical
+    // request shape costs markedly less than the one that must touch the ledger
+    // once per entry.
+    assert!(
+        dup_cost < distinct_cost,
+        "duplicates {dup_cost} vs distinct {distinct_cost}"
+    );
+
+    let mut all_some = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        all_some.push_back(Some(addr.clone()));
+    }
+    assert_eq!(dup, all_some);
+    assert_eq!(all, all_some);
 }
