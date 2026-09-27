@@ -122,6 +122,73 @@ impl RegistryRole {
     }
 }
 
+/// Key for a single version lookup in the global upgrade map.
+///
+/// Mirrors [`ModuleId`] for the module-address map. Used by
+/// [`RegistryContract::get_versions_batch`] so a batch can carry several
+/// `(kind, version)` pairs in one invocation while preserving order and
+/// duplicates, just as the module batch does. Keeps the lookup surface
+/// uniform across both maps.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionId {
+    pub kind: ModuleKind,
+    pub version: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade-map lookup helpers — cached, minimal ledger access.
+// ---------------------------------------------------------------------------
+/// Per-invocation cache for the global version upgrade map.
+///
+/// Persistent storage reads dominate gas. When a caller resolves many versions
+/// (e.g. a batch verification or upgrade-path walk) the same
+/// `(kind, version)` is often requested repeatedly. Re-reading it would pay
+/// the ledger cost each time. The cache keeps the first result — including
+/// `None` for a missing key — and serves duplicates by a linear scan over an
+/// in-memory `Vec` bounded by `MAX_REGISTRY_BATCH`, so only comparisons are
+/// paid after the first hit.
+///
+/// Mirrors `VelocityGate` in the wallet contract and `RuleEvaluationContext`
+/// in the policy contract: reuse a ledger record within one invocation
+/// rather than re-reading it.
+struct VersionLookupCache {
+    env: Env,
+    entries: Vec<(ModuleKind, u32, Option<Address>)>,
+}
+
+impl VersionLookupCache {
+    fn new(env: &Env) -> Self {
+        Self {
+            env: env.clone(),
+            entries: Vec::new(env),
+        }
+    }
+
+    /// Return the cached address for `(kind, version)`, loading it once on a
+    /// miss and extending TTL only when the record exists and only once per
+    /// distinct key in this invocation (matching `get_version` policy).
+    fn get(&mut self, kind: ModuleKind, version: u32) -> Option<Address> {
+        for i in 0..self.entries.len() {
+            let (k, v, addr) = self.entries.get(i).unwrap();
+            if k == kind && v == version {
+                return addr.clone();
+            }
+        }
+        let key = DataKey::Version(kind, version);
+        let addr: Option<Address> = self.env.storage().persistent().get(&key);
+        if addr.is_some() {
+            self.env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        self.entries.push_back((kind, version, addr.clone()));
+        addr
+    }
+}
+
 #[contract]
 pub struct RegistryContract;
 
@@ -835,6 +902,40 @@ impl RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Self::get_version(env, kind, latest)
+    }
+
+    /// Batch counterpart of [`Self::get_version`]: resolve up to
+    /// [`MAX_REGISTRY_BATCH`] version addresses in one invocation.
+    ///
+    /// - `result[i]` answers `ids[i]`; length and order are preserved and
+    ///   duplicate ids are answered at every position.
+    /// - An unregistered id yields `None` instead of failing the batch, so one
+    ///   missing version does not hide the others.
+    /// - A mix of registered and missing ids is handled per entry.
+    /// - An empty `ids` returns an empty list.
+    ///
+    /// Errors: [`Error::InvalidInput`] when more than [`MAX_REGISTRY_BATCH`] ids
+    /// are requested (checked before any storage is read). Read-only: no auth
+    /// is required and the frozen flag is not consulted, matching
+    /// [`Self::get_version`].
+    ///
+    /// Gas optimization: a per-invocation [`VersionLookupCache`] keeps the first
+    /// ledger read for each distinct `(kind, version)` — including `None` for a
+    /// missing key — and serves duplicates from an in-memory `Vec` bounded by
+    /// [`MAX_REGISTRY_BATCH`]. A batch with duplicates therefore pays one
+    /// persistent read and one TTL bump per distinct key, not per entry, while
+    /// preserving order and duplicates exactly like [`Self::get_modules_batch`].
+    pub fn get_versions_batch(
+        env: Env,
+        ids: Vec<VersionId>,
+    ) -> Result<Vec<Option<Address>>, Error> {
+        ensure!(ids.len() <= MAX_REGISTRY_BATCH, Error::InvalidInput);
+        let mut cache = VersionLookupCache::new(&env);
+        let mut results = Vec::new(&env);
+        for vid in ids.iter() {
+            results.push_back(cache.get(vid.kind, vid.version));
+        }
+        Ok(results)
     }
 
     /// Read the recorded owner of an organization.
