@@ -285,7 +285,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "Version"
+                  "symbol": "VersionRecord"
                 },
                 {
                   "u32": 0
@@ -308,7 +308,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "Version"
+                      "symbol": "VersionRecord"
                     },
                     {
                       "u32": 0
@@ -320,7 +320,31 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "address"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "hash"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "symbol": "Bound"
+                          },
+                          {
+                            "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
+                          }
+                        ]
+                      }
+                    }
+                  ]
                 }
               }
             },
@@ -336,7 +360,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "Version"
+                  "symbol": "VersionRecord"
                 },
                 {
                   "u32": 0
@@ -359,7 +383,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "Version"
+                      "symbol": "VersionRecord"
                     },
                     {
                       "u32": 0
@@ -371,109 +395,31 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          518400
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "VersionWasm"
-                },
-                {
-                  "u32": 0
-                },
-                {
-                  "u32": 1
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
+                  "map": [
                     {
-                      "symbol": "VersionWasm"
+                      "key": {
+                        "symbol": "address"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
                     },
                     {
-                      "u32": 0
-                    },
-                    {
-                      "u32": 1
+                      "key": {
+                        "symbol": "hash"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "symbol": "Bound"
+                          },
+                          {
+                            "bytes": "0202020202020202020202020202020202020202020202020202020202020202"
+                          }
+                        ]
+                      }
                     }
                   ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          518400
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "VersionWasm"
-                },
-                {
-                  "u32": 0
-                },
-                {
-                  "u32": 2
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "VersionWasm"
-                    },
-                    {
-                      "u32": 0
-                    },
-                    {
-                      "u32": 2
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "bytes": "0202020202020202020202020202020202020202020202020202020202020202"
                 }
               }
             },
