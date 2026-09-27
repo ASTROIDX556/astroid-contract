@@ -26,3 +26,5 @@ pub mod policy_test;
 pub mod registry_batch;
 #[cfg(test)]
 pub mod registry_upgrade;
+#[cfg(test)]
+pub mod treasury_transfer_auth;

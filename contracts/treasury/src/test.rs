@@ -1230,3 +1230,342 @@ fn milestone_math_is_overflow_safe_at_i128_max() {
     assert_eq!(token_balance(&h, &to), i128::MAX);
     assert_eq!(h.client.holding(&h.asset).total_in, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #241: authorization on every privileged / outbound operation.
+//
+// The rest of this suite calls `env.mock_all_auths()`, so it pins the happy
+// path but never exercises the failure mode. These tests turn mocking off with
+// `Env::set_auths`, which disables it and installs an empty authorization list,
+// so `require_auth` is left unsatisfied and the host aborts the invocation.
+// That is the shape of an unauthorized direct call: the contract is reached,
+// the caller simply cannot sign for it.
+//
+// Two distinct refusals are pinned, and they are not interchangeable:
+//
+// - authorization absent            -> `Err(Err(Abort))` (host refused)
+// - signature present, wrong caller -> `Err(Ok(Error::Unauthorized))`
+//
+// Both are terminal for value: a caller must not be able to slip past either
+// gate, and a refusal must leave every balance untouched.
+// ---------------------------------------------------------------------------
+
+/// A treasury holding `funded` of an approved token, so the outflow paths have
+/// real custody to move (and to prove they did not).
+fn funded(org: &str, amount: i128) -> Harness<'static> {
+    let h = setup(org, amount);
+    h.client.deposit(&h.admin, &h.asset, &amount);
+    h
+}
+
+/// Turn auth mocking off, leaving `require_auth` unsatisfiable.
+fn sign_nothing(h: &Harness) {
+    h.env.set_auths(&[]);
+}
+
+/// Assert a call was refused by the host for want of a signature.
+///
+/// An unsatisfied `require_auth` never reaches the contract body: the host
+/// aborts the invocation, which a `try_*` client surfaces as
+/// `Err(Err(Abort))`. The success arm of a generated `try_*` is a
+/// `soroban_sdk` conversion wrapper that is not part of this contract's API,
+/// so the outcome is pinned by its observable representation.
+fn assert_refused_for_lack_of_auth<R: core::fmt::Debug>(res: R) {
+    use std::format;
+    assert_eq!(
+        format!("{:?}", res),
+        "Err(Err(Abort))",
+        "call must be refused for want of an authorization signature"
+    );
+}
+
+/// Assert a call was refused by the identity check rather than by a missing
+/// signature: the caller is known, and is simply not the right party.
+fn assert_refused_as_wrong_caller<R: core::fmt::Debug>(res: R) {
+    use std::format;
+    assert_eq!(
+        format!("{:?}", res),
+        "Err(Ok(Unauthorized))",
+        "call must be refused for want of the right caller"
+    );
+}
+
+#[test]
+fn an_unsigned_call_cannot_move_value_out_of_the_treasury() {
+    let h = funded("acme", 1_000);
+    let to = Address::generate(&h.env);
+    let custody = h.client.address.clone();
+    let to_before = token_balance(&h, &to);
+    sign_nothing(&h);
+
+    // withdraw
+    assert_refused_for_lack_of_auth(h.client.try_withdraw(&h.admin, &h.asset, &to, &100));
+    // batch_transfer
+    let mut payments = Vec::new(&h.env);
+    payments.push_back(Payment {
+        recipient: to.clone(),
+        amount: 100,
+    });
+    assert_refused_for_lack_of_auth(h.client.try_batch_transfer(&h.admin, &h.asset, &payments));
+
+    // Nothing moved: the recipient gained nothing and custody is untouched.
+    assert_eq!(token_balance(&h, &to), to_before);
+    assert_eq!(token_balance(&h, &custody), 1_000);
+    assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+}
+
+#[test]
+fn an_unsigned_call_cannot_release_a_milestone_payout() {
+    let h = funded("acme", 1_000);
+    let to = Address::generate(&h.env);
+    h.client
+        .init_milestone_disbursement(&h.admin, &h.asset, &to, &400, &2);
+    sign_nothing(&h);
+
+    // A disbursement is an outflow like any other and needs the same signature.
+    assert_refused_for_lack_of_auth(h.client.try_release_next_milestone(&h.admin, &1u64));
+
+    assert_eq!(token_balance(&h, &to), 0);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+    // The counter did not advance, so the payout is still owed in full.
+    let id = h.client.address.clone();
+    let d = h.env.as_contract(&id, || {
+        h.env
+            .storage()
+            .persistent()
+            .get::<_, crate::MilestoneDisbursement>(&crate::DataKey::Milestone(1u64))
+    });
+    assert_eq!(d.map(|d| d.disbursed), Some(0u32));
+}
+
+#[test]
+fn an_unsigned_call_cannot_deposit_or_reconfigure_the_treasury() {
+    let h = funded("acme", 1_000);
+    let to = Address::generate(&h.env);
+    let other = Address::generate(&h.env);
+    let admin_holds = token_balance(&h, &h.admin);
+    let custody = h.client.address.clone();
+    sign_nothing(&h);
+
+    // Inbound movement: the depositor's own signature is required, so a third
+    // party cannot push tokens in under someone else's name.
+    assert_refused_for_lack_of_auth(h.client.try_deposit(&h.admin, &h.asset, &100));
+    assert_eq!(token_balance(&h, &h.admin), admin_holds);
+    assert_eq!(token_balance(&h, &custody), 1_000);
+
+    // Administration, all of it reached by the recorded admin.
+    assert_refused_for_lack_of_auth(h.client.try_set_policy(&h.admin, &other));
+    assert_refused_for_lack_of_auth(h.client.try_set_budget(&h.admin, &other));
+    assert_refused_for_lack_of_auth(h.client.try_set_multisig(&h.admin, &other));
+    assert_refused_for_lack_of_auth(h.client.try_set_guardian(&h.admin, &other));
+    assert_refused_for_lack_of_auth(h.client.try_add_approved_asset(&h.admin, &other));
+    assert_refused_for_lack_of_auth(h.client.try_remove_approved_asset(&h.admin, &h.asset));
+    assert_refused_for_lack_of_auth(h.client.try_allocate_budget(
+        &h.admin,
+        &h.asset,
+        &String::from_str(&h.env, "b1"),
+    ));
+    assert_refused_for_lack_of_auth(
+        h.client
+            .try_set_allowance(&h.admin, &h.admin, &to, &h.asset, &100, &0u64),
+    );
+    assert_refused_for_lack_of_auth(
+        h.client
+            .try_remove_allowance(&h.admin, &h.admin, &to, &h.asset),
+    );
+    assert_refused_for_lack_of_auth(
+        h.client
+            .try_init_milestone_disbursement(&h.admin, &h.asset, &to, &400, &2),
+    );
+    // The guardian may pause; its own signature is still required.
+    assert_refused_for_lack_of_auth(h.client.try_pause(&h.admin));
+    assert_refused_for_lack_of_auth(h.client.try_unpause(&h.admin));
+    // freeze / unfreeze belong to the multisig, not the admin, so an unsigned
+    // admin call is refused on identity before a signature is even demanded.
+    assert_refused_as_wrong_caller(h.client.try_freeze(&h.admin));
+    assert_refused_as_wrong_caller(h.client.try_unfreeze(&h.admin));
+
+    // None of the above took effect.
+    let t = h.client.get();
+    assert_eq!(t.admin, h.admin);
+    assert_eq!(t.policy, None);
+    assert_eq!(t.budget, None);
+    assert_eq!(t.multisig, Some(h.multisig.clone()));
+    assert_eq!(t.guardian, h.admin);
+    assert!(!t.paused);
+    assert!(!h.client.is_approved_asset(&other));
+    assert!(h.client.is_approved_asset(&h.asset));
+}
+
+#[test]
+fn initialize_demands_the_admins_signature() {
+    // A fresh contract with auth mocking off: the deployer's admin is recorded
+    // only if the deployer signs for it. Without this, anyone able to reach a
+    // freshly deployed treasury could record themselves as admin.
+    let env = Env::default();
+    env.set_auths(&[]);
+    let id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &id);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    // Nobody can seize the treasury without a signature.
+    assert_refused_for_lack_of_auth(
+        client.try_initialize(&String::from_str(&env, "acme"), &attacker),
+    );
+    // The admin's own unsigned call is refused too, and nothing was recorded,
+    // so the contract is still unclaimed rather than half-initialized.
+    assert_refused_for_lack_of_auth(client.try_initialize(&String::from_str(&env, "acme"), &admin));
+    assert!(
+        matches!(client.try_get(), Err(Ok(Error::NotInitialized))),
+        "a refused initialize must leave the treasury unclaimed, got {:?}",
+        client.try_get()
+    );
+
+    // With the signature present it succeeds, and the real admin is in charge.
+    env.mock_all_auths();
+    client.initialize(&String::from_str(&env, "acme"), &admin);
+    assert_eq!(client.get().admin, admin);
+}
+
+#[test]
+fn a_signed_but_wrong_caller_cannot_move_value_out_of_the_treasury() {
+    let h = funded("acme", 1_000);
+    let to = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let custody = h.client.address.clone();
+    h.client
+        .init_milestone_disbursement(&h.admin, &h.asset, &to, &400, &2);
+
+    // Auth mocking stays ON, so `require_auth` is satisfied and the failure
+    // under test is the identity check rather than a missing signature: an
+    // identity check alone is not enough, and neither is a signature alone.
+    assert_refused_as_wrong_caller(h.client.try_withdraw(&stranger, &h.asset, &to, &100));
+    let mut payments = Vec::new(&h.env);
+    payments.push_back(Payment {
+        recipient: to.clone(),
+        amount: 100,
+    });
+    assert_refused_as_wrong_caller(h.client.try_batch_transfer(&stranger, &h.asset, &payments));
+    assert_refused_as_wrong_caller(h.client.try_release_next_milestone(&stranger, &1u64));
+    // Administration is identity-gated the same way.
+    assert_refused_as_wrong_caller(h.client.try_set_policy(&stranger, &other_address(&h.env)));
+    assert_refused_as_wrong_caller(h.client.try_remove_approved_asset(&stranger, &h.asset));
+    assert_refused_as_wrong_caller(h.client.try_pause(&stranger));
+    assert_refused_as_wrong_caller(h.client.try_set_guardian(&stranger, &other_address(&h.env)));
+
+    assert_eq!(token_balance(&h, &to), 0);
+    assert_eq!(token_balance(&h, &custody), 1_000);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+    let id = h.client.address.clone();
+    let d = h.env.as_contract(&id, || {
+        h.env
+            .storage()
+            .persistent()
+            .get::<_, crate::MilestoneDisbursement>(&crate::DataKey::Milestone(1u64))
+    });
+    assert_eq!(d.map(|d| d.disbursed), Some(0u32));
+}
+
+fn other_address(env: &Env) -> Address {
+    Address::generate(env)
+}
+
+#[test]
+fn freeze_is_the_multisigs_alone_and_pause_is_the_guardians_or_the_multisigs() {
+    let h = setup("acme", 0);
+    let stranger = Address::generate(&h.env);
+
+    // freeze / unfreeze: the multisig only. Not the admin, not a stranger.
+    assert_refused_as_wrong_caller(h.client.try_freeze(&h.admin));
+    assert_refused_as_wrong_caller(h.client.try_unfreeze(&h.admin));
+    assert_refused_as_wrong_caller(h.client.try_freeze(&stranger));
+    h.client.freeze(&h.multisig);
+    h.client.unfreeze(&h.multisig);
+
+    // pause / unpause: the guardian (bootstrapped to the admin) or the multisig.
+    assert_refused_as_wrong_caller(h.client.try_pause(&stranger));
+    h.client.pause(&h.admin);
+    h.client.unpause(&h.admin);
+    h.client.pause(&h.multisig);
+    h.client.unpause(&h.multisig);
+    assert!(!h.client.is_paused());
+}
+
+#[test]
+fn the_reentrancy_guard_is_held_for_the_duration_of_a_withdrawal() {
+    let h = funded("acme", 1_000);
+    let to = Address::generate(&h.env);
+    let id = h.client.address.clone();
+    let read_lock = |env: &Env, id: &Address| -> bool {
+        env.as_contract(id, || {
+            env.storage()
+                .instance()
+                .get(&crate::DataKey::ReentrancyLock)
+                .unwrap_or(false)
+        })
+    };
+
+    // Simulate being re-entered while a guard is already held: a second
+    // invocation of the same outflow must be refused rather than proceeding.
+    h.env.as_contract(&id, || {
+        h.env
+            .storage()
+            .instance()
+            .set(&crate::DataKey::ReentrancyLock, &true);
+    });
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &to, &100),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(token_balance(&h, &to), 0);
+    // The refused call neither paid out nor consumed the guard.
+    assert!(read_lock(&h.env, &id));
+
+    // Release the guard as the holder would, then a withdrawal that starts
+    // with it free still succeeds, and the guard is released again on the way
+    // out rather than left engaged.
+    h.env.as_contract(&id, || {
+        h.env
+            .storage()
+            .instance()
+            .set(&crate::DataKey::ReentrancyLock, &false);
+    });
+    h.client.withdraw(&h.admin, &h.asset, &to, &100);
+    assert_eq!(token_balance(&h, &to), 100);
+    assert!(
+        !read_lock(&h.env, &id),
+        "the guard must be released once the withdrawal completes"
+    );
+}
+
+#[test]
+fn a_failed_withdrawal_leaves_no_guard_behind() {
+    let h = funded("acme", 100);
+    let to = Address::generate(&h.env);
+    let id = h.client.address.clone();
+
+    // Overdrawing fails part-way through the outflow. The host rolls the
+    // invocation back, so the guard taken at the start cannot survive the
+    // error and strand the treasury against every later withdrawal.
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &to, &1_000),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    let still_locked: bool = h.env.as_contract(&id, || {
+        h.env
+            .storage()
+            .instance()
+            .get(&crate::DataKey::ReentrancyLock)
+            .unwrap_or(false)
+    });
+    assert!(
+        !still_locked,
+        "a reverted withdrawal must not leave the guard engaged"
+    );
+
+    // And the treasury is still usable afterwards.
+    h.client.withdraw(&h.admin, &h.asset, &to, &50);
+    assert_eq!(token_balance(&h, &to), 50);
+}
