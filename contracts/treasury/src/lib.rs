@@ -61,6 +61,40 @@
 //! [`Error::TreasuryPaused`] code so off-chain monitors can distinguish "we
 //! paused on purpose" from a generic state failure.
 //!
+//! ## Authorization
+//!
+//! Every function that can move value or rewire the treasury is gated on a
+//! `require_auth`, and the gate is a single shared helper per role so the set
+//! of authorized entry points can be audited in one place rather than
+//! re-derived per function:
+//!
+//! - [`Self::require_admin`] — the recorded `admin`, for `initialize`-time
+//!   configuration, allowances, budgets, the asset whitelist, and all three
+//!   outbound paths (`withdraw`, `batch_transfer`, `release_next_milestone`).
+//! - [`Self::require_multisig`] — the organization multisig, for the frozen
+//!   circuit breaker alone.
+//! - [`Self::require_guardian`] — the guardian (or the multisig), for the
+//!   `paused` breaker alone.
+//! - `from.require_auth()` — the depositor, on the one inbound path.
+//!
+//! An emergency role is never also an admin: neither the multisig nor the
+//! guardian can pay out, approve an asset, or rewire the treasury, and an
+//! allowance never confers authority — it only lowers a ceiling for a caller
+//! that is already authorized.
+//!
+//! A role check is never sufficient on its own. Each helper compares the caller
+//! against storage and *then* demands the caller's signature, so knowing an
+//! address is not enough to act as it, and a signature is not a substitute for
+//! being the right party. `initialize` demands the admin's signature for the
+//! same reason: it is the moment the admin is chosen, so before it the contract
+//! has no recorded owner to check against and the signature is the only thing
+//! standing between a fresh deployment and a claim by whoever calls first.
+//!
+//! Outflows additionally hold a reentrancy guard for the duration of the
+//! transfer. The guard is taken before any state is advanced and released on
+//! the way out; if the invocation reverts first the host rolls the write back,
+//! so a failed spend can never leave the treasury locked against later ones.
+//!
 //! ## Multi-token accounting
 //!
 //! The treasury custodies any number of approved Soroban token contracts side
@@ -245,6 +279,14 @@ impl TreasuryContract {
         if env.storage().instance().has(&DataKey::Treasury) {
             return Err(Error::AlreadyInitialized);
         }
+        // Initialization decides who owns the treasury and who may later move
+        // every asset it custodies, so the admin's signature is what makes the
+        // function safe to expose at all: without it, anyone who can reach a
+        // freshly deployed contract could record themselves as admin and lock
+        // the deployer out. Demanded before anything is written, and after the
+        // re-initialization guard so a second attempt still reports
+        // `AlreadyInitialized` rather than an auth failure.
+        admin.require_auth();
         require_non_empty(&org)?;
         env.storage().instance().set(
             &DataKey::Treasury,
@@ -540,7 +582,6 @@ impl TreasuryContract {
             },
         );
         Self::unlock(&env);
-        Self::unlock(&env);
         Ok(())
     }
 
@@ -661,12 +702,10 @@ impl TreasuryContract {
         require_positive_amount(amount)?;
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env)?;
+        // Single audited authorization point for every outbound movement: the
+        // caller must be the recorded admin and must sign for it.
+        let t = Self::require_admin(&env, &caller)?;
         Self::require_active(&t)?;
-        if t.admin != caller {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
 
         // 1. Routing validation — refuse to invoke a token contract the
         //    organization has not approved, before any gate is consulted.
@@ -781,12 +820,10 @@ impl TreasuryContract {
         }
         Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
-        let t = Self::load(&env)?;
+        // Same single audited authorization point as `withdraw`: admin identity
+        // plus the caller's own signature.
+        let t = Self::require_admin(&env, &caller)?;
         Self::require_active(&t)?;
-        if t.admin != caller {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
 
         // 1. Validate every leg and accumulate the payout with checked math, so
         //    a malformed or overflowing batch is rejected before anything moves.
@@ -930,6 +967,9 @@ impl TreasuryContract {
     ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         let t = Self::require_admin(&env, &caller)?;
+        // Take the same reentrancy guard the other two outflows take, before
+        // the disbursement counter is advanced and the payout is made.
+        Self::lock(&env)?;
         let key = DataKey::Milestone(milestone_id);
         let mut d: MilestoneDisbursement = env
             .storage()
@@ -1238,7 +1278,9 @@ impl TreasuryContract {
         if frozen {
             return Err(Error::InvalidState);
         }
-        Self::unlock(env);
+        // Deliberately does not touch `DataKey::ReentrancyLock`: freezing is a
+        // state predicate, and clearing the guard here would let a caller that
+        // had already taken it release it mid-operation.
         Ok(())
     }
 
@@ -1266,10 +1308,13 @@ impl TreasuryContract {
         if is_locked {
             return Err(Error::InvalidState);
         }
+        // Hold the guard for the remainder of the invocation. It is released by
+        // `unlock` on the way out; if the invocation instead returns an error
+        // before reaching that point, the host rolls the write back, so the
+        // guard can never be left engaged.
         env.storage()
             .instance()
             .set(&DataKey::ReentrancyLock, &true);
-        Self::unlock(env);
         Ok(())
     }
 
