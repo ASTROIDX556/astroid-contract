@@ -10,12 +10,12 @@ use soroban_sdk::{
 };
 
 use astroid_shared::constants::{MAX_ESCROW_ASSETS, MAX_SIGNERS};
-use astroid_shared::errors::Error;
+use astroid_shared::errors::{Error, MilestoneError};
 use astroid_shared::types::AssetAmount;
 
 use crate::{
-    EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, OverrideSignature,
-    ReleaseSchedule, ReleaseType,
+    EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, MilestoneStatus,
+    OverrideSignature, ReleaseSchedule, ReleaseType,
 };
 
 const START: u64 = 1_000;
@@ -585,6 +585,46 @@ fn override_release_disabled_without_configured_signers() {
 
 // --- Milestone tests ---
 
+/// Deposit a single-asset milestone escrow with the harness defaults.
+fn deposit_milestones(h: &Harness, amount: i128, deadline: u64, specs: &Vec<MilestoneSpec>) -> u64 {
+    h.client.deposit_with_milestones(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &h.asset_a,
+        &amount,
+        &deadline,
+        &String::from_str(&h.env, "project"),
+        specs,
+    )
+}
+
+#[test]
+fn milestone_multi_creation_stores_ordered_schedule() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 2_000),
+        milestone_spec(&h.env, "build", 3_000),
+        milestone_spec(&h.env, "ship", 5_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+
+    let set = h.client.milestones(&id);
+    assert_eq!(set.milestones.len(), 3);
+    assert_eq!(set.released_amount, 0);
+    assert!(!set.cancelled);
+    for (i, expected_bps) in [(0u32, 2_000u32), (1, 3_000), (2, 5_000)] {
+        let m = set.milestones.get(i).unwrap();
+        assert_eq!(m.index, i);
+        assert_eq!(m.release_bps, expected_bps);
+        assert_eq!(m.status, MilestoneStatus::Pending);
+    }
+}
+
 #[test]
 fn milestone_partial_then_full_release() {
     let h = setup(10_000, 0);
@@ -593,22 +633,20 @@ fn milestone_partial_then_full_release() {
         milestone_spec(&h.env, "design", 4_000),
         milestone_spec(&h.env, "build", 6_000),
     ];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "project"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 
     h.client.release_milestone(&h.arbiter, &id, &0);
     let set = h.client.milestones(&id);
-    assert!(set.milestones.get(0).unwrap().released);
+    assert_eq!(
+        set.milestones.get(0).unwrap().status,
+        MilestoneStatus::Completed
+    );
+    assert_eq!(
+        set.milestones.get(1).unwrap().status,
+        MilestoneStatus::Pending
+    );
     assert_eq!(set.released_amount, 4_000);
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
@@ -623,21 +661,65 @@ fn milestone_partial_then_full_release() {
 }
 
 #[test]
+fn milestone_sequential_completion_releases_each_share() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 2_000),
+        milestone_spec(&h.env, "b", 3_000),
+        milestone_spec(&h.env, "c", 5_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    let mut paid = 0i128;
+    for index in 0..3u32 {
+        h.client.release_milestone(&h.arbiter, &id, &index);
+        let set = h.client.milestones(&id);
+        assert_eq!(
+            set.milestones.get(index).unwrap().status,
+            MilestoneStatus::Completed
+        );
+        assert_eq!(balance(&h, &h.asset_a, &h.recipient), set.released_amount);
+        assert!(set.released_amount > paid);
+        paid = set.released_amount;
+    }
+    assert_eq!(paid, 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+#[test]
+fn milestone_final_payout_absorbs_rounding_dust() {
+    // 3333 + 3333 + 3334 bps of 10_000 floors to 3333 + 3333 + 3334: the last
+    // approval pays the remainder, so nothing is stranded.
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 3_333),
+        milestone_spec(&h.env, "b", 3_333),
+        milestone_spec(&h.env, "c", 3_334),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(h.client.milestones(&id).released_amount, 3_333);
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(h.client.milestones(&id).released_amount, 6_666);
+    h.client.release_milestone(&h.arbiter, &id, &2);
+    assert_eq!(h.client.milestones(&id).released_amount, 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
 fn milestone_unauthorized_approval_rejected() {
     let h = setup(10_000, 0);
     let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "p"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     let res = h.client.try_release_milestone(&h.sender, &id, &0);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(res, Err(Ok(MilestoneError::Unauthorized)));
+    // The milestone-specific enum still carries the canonical wire code.
+    let wire = soroban_sdk::Error::from(MilestoneError::Unauthorized).get_code();
+    assert_eq!(wire, Error::Unauthorized.code());
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
 }
@@ -646,20 +728,30 @@ fn milestone_unauthorized_approval_rejected() {
 fn milestone_double_release_rejected() {
     let h = setup(10_000, 0);
     let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "p"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     h.client.release_milestone(&h.arbiter, &id, &0);
     let res = h.client.try_release_milestone(&h.arbiter, &id, &0);
-    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(res, Err(Ok(MilestoneError::MilestoneAlreadyCompleted)));
+    assert_eq!(
+        soroban_sdk::Error::from(MilestoneError::MilestoneAlreadyCompleted).get_code(),
+        87
+    );
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
+fn milestone_unknown_index_rejected() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+    let res = h.client.try_release_milestone(&h.arbiter, &id, &7);
+    assert_eq!(res, Err(Ok(MilestoneError::InvalidMilestone)));
+    assert_eq!(
+        soroban_sdk::Error::from(MilestoneError::InvalidMilestone).get_code(),
+        86
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
 }
 
 #[test]
@@ -688,19 +780,207 @@ fn milestone_bps_must_total_100() {
 fn plain_release_blocked_on_milestone_escrow() {
     let h = setup(10_000, 0);
     let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
-    let id = h.client.deposit_with_milestones(
-        &h.sender,
-        &h.recipient,
-        &h.arbiter,
-        &h.asset_a,
-        &10_000,
-        &(START + 86_400),
-        &String::from_str(&h.env, "p"),
-        &specs,
-    );
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
     let res = h.client.try_release(&h.arbiter, &id, &10_000);
     assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+}
+
+#[test]
+fn milestone_escrow_refuses_generic_settlement_paths() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    // Beneficiary paths are refused before any schedule math.
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &1_000),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // Reclaim / refund after the grace window are refused too: the milestone
+    // cancel path is the only exit for the unreleased remainder.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200_000);
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_reclaim(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
+
+#[test]
+fn milestone_cancel_refunds_only_remaining() {
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "design", 4_000),
+        milestone_spec(&h.env, "build", 6_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+
+    let refunded = h.client.cancel_remaining_milestones(&h.sender, &id);
+    assert_eq!(refunded, 6_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+
+    let set = h.client.milestones(&id);
+    assert!(set.cancelled);
+    assert_eq!(
+        set.milestones.get(0).unwrap().status,
+        MilestoneStatus::Completed
+    );
+    assert_eq!(
+        set.milestones.get(1).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+
+    // A cancelled schedule can no longer be approved.
+    assert_eq!(
+        h.client.try_release_milestone(&h.arbiter, &id, &1),
+        Err(Ok(MilestoneError::InvalidState))
+    );
+}
+
+#[test]
+fn milestone_cancel_is_idempotency_guarded() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.cancel_remaining_milestones(&h.sender, &id);
+    let res = h.client.try_cancel_remaining_milestones(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 10_000);
+}
+
+#[test]
+fn milestone_cancel_rejected_for_non_party() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+    let intruder = Address::generate(&h.env);
+    let res = h.client.try_cancel_remaining_milestones(&intruder, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+}
+
+#[test]
+fn milestone_cancel_reachable_through_cancel_entrypoint() {
+    // `cancel` stays usable on a milestone escrow, but routes through the
+    // milestone-aware path so a partial payout is never double-refunded.
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "a", 4_000),
+        milestone_spec(&h.env, "b", 6_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+    h.client.release_milestone(&h.arbiter, &id, &0);
+
+    h.client.cancel(&h.arbiter, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 6_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 4_000);
+    assert!(h.client.milestones(&id).cancelled);
+}
+
+#[test]
+fn milestone_dispute_freezes_and_resolve_reenables() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.dispute_milestone(&h.arbiter, &id, &0);
+    assert_eq!(
+        h.client.milestones(&id).milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+    assert_eq!(
+        h.client.try_release_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::InvalidMilestone))
+    );
+
+    h.client.resolve_milestone(&h.arbiter, &id, &0);
+    assert_eq!(
+        h.client.milestones(&id).milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+}
+
+#[test]
+fn milestone_dispute_and_resolve_are_state_guarded() {
+    let h = setup(10_000, 0);
+    let specs = vec![&h.env, milestone_spec(&h.env, "m", 10_000)];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    // Resolving something that was never disputed is invalid.
+    assert_eq!(
+        h.client.try_resolve_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::InvalidMilestone))
+    );
+    // A non-arbiter cannot dispute.
+    assert_eq!(
+        h.client.try_dispute_milestone(&h.sender, &id, &0),
+        Err(Ok(MilestoneError::Unauthorized))
+    );
+    // Disputing an unknown index is invalid.
+    assert_eq!(
+        h.client.try_dispute_milestone(&h.arbiter, &id, &9),
+        Err(Ok(MilestoneError::InvalidMilestone))
+    );
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    // A completed milestone can be neither disputed nor resolved.
+    assert_eq!(
+        h.client.try_dispute_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::MilestoneAlreadyCompleted))
+    );
+    assert_eq!(
+        h.client.try_resolve_milestone(&h.arbiter, &id, &0),
+        Err(Ok(MilestoneError::MilestoneAlreadyCompleted))
+    );
+}
+
+#[test]
+fn milestone_zero_weight_approves_without_payout() {
+    // A review/verification milestone can carry zero basis points: it is still
+    // tracked and completed, but moves no funds, and the weighted milestones
+    // still sum to the full amount.
+    let h = setup(10_000, 0);
+    let specs = vec![
+        &h.env,
+        milestone_spec(&h.env, "kickoff", 0),
+        milestone_spec(&h.env, "delivery", 10_000),
+    ];
+    let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+    h.client.release_milestone(&h.arbiter, &id, &0);
+    assert_eq!(h.client.milestones(&id).released_amount, 0);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+    assert_eq!(
+        h.client.milestones(&id).milestones.get(0).unwrap().status,
+        MilestoneStatus::Completed
+    );
+
+    // The final milestone still pays the dust-free remainder.
+    h.client.release_milestone(&h.arbiter, &id, &1);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
 }
 
 #[test]
@@ -1250,10 +1530,10 @@ fn an_absurd_window_saturates_instead_of_overflowing() {
     h.client.refund(&h.sender, &id);
 }
 
-// --- Time-lock validation on `release` (Issue #238) ---
+// --- Time-lock validation on `release` (Issue #238, #332) ---
 
 #[test]
-fn release_before_cliff_maturity_is_refused_with_time_lock_active() {
+fn release_before_cliff_maturity_is_refused_with_escrow_not_ready() {
     let h = setup(10_000, 0);
     let unlock_time = START + 1_000;
 
@@ -1268,9 +1548,13 @@ fn release_before_cliff_maturity_is_refused_with_time_lock_active() {
 
     // The settlement deadline is still far in the future, but the arbiter must
     // not be able to route around the time lock: the cliff has not matured.
+    // Release attempts report the distinct TimelockNotExpired code
+    // (TIMELOCK_NOT_EXPIRED), separate from the beneficiary's TimeLockActive.
     h.env.ledger().with_mut(|l| l.timestamp = START + 500);
     let res = h.client.try_release(&h.arbiter, &id, &10_000);
-    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    // The distinct early-release code: 91, not the beneficiary's 81.
+    assert_eq!(Error::TimelockNotExpired as u32, 91);
     // No funds moved and the escrow is still live.
     assert_eq!(h.client.get(&id).state, EscrowState::Funded);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
@@ -1280,7 +1564,7 @@ fn release_before_cliff_maturity_is_refused_with_time_lock_active() {
     h.env.ledger().with_mut(|l| l.timestamp = unlock_time - 1);
     assert_eq!(
         h.client.try_release(&h.arbiter, &id, &10_000),
-        Err(Ok(Error::TimeLockActive))
+        Err(Ok(Error::TimelockNotExpired))
     );
 
     // At maturity the pre-existing settlement window rule takes over: a
@@ -1322,11 +1606,11 @@ fn linear_release_cannot_exceed_vested_amount() {
     );
 
     // Before the cliff nothing has vested: release must fail with
-    // TimeLockActive even though the deadline is far away.
+    // TimelockNotExpired even though the deadline is far away.
     h.env.ledger().with_mut(|l| l.timestamp = START + 100);
     assert_eq!(
         h.client.try_release(&h.arbiter, &id, &5_000),
-        Err(Ok(Error::TimeLockActive))
+        Err(Ok(Error::TimelockNotExpired))
     );
 
     // Halfway through the schedule only half has vested (50% of 10,000 =
@@ -1335,7 +1619,7 @@ fn linear_release_cannot_exceed_vested_amount() {
     assert_eq!(h.client.get_vested_amount(&id), 5_000);
     assert_eq!(
         h.client.try_release(&h.arbiter, &id, &10_000),
-        Err(Ok(Error::TimeLockActive))
+        Err(Ok(Error::TimelockNotExpired))
     );
 
     // Releasing the vested amount works — the escrow settles in full per the
@@ -1345,7 +1629,138 @@ fn linear_release_cannot_exceed_vested_amount() {
     assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
 }
 
-// --- Release / timeout-refund lifecycle (Issue #248) ---
+// --- Time-locked release verification (Issue #332) ---
+
+#[test]
+fn release_transitions_from_not_ready_to_ready_as_the_ledger_clock_advances() {
+    let h = setup(10_000, 0);
+    let unlock_time = START + 1_000;
+
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &unlock_time,
+        &String::from_str(&h.env, "timelock"),
+    );
+
+    // Simulated ledger-timestamp advancement: every instant strictly before
+    // the configured release time refuses with the distinct
+    // TIMELOCK_NOT_EXPIRED code; the very first instant at/after it succeeds.
+    for ts in [START + 100, START + 500, unlock_time - 2, unlock_time - 1] {
+        h.env.ledger().with_mut(|l| l.timestamp = ts);
+        assert_eq!(
+            h.client.try_release(&h.arbiter, &id, &10_000),
+            Err(Ok(Error::TimelockNotExpired)),
+            "release at {ts} must be refused"
+        );
+    }
+    // (Timelock escrows set deadline = unlock_time, so at maturity the
+    // settlement window is already closed and release reports EscrowExpired;
+    // the beneficiary claims via `claim` instead — covered below.)
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::EscrowExpired))
+    );
+    assert_eq!(h.client.claim(&h.recipient, &id), 10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+#[test]
+fn scheduled_release_succeeds_once_the_release_time_has_passed() {
+    // A scheduled escrow with a settlement deadline beyond the schedule end:
+    // release flips from TimelockNotExpired to success exactly at the cliff.
+    let h = setup(10_000, 0);
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Cliff,
+        start_time: START,
+        cliff_time: START + 500,
+        end_time: START + 500,
+    };
+    let id = h.client.create_scheduled(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &schedule,
+        &(START + 2_000),
+        &String::from_str(&h.env, "cliff release"),
+    );
+
+    at(&h, START + 499);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &10_000),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    at(&h, START + 500);
+    h.client.release(&h.arbiter, &id, &10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+}
+#[test]
+fn override_release_respects_the_time_lock() {
+    // No public constructor combines a ReleaseSchedule with override signers,
+    // so seed the schedule directly into storage (as `create_scheduled` would
+    // have stored it) on an escrow that carries an override signer set. This
+    // keeps the check honest: the override path must consult the schedule no
+    // matter how the escrow was created.
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
+
+    let schedule = ReleaseSchedule {
+        release_type: ReleaseType::Cliff,
+        start_time: START,
+        cliff_time: START + 800,
+        end_time: START + 800,
+    };
+    let deadline = START + 2_000;
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &deadline,
+        &0,
+        &String::from_str(&h.env, "override timelock"),
+        &signers,
+        &2,
+    );
+
+    // Attach the cliff schedule to the stored escrow.
+    let mut escrow = h.client.get(&id);
+    escrow.schedule = schedule;
+    h.env.as_contract(&h.client.address, || {
+        crate::store_escrow(&h.env, id, &escrow);
+    });
+
+    // Before the cliff: a threshold-clearing signature set is refused with
+    // the distinct TimelockNotExpired code — signatures authorize *who*, not
+    // *when* (Issue #332).
+    at(&h, START + 100);
+    let nonce = 1u64;
+    let sigs = vec![
+        &h.env,
+        sign_override(&h, &kp1, id, nonce),
+        sign_override(&h, &kp2, id, nonce),
+    ];
+    assert_eq!(
+        h.client.try_override_release(&id, &nonce, &sigs),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+
+    // The nonce was never consumed by the refused attempt.
+    at(&h, START + 800);
+    h.client.override_release(&id, &nonce, &sigs);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+}
 //
 // Expiration is measured on the ledger clock against the stored `deadline` and
 // `grace_period`. Refunds open at `deadline + grace_period` (inclusive), the
