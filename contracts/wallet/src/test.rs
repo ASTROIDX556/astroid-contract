@@ -7,8 +7,8 @@ use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, testutils::Events, token, Address, Env, IntoVal, String,
-    Symbol, Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, testutils::Events, token, Address, Env,
+    IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
@@ -21,6 +21,78 @@ fn assert_event(env: &Env, variant: &str) {
         .iter()
         .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
+
+/// Number of times the canonical single-topic `variant` event was published,
+/// ignoring the payload.
+fn count_event(env: &Env, variant: &str) -> usize {
+    let topic: Val = Symbol::new(env, variant).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_contract_id, topics, _data)| topics.len() == 1 && topics.contains(topic))
+        .count()
+}
+
+/// Number of times the canonical `variant` event was published with a payload
+/// that decodes to `expected`.
+///
+/// Decoding into a concrete Rust type is the point: it proves the published
+/// payload really is the documented shape, not merely that some bytes landed
+/// under that topic. `Val` itself is not `PartialEq`, so comparing raw
+/// encodings is not possible.
+fn count_event_data<T>(env: &Env, variant: &str, expected: &T) -> usize
+where
+    T: TryFromVal<Env, Val> + PartialEq,
+{
+    let topic: Val = Symbol::new(env, variant).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_contract_id, topics, _data)| topics.len() == 1 && topics.contains(topic))
+        .filter(|(_contract_id, _topics, data)| {
+            T::try_from_val(env, data)
+                .map(|got| &got == expected)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Assert the canonical `variant` event was published exactly `expected` time(s)
+/// with exactly the payload `want`. A count of `0` catches a dropped event, and
+/// a count above `1` catches a fact that is still being emitted twice under two
+/// different encodings.
+fn assert_event_data<T>(env: &Env, variant: &str, expected: usize, want: T)
+where
+    T: TryFromVal<Env, Val> + PartialEq,
+{
+    let seen = count_event_data(env, variant, &want);
+    assert_eq!(
+        seen, expected,
+        "expected ContractEvent::{variant} {expected} time(s) with that payload, saw {seen}"
+    );
+}
+
+/// The wallet must not publish ad-hoc `("wallet", "<x>")` topics any more:
+/// every wallet-owned event is a single canonical topic equal to its variant
+/// name, so an indexer can dispatch on `topic[0]` alone.
+///
+/// The repo-wide `("transfer", "executed")` helper is deliberately exempt. It
+/// is a cross-contract convention shared with escrow and treasury, so
+/// converting only the wallet's call sites would emit the same fact under two
+/// encodings across the protocol - worse than leaving it consistent. That
+/// migration belongs to all three contracts together, not to the wallet alone.
+fn assert_no_legacy_wallet_topics(env: &Env, contract_id: &Address) {
+    let legacy: Val = symbol_short!("wallet").into_val(env);
+    for (emitter, topics, _data) in env.events().all().iter() {
+        if emitter != *contract_id {
+            continue;
+        }
+        assert!(
+            !topics.contains(legacy),
+            "wallet published a legacy (\"wallet\", ...) topic, which an indexer cannot map to a variant"
+        );
+    }
 }
 
 struct Harness {
@@ -1043,15 +1115,10 @@ fn validated_batch_executes_and_reports_aggregates() {
         650
     );
 
-    // The aggregated outcome is published as ("wallet", "batch_validated").
-    let want: Val = Symbol::new(&h.env, "batch_validated").into_val(&h.env);
-    let found = h
-        .env
-        .events()
-        .all()
-        .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(want));
-    assert!(found, "expected batch_validated event to be emitted");
+    // The aggregated outcome is published once for the whole batch, under the
+    // canonical `WalletBatchValidated` topic (issue #243 replaced the old
+    // `("wallet", "batch_validated")` topic).
+    assert_event(&h.env, "WalletBatchValidated");
 }
 
 #[test]
@@ -2018,4 +2085,250 @@ fn velocity_storage_stays_constant_size() {
     assert_eq!(record.bucket, (T0 + 39 * BUCKET) / BUCKET);
     // The trailing window holds the last four spends only.
     assert_eq!(usage(&h, id), 40);
+}
+
+// --- Standardized event schemas for off-chain indexing (Issue #243) ---
+
+#[test]
+fn a_deposit_is_reported_as_exactly_one_standard_funded_event() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let payer = Address::generate(&h.env);
+    mint(&h, &payer, 1_000);
+
+    h.client.deposit(&id, &payer, &h.token, &400);
+
+    assert_event_data(
+        &h.env,
+        "WalletFunded",
+        1,
+        (id, payer.clone(), h.token.clone(), 400i128),
+    );
+    // The old ad-hoc `("wallet", "deposit")` topic is gone, and the funded
+    // event is not double-reported under the legacy encoding.
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+    assert_eq!(h.client.balance(&id, &h.token), 400);
+}
+
+#[test]
+fn a_withdrawal_is_reported_as_exactly_one_standard_withdrawn_event() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    h.client.withdraw(&owner, &id, &h.token, &250);
+
+    assert_event_data(
+        &h.env,
+        "WalletWithdrawn",
+        1,
+        (id, owner.clone(), h.token.clone(), 250i128),
+    );
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+    assert_eq!(token_balance(&h, &owner), 250);
+    assert_eq!(h.client.balance(&id, &h.token), 750);
+}
+
+#[test]
+fn wiring_and_unwiring_the_policy_gate_report_distinct_standard_events() {
+    let h = setup();
+    let policy = register_stub(&h);
+
+    h.client.set_policy(&h.admin, &policy);
+    assert_event_data(&h.env, "WalletPolicyConfigured", 1, (policy.clone(),));
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+
+    h.client.clear_policy(&h.admin);
+    // A dedicated variant with an empty payload: the old encoding reused the
+    // `("wallet", "policy")` topic for both set and clear with two different
+    // payload shapes, which no indexer could decode unambiguously.
+    assert_eq!(count_event(&h.env, "WalletPolicyCleared"), 1);
+    assert_event_data(&h.env, "WalletPolicyConfigured", 1, (policy,));
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+    assert_eq!(h.client.get_policy(), None);
+}
+
+#[test]
+fn flipping_the_policy_bypass_reports_a_typed_standard_event() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    h.client.set_policy_bypass(&h.admin, &id, &true);
+    h.client.set_policy_bypass(&h.admin, &id, &false);
+
+    assert_event_data(&h.env, "WalletPolicyBypassChanged", 1, (id, true));
+    assert_event_data(&h.env, "WalletPolicyBypassChanged", 1, (id, false));
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+}
+
+#[test]
+fn a_spend_that_clears_the_policy_gate_records_the_check() {
+    let h = setup();
+    h.client.set_policy(&h.admin, &register_stub(&h));
+    let (id, _owner, agent) = funded_agent_wallet(&h, 5_000);
+
+    let to = Address::generate(&h.env);
+    h.client.transfer(&agent, &id, &to, &h.token, &600);
+
+    assert_event_data(
+        &h.env,
+        "WalletPolicyChecked",
+        1,
+        (id, h.token.clone(), 600i128),
+    );
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+}
+
+#[test]
+fn a_denied_spend_records_no_policy_check() {
+    let h = setup();
+    h.client.set_policy(&h.admin, &register_stub(&h));
+    let (id, _owner, agent) = funded_agent_wallet(&h, 5_000);
+
+    // Above the stub's cap the gate refuses and the whole invocation reverts.
+    let to = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_transfer(&agent, &id, &to, &h.token, &2_000),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // A passing check is the only thing this event reports, so a refusal must
+    // not leave one behind for an agent to mistake for an approval.
+    assert_event_data(
+        &h.env,
+        "WalletPolicyChecked",
+        0,
+        (id, h.token.clone(), 2_000i128),
+    );
+    assert_eq!(h.client.balance(&id, &h.token), 5_000);
+}
+
+#[test]
+fn velocity_ceilings_report_distinct_standard_events_for_set_and_clear() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    h.client
+        .set_velocity_limit(&owner, &id, &h.token, &1_000, &3_600);
+    assert_event_data(
+        &h.env,
+        "WalletVelocityLimitSet",
+        1,
+        (id, h.token.clone(), 1_000i128, 3_600u64),
+    );
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+
+    h.client.clear_velocity_limit(&owner, &id, &h.token);
+    // Previously both directions shared `("wallet", "velocity")` with a
+    // 4-field and a 3-field payload respectively.
+    assert_event_data(
+        &h.env,
+        "WalletVelocityLimitCleared",
+        1,
+        (id, h.token.clone()),
+    );
+    assert_event_data(
+        &h.env,
+        "WalletVelocityLimitSet",
+        1,
+        (id, h.token.clone(), 1_000i128, 3_600u64),
+    );
+}
+
+#[test]
+fn role_grants_and_revocations_share_one_standard_event() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let agent = Address::generate(&h.env);
+
+    h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+    h.client.revoke_role(&owner, &id, &agent);
+
+    // One topic, one payload shape; `action` carries the direction and
+    // `role` is absent on a revocation, where the account simply holds nothing.
+    let granted: (u64, Address, Option<Symbol>, Symbol) = (
+        id,
+        agent.clone(),
+        Some(Symbol::new(&h.env, "agent")),
+        Symbol::new(&h.env, "granted"),
+    );
+    let revoked: (u64, Address, Option<Symbol>, Symbol) =
+        (id, agent.clone(), None, Symbol::new(&h.env, "revoked"));
+    assert_event_data(&h.env, "WalletRoleChanged", 1, granted);
+    assert_event_data(&h.env, "WalletRoleChanged", 1, revoked);
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+}
+
+#[test]
+fn module_wiring_and_asset_budgets_report_standard_events() {
+    let h = setup();
+    let budget = Address::generate(&h.env);
+    let registry = Address::generate(&h.env);
+
+    h.client.set_budget(&h.admin, &budget);
+    h.client.set_registry(&h.admin, &registry);
+    assert_event_data(
+        &h.env,
+        "WalletModuleWired",
+        1,
+        (Symbol::new(&h.env, "budget"), budget.clone()),
+    );
+    assert_event_data(
+        &h.env,
+        "WalletModuleWired",
+        1,
+        (Symbol::new(&h.env, "registry"), registry),
+    );
+
+    let budget_id = String::from_str(&h.env, "budget-1");
+    h.client.set_asset_budget_id(&h.admin, &h.token, &budget_id);
+    assert_event_data(
+        &h.env,
+        "WalletAssetBudgetSet",
+        1,
+        (h.token.clone(), budget_id),
+    );
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+}
+
+#[test]
+fn designating_a_guardian_reports_a_standard_event() {
+    let h = setup();
+    let guardian = Address::generate(&h.env);
+
+    h.client.set_guardian(&h.admin, &guardian);
+    assert_event_data(&h.env, "WalletGuardianChanged", 1, (guardian,));
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+}
+
+#[test]
+fn creating_and_freezing_a_wallet_each_report_one_standard_event() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    // Creation used to emit the same fact twice: once through the legacy
+    // `events::wallet_created` helper and once canonically.
+    assert_event_data(&h.env, "WalletCreated", 1, (id, owner.clone()));
+    assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+
+    let h2 = setup();
+    let owner2 = Address::generate(&h2.env);
+    let id2 = h2.client.create_wallet(&owner2);
+    h2.client.freeze(&owner2, &id2);
+    // Likewise for freezing, which emitted both the legacy
+    // `("wallet", "frozen")` topic and the canonical state change.
+    assert_event_data(
+        &h2.env,
+        "WalletStateChanged",
+        1,
+        (id2, Symbol::new(&h2.env, "frozen")),
+    );
+    assert_no_legacy_wallet_topics(&h2.env, &h2.contract_id);
 }

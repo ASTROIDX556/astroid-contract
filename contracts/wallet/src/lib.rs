@@ -354,9 +354,9 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Guardian, &guardian);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("guardian")),
-            guardian,
+        events::publish(
+            &env,
+            events::ContractEvent::WalletGuardianChanged { guardian },
         );
         Ok(())
     }
@@ -412,7 +412,6 @@ impl WalletContract {
         Self::bump_wallet(&env, id);
         env.storage().instance().set(&DataKey::WalletCount, &count);
         Self::bump_instance(&env);
-        events::wallet_created(&env, id, &owner);
         events::publish(
             &env,
             events::ContractEvent::WalletCreated {
@@ -432,9 +431,9 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Policy, &policy);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("policy")),
-            (caller, policy),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletPolicyConfigured { policy },
         );
         Ok(())
     }
@@ -447,10 +446,7 @@ impl WalletContract {
         }
         env.storage().instance().remove(&DataKey::Policy);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("policy")),
-            (caller, "cleared"),
-        );
+        events::publish(&env, events::ContractEvent::WalletPolicyCleared);
         Ok(())
     }
 
@@ -486,9 +482,9 @@ impl WalletContract {
             env.storage().persistent().remove(&key);
         }
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("pol_byp")),
-            (wallet_id, bypass),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletPolicyBypassChanged { wallet_id, bypass },
         );
         Ok(())
     }
@@ -543,9 +539,14 @@ impl WalletContract {
         };
         env.storage().persistent().set(&lkey, &limit);
         Self::bump_persistent(&env, &lkey);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("velocity")),
-            (wallet_id, asset, max_amount, window_seconds),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletVelocityLimitSet {
+                wallet_id,
+                asset,
+                max_amount,
+                window_seconds,
+            },
         );
         Ok(())
     }
@@ -565,9 +566,9 @@ impl WalletContract {
         env.storage()
             .persistent()
             .remove(&DataKey::VelocityUsage(wallet_id, asset.clone()));
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("velocity")),
-            (wallet_id, asset, "cleared"),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletVelocityLimitCleared { wallet_id, asset },
         );
         Ok(())
     }
@@ -615,9 +616,14 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("deposit")),
-            (wallet_id, asset, amount),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletFunded {
+                wallet_id,
+                from,
+                asset,
+                amount,
+            },
         );
         Ok(())
     }
@@ -705,9 +711,14 @@ impl WalletContract {
             &wallet.owner,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("withdraw")),
-            (wallet_id, asset, amount),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletWithdrawn {
+                wallet_id,
+                to: wallet.owner,
+                asset,
+                amount,
+            },
         );
         Self::unlock(&env);
         Ok(())
@@ -724,7 +735,6 @@ impl WalletContract {
 
         wallet.state = ResourceState::Frozen;
         Self::store_wallet(&env, wallet_id, &wallet);
-        events::wallet_frozen(&env, wallet_id, &caller);
         events::publish(
             &env,
             events::ContractEvent::WalletStateChanged {
@@ -801,7 +811,8 @@ impl WalletContract {
     /// failure — a policy denial, a budget overrun, a cumulative overflow, or a
     /// failing sub-call — reverts the entire transaction, so validation and
     /// execution are atomic. On success an aggregated [`BatchReceipt`] is
-    /// returned and `("wallet", "batch_validated")` is published.
+    /// returned and a [`events::ContractEvent::WalletBatchValidated`] is
+    /// published.
     pub fn batch_execute_validated(
         env: Env,
         caller: Address,
@@ -874,6 +885,7 @@ impl WalletContract {
                 };
                 if let Err(e) = Self::require_policy_check(
                     &env,
+                    wallet_id,
                     policy_addr,
                     &action.policy_id,
                     &action.asset,
@@ -945,7 +957,15 @@ impl WalletContract {
             executed += 1;
         }
 
-        events::wallet_batch_validated(&env, wallet_id, executed, total_amount, budget_remaining);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletBatchValidated {
+                wallet_id,
+                executed,
+                total_amount,
+                budget_remaining,
+            },
+        );
         Self::unlock(&env);
         Ok(BatchReceipt {
             executed,
@@ -960,9 +980,12 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Budget, &budget);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("budget")),
-            (caller, budget),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletModuleWired {
+                module: symbol_short!("budget"),
+                address: budget,
+            },
         );
         Ok(())
     }
@@ -976,9 +999,12 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Registry, &registry);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("registry")),
-            registry,
+        events::publish(
+            &env,
+            events::ContractEvent::WalletModuleWired {
+                module: symbol_short!("registry"),
+                address: registry,
+            },
         );
         Ok(())
     }
@@ -1047,9 +1073,9 @@ impl WalletContract {
         let key = DataKey::AssetBudgetId(asset.clone());
         env.storage().persistent().set(&key, &budget_id);
         Self::bump_persistent(&env, &key);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("asset_bdg")),
-            (asset, budget_id),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletAssetBudgetSet { asset, budget_id },
         );
         Ok(())
     }
@@ -1110,9 +1136,14 @@ impl WalletContract {
             return Err(Error::InvalidInput);
         }
         access::set_role(&env, wallet_id, &account, role);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (wallet_id, account, role),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletRoleChanged {
+                wallet_id,
+                account,
+                role: Some(role.as_symbol()),
+                action: symbol_short!("granted"),
+            },
         );
         Ok(())
     }
@@ -1130,9 +1161,14 @@ impl WalletContract {
     ) -> Result<(), Error> {
         Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         access::clear_role(&env, wallet_id, &account)?;
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (wallet_id, account),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletRoleChanged {
+                wallet_id,
+                account,
+                role: None,
+                action: symbol_short!("revoked"),
+            },
         );
         Ok(())
     }
@@ -1189,8 +1225,15 @@ impl WalletContract {
 
     /// Map policy denials and cross-contract invocation failures to one stable
     /// wallet-facing error. Only a successful policy response authorizes spend.
+    ///
+    /// Records a [`events::ContractEvent::WalletPolicyChecked`] on the passing
+    /// path. No event is published for a denial: the invocation is about to
+    /// revert, which discards anything already published, and the policy module
+    /// emits its own [`events::ContractEvent::PolicyViolation`] for the reason
+    /// - duplicating it here would double-count every refusal.
     fn require_policy_check(
         env: &Env,
+        wallet_id: u64,
         policy_addr: &Address,
         policy_id: &String,
         asset: &Address,
@@ -1200,7 +1243,17 @@ impl WalletContract {
         match PolicyClient::new(env, policy_addr)
             .try_check_transfer(policy_id, asset, recipient, &amount)
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                events::publish(
+                    env,
+                    events::ContractEvent::WalletPolicyChecked {
+                        wallet_id,
+                        asset: asset.clone(),
+                        amount,
+                    },
+                );
+                Ok(())
+            }
             Ok(Err(_)) | Err(_) => Err(Error::PolicyDenied),
         }
     }
@@ -1322,6 +1375,7 @@ impl WalletContract {
             if !Self::get_policy_bypass(env.clone(), wallet_id) {
                 Self::require_policy_check(
                     env,
+                    wallet_id,
                     policy_addr,
                     &String::from_str(env, "active"),
                     asset,

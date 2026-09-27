@@ -22,7 +22,7 @@
 
 use astroid_shared::constants::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 
 /// A principal's role on a specific wallet.
 ///
@@ -55,6 +55,17 @@ impl Role {
     /// `required`.
     pub fn satisfies(self, required: Role) -> bool {
         self.rank() >= required.rank()
+    }
+
+    /// Stable short symbol for this role, used in event payloads so an indexer
+    /// reads a name rather than a bare discriminant. Kept in lockstep with the
+    /// discriminants above.
+    pub fn as_symbol(self) -> Symbol {
+        match self {
+            Role::Auditor => symbol_short!("auditor"),
+            Role::Agent => symbol_short!("agent"),
+            Role::Admin => symbol_short!("admin"),
+        }
     }
 }
 
