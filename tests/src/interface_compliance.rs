@@ -18,14 +18,14 @@ use astroid_interfaces::{
     BudgetClient, BudgetInterface, MultisigClient, MultisigInterface, PolicyClient,
     PolicyInterface, ProposalClient, ProposalInterface, ProposalState, RegistryClient,
     RegistryInterface, TreasuryClient, TreasuryInterface, UpgradeableClient, UpgradeableInterface,
-    INTERFACE_VERSION,
+    WalletClient, INTERFACE_VERSION,
 };
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::PolicyContract;
 use astroid_proposal::ProposalContract;
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
-use astroid_shared::types::ModuleKind;
+use astroid_shared::types::{ModuleKind, ResourceState, WalletData};
 use astroid_treasury::{TreasuryContract, TreasuryContractClient};
 use astroid_wallet::WalletContract;
 use soroban_sdk::testutils::Address as _;
@@ -71,7 +71,30 @@ fn interface_table_compiles() {
 #[test]
 fn interface_version_is_pinned() {
     // Bumping the version is a deliberate act; this catches accidental edits.
-    assert_eq!(INTERFACE_VERSION, 1);
+    assert_eq!(INTERFACE_VERSION, 2);
+}
+
+#[test]
+fn wallet_serves_the_wallet_interface_client() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, WalletContract);
+
+    astroid_wallet::WalletContractClient::new(&env, &id).initialize(&admin);
+
+    let wallet = WalletClient::new(&env, &id);
+    let wallet_id = wallet.create_wallet(&owner);
+    assert_eq!(
+        wallet.get_wallet(&wallet_id),
+        WalletData {
+            owner,
+            state: ResourceState::Active,
+        }
+    );
+    assert_eq!(wallet.balance(&wallet_id, &Address::generate(&env)), 0);
+    assert!(!wallet.is_paused());
 }
 
 #[test]
