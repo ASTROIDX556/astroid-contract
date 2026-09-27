@@ -6,7 +6,7 @@
 //! 1. `wallet → treasury.deposit` — the wallet is registered as the org's
 //!    [`ModuleKind::Wallet`], the only contract kind allowed to fund the
 //!    treasury; a hostile, unregistered contract is refused with
-//!    `UnverifiedCaller` before any ledger entry moves.
+//!    `Unauthorized` before any ledger entry moves.
 //! 2. `treasury.withdraw → wallet` and a time-locked `escrow` — the time lock
 //!    (Issue #307) is verified end to end across the deployed escrow:
 //!    withdrawal/claim before unlock time fails with `TimeLockActive` and
@@ -75,7 +75,7 @@ fn setup() -> Harness<'static> {
     // The org's escrow: registered conditional custody.
     let escrow_id = env.register_contract(None, EscrowContract);
     let escrow = EscrowContractClient::new(&env, &escrow_id);
-    escrow.initialize();
+    escrow.initialize(&admin);
     registry.register_module(&admin, &org.clone(), &ModuleKind::Escrow, &escrow_id);
 
     // Ancillary modules, registered but unused by these flows.
@@ -95,6 +95,9 @@ fn setup() -> Harness<'static> {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
     treasury.add_approved_asset(&admin, &asset);
+    // The escrow's own token whitelist starts empty, so the same asset has to
+    // be approved there before it can lock value in custody.
+    escrow.approve_token(&admin, &asset);
     token::StellarAssetClient::new(&env, &asset).mint(&admin, &50_000);
 
     // The funder stands in for the org's funding wallet; recorded as the
@@ -196,7 +199,7 @@ fn hostile_contract_cannot_fund_the_gated_treasury() {
     token::StellarAssetClient::new(&h.env, &h.asset).mint(&hostile, &5_000);
 
     let res = h.treasury.try_deposit(&hostile, &h.asset, &5_000);
-    assert_eq!(res, Err(Ok(Error::UnverifiedCaller)));
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
     assert_eq!(h.treasury.holding(&h.asset).total_in, 0);
     assert_eq!(token_balance(&h, &h.treasury.address), 0);
 
@@ -216,7 +219,7 @@ fn frozen_registry_blocks_deposits_fail_closed() {
     h.registry.freeze(&h.admin, &String::from_str(&h.env, ORG));
 
     let res = h.treasury.try_deposit(&h.funder, &h.asset, &1_000);
-    assert_eq!(res, Err(Ok(Error::UnverifiedCaller)));
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
     assert_eq!(h.treasury.holding(&h.asset).total_in, 1_000);
 
     // While frozen, the outbound gate fails closed for the recorded
@@ -224,7 +227,7 @@ fn frozen_registry_blocks_deposits_fail_closed() {
     let res2 = h
         .treasury
         .try_withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &100);
-    assert_eq!(res2, Err(Ok(Error::UnverifiedCaller)));
+    assert_eq!(res2, Err(Ok(Error::Unauthorized)));
     assert_eq!(h.treasury.holding(&h.asset).total_out, 0);
 
     // Unfreezing restores the flow.
