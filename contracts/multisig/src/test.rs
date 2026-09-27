@@ -447,6 +447,49 @@ fn max_weight_quorum_and_capacity_edge() {
     );
 }
 
+#[test]
+fn full_capacity_unanimous_quorum_and_one_signer_too_many() {
+    // A signer set sitting exactly on MAX_SIGNERS with a unanimous threshold is
+    // the largest quorum configuration the contract admits.
+    let n = MAX_SIGNERS as usize;
+    let h = setup(&std::vec![1u32; n], MAX_SIGNERS);
+    assert_eq!(h.client.get_signers().len(), MAX_SIGNERS);
+    assert_eq!(h.client.get_total_weight(), MAX_SIGNERS);
+
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    // Every remaining signer but the last: one weight short of unanimity.
+    for i in 1..n - 1 {
+        h.client.approve(&h.signers[i], &id);
+    }
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+    // The last approval lands exactly on the threshold.
+    h.client.approve(&h.signers[n - 1], &id);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+
+    // A set already at capacity admits nobody else, on either path.
+    let extra = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_add_signer(&h.signers[0], &extra, &1),
+        Err(Ok(Error::TooManySigners))
+    );
+    assert_eq!(
+        h.client
+            .try_propose_signer_addition(&h.signers[0], &extra, &1),
+        Err(Ok(Error::TooManySigners))
+    );
+    assert!(!h.client.is_signer(&extra));
+    assert_eq!(h.client.get_signers().len(), MAX_SIGNERS);
+}
+
 // --- timelocked governance ---
 
 #[test]
