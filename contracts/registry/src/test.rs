@@ -5,8 +5,10 @@ use crate::{DataKey, RegistryContract, RegistryContractClient, RegistryRole};
 use astroid_shared::constants::{MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
-use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger};
-use soroban_sdk::{testutils::Events, vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
+use soroban_sdk::testutils::{storage::Persistent as _, Address as _, AuthorizedFunction, Ledger};
+use soroban_sdk::{
+    symbol_short, testutils::Events, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
@@ -115,8 +117,10 @@ fn version_lookup_upgrade_strategy() {
     let (env, client, admin) = setup();
     let v1 = Address::generate(&env);
     let v2 = Address::generate(&env);
-    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1);
-    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
     assert_eq!(client.get_version(&ModuleKind::Wallet, &1), v1);
     assert_eq!(client.get_version(&ModuleKind::Wallet, &2), v2);
     // Latest points at the highest registered version.
@@ -127,8 +131,382 @@ fn version_lookup_upgrade_strategy() {
 fn register_version_zero_fails() {
     let (env, client, admin) = setup();
     let addr = Address::generate(&env);
-    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &0, &addr);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &0, &addr, &h);
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+// --- Version registration: auth, hash integrity, immutability (Issue #217) ---
+
+/// Approve `[seed; 32]` for `kind` and return it.
+fn approved_hash(
+    env: &Env,
+    client: &RegistryContractClient,
+    admin: &Address,
+    kind: ModuleKind,
+    seed: u8,
+) -> BytesN<32> {
+    let h = BytesN::from_array(env, &[seed; 32]);
+    client.add_approved_wasm(admin, &kind, &h);
+    h
+}
+
+#[test]
+fn register_version_binds_hash_and_is_retrievable() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Policy, 7);
+
+    client.register_version(&admin, &ModuleKind::Policy, &3, &addr, &h);
+
+    assert_eq!(client.get_version(&ModuleKind::Policy, &3), addr);
+    assert_eq!(client.get_version_wasm(&ModuleKind::Policy, &3), h);
+    assert_eq!(client.get_latest(&ModuleKind::Policy), addr);
+    assert_eq!(client.verify_version(&ModuleKind::Policy, &3, &h), addr);
+}
+
+#[test]
+fn register_version_demands_the_admin_signature() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    // The admin's signature was required for exactly this invocation.
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    let (signer, invocation) = &auths[0];
+    assert_eq!(signer, &admin);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, function, _args)) => {
+            assert_eq!(contract, &client.address);
+            assert_eq!(function, &Symbol::new(&env, "register_version"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+fn register_version_without_any_signature_is_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let h = BytesN::from_array(&env, &[1; 32]);
+    let addr = Address::generate(&env);
+
+    // Approving and registering both need the admin's auth; with no auth
+    // mocked the host refuses before anything is written.
+    assert!(client
+        .try_add_approved_wasm(&admin, &ModuleKind::Wallet, &h)
+        .is_err());
+    assert!(client
+        .try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h)
+        .is_err());
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn non_admin_cannot_register_version() {
+    let (env, client, admin, org, owner) = setup_org();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let stranger = Address::generate(&env);
+    let upgrader = Address::generate(&env);
+    client.grant_role(&owner, &org, &upgrader, &RegistryRole::ModuleUpgrader);
+
+    // Neither a stranger, an org owner, nor an org-scoped ModuleUpgrader may
+    // write the global version map: it is protocol-admin only.
+    for caller in [&stranger, &owner, &upgrader] {
+        assert_eq!(
+            client.try_register_version(caller, &ModuleKind::Wallet, &1, &addr, &h),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_latest(&ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn non_admin_cannot_approve_wasm() {
+    let (env, client, admin) = setup();
+    let stranger = Address::generate(&env);
+    let h = BytesN::from_array(&env, &[9; 32]);
+    assert_eq!(
+        client.try_add_approved_wasm(&stranger, &ModuleKind::Wallet, &h),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(!client.is_wasm_approved(&ModuleKind::Wallet, &h));
+
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &h);
+    assert_eq!(
+        client.try_remove_approved_wasm(&stranger, &ModuleKind::Wallet, &h),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(client.is_wasm_approved(&ModuleKind::Wallet, &h));
+}
+
+#[test]
+fn register_version_rejects_unapproved_hash() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let unapproved = BytesN::from_array(&env, &[42; 32]);
+
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &unapproved),
+        Err(Ok(Error::Unauthorized))
+    );
+    // A rejected registration writes nothing, including the latest pointer.
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_version_wasm(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_latest(&ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn register_version_rejects_hash_approved_for_another_kind() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let treasury_code = approved_hash(&env, &client, &admin, ModuleKind::Treasury, 5);
+
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &treasury_code),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn register_version_rejects_revoked_hash() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.remove_approved_wasm(&admin, &ModuleKind::Wallet, &h);
+
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn registered_version_cannot_be_repointed() {
+    let (env, client, admin) = setup();
+    let original = Address::generate(&env);
+    let hijack = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &original, &h1);
+
+    // Even the admin with an approved hash cannot overwrite a published
+    // version, so a consumer pinned to v1 keeps getting v1.
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &hijack, &h2),
+        Err(Ok(Error::AlreadyExists))
+    );
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), original);
+    assert_eq!(client.get_version_wasm(&ModuleKind::Wallet, &1), h1);
+}
+
+#[test]
+fn same_version_number_is_independent_per_kind() {
+    let (env, client, admin) = setup();
+    let wallet_v1 = Address::generate(&env);
+    let policy_v1 = Address::generate(&env);
+    let hw = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let hp = approved_hash(&env, &client, &admin, ModuleKind::Policy, 2);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &wallet_v1, &hw);
+    client.register_version(&admin, &ModuleKind::Policy, &1, &policy_v1, &hp);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), wallet_v1);
+    assert_eq!(client.get_version(&ModuleKind::Policy, &1), policy_v1);
+}
+
+#[test]
+fn backfilled_older_version_does_not_move_latest() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v5 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h5 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 5);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &5, &v5, &h5);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    assert_eq!(client.get_latest(&ModuleKind::Wallet), v5);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), v1);
+}
+
+#[test]
+fn frozen_registry_blocks_version_registration() {
+    let (env, client, admin, org, owner) = setup_org();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.freeze(&owner, &org);
+
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h),
+        Err(Ok(Error::RegistryFrozen))
+    );
+    client.unfreeze(&owner, &org);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
+}
+
+#[test]
+fn unknown_version_keys_fail_with_not_found() {
+    let (env, client, admin) = setup();
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_version_wasm(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_latest(&ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_verify_version(&ModuleKind::Wallet, &1, &h),
+        Err(Ok(Error::NotFound))
+    );
+
+    // A registered kind still reports NotFound for a version it lacks.
+    let addr = Address::generate(&env);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &2),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_verify_version(&ModuleKind::Wallet, &2, &h),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn verify_version_rejects_mismatched_hash() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let other = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h1);
+
+    // Approved, but not the code v1 was registered with.
+    assert_eq!(
+        client.try_verify_version(&ModuleKind::Wallet, &1, &other),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(client.verify_version(&ModuleKind::Wallet, &1, &h1), addr);
+}
+
+#[test]
+fn verify_version_fails_once_the_bound_hash_is_revoked() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+    client.remove_approved_wasm(&admin, &ModuleKind::Wallet, &h);
+
+    assert_eq!(
+        client.try_verify_version(&ModuleKind::Wallet, &1, &h),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The record itself is untouched; only its verification now fails.
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
+}
+
+#[test]
+fn legacy_version_without_bound_hash_never_verifies() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    // A record written before hashes were bound: address only.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 1), &addr);
+    });
+
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
+    assert_eq!(
+        client.try_get_version_wasm(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_verify_version(&ModuleKind::Wallet, &1, &h),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn version_registration_emits_structured_event() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Escrow, 3);
+
+    client.register_version(&admin, &ModuleKind::Escrow, &4, &addr, &h);
+
+    let want_topic: Val = Symbol::new(&env, "RegistryVersionRegistered").into_val(&env);
+    let event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_id, topics, _data)| topics.contains(want_topic))
+        .expect("RegistryVersionRegistered must be emitted");
+    assert_eq!(event.0, client.address);
+    let data: (ModuleKind, u32, Address, BytesN<32>) = event.2.into_val(&env);
+    assert_eq!(data, (ModuleKind::Escrow, 4, addr.clone(), h));
+
+    // The legacy tuple-topic event is still published for existing consumers.
+    let legacy: Vec<Val> = (
+        symbol_short!("version"),
+        symbol_short!("register"),
+        ModuleKind::Escrow,
+        4u32,
+    )
+        .into_val(&env);
+    assert!(env
+        .events()
+        .all()
+        .iter()
+        .any(|(_id, topics, _data)| topics == legacy));
+}
+
+#[test]
+fn rejected_registration_emits_no_version_event() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let unapproved = BytesN::from_array(&env, &[1; 32]);
+    let _ = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &unapproved);
+
+    let want_topic: Val = Symbol::new(&env, "RegistryVersionRegistered").into_val(&env);
+    assert!(!env
+        .events()
+        .all()
+        .iter()
+        .any(|(_id, topics, _data)| topics.contains(want_topic)));
 }
 
 #[test]
@@ -731,6 +1109,40 @@ fn only_the_current_admin_can_rotate_the_authority() {
     assert_eq!(h.member.get_upgrade_authority().admin, stranger);
 }
 
+#[test]
+fn only_the_registry_admin_can_bootstrap_the_upgrade_authority() {
+    let h = setup_upgrade();
+    let squatter = Address::generate(&h.env);
+    // Before bootstrap, a stranger cannot claim upgrade rights over the
+    // registry by getting to `set_upgrade_authority` first.
+    assert_eq!(
+        h.member
+            .try_set_upgrade_authority(&squatter, &squatter, &h.registry_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.member.try_get_upgrade_authority(),
+        Err(Ok(Error::NotInitialized))
+    );
+
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    assert_eq!(h.member.get_upgrade_authority().admin, h.admin);
+}
+
+#[test]
+fn uninitialized_registry_cannot_bootstrap_the_upgrade_authority() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &id);
+    let anyone = Address::generate(&env);
+    assert_eq!(
+        client.try_set_upgrade_authority(&anyone, &anyone, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
 // --- Batch lookup (Issue #228) ---
 
 fn module_id(env: &Env, org: &str, kind: ModuleKind) -> ModuleId {
@@ -1003,4 +1415,268 @@ fn batch_extends_ttl_exactly_like_lookup() {
     // `lookup` on the policy record produces the same extension.
     client.lookup(&org, &ModuleKind::Policy);
     assert_eq!(ttl(ModuleKind::Policy), PERSISTENT_BUMP_AMOUNT);
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic error codes
+//
+// Every failure below must surface as a specific `Error` variant, never as a
+// generic code and never as a host trap, so an off-chain consumer can branch on
+// it. The three groups mirror the classes the protocol promises to keep
+// distinct: out-of-bounds / invalid input, unauthorized callers, and frozen
+// (lifecycle) refusals.
+// ---------------------------------------------------------------------------
+
+/// A registry that was registered but never `initialize`d, so the guards that
+/// read instance storage report `NotInitialized` instead of panicking.
+fn uninitialized() -> (Env, RegistryContractClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &contract_id);
+    (env, client)
+}
+
+#[test]
+fn uninitialized_registry_reports_not_initialized() {
+    let (env, client) = uninitialized();
+    let admin = Address::generate(&env);
+    let org = String::from_str(&env, "acme");
+
+    assert_eq!(client.try_get_admin(), Err(Ok(Error::NotInitialized)));
+    assert_eq!(
+        client.try_register_org(&admin, &org, &Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_deprecate_module(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_admin(&admin, &Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn out_of_bounds_lookups_report_not_found() {
+    let (env, client, _admin) = setup();
+    let ghost = String::from_str(&env, "ghost");
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&_admin, &org, &owner);
+
+    // A key that was never written must not read as a default value.
+    assert_eq!(client.try_get_org_owner(&ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        client.try_get_module_address(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_verify_owner(&ghost, &owner),
+        Err(Ok(Error::NotFound))
+    );
+    // No version has been registered, and version 0 can never be registered.
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_latest(&ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn empty_org_slug_is_rejected_as_invalid_input() {
+    let (env, client, admin) = setup();
+    // An empty string is a valid `String` but not a valid org identifier; it
+    // must be refused with `InvalidInput` rather than stored.
+    let res = client.try_register_org(
+        &admin,
+        &String::from_str(&env, ""),
+        &Address::generate(&env),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        client.try_get_org_owner(&String::from_str(&env, "")),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn unknown_org_is_not_found_for_every_owner_gated_call() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let ghost = String::from_str(&env, "ghost");
+    let new_owner = Address::generate(&env);
+
+    // A real owner naming an organization that does not exist gets `NotFound`,
+    // not a permission failure — the two are different diagnoses.
+    assert_eq!(
+        client.try_set_org_owner(&owner, &ghost, &new_owner),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_register_module(
+            &owner,
+            &ghost,
+            &ModuleKind::Wallet,
+            &Address::generate(&env)
+        ),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_remove_module(&owner, &ghost, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(client.try_freeze(&owner, &ghost), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        client.try_unfreeze(&owner, &ghost),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn unauthorized_callers_are_refused_by_the_protocol_admin() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let intruder = Address::generate(&env);
+    let intruder_org = String::from_str(&env, "evil");
+    client.register_org(&admin, &intruder_org, &intruder);
+
+    // A stranger must never seize the protocol admin, approve Wasm, or record a
+    // version, even while holding ownership of an organization of their own.
+    assert_eq!(
+        client.try_set_admin(&intruder, &intruder),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_add_approved_wasm(&intruder, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_remove_approved_wasm(&intruder, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_register_version(
+            &intruder,
+            &ModuleKind::Wallet,
+            &1,
+            &Address::generate(&env),
+            &hash(&env, 1)
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The admin is unchanged.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn freeze_and_unfreeze_require_the_owner_or_admin() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let intruder = Address::generate(&env);
+
+    assert_eq!(
+        client.try_freeze(&intruder, &org),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.freeze(&owner, &org);
+    assert_eq!(
+        client.try_unfreeze(&intruder, &org),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Only the owner or the protocol admin may lift the breaker.
+    client.unfreeze(&owner, &org);
+    client.freeze(&admin, &org);
+    client.unfreeze(&admin, &org);
+}
+
+#[test]
+fn frozen_registry_refuses_every_organization_scoped_write() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.freeze(&owner, &org);
+
+    // Every write that would change routing for this org must report the single
+    // dedicated `RegistryFrozen` code — never a generic `Unauthorized`.
+    for res in [
+        client.try_register_module(&owner, &org, &ModuleKind::Policy, &Address::generate(&env)),
+        client.try_remove_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_set_org_owner(&owner, &org, &Address::generate(&env)),
+        client.try_deprecate_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_reactivate_module(&owner, &org, &ModuleKind::Wallet),
+        client.try_register_org(&admin, &String::from_str(&env, "other"), &owner),
+        client.try_grant_role(
+            &owner,
+            &org,
+            &Address::generate(&env),
+            &RegistryRole::PolicyManager,
+        ),
+    ] {
+        assert_eq!(res, Err(Ok(Error::RegistryFrozen)));
+    }
+
+    // Routing is frozen too, so a live module reports the same dedicated code
+    // rather than being served; the legacy getter stays open for recovery.
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::RegistryFrozen))
+    );
+    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
+    client.unfreeze(&owner, &org);
+    client.register_module(&owner, &org, &ModuleKind::Policy, &Address::generate(&env));
+}
+
+#[test]
+fn deprecated_module_reports_module_deprecated_not_not_found() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    // Deprecation is protocol-admin gated; the org owner is refused.
+    assert_eq!(
+        client.try_deprecate_module(&owner, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.deprecate_module(&admin, &org, &ModuleKind::Wallet);
+
+    // The record still exists for the legacy getter, but routing must report the
+    // dedicated deprecation code so callers can distinguish it from a missing
+    // module.
+    assert_eq!(client.get_module_address(&org, &ModuleKind::Wallet), wallet);
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::ModuleDeprecated))
+    );
+    // A module that was never registered is `NotFound`, not deprecated.
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Policy),
+        Err(Ok(Error::NotFound))
+    );
+    // Reactivating restores routing and clears the code.
+    client.reactivate_module(&admin, &org, &ModuleKind::Wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+}
+
+#[test]
+fn unapproved_wasm_cannot_be_removed() {
+    let (env, client, admin) = setup();
+    // Revoking a hash that was never approved is `NotFound`, not a silent no-op.
+    let res = client.try_remove_approved_wasm(&admin, &ModuleKind::Wallet, &hash(&env, 7));
+    assert_eq!(res, Err(Ok(Error::NotFound)));
 }

@@ -21,7 +21,7 @@
 //! existing nor new consumers break.
 
 use crate::types::{AssetAmount, ModuleKind};
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -42,6 +42,14 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// A contract implementation version was registered in the global upgrade
+    /// map, bound to the approved WASM hash it runs.
+    RegistryVersionRegistered {
+        kind: ModuleKind,
+        version: u32,
+        address: Address,
+        wasm_hash: BytesN<32>,
+    },
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
@@ -68,6 +76,24 @@ pub enum ContractEvent {
     TreasuryFrozen { org: String },
     /// A treasury was unfrozen by the multisig.
     TreasuryUnfrozen { org: String },
+    /// Value was deposited into a treasury. `balance` is the treasury's
+    /// recorded balance of `asset` after the deposit.
+    TreasuryDeposited {
+        org: String,
+        from: Address,
+        asset: Address,
+        amount: i128,
+        balance: i128,
+    },
+    /// Value was withdrawn from a treasury. `balance` is the treasury's
+    /// recorded balance of `asset` after the withdrawal.
+    TreasuryWithdrawn {
+        org: String,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        balance: i128,
+    },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -118,6 +144,17 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
+        }
+        ContractEvent::RegistryVersionRegistered {
+            kind,
+            version,
+            address,
+            wasm_hash,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryVersionRegistered"),),
+                (kind, version, address, wasm_hash),
+            );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
@@ -176,6 +213,30 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::TreasuryUnfrozen { org } => {
             env.events()
                 .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
+        }
+        ContractEvent::TreasuryDeposited {
+            org,
+            from,
+            asset,
+            amount,
+            balance,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryDeposited"),),
+                (org, from, asset, amount, balance),
+            );
+        }
+        ContractEvent::TreasuryWithdrawn {
+            org,
+            to,
+            asset,
+            amount,
+            balance,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryWithdrawn"),),
+                (org, to, asset, amount, balance),
+            );
         }
         ContractEvent::EscrowReleased {
             escrow_id,
