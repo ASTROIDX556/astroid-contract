@@ -4080,3 +4080,311 @@ fn evaluate_policy_reports_each_rule_exactly_once() {
         "the dry run must report exactly what the write path reports"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Transfer time windows (operating hours)
+// ---------------------------------------------------------------------------
+
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Register a policy and confine it to the daily operating window
+/// `start → end` (seconds since midnight UTC) repeating every `window_days`
+/// seconds. Returns the client and the policy id.
+fn time_window_setup<'a>(
+    env: &Env,
+    owner: &Address,
+    policy_id: &str,
+    start: u64,
+    end: u64,
+    window_days: u64,
+) -> (PolicyContractClient<'a>, String) {
+    let id = env.register_contract(None, PolicyContract);
+    let p = PolicyContractClient::new(env, &id);
+    p.initialize();
+    let pid = String::from_str(env, policy_id);
+    p.register_policy(
+        owner,
+        &pid,
+        &BytesN::from_array(env, &[7u8; 32]),
+        &1_000_000,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+    p.set_transfer_window(owner, &pid, &start, &end, &window_days);
+    (p, pid)
+}
+
+#[test]
+fn transfer_allowed_inside_operating_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    // 09:00–17:00 UTC, standard day.
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 9 * 3600, 17 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Valid ledger timestamps: 10:00 and 16:59 on day 1.
+    env.ledger().set_timestamp(86_400 + 10 * 3600);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &100).is_ok());
+    env.ledger().set_timestamp(86_400 + 16 * 3600 + 59 * 60);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &100).is_ok());
+}
+
+#[test]
+fn transfer_denied_outside_operating_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 9 * 3600, 17 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Expired-window ledger timestamps: 06:00 and 23:59 on day 1.
+    env.ledger().set_timestamp(6 * 3600);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+    env.ledger().set_timestamp(23 * 3600 + 59 * 60);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn window_boundaries_are_start_inclusive_and_end_exclusive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 9 * 3600, 17 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // Exactly the start instant is inside; exactly the end instant is outside.
+    env.ledger().set_timestamp(9 * 3600);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+    env.ledger().set_timestamp(17 * 3600);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recip, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn window_denial_emits_policy_violation_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 9 * 3600, 17 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    env.ledger().set_timestamp(2 * 3600);
+    let _ = p.try_check_transfer(&pid, &asset, &recip, &1);
+    assert_event(&env, "PolicyViolation");
+}
+
+#[test]
+fn window_wraps_over_midnight() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    // Night window 22:00 → 06:00 crossing the day boundary.
+    let (p, pid) = time_window_setup(&env, &owner, "night", 22 * 3600, 6 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    for now in [23u64 * 3600, 86_400, 86_400 + 5 * 3600] {
+        env.ledger().set_timestamp(now);
+        assert!(
+            p.try_check_transfer(&pid, &asset, &recip, &1).is_ok(),
+            "transfer at {} must be inside the night window",
+            now
+        );
+    }
+    for now in [6u64 * 3600, 12 * 3600, 21 * 3600 + 59 * 60] {
+        env.ledger().set_timestamp(now);
+        assert_eq!(
+            p.try_check_transfer(&pid, &asset, &recip, &1),
+            Err(Ok(Error::PolicyDenied)),
+            "transfer at {} must be outside the night window",
+            now
+        );
+    }
+}
+
+#[test]
+fn zero_length_window_fails_closed_and_blocks_everything() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "shut", 9 * 3600, 9 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    for now in [0u64, 9 * 3600, 86_400 + 9 * 3600 + 1, 172_800] {
+        env.ledger().set_timestamp(now);
+        assert_eq!(
+            p.try_check_transfer(&pid, &asset, &recip, &1),
+            Err(Ok(Error::PolicyDenied)),
+            "zero-length window must deny at {}",
+            now
+        );
+    }
+}
+
+#[test]
+fn policies_without_a_window_keep_the_permissive_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    assert_eq!(p.get_transfer_window(&pid), (0, 0, 0));
+    // Every timestamp is fine when no window is configured.
+    for now in [0u64, 1, 3_600, 86_399, 500_000] {
+        env.ledger().set_timestamp(now);
+        assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+    }
+}
+
+#[test]
+fn clearing_the_window_restores_full_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 9 * 3600, 17 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    env.ledger().set_timestamp(3 * 3600);
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_err());
+
+    // `window_days == 0` clears the restriction.
+    p.set_transfer_window(&owner, &pid, &0, &0, &0);
+    assert_eq!(p.get_transfer_window(&pid), (0, 0, 0));
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1).is_ok());
+}
+
+#[test]
+fn window_rejects_bounds_outside_the_configured_day() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let p = PolicyContractClient::new(&env, &id);
+    p.initialize();
+    let pid = String::from_str(&env, "hours");
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[7u8; 32]),
+        &1_000_000,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+
+    // A bound at or past the day length can never occur inside that day.
+    assert_eq!(
+        p.try_set_transfer_window(&owner, &pid, &(SECONDS_PER_DAY + 1), &100, &SECONDS_PER_DAY),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        p.try_set_transfer_window(&owner, &pid, &100, &SECONDS_PER_DAY, &SECONDS_PER_DAY),
+        Err(Ok(Error::InvalidInput))
+    );
+    // A day longer than one calendar month is rejected as a likely unit mix-up.
+    assert_eq!(
+        p.try_set_transfer_window(&owner, &pid, &100, &200, &(2_592_001)),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn window_config_requires_the_policy_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 9 * 3600, 17 * 3600, SECONDS_PER_DAY);
+    let stranger = Address::generate(&env);
+
+    assert_eq!(
+        p.try_set_transfer_window(&stranger, &pid, &0, &100, &SECONDS_PER_DAY),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The configured window is untouched by the rejected call.
+    assert_eq!(
+        p.get_transfer_window(&pid),
+        (9 * 3600, 17 * 3600, SECONDS_PER_DAY)
+    );
+}
+
+#[test]
+fn unknown_policy_reports_no_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, PolicyContract);
+    let p = PolicyContractClient::new(&env, &id);
+    p.initialize();
+    assert_eq!(
+        p.get_transfer_window(&String::from_str(&env, "ghost")),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn time_window_gates_multi_asset_spends_too() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 9 * 3600, 17 * 3600, SECONDS_PER_DAY);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let amounts = vec![
+        &env,
+        AssetAmount {
+            asset: asset.clone(),
+            amount: 50,
+        },
+    ];
+
+    // Outside the window the whole multi-asset request is denied...
+    env.ledger().set_timestamp(5 * 3600);
+    assert_eq!(
+        p.try_check_multi_asset_transfer(&pid, &recip, &amounts),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // ...and inside it the request evaluates normally.
+    env.ledger().set_timestamp(12 * 3600);
+    assert!(p
+        .try_check_multi_asset_transfer(&pid, &recip, &amounts)
+        .is_ok());
+}
+
+#[test]
+fn time_window_is_persisted_on_the_policy_record() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let (p, pid) = time_window_setup(&env, &owner, "hours", 22 * 3600, 6 * 3600, SECONDS_PER_DAY);
+
+    assert_eq!(
+        p.get_transfer_window(&pid),
+        (22 * 3600, 6 * 3600, SECONDS_PER_DAY)
+    );
+    let policy = p.get(&pid);
+    assert_eq!(policy.window_start_time, 22 * 3600);
+    assert_eq!(policy.window_end_time, 6 * 3600);
+    assert_eq!(policy.window_days, SECONDS_PER_DAY);
+    assert!(policy.enabled);
+}
