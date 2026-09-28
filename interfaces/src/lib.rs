@@ -60,6 +60,14 @@ pub trait RegistryInterface {
     /// Verify that `owner` is the recorded owner of `org`.
     fn verify_owner(env: Env, org: String, owner: Address) -> Result<bool, Error>;
 
+    /// Whether the registry's global emergency circuit breaker is engaged.
+    ///
+    /// While `true`, every state-mutating registry entrypoint fails with
+    /// `Error::RegistryPaused`; read-only lookups stay available for incident
+    /// inspection. Cross-contract upgrades observe the pause too, because
+    /// `is_wasm_approved` reports no hash as approved while paused.
+    fn is_paused(env: Env) -> bool;
+
     /// Resolve several module registrations in one call.
     ///
     /// `result[i]` answers `ids[i]`: the output has the input's length and

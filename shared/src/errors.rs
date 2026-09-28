@@ -37,6 +37,14 @@ pub enum Error {
     PolicyAllowanceExceeded = 26,
 
     // --- Registry (30-39) ---
+    /// The registry's emergency circuit breaker is engaged (REGISTRY_PAUSED).
+    /// Every state-mutating registry interaction — module registration and
+    /// removal, role administration, version records, WASM approvals, and
+    /// registry-gated upgrades — short-circuits with this code until a protocol
+    /// administrator unpauses it. Read-only lookups deliberately stay available
+    /// so operators can inspect protocol state during an incident. Use the
+    /// [`Error::RegistryPaused`] alias when reporting the circuit breaker; the
+    /// legacy name is retained so existing clients keep decoding code 30.
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
 
@@ -103,4 +111,17 @@ pub enum Error {
     /// with this code until the guardian or multisig unpauses it. Inbound
     /// deposits deliberately stay open so recovery funding can still arrive.
     TreasuryPaused = 85,
+}
+
+impl Error {
+    /// The registry's designated emergency-circuit-breaker code.
+    ///
+    /// This is an alias for [`Error::RegistryFrozen`], not a distinct variant:
+    /// the protocol's error table already sits at Stellar's hard limit of 50
+    /// `ScSpecUdtUnionCaseV0` entries, so the registry's single halt code (30)
+    /// serves both the organization freeze and the new admin pause. Exposing it
+    /// under the pause name lets contracts and clients speak in the circuit
+    /// breaker's terms while off-chain decoders keep seeing the stable code 30.
+    #[allow(non_upper_case_globals)]
+    pub const RegistryPaused: Error = Error::RegistryFrozen;
 }

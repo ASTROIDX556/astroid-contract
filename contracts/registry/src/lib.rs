@@ -74,6 +74,10 @@ enum DataKey {
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+    /// Global emergency circuit breaker (instance). Deliberately distinct from
+    /// [`DataKey::Frozen`]: it is admin-only, pauses every state-mutating
+    /// entrypoint at once, and reports [`Error::RegistryPaused`].
+    Paused,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
 }
@@ -131,6 +135,9 @@ impl RegistryContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        // The circuit breaker starts released; storing it explicitly keeps the
+        // initial state readable and bumps the instance TTL alongside `Admin`.
+        env.storage().instance().set(&DataKey::Paused, &false);
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
@@ -147,6 +154,7 @@ impl RegistryContract {
         owner: Address,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         require_non_empty(&org)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::Org(org.clone());
@@ -170,6 +178,7 @@ impl RegistryContract {
         org: String,
         new_owner: Address,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         let key = DataKey::Org(org.clone());
@@ -207,6 +216,7 @@ impl RegistryContract {
         kind: ModuleKind,
         address: Address,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
@@ -249,6 +259,7 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         let mkey = DataKey::Module(org.clone(), kind);
@@ -272,6 +283,7 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         let mkey = DataKey::Module(org.clone(), kind);
@@ -314,6 +326,7 @@ impl RegistryContract {
         org: String,
         kind: ModuleKind,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
@@ -354,6 +367,7 @@ impl RegistryContract {
         account: Address,
         role: RegistryRole,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::check_frozen(&env)?;
         caller.require_auth();
         let owner = Self::require_root_owner(&env, &caller, &org)?;
@@ -426,6 +440,7 @@ impl RegistryContract {
         version: u32,
         address: Address,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
         let vkey = DataKey::Version(kind, version);
@@ -496,6 +511,7 @@ impl RegistryContract {
 
     /// Rotate the admin. Only the current admin may do this.
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage()
@@ -559,6 +575,63 @@ impl RegistryContract {
         Ok(())
     }
 
+    /// Engage the registry's global emergency circuit breaker. Admin-gated.
+    ///
+    /// While engaged, every state-mutating registry entrypoint short-circuits
+    /// with [`Error::RegistryPaused`]: organization and module registration,
+    /// module deprecation, role grants, version records, WASM approvals and
+    /// registry-gated upgrades. Read-only lookups stay available so operators
+    /// can inspect protocol state during an incident, and reverting a delegated
+    /// role stays available so an owner can always withdraw access. This is
+    /// deliberately distinct from [`Self::freeze`]: `freeze` is org-scoped and
+    /// may be driven by an organization owner, whereas the circuit breaker is a
+    /// protocol-wide, admin-only control.
+    ///
+    /// Pausing an already-paused registry fails with [`Error::InvalidState`]
+    /// rather than silently doing nothing, so an operator always knows the
+    /// breaker's state.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryPaused { paused: true },
+        );
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("paused")), ());
+        Ok(())
+    }
+
+    /// Release the registry's emergency circuit breaker and restore normal
+    /// operation. Admin-gated, and symmetric with [`Self::pause`]: unpausing a
+    /// registry that is not paused fails with [`Error::InvalidState`].
+    ///
+    /// This entrypoint bypasses the pause check by design — it is the recovery
+    /// path an operator must always be able to reach.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryPaused { paused: false },
+        );
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("unpaused")), ());
+        Ok(())
+    }
+
     /// Record an approved WASM hash for a specific module kind.
     pub fn add_approved_wasm(
         env: Env,
@@ -566,6 +639,7 @@ impl RegistryContract {
         kind: ModuleKind,
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         env.storage().persistent().set(&key, &true);
@@ -584,6 +658,7 @@ impl RegistryContract {
         kind: ModuleKind,
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         if !env.storage().persistent().has(&key) {
@@ -598,12 +673,38 @@ impl RegistryContract {
     }
 
     /// Read-only check to see if a WASM hash is approved for a given kind.
+    ///
+    /// Reporting `false` while the circuit breaker is engaged is what freezes
+    /// module upgrades protocol-wide: every member contract routes its upgrade
+    /// authorization through this method (see `astroid_interfaces::upgrade`),
+    /// and its cross-contract check fails closed on a `false` answer. The
+    /// stored approval itself is untouched, so releasing the pause restores
+    /// exactly the approvals that were in force before it.
     pub fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool {
+        if Self::paused(&env) {
+            return false;
+        }
         let key = DataKey::ApprovedWasm(kind, wasm_hash);
         env.storage().persistent().get(&key).unwrap_or(false)
     }
 
     // --- internal helpers ---
+
+    /// Read the global emergency circuit breaker flag (instance storage).
+    fn paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Short-circuit a state-mutating operation while the emergency circuit
+    /// breaker is engaged, with the dedicated [`Error::RegistryPaused`] code.
+    /// The flag is read from storage on every call rather than cached.
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        ensure!(!Self::paused(env), Error::RegistryPaused);
+        Ok(())
+    }
 
     fn check_frozen(env: &Env) -> Result<(), Error> {
         ensure!(
@@ -746,6 +847,15 @@ impl RegistryInterface for RegistryContract {
         Ok(recorded == owner)
     }
 
+    /// Whether the registry's global emergency circuit breaker is engaged.
+    ///
+    /// Exposed through [`RegistryInterface`] so a cross-contract consumer can
+    /// observe the pause through the generated `RegistryClient`. While `true`, a
+    /// mutation through this contract fails with [`Error::RegistryPaused`].
+    fn is_paused(env: Env) -> bool {
+        Self::paused(&env)
+    }
+
     /// Batch counterpart of [`Self::lookup`]: resolve up to
     /// [`MAX_REGISTRY_BATCH`] module registrations in a single invocation.
     ///
@@ -786,6 +896,7 @@ impl UpgradeableInterface for RegistryContract {
         admin: Address,
         registry: Address,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
     }
 
@@ -802,6 +913,9 @@ impl UpgradeableInterface for RegistryContract {
     /// `wasm_hash` must be approved for `ModuleKind::Organization` in the registry.
     /// Any other outcome leaves the contract running its current code.
     fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        // The circuit breaker freezes the registry's own upgrade too, not just
+        // the approvals it hands out to other member contracts.
+        Self::require_not_paused(&env)?;
         astroid_interfaces::upgrade::perform(
             &env,
             &caller,
