@@ -18,10 +18,11 @@
 pub mod errors;
 pub mod upgrade;
 
-use crate::errors::Error;
-use astroid_shared::types::ModuleKind;
-use soroban_sdk::{contractclient, Address, Env, String};
-use astroid_shared::errors::Error;
+// The canonical error type is re-exported at the crate root so client SDKs and
+// member contracts can import it directly:
+// `use astroid_interfaces::Error;`.
+pub use crate::errors::Error;
+
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use soroban_sdk::{contractclient, Address, Env, String, Vec};
 

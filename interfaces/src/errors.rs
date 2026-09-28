@@ -9,92 +9,112 @@ pub use astroid_shared::errors::Error;
 
 #[cfg(test)]
 mod test {
+    extern crate alloc;
+
     use super::*;
-    use soroban_sdk::{testutils::Ledger, Env};
+    use alloc::{format, string::String};
+    use soroban_sdk::xdr::{Limits, ReadXdr, ScErrorType, ScSpecEntry, ScSpecUdtErrorEnumV0};
+    use soroban_sdk::{testutils::Ledger, Env, InvokeError};
+
+    /// Every variant of the consolidated error enum, grouped by domain.
+    /// All per-variant tests iterate this table. When introducing a new
+    /// variant, add it here with its assigned code — the stability, uniqueness
+    /// and serialization tests will then cover it automatically.
+    const ALL_VARIANTS: &[(Error, u32)] = &[
+        // Generic / lifecycle (1-6)
+        (Error::NotFound, 1),
+        (Error::AlreadyExists, 2),
+        (Error::Unauthorized, 3),
+        (Error::InvalidInput, 4),
+        (Error::NotInitialized, 5),
+        (Error::AlreadyInitialized, 6),
+        // Value / arithmetic (10-12)
+        (Error::InsufficientFunds, 10),
+        (Error::Overflow, 11),
+        (Error::InvalidAmount, 12),
+        // Policy (20-27; 25 retired, never reused)
+        (Error::PolicyDenied, 20),
+        (Error::EmergencyLock, 21),
+        (Error::PolicyRecipientRestricted, 22),
+        (Error::PolicyMerchantBlocked, 23),
+        (Error::PolicyCategoryRestricted, 24),
+        (Error::PolicyAllowanceExceeded, 26),
+        // Registry (30-39)
+        (Error::RegistryFrozen, 30),
+        (Error::ModuleDeprecated, 31),
+        // Budget (40-44)
+        (Error::BudgetExceeded, 40),
+        (Error::BudgetFrozen, 41),
+        (Error::BudgetArchived, 42),
+        (Error::AssetNotAuthorized, 43),
+        (Error::BudgetExpired, 44),
+        // Wallet (50-53)
+        (Error::WalletFrozen, 50),
+        (Error::WalletArchived, 51),
+        (Error::WalletPaused, 52),
+        (Error::InvalidState, 53),
+        // Multisig / approvals (61-69, 90-92)
+        (Error::ThresholdNotMet, 61),
+        (Error::AlreadySigned, 62),
+        (Error::NotASigner, 63),
+        (Error::InvalidThreshold, 64),
+        (Error::TooManySigners, 66),
+        (Error::BatchCallFailed, 67),
+        (Error::InvalidNonce, 68),
+        (Error::InvalidSignerWeight, 69),
+        (Error::InsufficientWeight, 90),
+        (Error::TimelockNotExpired, 91),
+        (Error::UnauthorizedModification, 92),
+        // Proposal (71-79)
+        (Error::ProposalExpired, 71),
+        (Error::InvalidProposalState, 72),
+        (Error::ProposalNotApproved, 73),
+        (Error::NotAnApprover, 74),
+        (Error::CancellationWindowClosed, 75),
+        (Error::PrerequisiteNotMet, 78),
+        (Error::CircularDependencyDetected, 79),
+        // Escrow (80-82)
+        (Error::EscrowExpired, 80),
+        (Error::TimeLockActive, 81),
+        (Error::GraceActive, 82),
+        // Treasury (83-85)
+        (Error::AllowanceExceeded, 83),
+        (Error::AllowanceExpired, 84),
+        (Error::TreasuryPaused, 85),
+    ];
 
     /// Verify that every Error variant has a stable, explicit u32 discriminant.
     /// These values are part of the public ABI and must never change.
     #[test]
     fn error_discriminants_are_stable() {
-        // Generic / lifecycle (1-6)
-        assert_eq!(Error::NotFound as u32, 1);
-        assert_eq!(Error::AlreadyExists as u32, 2);
-        assert_eq!(Error::Unauthorized as u32, 3);
-        assert_eq!(Error::InvalidInput as u32, 4);
-        assert_eq!(Error::NotInitialized as u32, 5);
-        assert_eq!(Error::AlreadyInitialized as u32, 6);
-
-        // Value / arithmetic (10-12)
-        assert_eq!(Error::InsufficientFunds as u32, 10);
-        assert_eq!(Error::Overflow as u32, 11);
-        assert_eq!(Error::InvalidAmount as u32, 12);
-
-        // Policy (20-27)
-        assert_eq!(Error::PolicyDenied as u32, 20);
-        assert_eq!(Error::EmergencyLock as u32, 21);
-        assert_eq!(Error::PolicyRecipientRestricted as u32, 22);
-        assert_eq!(Error::PolicyMerchantBlocked as u32, 23);
-        assert_eq!(Error::PolicyCategoryRestricted as u32, 24);
-        assert_eq!(Error::AssetNotWhitelisted as u32, 25);
-        assert_eq!(Error::PolicyAllowanceExceeded as u32, 26);
-
-        // Registry (30-39)
-        assert_eq!(Error::RegistryFrozen as u32, 30);
-        assert_eq!(Error::ModuleDeprecated as u32, 31);
-
-        // Budget (40-44)
-        assert_eq!(Error::BudgetExceeded as u32, 40);
-        assert_eq!(Error::BudgetFrozen as u32, 41);
-        assert_eq!(Error::BudgetArchived as u32, 42);
-        assert_eq!(Error::AssetNotAuthorized as u32, 43);
-        assert_eq!(Error::BudgetExpired as u32, 44);
-
-        // Wallet (50-53)
-        assert_eq!(Error::WalletFrozen as u32, 50);
-        assert_eq!(Error::WalletArchived as u32, 51);
-        assert_eq!(Error::WalletPaused as u32, 52);
-        assert_eq!(Error::InvalidState as u32, 53);
-
-        // Multisig / approvals (61-69, 90-92)
-        assert_eq!(Error::ThresholdNotMet as u32, 61);
-        assert_eq!(Error::AlreadySigned as u32, 62);
-        assert_eq!(Error::NotASigner as u32, 63);
-        assert_eq!(Error::InvalidThreshold as u32, 64);
-        assert_eq!(Error::TooManySigners as u32, 66);
-        assert_eq!(Error::BatchCallFailed as u32, 67);
-        assert_eq!(Error::InvalidNonce as u32, 68);
-        assert_eq!(Error::InvalidSignerWeight as u32, 69);
-        assert_eq!(Error::InsufficientWeight as u32, 90);
-        assert_eq!(Error::TimelockNotExpired as u32, 91);
-        assert_eq!(Error::UnauthorizedModification as u32, 92);
-
-        // Proposal (71-79)
-        assert_eq!(Error::ProposalExpired as u32, 71);
-        assert_eq!(Error::InvalidProposalState as u32, 72);
-        assert_eq!(Error::ProposalNotApproved as u32, 73);
-        assert_eq!(Error::NotAnApprover as u32, 74);
-        assert_eq!(Error::CancellationWindowClosed as u32, 75);
-        assert_eq!(Error::PrerequisiteNotMet as u32, 78);
-        assert_eq!(Error::CircularDependencyDetected as u32, 79);
-
-        // Escrow (80-82)
-        assert_eq!(Error::EscrowExpired as u32, 80);
-        assert_eq!(Error::TimeLockActive as u32, 81);
-        assert_eq!(Error::GraceActive as u32, 82);
-
-        // Treasury allowances (83-84)
-        assert_eq!(Error::AllowanceExceeded as u32, 83);
-        assert_eq!(Error::AllowanceExpired as u32, 84);
+        for (variant, code) in ALL_VARIANTS {
+            assert_eq!(
+                *variant as u32, *code,
+                "discriminant of {variant:?} changed"
+            );
+        }
     }
 
-    /// Verify that Error implements the required traits for Soroban SDK compatibility.
+    /// Verify no duplicate discriminants exist (critical for ABI stability).
+    #[test]
+    fn error_discriminants_are_unique() {
+        for (i, (_, code_a)) in ALL_VARIANTS.iter().enumerate() {
+            for (variant_b, code_b) in ALL_VARIANTS.iter().skip(i + 1) {
+                assert_ne!(
+                    code_a, code_b,
+                    "duplicate discriminant {code_a}: {:?} vs {:?}",
+                    ALL_VARIANTS[i].0, variant_b,
+                );
+            }
+        }
+    }
+
+    /// Verify that Error implements the required traits for Soroban SDK
+    /// compatibility (`#[contracterror]` requires `Copy`).
     #[test]
     fn error_implements_required_traits() {
-        fn assert_copy_clone_debug_eq_partial_eq<
-            T: Copy + Clone + core::fmt::Debug + Eq + PartialEq,
-        >() {
-        }
-        assert_copy_clone_debug_eq_partial_eq::<Error>();
+        fn assert_contracterror_traits<T: Copy + Clone + core::fmt::Debug + Eq + PartialEq>() {}
+        assert_contracterror_traits::<Error>();
     }
 
     /// Verify Error can be used as a contract error return type.
@@ -114,96 +134,147 @@ mod test {
         assert_eq!(result.unwrap_err() as u32, 20);
     }
 
-    /// Verify that Error can be constructed from its discriminant (for off-chain SDKs).
+    /// Verify that Error can be constructed from its discriminant (for
+    /// off-chain SDKs).
     #[test]
     fn error_from_discriminant() {
-        // This tests that the discriminant values match what off-chain SDKs expect
-        // Off-chain consumers can map u32 codes to Error variants
-        let code_to_variant = [
-            (1u32, Error::NotFound),
-            (3u32, Error::Unauthorized),
-            (10u32, Error::InsufficientFunds),
-            (20u32, Error::PolicyDenied),
-            (40u32, Error::BudgetExceeded),
-            (50u32, Error::WalletFrozen),
-            (61u32, Error::ThresholdNotMet),
-            (71u32, Error::ProposalExpired),
-            (80u32, Error::EscrowExpired),
-            (83u32, Error::AllowanceExceeded),
-        ];
-
-        for (code, expected) in code_to_variant {
-            // Verify we can match by discriminant
-            let variant: Error = unsafe { core::mem::transmute(code) };
-            assert_eq!(variant, expected, "discriminant {} mismatch", code);
+        for (variant, code) in ALL_VARIANTS {
+            // SAFETY: Error is a fieldless enum with `#[repr(u32)]`-style
+            // explicit discriminants, so `transmute` from a valid discriminant
+            // round-trips to the matching variant.
+            let round_tripped: Error = unsafe { core::mem::transmute(*code) };
+            assert_eq!(round_tripped, *variant, "discriminant {code} mismatch");
         }
     }
 
-    /// Verify no duplicate discriminants exist (critical for ABI stability).
+    /// Verify the generated interface spec is present and valid: it must
+    /// deserialize as a `ScSpecEntry::UdtErrorEnumV0` whose cases carry the
+    /// exact variant names and codes client SDKs generate bindings from.
     #[test]
-    fn error_discriminants_are_unique() {
-        // Simple O(n^2) check since we have a fixed, small number of variants
-        let variants = [
-            Error::NotFound,
-            Error::AlreadyExists,
-            Error::Unauthorized,
-            Error::InvalidInput,
-            Error::NotInitialized,
-            Error::AlreadyInitialized,
-            Error::InsufficientFunds,
-            Error::Overflow,
-            Error::InvalidAmount,
-            Error::PolicyDenied,
-            Error::EmergencyLock,
-            Error::PolicyRecipientRestricted,
-            Error::PolicyMerchantBlocked,
-            Error::PolicyCategoryRestricted,
-            Error::AssetNotWhitelisted,
-            Error::PolicyAllowanceExceeded,
-            Error::RegistryFrozen,
-            Error::ModuleDeprecated,
-            Error::BudgetExceeded,
-            Error::BudgetFrozen,
-            Error::BudgetArchived,
-            Error::AssetNotAuthorized,
-            Error::BudgetExpired,
-            Error::WalletFrozen,
-            Error::WalletArchived,
-            Error::WalletPaused,
-            Error::InvalidState,
-            Error::ThresholdNotMet,
-            Error::AlreadySigned,
-            Error::NotASigner,
-            Error::InvalidThreshold,
-            Error::TooManySigners,
-            Error::BatchCallFailed,
-            Error::InvalidNonce,
-            Error::InvalidSignerWeight,
-            Error::InsufficientWeight,
-            Error::TimelockNotExpired,
-            Error::UnauthorizedModification,
-            Error::ProposalExpired,
-            Error::InvalidProposalState,
-            Error::ProposalNotApproved,
-            Error::NotAnApprover,
-            Error::CancellationWindowClosed,
-            Error::PrerequisiteNotMet,
-            Error::CircularDependencyDetected,
-            Error::EscrowExpired,
-            Error::TimeLockActive,
-            Error::GraceActive,
-            Error::AllowanceExceeded,
-            Error::AllowanceExpired,
-        ];
+    fn error_spec_xdr_deserializes_with_all_variants() {
+        let spec_bytes = Error::spec_xdr();
+        let entry = ScSpecEntry::from_xdr(spec_bytes, Limits::none())
+            .expect("generated spec XDR must deserialize");
 
-        for i in 0..variants.len() {
-            for j in (i + 1)..variants.len() {
-                assert_ne!(
-                    variants[i] as u32, variants[j] as u32,
-                    "Duplicate discriminant for {:?} and {:?}",
-                    variants[i], variants[j]
-                );
-            }
+        let ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
+            name,
+            doc: _,
+            lib: _,
+            cases,
+        }) = entry
+        else {
+            panic!("spec entry must be a UdtErrorEnumV0");
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&name),
+            "Error",
+            "spec type name must match the enum name"
+        );
+
+        assert_eq!(
+            cases.len(),
+            ALL_VARIANTS.len(),
+            "spec must expose exactly one case per variant"
+        );
+        for (case, (variant, code)) in cases.iter().zip(ALL_VARIANTS.iter()) {
+            assert_eq!(
+                case.value,
+                *code,
+                "spec case {:?} carries wrong code",
+                String::from_utf8_lossy(&case.name)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&case.name),
+                format!("{variant:?}"),
+                "spec case name must match the Rust variant name"
+            );
         }
+    }
+
+    /// Verify every variant converts losslessly into the SDK's host error
+    /// (`Into<soroban_sdk::Error>`, what `panic_with_error!` raises on-chain)
+    /// and preserves its code and Contract error type.
+    #[test]
+    fn error_converts_into_sdk_error_preserving_code() {
+        for (variant, code) in ALL_VARIANTS {
+            let host_error: soroban_sdk::Error = (*variant).into();
+            assert!(
+                host_error.is_type(ScErrorType::Contract),
+                "{variant:?} must map to a Contract-type host error"
+            );
+            assert_eq!(
+                host_error.get_code(),
+                *code,
+                "{variant:?} must preserve its discriminant in the host error"
+            );
+        }
+    }
+
+    /// Verify the inverse conversion: an SDK host error built from a known
+    /// code converts back via `TryFrom` to the exact protocol variant, and
+    /// that codes outside the enum do not fabricate a variant (fail closed).
+    #[test]
+    fn error_try_from_sdk_error_round_trips() {
+        for (variant, code) in ALL_VARIANTS {
+            let host_error = soroban_sdk::Error::from_contract_error(*code);
+            let round_tripped = Error::try_from(host_error)
+                .unwrap_or_else(|_| panic!("code {code} must convert back to {variant:?}"));
+            assert_eq!(round_tripped, *variant);
+
+            // The same conversion via the InvokeError representation.
+            let invoke: InvokeError = (*variant).into();
+            assert_eq!(invoke, InvokeError::Contract(*code));
+            assert_eq!(
+                Error::try_from(invoke).expect("InvokeError::Contract must convert back"),
+                *variant
+            );
+        }
+
+        // A Contract-type code this enum does not define must fail conversion
+        // rather than invent a variant.
+        let unassigned = soroban_sdk::Error::from_contract_error(999);
+        assert!(Error::try_from(unassigned).is_err());
+    }
+
+    /// Verify the ScVal wire representation: on the Soroban host a contract
+    /// error enum is serialized as `ScVal::Error(ScError::Contract(code))`,
+    /// so a variant → host error → ScVal round trip must carry the exact
+    /// discriminant client SDKs decode.
+    #[test]
+    fn error_scval_serialization_round_trips() {
+        use soroban_sdk::xdr::{ScError, ScVal};
+        use soroban_sdk::TryFromVal;
+
+        for (variant, code) in ALL_VARIANTS {
+            let env = Env::default();
+            // The macro generates `TryFromVal<Env, Error> for Val` (what
+            // `panic_with_error!` raises) but no bare `From<Error> for Val`,
+            // so route through the SDK host error.
+            let host: soroban_sdk::Error = (*variant).into();
+            let val: soroban_sdk::Val = host.into();
+            // On-wire representation seen by off-chain decoders.
+            let sc_val =
+                ScVal::try_from_val(&env, &val).expect("contract error must serialize to an ScVal");
+            assert_eq!(
+                sc_val,
+                ScVal::Error(ScError::Contract(*code)),
+                "{variant:?} must serialize as ScVal::Error(Contract({code}))"
+            );
+
+            // And the wire bytes decode back to the exact variant.
+            let round_tripped = Error::try_from_val(&env, &val)
+                .expect("serialized error must convert back to the enum");
+            assert_eq!(round_tripped, *variant);
+        }
+    }
+
+    /// Smoke-test the crate-root re-export path SDK consumers rely on
+    /// (`astroid_interfaces::Error`): it must be one and the same type as the
+    /// canonical shared error, so client code written against the interfaces
+    /// crate interoperates with every member contract's `Result<_, Error>`.
+    #[test]
+    fn crate_root_reexport_is_the_canonical_error() {
+        fn assert_same_type<T>(_: T, _: T) {}
+        assert_same_type(Error::NotFound, astroid_shared::errors::Error::NotFound);
     }
 }
