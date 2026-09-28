@@ -17,6 +17,8 @@ pub mod e2e_agent_spending;
 #[cfg(test)]
 pub mod error_codes;
 #[cfg(test)]
+pub mod escrow_lifecycle;
+#[cfg(test)]
 pub mod gated_fund_flows;
 #[cfg(test)]
 pub mod interface_compliance;
