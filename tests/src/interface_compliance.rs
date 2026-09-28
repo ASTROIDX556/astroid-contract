@@ -15,10 +15,10 @@ use astroid_budget::BudgetContract;
 use astroid_escrow::EscrowContract;
 use astroid_interfaces::upgrade::UpgradeAuthority;
 use astroid_interfaces::{
-    BudgetClient, BudgetInterface, EscrowClient, EscrowInterface, MultisigClient, MultisigInterface,
-    PolicyClient, PolicyInterface, ProposalClient, ProposalInterface, ProposalState, RegistryClient,
-    RegistryInterface, TreasuryClient, TreasuryInterface, UpgradeableClient, UpgradeableInterface,
-    WalletClient, INTERFACE_VERSION,
+    BudgetClient, BudgetInterface, EscrowClient, EscrowInterface, MultisigClient,
+    MultisigInterface, PolicyClient, PolicyInterface, ProposalClient, ProposalInterface,
+    ProposalState, RegistryClient, RegistryInterface, TreasuryClient, TreasuryInterface,
+    UpgradeableClient, UpgradeableInterface, WalletClient, INTERFACE_VERSION,
 };
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::PolicyContract;
