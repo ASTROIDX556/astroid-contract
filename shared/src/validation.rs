@@ -5,24 +5,7 @@
 //! every contract validates inputs identically.
 
 use crate::errors::Error;
-use soroban_sdk::{BytesN, Env, String};
-
-/// Require a syntactically valid Wasm hash.
-///
-/// A Wasm code hash on Stellar is the 32-byte SHA-256 of the deployed Wasm
-/// blob. The [`BytesN<32>`] parameter pins the width — a shorter payload can
-/// never decode into it — so what remains to check here is the degenerate
-/// value: the all-zero hash is refused because no real contract code hashes to
-/// zeros, and accepting it would let a proposal launder a meaningless hash
-/// into the approval table. Reports [`Error::InvalidInput`] — the shared
-/// error table is already at the 50-case spec limit, so no dedicated variant
-/// can be added.
-pub fn require_valid_wasm_hash(env: &Env, hash: &BytesN<32>) -> Result<(), Error> {
-    if hash == &BytesN::from_array(env, &[0u8; 32]) {
-        return Err(Error::InvalidInput);
-    }
-    Ok(())
-}
+use soroban_sdk::{Address, Env, String};
 
 /// Require a strictly positive amount (typical for transfers / deposits).
 pub fn require_positive_amount(amount: i128) -> Result<(), Error> {
@@ -74,5 +57,72 @@ pub fn require_within_amount_bounds(value: i128, min: i128, max: i128) -> Result
     if max != 0 && value > max {
         return Err(Error::PolicyDenied);
     }
+    Ok(())
+}
+
+/// Verify multi-signer quorum approvals against configured signer weights and threshold.
+///
+/// Validates:
+/// - `signers` and `weights` have equal non-zero length (`Error::InvalidInput`).
+/// - `threshold` is strictly positive (`Error::InvalidThreshold`).
+/// - `signers` contains no duplicate addresses (`Error::InvalidInput`).
+/// - `approvals` contains no duplicate signers (`Error::AlreadySigned`).
+/// - Every address in `approvals` is present in `signers` (`Error::NotASigner`).
+/// - Accumulated weight summation does not overflow `u32::MAX` (`Error::Overflow`).
+/// - Total accumulated approval weight meets or exceeds `threshold` (`Error::ThresholdNotMet`).
+pub fn verify_quorum(
+    signers: &[Address],
+    weights: &[u32],
+    approvals: &[Address],
+    threshold: u32,
+) -> Result<(), Error> {
+    if signers.len() != weights.len() || signers.is_empty() {
+        return Err(Error::InvalidInput);
+    }
+    if threshold == 0 {
+        return Err(Error::InvalidThreshold);
+    }
+
+    for i in 0..signers.len() {
+        for j in (i + 1)..signers.len() {
+            if signers[i] == signers[j] {
+                return Err(Error::InvalidInput);
+            }
+        }
+    }
+
+    for i in 0..approvals.len() {
+        for j in (i + 1)..approvals.len() {
+            if approvals[i] == approvals[j] {
+                return Err(Error::AlreadySigned);
+            }
+        }
+    }
+
+    let mut total_weight: u64 = 0;
+
+    for app in approvals.iter() {
+        let mut found = false;
+        for (idx, signer) in signers.iter().enumerate() {
+            if app == signer {
+                found = true;
+                total_weight = total_weight
+                    .checked_add(weights[idx] as u64)
+                    .ok_or(Error::Overflow)?;
+                if total_weight > u32::MAX as u64 {
+                    return Err(Error::Overflow);
+                }
+                break;
+            }
+        }
+        if !found {
+            return Err(Error::NotASigner);
+        }
+    }
+
+    if total_weight < threshold as u64 {
+        return Err(Error::ThresholdNotMet);
+    }
+
     Ok(())
 }

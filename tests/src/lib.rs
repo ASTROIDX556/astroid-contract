@@ -25,6 +25,8 @@ pub mod policy_enforcement;
 #[cfg(test)]
 pub mod policy_test;
 #[cfg(test)]
+pub mod proposal_to_wallet_execution;
+#[cfg(test)]
 pub mod registry_batch;
 #[cfg(test)]
 pub mod registry_upgrade;
