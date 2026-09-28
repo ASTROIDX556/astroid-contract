@@ -11,10 +11,10 @@ use crate::math::{
 };
 use crate::validation::{
     require_non_negative_amount, require_not_expired, require_positive_amount,
-    require_time_reached, require_within_amount_bounds,
+    require_time_reached, require_within_amount_bounds, verify_quorum,
 };
-use soroban_sdk::testutils::Ledger;
-use soroban_sdk::Env;
+use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::{Address, Env};
 
 // ---------------------------------------------------------------------------
 // checked_add
@@ -482,6 +482,98 @@ fn time_validation() {
     assert_eq!(
         require_time_reached(&env, 2_000),
         Err(Error::TimelockNotExpired)
+    );
+}
+
+#[test]
+fn quorum_validation_helper_tests() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+
+    // 1. Exact threshold met
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[2, 3],
+            &[s1.clone(), s2.clone()],
+            5
+        ),
+        Ok(())
+    );
+
+    // 2. Exceeding threshold met
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[2, 4],
+            &[s1.clone(), s2.clone()],
+            5
+        ),
+        Ok(())
+    );
+
+    // 3. Threshold not met
+    assert_eq!(
+        verify_quorum(&[s1.clone(), s2.clone()], &[2, 2], &[s1.clone()], 3),
+        Err(Error::ThresholdNotMet)
+    );
+
+    // 4. Duplicate signers in approval list rejected
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[2, 3],
+            &[s1.clone(), s1.clone()],
+            4
+        ),
+        Err(Error::AlreadySigned)
+    );
+
+    // 5. Duplicate signers in signer set rejected
+    assert_eq!(
+        verify_quorum(&[s1.clone(), s1.clone()], &[2, 3], &[s1.clone()], 2),
+        Err(Error::InvalidInput)
+    );
+
+    // 6. Empty signers or empty approvals with threshold > 0
+    assert_eq!(
+        verify_quorum(&[], &[], &[s1.clone()], 1),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        verify_quorum(&[s1.clone()], &[1], &[], 1),
+        Err(Error::ThresholdNotMet)
+    );
+
+    // 7. Mismatched signers and weights lengths
+    assert_eq!(
+        verify_quorum(&[s1.clone(), s2.clone()], &[2], &[s1.clone()], 1),
+        Err(Error::InvalidInput)
+    );
+
+    // 8. Zero threshold rejected
+    assert_eq!(
+        verify_quorum(&[s1.clone()], &[2], &[s1.clone()], 0),
+        Err(Error::InvalidThreshold)
+    );
+
+    // 9. Non-signer in approval list
+    assert_eq!(
+        verify_quorum(&[s1.clone()], &[2], &[s3.clone()], 1),
+        Err(Error::NotASigner)
+    );
+
+    // 10. Weight overflow prevention
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[u32::MAX, 1],
+            &[s1.clone(), s2.clone()],
+            u32::MAX
+        ),
+        Err(Error::Overflow)
     );
 }
 
