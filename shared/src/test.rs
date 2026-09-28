@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
 //! Unit tests for the shared math, validation and constant helpers.
 
 use crate::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS};
@@ -6,10 +7,11 @@ use crate::errors::{
     BudgetError, Error, MilestoneError, BUDGET_ERROR_CODES, MILESTONE_ERROR_CODES,
 };
 use crate::math::{
-    checked_abs, checked_add, checked_add_u64, checked_balance_add, checked_balance_sub,
-    checked_div, checked_div_u64, checked_mul, checked_mul_u64, checked_neg, checked_rem,
-    checked_sub, checked_sub_u64, validate_sufficient_balance, CheckedOptionExt, SafeAdd,
-    SafeBalance, SafeDiv, SafeMul, SafeSub,
+    calculate_budget_rollover, calculate_rollover_allowance, checked_abs, checked_add,
+    checked_add_u64, checked_balance_add, checked_balance_sub, checked_div, checked_div_u64,
+    checked_mul, checked_mul_u64, checked_neg, checked_rem, checked_sub, checked_sub_u64,
+    compute_budget_rollover, validate_sufficient_balance, CheckedOptionExt, SafeAdd, SafeBalance,
+    SafeDiv, SafeMul, SafeSub,
 };
 use crate::validation::{
     require_non_negative_amount, require_not_expired, require_positive_amount,
@@ -1817,4 +1819,96 @@ fn error_enums_implement_the_traits_the_sdk_requires() {
     assert_contracterror_traits::<Error>();
     assert_contracterror_traits::<BudgetError>();
     assert_contracterror_traits::<MilestoneError>();
+}
+
+// ---------------------------------------------------------------------------
+// calculate_budget_rollover & calculate_rollover_allowance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn budget_rollover_happy_path() {
+    // 50% rollover (5_000 bps) of 1_000 unspent without cap
+    assert_eq!(calculate_budget_rollover(1_000, 5_000, 0), Ok(500));
+    // 25% rollover (2_500 bps) of 1_000 unspent without cap
+    assert_eq!(calculate_budget_rollover(1_000, 2_500, 0), Ok(250));
+    // 100% rollover (10_000 bps) of 1_000 unspent without cap
+    assert_eq!(calculate_budget_rollover(1_000, 10_000, 0), Ok(1_000));
+    // 0 bps => 0 rollover
+    assert_eq!(calculate_budget_rollover(1_000, 0, 0), Ok(0));
+    // 0 unspent => 0 rollover
+    assert_eq!(calculate_budget_rollover(0, 5_000, 1_000), Ok(0));
+    // Alias compute_budget_rollover matches
+    assert_eq!(compute_budget_rollover(1_000, 5_000, 0), Ok(500));
+}
+
+#[test]
+fn budget_rollover_cap_clamping() {
+    // Calculated rollover = 500, cap = 300 => clamped to 300
+    assert_eq!(calculate_budget_rollover(1_000, 5_000, 300), Ok(300));
+    // Calculated rollover = 500, cap = 600 => uncapped at 500
+    assert_eq!(calculate_budget_rollover(1_000, 5_000, 600), Ok(500));
+    // Calculated rollover = 1_000, cap = 400 => clamped to 400
+    assert_eq!(calculate_budget_rollover(1_000, 10_000, 400), Ok(400));
+}
+
+#[test]
+fn budget_rollover_input_validation() {
+    // Negative unspent is rejected
+    assert_eq!(
+        calculate_budget_rollover(-1, 5_000, 1_000),
+        Err(Error::InvalidAmount)
+    );
+    // Negative bps is rejected
+    assert_eq!(
+        calculate_budget_rollover(1_000, -1, 1_000),
+        Err(Error::InvalidAmount)
+    );
+    // Negative cap is rejected
+    assert_eq!(
+        calculate_budget_rollover(1_000, 5_000, -1),
+        Err(Error::InvalidAmount)
+    );
+    // bps > 10_000 is rejected
+    assert_eq!(
+        calculate_budget_rollover(1_000, 10_001, 1_000),
+        Err(Error::InvalidInput)
+    );
+}
+
+#[test]
+fn budget_rollover_large_values_no_overflow() {
+    // i128::MAX with 10_000 bps (100%) does not overflow
+    assert_eq!(
+        calculate_budget_rollover(i128::MAX, 10_000, 0),
+        Ok(i128::MAX)
+    );
+    // i128::MAX with 5_000 bps (50%) does not overflow
+    assert_eq!(
+        calculate_budget_rollover(i128::MAX, 5_000, 0),
+        Ok(i128::MAX / 2)
+    );
+    // i128::MAX clamped by cap
+    assert_eq!(
+        calculate_budget_rollover(i128::MAX, 10_000, 50_000),
+        Ok(50_000)
+    );
+}
+
+#[test]
+fn rollover_allowance_calculation() {
+    // base_limit = 1_000, unspent = 1_000, 50% rollover capped at 300 => 1_000 + 300 = 1_300
+    assert_eq!(
+        calculate_rollover_allowance(1_000, 1_000, 5_000, 300),
+        Ok(1_300)
+    );
+    // Negative base limit is rejected
+    assert_eq!(
+        calculate_rollover_allowance(-1, 1_000, 5_000, 300),
+        Err(Error::InvalidAmount)
+    );
+    // Overflow when adding to i128::MAX
+    assert_eq!(
+        calculate_rollover_allowance(i128::MAX, 1_000, 5_000, 300),
+        Err(Error::Overflow)
+    );
 }
