@@ -18,7 +18,8 @@
 //!
 //! Functions: `initialize`, `register_policy`, `rotate_policy`, `set_allowance`,
 //! `set_recurring_allowance`, `get_allowance`, `check_allowance`,
-//! `update_allowance`, `check_transfer`, `check_multi_asset_transfer`,
+//! `update_allowance`, `set_transfer_window`, `get_transfer_window`,
+//! `check_transfer`, `check_multi_asset_transfer`,
 //! `record_multi_asset_spend`.
 //!
 //! ## Multi-token allowances
@@ -59,6 +60,24 @@
 //! different assets are never compared or summed, since their decimals
 //! differ. Evaluation is all-or-nothing: every asset is validated before any
 //! spend is recorded.
+//!
+//! ## Transfer time windows
+//!
+//! Autonomous agents are only meant to operate during approved hours, so a
+//! policy can be narrowed to a daily operating window in ledger time. The
+//! window is configured by the policy owner with `set_transfer_window` as a
+//! time-of-day `start_time` and `end_time` (both seconds since midnight UTC)
+//! plus the length of the day they repeat over (`window_days`). Both bounds
+//! default to `0`, which leaves the gate off and every policy created before
+//! this feature keeps its behaviour.
+//!
+//! `check_transfer` reads the current time from `env.ledger().timestamp()` —
+//! no caller-supplied time is ever trusted — and denies a transaction with
+//! [`Error::PolicyDenied`] (and an `outside_window` violation event) when the
+//! time of day falls outside `[start_time, end_time)`. The bounds are inclusive
+//! at the start and exclusive at the end, so a midnight-crossing window such as
+//! `22:00 → 06:00` wraps over the day boundary and an `end_time` exactly equal
+//! to `start_time` degenerates to "no time is allowed" rather than "all day".
 //!
 //! ## Asset deny list
 //!
@@ -103,6 +122,7 @@
 //! their behaviour until governance opts in.
 
 use astroid_interfaces::{PolicyInterface, UpgradeableInterface};
+use astroid_shared::constants::SECONDS_PER_MONTH;
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::math::{checked_add, checked_sub};
@@ -371,6 +391,44 @@ pub struct Policy {
     pub enabled: bool,
     /// Strategy for combining multiple policy rules (All by default).
     pub rule_combination_strategy: PolicyCombinationStrategy,
+    /// Time of day (seconds since midnight UTC) the operating window opens.
+    /// `0` together with `window_end_time == 0` disables the gate.
+    pub window_start_time: u64,
+    /// Time of day (seconds since midnight UTC) the operating window closes
+    /// (exclusive). Equal to `window_start_time` when the gate is disabled.
+    pub window_end_time: u64,
+    /// Length of the repeating window day in seconds (86_400 for a standard
+    /// day). `0` means the time window is not enforced.
+    pub window_days: u64,
+}
+
+impl Policy {
+    /// Whether a transfer at ledger time `now` falls inside this policy's
+    /// operating window.
+    ///
+    /// The gate is off when `window_days == 0` (always inside). Otherwise the
+    /// time of day is `now % window_days` and the window is the half-open
+    /// range `[window_start_time, window_end_time)`; a window whose start is
+    /// not before its end wraps over the day boundary, so `22:00 → 06:00`
+    /// admits the night hours. An `end_time` equal to `start_time` admits no
+    /// time at all (fail closed). Callers supply `now` only for testability;
+    /// production code passes `env.ledger().timestamp()`.
+    fn is_within_transfer_window(&self, now: u64) -> bool {
+        if self.window_days == 0 {
+            return true;
+        }
+        let time_of_day = now % self.window_days;
+        if self.window_start_time < self.window_end_time {
+            time_of_day >= self.window_start_time && time_of_day < self.window_end_time
+        } else if self.window_start_time == self.window_end_time {
+            // Degenerate zero-length window: fail closed — no time is allowed,
+            // mirroring the empty-recipient-whitelist behaviour.
+            false
+        } else {
+            // Wrapping window across the day boundary (e.g. `22:00 → 06:00`).
+            time_of_day >= self.window_start_time || time_of_day < self.window_end_time
+        }
+    }
 }
 
 #[contracttype]
@@ -507,6 +565,11 @@ impl PolicyContract {
             enabled: true,
             rule_combination_strategy: rule_combination_strategy
                 .unwrap_or_else(PolicyCombinationStrategy::default_strategy),
+            // New policies start with no operating-window restriction; the
+            // owner narrows them with `set_transfer_window` when required.
+            window_start_time: 0,
+            window_end_time: 0,
+            window_days: 0,
         };
         env.storage()
             .persistent()
@@ -584,6 +647,71 @@ impl PolicyContract {
             (policy_id, strategy as u32),
         );
         Ok(())
+    }
+
+    /// Restrict transfers to a daily operating time window (owner only).
+    ///
+    /// `start_time` and `end_time` are times of day in seconds since midnight
+    /// UTC; the window repeats every `window_days` seconds (86 400 for a
+    /// standard day, shared with [`astroid_shared::constants::SECONDS_PER_DAY`]).
+    /// A transaction whose time of day — read from `env.ledger().timestamp()` —
+    /// falls outside `[start_time, end_time)` is denied by `check_transfer`
+    /// with [`Error::PolicyDenied`]. A window may cross midnight
+    /// (`start_time > end_time` wraps over the day boundary); passing
+    /// `window_days == 0` clears the restriction entirely.
+    ///
+    /// Validation rejects a `window_days` longer than one calendar month and
+    /// bounds that cannot occur in a day of that length, so the modular
+    /// time-of-day arithmetic in [`Self::is_within_transfer_window`] can never
+    /// overflow or divide by zero.
+    pub fn set_transfer_window(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        start_time: u64,
+        end_time: u64,
+        window_days: u64,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        // A non-zero day must be able to contain both bounds, otherwise the
+        // `now % window_days` arithmetic below would compare times that can
+        // never occur. The month cap keeps a mistyped value (e.g. ms instead
+        // of s) from silently disabling the gate.
+        if window_days != 0 && (start_time >= window_days || end_time >= window_days) {
+            return Err(Error::InvalidInput);
+        }
+        if window_days > SECONDS_PER_MONTH {
+            return Err(Error::InvalidInput);
+        }
+        let mut policy = Self::load(&env, &policy_id)?;
+        policy.window_start_time = start_time;
+        policy.window_end_time = end_time;
+        policy.window_days = window_days;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Policy(policy_id.clone()), &policy);
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("timewin")),
+            (policy_id, start_time, end_time, window_days),
+        );
+        Ok(())
+    }
+
+    /// Read the configured operating window for a policy.
+    ///
+    /// Returns `(start_time, end_time, window_days)`; `window_days == 0` means
+    /// no time restriction is enforced (the default for every policy).
+    pub fn get_transfer_window(env: Env, policy_id: String) -> (u64, u64, u64) {
+        match Self::load(&env, &policy_id) {
+            Ok(policy) => (
+                policy.window_start_time,
+                policy.window_end_time,
+                policy.window_days,
+            ),
+            // An unknown policy has no window; the caller's own lookup will
+            // surface the canonical `NotFound` when it matters.
+            Err(_) => (0, 0, 0),
+        }
     }
 
     /// Add an asset to the policy's whitelist (owner only). When the asset
@@ -1777,6 +1905,13 @@ impl PolicyContract {
         // Runs with the other recipient gates and fails closed: an enabled
         // whitelist with no entries denies every destination.
         Self::check_recipient_whitelist(env, policy_id, recipient)?;
+        // --- Operating time window: approved hours only ---
+        // Ledger time is the only trusted clock: `env.ledger().timestamp()` is
+        // consensus-provided, no caller input reaches this comparison.
+        if !policy.is_within_transfer_window(env.ledger().timestamp()) {
+            events_policy_violation(env, policy_id, "outside_window");
+            return Err(Error::PolicyDenied);
+        }
         if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
             events_policy_violation(env, policy_id, "expired");
             return Err(Error::PolicyDenied);
