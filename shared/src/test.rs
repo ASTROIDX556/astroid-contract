@@ -6,10 +6,14 @@ use crate::errors::{
     BudgetError, Error, MilestoneError, BUDGET_ERROR_CODES, MILESTONE_ERROR_CODES,
 };
 use crate::math::{
-    checked_abs, checked_add, checked_add_u64, checked_balance_add, checked_balance_sub,
-    checked_div, checked_div_u64, checked_mul, checked_mul_u64, checked_neg, checked_rem,
-    checked_sub, checked_sub_u64, validate_sufficient_balance, CheckedOptionExt, SafeAdd,
-    SafeBalance, SafeDiv, SafeMul, SafeSub,
+    checked_abs, checked_add, checked_add_u128, checked_add_u64, checked_balance_add,
+    checked_balance_sub, checked_batch_allowance, checked_batch_calculation,
+    checked_batch_calculation_with_multipliers, checked_div, checked_div_u128, checked_div_u64,
+    checked_mul, checked_mul_u128, checked_mul_u64, checked_neg, checked_rem, checked_sub,
+    checked_sub_u128, checked_sub_u64, validate_batch_allowance, validate_sufficient_balance,
+    verify_batch_allowance, verify_batch_allowance_aggregate, verify_batch_allowance_iter,
+    verify_batch_allowance_pairs, verify_batch_allowance_with_multipliers, BatchAmount,
+    CheckedOptionExt, ContractError, SafeAdd, SafeBalance, SafeDiv, SafeMul, SafeSub,
 };
 use crate::validation::{
     require_non_negative_amount, require_not_expired, require_positive_amount,
@@ -436,6 +440,89 @@ fn safe_balance_trait_delegates() {
     assert_eq!(i128::MAX.safe_credit(0), Ok(i128::MAX));
     assert_eq!(i128::MAX.safe_credit(1), Err(Error::Overflow));
     assert_eq!(1i128.safe_credit(-1), Err(Error::InvalidAmount));
+}
+
+// ---------------------------------------------------------------------------
+// Batch allowance verification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_allowance_suite_in_test_module() {
+    // ContractError alias is usable and equal to Error
+    let err: ContractError = Error::AllowanceExceeded;
+    assert_eq!(err, ContractError::AllowanceExceeded);
+
+    // BatchAmount trait constants and methods
+    assert_eq!(<i128 as BatchAmount>::ZERO, 0);
+    assert_eq!(<u128 as BatchAmount>::ZERO, 0);
+    assert!((-1i128).is_negative());
+    assert!(!0i128.is_negative());
+    assert!(!0u128.is_negative());
+
+    // u128 checked arithmetic helpers
+    assert_eq!(checked_add_u128(1, 2), Ok(3));
+    assert_eq!(checked_sub_u128(3, 1), Ok(2));
+    assert_eq!(checked_mul_u128(2, 3), Ok(6));
+    assert_eq!(checked_div_u128(6, 2), Ok(3));
+
+    // Single limit verification
+    let amounts = [50i128, 75, 125];
+    assert_eq!(verify_batch_allowance(&amounts, &[250i128]), Ok(250));
+    assert_eq!(checked_batch_allowance(&amounts, &[250i128]), Ok(250));
+    assert_eq!(checked_batch_calculation(&amounts, &[250i128]), Ok(250));
+    assert_eq!(validate_batch_allowance(&amounts, &[250i128]), Ok(()));
+
+    // Exceeded single limit
+    assert_eq!(
+        verify_batch_allowance(&amounts, &[249i128]),
+        Err(Error::AllowanceExceeded)
+    );
+
+    // Pairwise verification
+    let limits = [50i128, 100, 150];
+    assert_eq!(verify_batch_allowance(&amounts, &limits), Ok(250));
+    assert_eq!(
+        verify_batch_allowance(&[51i128, 75, 125], &limits),
+        Err(Error::AllowanceExceeded)
+    );
+
+    // Multipliers
+    let unit_prices = [10i128, 25];
+    let quantities = [4i128, 2]; // 40 + 50 = 90
+    assert_eq!(
+        verify_batch_allowance_with_multipliers(&unit_prices, &quantities, &[90i128]),
+        Ok(90)
+    );
+    assert_eq!(
+        checked_batch_calculation_with_multipliers(&unit_prices, &quantities, &[90i128]),
+        Ok(90)
+    );
+    assert_eq!(
+        verify_batch_allowance_with_multipliers(&unit_prices, &quantities, &[89i128]),
+        Err(Error::AllowanceExceeded)
+    );
+
+    // Overflow protection
+    assert_eq!(
+        verify_batch_allowance(&[i128::MAX, 1], &[i128::MAX]),
+        Err(Error::Overflow)
+    );
+    assert_eq!(
+        verify_batch_allowance_with_multipliers(&[i128::MAX], &[2], &[i128::MAX]),
+        Err(Error::Overflow)
+    );
+
+    // Iterators
+    let pairs = [(10i128, 20i128), (30, 40)];
+    assert_eq!(verify_batch_allowance_pairs(pairs), Ok(40));
+    assert_eq!(
+        verify_batch_allowance_aggregate([10i128, 20, 30], 60),
+        Ok(60)
+    );
+    assert_eq!(
+        verify_batch_allowance_iter([10i128, 20], [10i128, 20]),
+        Ok(30)
+    );
 }
 
 #[test]
