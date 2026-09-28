@@ -2301,22 +2301,22 @@ fn ai_agent_sliding_window_rate_limiting_and_consumption_tracking() {
     let h = setup();
     let agent_budget_id = id(&h.env, "ai_agent_treasury");
     let limit = 5_000i128;
-    
+
     // Allocate budget for autonomous AI agent with daily sliding window
     allocate(&h, "ai_agent_treasury", limit, Period::Daily, false);
-    
+
     // Agent performs smaller incremental spends within active sliding window
     assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &1_500), 3_500);
     assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &2_000), 1_500);
     assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &1_500), 0);
-    
+
     // Total spent equals limit (5_000). Further spending breaches limit and returns BUDGET_EXCEEDED
     let res = h.client.try_consume(&h.owner, &agent_budget_id, &1);
     assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
-    
+
     // Advance ledger timestamp past the 24-hour sliding window boundary
     h.env.ledger().set_timestamp(1_000 + DAY);
-    
+
     // Sliding window auto-resets consumption totals and restores full allowance
     assert_eq!(h.client.remaining(&agent_budget_id), limit);
     let rem = h.client.consume(&h.owner, &agent_budget_id, &2_500);
@@ -2329,7 +2329,7 @@ fn ai_agent_sliding_window_custom_interval_rate_limiting() {
     let agent_budget_id = id(&h.env, "ai_agent_hourly");
     let limit = 1_000i128;
     let hourly_window = 3_600u64;
-    
+
     // Allocate custom budget and configure 1-hour recurring window
     allocate(&h, "ai_agent_hourly", limit, Period::None, false);
     h.client.set_recurrence(
@@ -2341,23 +2341,22 @@ fn ai_agent_sliding_window_custom_interval_rate_limiting() {
         &0,
         &0,
     );
-    
+
     // Agent spends up to limit inside the 1-hour window
     assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &600), 400);
     assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &400), 0);
-    
+
     // Spend exceeding limit is rejected with deterministic BudgetExceeded error
     let res = h.client.try_consume(&h.owner, &agent_budget_id, &100);
     assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
-    
+
     // 59 minutes later (still within sliding window): spend still rejected
     h.env.ledger().set_timestamp(1_000 + 3_540);
     let res = h.client.try_consume(&h.owner, &agent_budget_id, &100);
     assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
-    
+
     // Exactly on the 1-hour boundary (3,600s): sliding window resets spend counter
     h.env.ledger().set_timestamp(1_000 + hourly_window);
     assert_eq!(h.client.remaining(&agent_budget_id), limit);
     assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &500), 500);
 }
-
