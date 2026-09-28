@@ -16,6 +16,8 @@ on every outflow.
   guardian key cannot strand the treasury forever; indefinite stops must go
   through `freeze`.
 - `set_guardian(guardian)` — rotate the account that may pause / unpause.
+- `set_registry(registry)` — wire the registry used to verify contract
+  callers (Issue #308); `None` clears the gate.
 - `allocate_budget(asset, budget_id)` — attach an envelope to an asset.
 
 ## Invariants
@@ -36,6 +38,31 @@ applying on its own); the stale flag is cleared by the next `pause` cycle and
 `unpause` on a lapsed breaker fails with `InvalidState`.
 
 ## Events
+## Registry-verified callers and reentrancy (Issue #308)
+
+Every value path (`deposit`, `withdraw`, `batch_transfer`,
+`release_next_milestone`) is additionally guarded by two defenses:
+
+1. **Caller verification.** When a registry is wired (`set_registry`),
+   movement calls made *by contract addresses* must resolve to the expected
+   module record for the treasury's organization: deposits verify a contract
+   depositor against the org's `Wallet` record, outbound movements verify
+   their caller against the org's `Multisig` record. Anything else — an
+   unregistered contract, a contract registered under a different kind, a
+   frozen or otherwise unanswerable registry — is refused deterministically
+   with `UnverifiedCaller` (86). Account callers pass through to the ordinary
+   role checks, and clearing the registry restores the pre-registry
+   behaviour.
+2. **Reentrancy lock.** A flag in instance storage is engaged before the
+   first external call of a movement and released when it completes; a
+   re-entered movement finds the lock engaged and fails with `InvalidState`
+   instead of double-spending the ledger. Because the flag lives in instance
+   storage, the host rolls it back if the invocation aborts.
+
+Note that Soroban's test address generator mints contract-format addresses,
+so unit/integration tests that exercise gated flows must register their test
+admin/funder under the expected module kinds (see
+`contracts/treasury/src/test.rs` and `tests/src/gated_fund_flows.rs`).
 
 - `("treasury", "deposited")` on every deposit.
 - `("transfer", "executed")` on successful withdrawals (shared standard).
