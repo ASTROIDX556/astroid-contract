@@ -2,12 +2,6 @@
 extern crate std;
 
 use crate::{
-    DataKey, RegistryContract, RegistryContractClient, RegistryRole, UpgradeAction,
-    UpgradeAuditRecord,
-};
-use astroid_shared::constants::{
-    MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
-};
     BoundHash, DataKey, RegistryContract, RegistryContractClient, RegistryRole, VersionRecord,
 };
 use astroid_shared::constants::{MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT};
@@ -336,10 +330,11 @@ fn registered_version_cannot_be_repointed() {
     client.register_version(&admin, &ModuleKind::Wallet, &1, &original, &h1);
 
     // Even the admin with an approved hash cannot overwrite a published
-    // version, so a consumer pinned to v1 keeps getting v1.
+    // version: the monotonic guard rejects the repeat before the record-exists
+    // check, so a consumer pinned to v1 keeps getting v1.
     assert_eq!(
         client.try_register_version(&admin, &ModuleKind::Wallet, &1, &hijack, &h2),
-        Err(Ok(Error::AlreadyExists))
+        Err(Ok(Error::InvalidState))
     );
     assert_eq!(client.get_version(&ModuleKind::Wallet, &1), original);
     assert_eq!(client.get_version_wasm(&ModuleKind::Wallet, &1), h1);
@@ -368,9 +363,18 @@ fn backfilled_older_version_does_not_move_latest() {
     let h5 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 5);
 
     client.register_version(&admin, &ModuleKind::Wallet, &5, &v5, &h5);
-    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    // The version table is monotonic per kind: backfilling a number below the
+    // current latest is refused outright (Issue #304 downgrade protection),
+    // so latest never moves backwards.
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1),
+        Err(Ok(Error::InvalidState))
+    );
     assert_eq!(client.get_latest(&ModuleKind::Wallet), v5);
-    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), v1);
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
 }
 
 #[test]
@@ -533,24 +537,25 @@ fn register_version_rejects_downgrades_and_repeats() {
     let (env, client, admin) = setup();
     let v1 = Address::generate(&env);
     let v2 = Address::generate(&env);
-    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1);
-    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 7);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h);
 
     // The version table is monotonic per kind: the admin escape hatch may
     // never lower or repeat the latest version, mirroring the propose/commit
     // flow's downgrade protection (Issue #304).
     let addr = Address::generate(&env);
     assert_eq!(
-        client.try_register_version(&admin, &ModuleKind::Wallet, &2, &addr),
+        client.try_register_version(&admin, &ModuleKind::Wallet, &2, &addr, &h),
         Err(Ok(Error::InvalidState))
     );
     assert_eq!(
-        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr),
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h),
         Err(Ok(Error::InvalidState))
     );
     // Strictly newer versions still land.
     let v3 = Address::generate(&env);
-    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3, &h);
     assert_eq!(client.get_latest(&ModuleKind::Wallet), v3);
 }
 

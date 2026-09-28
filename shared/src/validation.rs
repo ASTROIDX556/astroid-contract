@@ -5,7 +5,7 @@
 //! every contract validates inputs identically.
 
 use crate::errors::Error;
-use soroban_sdk::{BytesN, Env, String};
+use soroban_sdk::{Address, BytesN, Env, String};
 
 /// Require a syntactically valid Wasm hash.
 ///
@@ -23,7 +23,6 @@ pub fn require_valid_wasm_hash(env: &Env, hash: &BytesN<32>) -> Result<(), Error
     }
     Ok(())
 }
-use soroban_sdk::{Address, Env, String};
 
 /// Require a strictly positive amount (typical for transfers / deposits).
 pub fn require_positive_amount(amount: i128) -> Result<(), Error> {
