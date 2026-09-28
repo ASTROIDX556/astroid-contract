@@ -433,13 +433,27 @@ impl MultiSigContract {
         count = checked_add(count as i128, 1)? as u64;
         let id = count;
 
+        let now = env.ledger().timestamp();
+        let delay = Self::timelock_delay(&env);
+        let min_unlock = now.saturating_add(delay);
+
+        let effective_unlock_at = if Self::is_quorum_or_weight_action(&action) {
+            if unlock_at < min_unlock {
+                min_unlock
+            } else {
+                unlock_at
+            }
+        } else {
+            unlock_at
+        };
+
         let proposal = MsProposal {
             proposer: proposer.clone(),
             action,
             payload,
             approval_weight: proposer_weight,
             executed: false,
-            unlock_at,
+            unlock_at: effective_unlock_at,
         };
         env.storage()
             .persistent()
@@ -873,6 +887,14 @@ impl MultiSigContract {
             // System-level failure (panic / abort / unknown error code).
             Err(Err(_)) => Err(Error::BatchCallFailed),
         }
+    }
+
+    fn is_quorum_or_weight_action(action: &Symbol) -> bool {
+        action == &symbol_short!("weight")
+            || action == &symbol_short!("threshold")
+            || action == &symbol_short!("signer")
+            || action == &symbol_short!("quorum")
+            || action == &symbol_short!("config")
     }
 
     /// Shared proposal path for every governance change: authorize, validate
