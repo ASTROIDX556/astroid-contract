@@ -58,8 +58,22 @@
 //! stretch from silently accruing a balance far larger than the limit it was
 //! granted, which an agent could then drain in one period.
 //!
+//! ## Multi-token allowance validation (Issue #294)
+//!
+//! Alongside the token-agnostic [`BudgetContract::consume`], every token can
+//! carry its own registered per-asset allowance
+//! ([`BudgetContract::set_budget_limit`]) that recurs on a fixed window.
+//! [`BudgetContract::check_and_record_batch_spend`] validates and records
+//! spends across several tokens **atomically**: every leg is checked against
+//! its registered allowance before anything is persisted, duplicate tokens are
+//! rejected so a cap cannot be breached by splitting one spend into legs, and
+//! unknown tokens fail with [`Error::AssetNotAuthorized`]. Batches are bounded
+//! by [`MAX_BATCH_TOKENS`] to cap worst-case invocation cost.
+//!
 //! Functions: `allocate`, `set_recurrence`, `consume`, `reset`, `rollover`,
-//! `freeze`, `unfreeze`, `archive`, `transfer_allocation`.
+//! `freeze`, `unfreeze`, `archive`, `transfer_allocation`,
+//! `set_budget_limit`, `check_and_record_spend`,
+//! `check_and_record_batch_spend`.
 //!
 //! ## Error codes
 //!
@@ -78,8 +92,8 @@
 
 use astroid_interfaces::{BudgetInterface, UpgradeableInterface};
 use astroid_shared::constants::{
-    BPS_DENOMINATOR, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
+    BPS_DENOMINATOR, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_TOKENS,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
@@ -88,7 +102,7 @@ use astroid_shared::types::ResourceState;
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use astroid_shared::{constants, events};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
 };
 
 /// Reset period for a recurring budget. `None` means one-shot (no auto-reset).
@@ -137,6 +151,16 @@ pub struct Budget {
     /// Unix timestamp after which the budget is expired (0 = never expires).
     pub expires_at: u64,
     pub state: ResourceState,
+}
+
+/// One leg of an atomic multi-token spend: `amount` of `token` against the
+/// per-asset allowance registered for that token (see
+/// [`BudgetContract::set_budget_limit`]).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetSpend {
+    pub token: Address,
+    pub amount: i128,
 }
 
 /// Per-asset budget tracking. Recurs on its own fixed-length window so a
@@ -534,6 +558,79 @@ impl BudgetContract {
             (symbol_short!("budget"), symbol_short!("ast_spend")),
             (budget_id, token, amount),
         );
+        Ok(())
+    }
+
+    /// Validate and record spends across multiple tokens atomically
+    /// (Issue #294).
+    ///
+    /// Every `(token, amount)` leg is validated against its registered
+    /// per-asset allowance **before** any spend is written: each token must
+    /// have a limit registered via [`Self::set_budget_limit`] (otherwise
+    /// [`Error::AssetNotAuthorized`]), amounts must be positive, duplicate
+    /// tokens are rejected with [`Error::InvalidInput`] so a spend cannot be
+    /// split into legs that individually fit but jointly breach the cap, and
+    /// each leg's new spent total must stay within the token's current-window
+    /// limit ([`Error::BudgetExceeded`] otherwise). Only when every leg passes
+    /// are all new spent totals persisted — a single breach rejects the whole
+    /// batch and leaves every ledger untouched. Time-based window resets are
+    /// settled along the way exactly as [`Self::check_and_record_spend`] does.
+    pub fn check_and_record_batch_spend(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        spends: Vec<AssetSpend>,
+    ) -> Result<(), Error> {
+        if spends.is_empty() || spends.len() > MAX_BATCH_TOKENS {
+            return Err(Error::InvalidInput);
+        }
+        let budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+        Self::require_not_expired(&env, &budget)?;
+
+        // First pass: settle each token's window and simulate its leg without
+        // persisting any spend, so a late failure cannot leave a partial
+        // batch behind.
+        let mut settled: Vec<AssetBudget> = Vec::new(&env);
+        for i in 0..spends.len() {
+            let spend = spends.get(i).unwrap();
+            require_positive_amount(spend.amount)?;
+            // A duplicate token would validate each leg against a stale
+            // spent counter, letting the legs jointly exceed the cap.
+            for j in 0..i {
+                if spends.get(j).unwrap().token == spend.token {
+                    return Err(Error::InvalidInput);
+                }
+            }
+            let key = DataKey::AssetBudget(budget_id.clone(), spend.token.clone());
+            let mut asset_budget: AssetBudget = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(Error::AssetNotAuthorized)?;
+            Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &spend.token, true);
+
+            let new_spent = checked_add(asset_budget.spent, spend.amount)?;
+            if new_spent > asset_budget.limit {
+                return Err(Error::BudgetExceeded);
+            }
+            asset_budget.spent = new_spent;
+            settled.push_back(asset_budget);
+        }
+
+        // Second pass: every leg validated — record the batch atomically.
+        for i in 0..spends.len() {
+            let spend = spends.get(i).unwrap();
+            env.storage().persistent().set(
+                &DataKey::AssetBudget(budget_id.clone(), spend.token.clone()),
+                &settled.get(i).unwrap(),
+            );
+            Self::bump_asset(&env, &budget_id, &spend.token);
+            env.events().publish(
+                (symbol_short!("budget"), symbol_short!("ast_spend")),
+                (budget_id.clone(), spend.token.clone(), spend.amount),
+            );
+        }
         Ok(())
     }
     // --- views ---

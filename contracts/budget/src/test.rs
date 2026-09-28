@@ -1,12 +1,13 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{Budget, BudgetContract, BudgetContractClient, Period};
+use crate::{AssetSpend, Budget, BudgetContract, BudgetContractClient, Period};
+use astroid_shared::constants::MAX_BATCH_TOKENS;
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Events;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, IntoVal, String, Symbol, Val};
+use soroban_sdk::{vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
 
 struct Harness {
     env: Env,
@@ -1656,4 +1657,252 @@ fn release_reports_the_same_remaining_as_the_view() {
     assert_eq!(after_release, h.client.remaining(&id(&h.env, "agent")));
     // limit 1_000 - deficit 500 - spent 100
     assert_eq!(after_release, 400);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-token allowance validation (issue #294)
+// ---------------------------------------------------------------------------
+
+fn asset_spend(_env: &Env, token: &Address, amount: i128) -> AssetSpend {
+    AssetSpend {
+        token: token.clone(),
+        amount,
+    }
+}
+
+#[test]
+fn batch_spend_records_multiple_tokens_atomically() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::None, false);
+    let usdc = Address::generate(&h.env);
+    let xlm = Address::generate(&h.env);
+    let euro = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &usdc, &500, &0);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &xlm, &1_000, &3_600);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &euro, &200, &0);
+
+    let batch = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 100),
+        asset_spend(&h.env, &xlm, 300),
+        asset_spend(&h.env, &euro, 50),
+    ];
+    h.client
+        .check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
+
+    // Each token tracks its own spent counter inside its own window.
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 400);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &xlm), 700);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &euro), 150);
+    // The token-agnostic budget is untouched by per-asset spends.
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 0);
+}
+
+#[test]
+fn batch_spend_rejects_the_whole_batch_when_one_leg_exceeds() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::None, false);
+    let usdc = Address::generate(&h.env);
+    let xlm = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &usdc, &500, &0);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &xlm, &500, &0);
+
+    // The second leg breaches; the first leg must not be recorded either.
+    let batch = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 100),
+        asset_spend(&h.env, &xlm, 600),
+    ];
+    let res = h
+        .client
+        .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
+    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &xlm), 500);
+
+    // All-within-limits legs go through and emit one event per token.
+    let ok = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 100),
+        asset_spend(&h.env, &xlm, 500),
+    ];
+    h.client
+        .check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &ok);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 400);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &xlm), 0);
+}
+
+#[test]
+fn batch_spend_rejects_unknown_and_duplicate_tokens() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::None, false);
+    let usdc = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &usdc, &500, &0);
+
+    // An unregistered token is refused before any state is touched.
+    let with_stranger = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 100),
+        asset_spend(&h.env, &stranger, 10),
+    ];
+    let res =
+        h.client
+            .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &with_stranger);
+    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
+
+    // The same token twice would validate each leg against a stale counter,
+    // letting 300 + 300 slip past a 500 cap — rejected outright.
+    let duplicated = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 300),
+        asset_spend(&h.env, &usdc, 300),
+    ];
+    let res = h
+        .client
+        .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &duplicated);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
+}
+
+#[test]
+fn batch_spend_rejects_empty_oversized_and_nonpositive_legs() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::None, false);
+    let usdc = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &usdc, &500, &0);
+
+    // Empty batch.
+    let empty: Vec<AssetSpend> = Vec::new(&h.env);
+    let res = h
+        .client
+        .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &empty);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+
+    // Batches beyond MAX_BATCH_TOKENS are capped for cost predictability.
+    let mut oversized: Vec<AssetSpend> = Vec::new(&h.env);
+    for _ in 0..=MAX_BATCH_TOKENS {
+        oversized.push_back(asset_spend(&h.env, &usdc, 1));
+    }
+    let res = h
+        .client
+        .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &oversized);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+
+    // Zero and negative amounts are refused before anything is validated.
+    for bad in [0i128, -5] {
+        let batch = vec![&h.env, asset_spend(&h.env, &usdc, bad)];
+        let res = h
+            .client
+            .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
+        assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+    }
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
+}
+
+#[test]
+fn batch_spend_enforces_aggregate_window_consumption() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::None, false);
+    let usdc = Address::generate(&h.env);
+    let xlm = Address::generate(&h.env);
+    // Both tokens share a one-hour window.
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &usdc, &300, &3_600);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &xlm, &300, &3_600);
+
+    let first = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 250),
+        asset_spend(&h.env, &xlm, 250),
+    ];
+    h.client
+        .check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &first);
+
+    // Same window: only 50 more per token fits, individually or in a batch.
+    let second = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 50),
+        asset_spend(&h.env, &xlm, 50),
+    ];
+    h.client
+        .check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &second);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 0);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &xlm), 0);
+
+    let over = vec![
+        &h.env,
+        asset_spend(&h.env, &usdc, 1),
+        asset_spend(&h.env, &xlm, 1),
+    ];
+    let res = h
+        .client
+        .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &over);
+    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+
+    // A fresh window replenishes every registered token at once.
+    h.env.ledger().set_timestamp(1_000 + 3_600);
+    h.client
+        .check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &first);
+}
+
+#[test]
+fn batch_spend_still_settles_windows_and_rejects_frozen_or_expired() {
+    let h = setup();
+    allocate(&h, "eng", 10_000, Period::Weekly, false);
+    let usdc = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &usdc, &500, &3_600);
+
+    // A due per-asset window reset is settled as part of validation.
+    h.env.ledger().set_timestamp(1_000 + 3_600);
+    let batch = vec![&h.env, asset_spend(&h.env, &usdc, 500)];
+    h.client
+        .check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 0);
+
+    // A frozen budget refuses the batch with the same code as a single spend.
+    h.client.freeze(&h.owner, &id(&h.env, "eng"));
+    let res = h
+        .client
+        .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
+    assert_eq!(res, Err(Ok(Error::BudgetFrozen)));
+    h.client.unfreeze(&h.owner, &id(&h.env, "eng"));
+
+    // An expired budget refuses the batch too.
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "tmp"),
+        &100,
+        &Period::None,
+        &false,
+        &(1_000 + DAY),
+    );
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "tmp"), &usdc, &100, &0);
+    h.env.ledger().set_timestamp(1_000 + DAY + 1);
+    let res = h.client.try_check_and_record_batch_spend(
+        &h.owner,
+        &id(&h.env, "tmp"),
+        &vec![&h.env, asset_spend(&h.env, &usdc, 1)],
+    );
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+
+    // Only the owner can drive the batch.
+    let intruder = Address::generate(&h.env);
+    let res = h.client.try_check_and_record_batch_spend(
+        &intruder,
+        &id(&h.env, "eng"),
+        &vec![&h.env, asset_spend(&h.env, &usdc, 1)],
+    );
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
