@@ -3917,7 +3917,10 @@ fn evaluate_policy_names_the_unapproved_destination_rule() {
         &String::from_str(&env, "vendor_list"),
         &transfer_payload(&asset, &stranger, 10),
     );
-    assert_eq!(denied.reason(), Some(PolicyDenialReason::RecipientNotAllowed));
+    assert_eq!(
+        denied.reason(),
+        Some(PolicyDenialReason::RecipientNotAllowed)
+    );
     assert_eq!(denied.reason().unwrap().as_str(), "bad_recipient");
 }
 
@@ -3935,10 +3938,7 @@ fn evaluate_policy_names_the_recipient_whitelist_rule() {
     p.add_recipient_to_whitelist(&owner, &policy_id, &approved);
     p.set_recipient_whitelist_enabled(&owner, &policy_id, &true);
 
-    let ok = p.evaluate_policy(
-        &policy_id,
-        &transfer_payload(&asset, &approved, 10),
-    );
+    let ok = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &approved, 10));
     assert!(ok.allowed());
 
     let denied = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &untrusted, 10));
@@ -4027,7 +4027,10 @@ fn evaluate_policy_agrees_with_check_transfer_on_every_refusal() {
     // The dry run reports the reason, and mapping it back onto an error must
     // reproduce exactly what the enforcement path returns.
     let decision = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &recipient, 1_000_001));
-    let mapped = decision.reason().expect("the ceiling must refuse this").to_error();
+    let mapped = decision
+        .reason()
+        .expect("the ceiling must refuse this")
+        .to_error();
     assert_eq!(
         p.try_check_transfer(&policy_id, &asset, &recipient, &1_000_001),
         Err(Ok(mapped))
@@ -4037,7 +4040,10 @@ fn evaluate_policy_agrees_with_check_transfer_on_every_refusal() {
     let blocked = Address::generate(&env);
     p.add_to_blocklist(&owner, &policy_id, &blocked);
     let decision = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &blocked, 10));
-    let mapped = decision.reason().expect("the blocklist must refuse this").to_error();
+    let mapped = decision
+        .reason()
+        .expect("the blocklist must refuse this")
+        .to_error();
     assert_eq!(mapped, Error::PolicyRecipientRestricted);
     assert_eq!(
         p.try_check_transfer(&policy_id, &asset, &blocked, &10),
@@ -4074,4 +4080,3 @@ fn evaluate_policy_reports_each_rule_exactly_once() {
         "the dry run must report exactly what the write path reports"
     );
 }
-

@@ -2113,13 +2113,9 @@ impl PolicyContract {
         let policy = Self::load(env, policy_id)?;
         let max_transaction_amount = policy.max_amount;
         let mut context = RuleEvaluationContext::default();
-        if let Some(reason) = Self::screen_recipient_rules(
-            env,
-            policy_id,
-            &policy,
-            &payload.recipient,
-            &mut context,
-        )? {
+        if let Some(reason) =
+            Self::screen_recipient_rules(env, policy_id, &policy, &payload.recipient, &mut context)?
+        {
             return Ok(PolicyDecision::deny(reason, max_transaction_amount));
         }
         let (_, denial) = Self::screen_asset_rules(
