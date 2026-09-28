@@ -159,7 +159,7 @@ pub use storage::{
     ReleaseSchedule, ReleaseType,
 };
 
-use astroid_interfaces::UpgradeableInterface;
+use astroid_interfaces::{EscrowInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_ESCROW_ASSETS, MAX_SIGNERS,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
@@ -1928,63 +1928,9 @@ impl EscrowContract {
         load_escrow(&env, id)
     }
 
-    /// Timestamp at which the escrow's refund window closes, or `0` when the
-    /// window has no upper bound. Lets clients show a countdown without
-    /// recomputing the window rule off-chain.
-    pub fn refund_window_closes_at(env: Env, id: u64) -> Result<u64, Error> {
-        Ok(Self::closes_at(&load_escrow(&env, id)?))
-    }
-
-    /// Whether the funds may be reclaimed for `id` at the current ledger time —
-    /// the escrow still holds them, the grace period has elapsed, and the refund
-    /// window has not closed.
-    pub fn is_refundable(env: Env, id: u64) -> Result<bool, Error> {
-        let escrow = load_escrow(&env, id)?;
-        if !matches!(
-            escrow.state,
-            EscrowState::Created | EscrowState::Funded | EscrowState::Expired
-        ) {
-            return Ok(false);
-        }
-        let now = env.ledger().timestamp();
-        if now < Self::grace_end(&escrow)? {
-            return Ok(false);
-        }
-        Ok(Self::require_refund_window_open(&env, &escrow).is_ok())
-    }
-
-    pub fn get_claimable_amount(env: Env, id: u64) -> Result<i128, Error> {
-        let escrow = load_escrow(&env, id)?;
-        calculate_claimable_amount(&escrow, env.ledger().timestamp())
-    }
-
-    pub fn get_vested_amount(env: Env, id: u64) -> Result<i128, Error> {
-        let escrow = load_escrow(&env, id)?;
-        calculate_vested_amount(
-            escrow.funded_amount,
-            &escrow.schedule,
-            env.ledger().timestamp(),
-        )
-    }
-
     pub fn get_schedule(env: Env, id: u64) -> Result<ReleaseSchedule, Error> {
         let escrow = load_escrow(&env, id)?;
         Ok(escrow.schedule)
-    }
-
-    /// Whether the escrow's release schedule has matured at the current ledger
-    /// timestamp: `true` for schedule-less escrows once they exist, `true` for
-    /// a `Cliff` schedule at/after `cliff_time`, and `true` for a `Linear`
-    /// schedule once anything has vested. Clients use this to show an unlock
-    /// countdown without recomputing the schedule off-chain.
-    pub fn is_unlocked(env: Env, id: u64) -> Result<bool, Error> {
-        let escrow = load_escrow(&env, id)?;
-        Ok(matches!(escrow.schedule.release_type, ReleaseType::None)
-            || calculate_vested_amount(
-                escrow.funded_amount,
-                &escrow.schedule,
-                env.ledger().timestamp(),
-            )? > 0)
     }
 
     /// Move `remaining` out of the contract's custody to `to`, pro-rata
@@ -2259,6 +2205,79 @@ impl EscrowContract {
         payload.append(&Bytes::from_array(env, &id.to_be_bytes()));
         payload.append(&Bytes::from_array(env, &nonce.to_be_bytes()));
         payload
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Escrow lifecycle reads, exposed through the shared `EscrowInterface`
+// (Issue #293).
+//
+// These views are the escrow crate's part of the workspace-wide read surface:
+// they answer with primitives only, so a wallet, a budget or an off-chain
+// monitor can drive them through the one generated `EscrowClient` without
+// depending on this crate's record types.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl EscrowInterface for EscrowContract {
+    /// Number of escrows created so far, i.e. the id the next `create` takes.
+    fn escrow_count(env: Env) -> u64 {
+        get_count(&env)
+    }
+
+    /// Timestamp at which the escrow's refund window closes, or `0` when the
+    /// window has no upper bound. Lets clients show a countdown without
+    /// recomputing the window rule off-chain.
+    fn refund_window_closes_at(env: Env, id: u64) -> Result<u64, Error> {
+        Ok(Self::closes_at(&load_escrow(&env, id)?))
+    }
+
+    /// Whether the funds may be reclaimed for `id` at the current ledger time —
+    /// the escrow still holds them, the grace period has elapsed, and the refund
+    /// window has not closed.
+    fn is_refundable(env: Env, id: u64) -> Result<bool, Error> {
+        let escrow = load_escrow(&env, id)?;
+        if !matches!(
+            escrow.state,
+            EscrowState::Created | EscrowState::Funded | EscrowState::Expired
+        ) {
+            return Ok(false);
+        }
+        let now = env.ledger().timestamp();
+        if now < Self::grace_end(&escrow)? {
+            return Ok(false);
+        }
+        Ok(Self::require_refund_window_open(&env, &escrow).is_ok())
+    }
+
+    /// Amount claimable right now under the escrow's release schedule.
+    fn get_claimable_amount(env: Env, id: u64) -> Result<i128, Error> {
+        let escrow = load_escrow(&env, id)?;
+        calculate_claimable_amount(&escrow, env.ledger().timestamp())
+    }
+
+    /// Amount vested so far under the escrow's release schedule.
+    fn get_vested_amount(env: Env, id: u64) -> Result<i128, Error> {
+        let escrow = load_escrow(&env, id)?;
+        calculate_vested_amount(
+            escrow.funded_amount,
+            &escrow.schedule,
+            env.ledger().timestamp(),
+        )
+    }
+
+    /// Whether the escrow's release schedule has matured at the current ledger
+    /// timestamp: `true` for schedule-less escrows once they exist, `true` for
+    /// a `Cliff` schedule at/after `cliff_time`, and `true` for a `Linear`
+    /// schedule once anything has vested. Clients use this to show an unlock
+    /// countdown without recomputing the schedule off-chain.
+    fn is_unlocked(env: Env, id: u64) -> Result<bool, Error> {
+        let escrow = load_escrow(&env, id)?;
+        Ok(matches!(escrow.schedule.release_type, ReleaseType::None)
+            || calculate_vested_amount(
+                escrow.funded_amount,
+                &escrow.schedule,
+                env.ledger().timestamp(),
+            )? > 0)
     }
 }
 
