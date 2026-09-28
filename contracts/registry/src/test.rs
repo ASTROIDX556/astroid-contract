@@ -2,12 +2,6 @@
 extern crate std;
 
 use crate::{
-    DataKey, RegistryContract, RegistryContractClient, RegistryRole, UpgradeAction,
-    UpgradeAuditRecord,
-};
-use astroid_shared::constants::{
-    MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
-};
     BoundHash, DataKey, RegistryContract, RegistryContractClient, RegistryRole, VersionRecord,
 };
 use astroid_shared::constants::{MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT};
