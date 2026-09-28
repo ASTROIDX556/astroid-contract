@@ -1862,8 +1862,11 @@ fn withdraw_publishes_each_transfer_event_once() {
 
     h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
 
-    let legacy: Vec<Val> =
-        (Symbol::new(&h.env, "transfer"), Symbol::new(&h.env, "executed")).into_val(&h.env);
+    let legacy: Vec<Val> = (
+        Symbol::new(&h.env, "transfer"),
+        Symbol::new(&h.env, "executed"),
+    )
+        .into_val(&h.env);
     let canonical: Val = Symbol::new(&h.env, "TransferExecuted").into_val(&h.env);
     let mut legacy_count = 0;
     let mut canonical_count = 0;
@@ -1880,7 +1883,10 @@ fn withdraw_publishes_each_transfer_event_once() {
             canonical_count += 1;
         }
     }
-    assert_eq!(legacy_count, 1, "the legacy transfer event is published once");
+    assert_eq!(
+        legacy_count, 1,
+        "the legacy transfer event is published once"
+    );
     assert_eq!(
         canonical_count, 1,
         "the canonical TransferExecuted event is published once"
