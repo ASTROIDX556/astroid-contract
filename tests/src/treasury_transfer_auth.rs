@@ -260,7 +260,7 @@ fn an_unauthorized_party_cannot_reconfigure_the_treasury() {
     assert_eq!(after.budget, treasury_before.budget);
     assert_eq!(after.multisig, treasury_before.multisig);
     assert_eq!(after.guardian, treasury_before.guardian);
-    assert_eq!(after.paused, false);
+    assert!(!after.paused);
     assert!(h.treasury.is_approved_asset(&h.asset));
     assert!(!h.treasury.is_approved_asset(&other));
 }
