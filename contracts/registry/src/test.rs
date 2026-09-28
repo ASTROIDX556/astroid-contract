@@ -3116,3 +3116,264 @@ fn modules_registered_before_this_feature_still_upgrade() {
     assert_eq!(h.client.get_version(&ModuleKind::Wallet, &1), h.v1);
     assert_eq!(h.client.get_version(&ModuleKind::Wallet, &2), h.v2);
 }
+
+// ---------------------------------------------------------------------------
+// Versioned registration (Issue #287)
+//
+// `register_module` takes an address from the caller, so it can point a module
+// at code the registry never published or approved. `register_module_version`
+// resolves the address from the immutable version record instead and advances
+// the pin with it, so a module can be brought up on a published version without
+// an address ever crossing the boundary — and the upgrade path stays monotonic
+// even when it is driven through registration rather than `upgrade_module`.
+// ---------------------------------------------------------------------------
+
+/// Whether the canonical `ContractEvent` with this variant symbol was published
+/// during the test.
+fn has_event(env: &Env, variant: &str) -> bool {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .any(|(_contract_id, topics, _data)| topics.contains(want.clone()))
+}
+
+/// Register a second organization in `h` and return its slug, so a test can
+/// exercise registration on a module that does not exist yet.
+fn fresh_org(h: &PathHarness) -> (String, Address) {
+    let org = String::from_str(&h.env, "globex");
+    let owner = Address::generate(&h.env);
+    h.client.register_org(&h.admin, &org, &owner);
+    (org, owner)
+}
+
+#[test]
+fn versioned_registration_creates_a_module_from_a_published_version() {
+    let h = setup_path();
+    let (org, owner) = fresh_org(&h);
+
+    assert_eq!(
+        h.client
+            .register_module_version(&owner, &org, &ModuleKind::Wallet, &2),
+        2
+    );
+    // The pointer is the version record's address, and the module starts its
+    // upgrade path already pinned to the version it runs.
+    assert_eq!(h.client.lookup(&org, &ModuleKind::Wallet), h.v2);
+    assert_eq!(h.client.get_module_version(&org, &ModuleKind::Wallet), 2);
+    // The version record itself is untouched: registration moves a module, it
+    // does not republish a version.
+    assert_eq!(h.client.get_version_wasm(&ModuleKind::Wallet, &2), h.h2);
+
+    // A module that did not exist was registered, not upgraded.
+    assert_event(&h.env, "RegistryModuleUpdated");
+    assert!(!has_event(&h.env, "RegistryModuleUpgraded"));
+    // ...and the harness's own module is exactly where it was.
+    assert_eq!(pin(&h), 0);
+    assert_eq!(pointed_at(&h), h.v1);
+}
+
+#[test]
+fn versioned_registration_pins_a_module_registered_by_address() {
+    let h = setup_path();
+    // The module predates validated upgrades: registered by address, no pin.
+    assert_eq!(pin(&h), 0);
+    assert_eq!(
+        h.client
+            .register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &3),
+        3
+    );
+    assert_eq!(pin(&h), 3);
+    assert_eq!(pointed_at(&h), h.v3);
+    // A move onto an existing registration is reported as an upgrade too, so an
+    // indexer sees one history whichever entrypoint drove it.
+    assert_event(&h.env, "RegistryModuleUpgraded");
+}
+
+#[test]
+fn versioned_registration_moves_an_existing_module_forward() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+
+    assert_eq!(
+        h.client
+            .register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &3),
+        3
+    );
+    assert_eq!(pointed_at(&h), h.v3);
+    assert_eq!(pin(&h), 3);
+
+    // The most recent upgrade event: the earlier `upgrade_module` call emitted
+    // one too, and this move must be reported as its own step.
+    let want_topic: Val = Symbol::new(&h.env, "RegistryModuleUpgraded").into_val(&h.env);
+    let event = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|(_id, topics, _data)| topics.contains(want_topic.clone()))
+        .last()
+        .expect("RegistryModuleUpgraded must be emitted");
+    // The move starts from the pin it replaced, not from zero: the upgrade path
+    // is continuous across the two entrypoints.
+    let data: (String, ModuleKind, u32, u32, Address, BytesN<32>) = event.2.into_val(&h.env);
+    assert_eq!(
+        data,
+        (
+            h.org.clone(),
+            ModuleKind::Wallet,
+            2,
+            3,
+            h.v3.clone(),
+            h.h3.clone()
+        )
+    );
+}
+
+#[test]
+fn versioned_registration_refuses_the_version_the_module_already_runs() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+
+    // Equal version: the degenerate cycle both validated paths refuse.
+    assert_eq!(
+        h.client
+            .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::CircularUpgrade))
+    );
+    assert_eq!(pointed_at(&h), h.v2);
+    assert_eq!(pin(&h), 2);
+}
+
+#[test]
+fn versioned_registration_cannot_walk_backwards() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+
+    // Older version: refused, and nothing is written, so the module cannot be
+    // rolled back through the registration path.
+    let before = h.env.events().all().len();
+    assert_eq!(
+        h.client
+            .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::CircularUpgrade))
+    );
+    assert_eq!(pointed_at(&h), h.v3);
+    assert_eq!(pin(&h), 3);
+    // A refusal reports nothing: no registration and no upgrade event.
+    assert_eq!(h.env.events().all().len(), before);
+}
+
+#[test]
+fn versioned_registration_validates_the_version_record() {
+    let h = setup_path();
+    let (org, owner) = fresh_org(&h);
+
+    // Never published for this kind, and version `0` is not a record at all.
+    assert_eq!(
+        h.client
+            .try_register_module_version(&owner, &org, &ModuleKind::Wallet, &99),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client
+            .try_register_module_version(&owner, &org, &ModuleKind::Wallet, &0),
+        Err(Ok(Error::InvalidInput))
+    );
+    // Code the admin has revoked is no longer a valid destination.
+    h.client
+        .remove_approved_wasm(&h.admin, &ModuleKind::Wallet, &h.h2);
+    assert_eq!(
+        h.client
+            .try_register_module_version(&owner, &org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Every refusal above wrote nothing: the module does not exist.
+    assert_eq!(
+        h.client.try_get_module_version(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn versioned_registration_needs_permission_and_a_signature() {
+    let h = setup_path();
+    let (org, owner) = fresh_org(&h);
+    let intruder = Address::generate(&h.env);
+
+    // A stranger reaches neither the organization nor its modules.
+    assert_eq!(
+        h.client
+            .try_register_module_version(&intruder, &org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The protocol admin and the recorded owner both do...
+    assert_eq!(
+        h.client
+            .register_module_version(&h.admin, &org, &ModuleKind::Wallet, &2),
+        2
+    );
+    // ...and so does an account the owner has delegated the upgrader role to.
+    h.client
+        .grant_role(&owner, &org, &intruder, &RegistryRole::ModuleUpgrader);
+    assert_eq!(
+        h.client
+            .register_module_version(&intruder, &org, &ModuleKind::Wallet, &3),
+        3
+    );
+
+    // The caller's own signature was demanded for exactly that invocation.
+    let auths = h.env.auths();
+    let (signer, invocation) = auths.last().expect("the registration must require auth");
+    assert_eq!(signer, &intruder);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, function, _args)) => {
+            assert_eq!(contract, &h.client.address);
+            assert_eq!(function, &Symbol::new(&h.env, "register_module_version"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+fn versioned_registration_clears_a_deprecation_flag() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    h.client
+        .deprecate_module(&h.admin, &h.org, &ModuleKind::Wallet);
+    assert_eq!(
+        h.client.try_lookup(&h.org, &ModuleKind::Wallet),
+        Err(Ok(Error::ModuleDeprecated))
+    );
+
+    h.client
+        .register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+    // The module runs a live, registered implementation again, so routing works.
+    assert_eq!(h.client.lookup(&h.org, &ModuleKind::Wallet), h.v3);
+    assert!(!h.client.is_module_deprecated(&h.org, &ModuleKind::Wallet));
+}
+
+#[test]
+fn versioned_registration_agrees_with_the_upgrade_validation() {
+    let h = setup_path();
+    // The pre-flight and the write path reach the same conclusion, before and
+    // after the move.
+    assert_eq!(
+        h.client.validate_upgrade(&h.org, &ModuleKind::Wallet, &2),
+        h.v2
+    );
+    assert_eq!(
+        h.client
+            .register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(
+        h.client
+            .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::CircularUpgrade))
+    );
+}
