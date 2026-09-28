@@ -66,7 +66,40 @@
 //! [`EscrowContract::release_milestone`], disbursing funds proportionally. The
 //! final milestone pays the dust-free remainder so the full amount is disbursed.
 //! Plain `release` is blocked on milestone escrows to enforce phased settlement.
-//!//! ## Time-lock release schedules
+//!
+//! ## Multi-party release conditions
+//!
+//! A settlement sometimes needs more than one pair of hands before the recipient
+//! is paid — a buyer agent, a seller agent and an independent validator oracle
+//! all signing off on the same delivery. An escrow created with
+//! [`EscrowContract::create_with_release_condition`] carries a
+//! [`ReleaseCondition`]: a bounded allow-list of `participants` and an
+//! `approval_threshold`. Each participant signs off on its own Soroban account
+//! via [`EscrowContract::approve_release`], and the arbiter's
+//! [`EscrowContract::release`] (or the signature override) only pays out once the
+//! threshold is met.
+//!
+//! Three properties matter:
+//!
+//! - **Additive, not substitutive.** The condition never replaces the arbiter or
+//!   the override signatures; a caller must clear both gates. It is a
+//!   precondition on every path that moves value *to the recipient* on an
+//!   escrow that carries a condition — `release`, `override_release`, `claim` and
+//!   `withdraw`. Milestone escrows are created by a different entrypoint that
+//!   never records a condition, so `release_milestone` needs no gate.
+//! - **Sender exits stay open.** `cancel`, `refund`, `refund_timelock` and
+//!   `reclaim` are deliberately ungated, so a timed-out multi-party escrow always
+//!   resolves back to the funder. A condition can delay a payout but can never
+//!   lock up the depositor's money.
+//! - **Distinct parties only.** Approvals are recorded one key per participant,
+//!   so a party approving twice fails with [`Error::AlreadySigned`] and cannot
+//!   inflate the count towards the threshold.
+//!
+//! The condition lives under its own storage key rather than inside [`Escrow`],
+//! so single-party escrows pay nothing for it and previously stored escrows keep
+//! deserializing after an upgrade.
+//!
+//! ## Time-lock release schedules
 //!
 //! Escrows support configurable time-locks and gradual release schedules:
 //! - Bullet / Cliff time-locks (`ReleaseType::Cliff`): 100% unlocked at maturity.
@@ -120,9 +153,10 @@
 pub mod storage;
 
 pub use storage::{
-    bump_escrow, bump_milestones, get_count, increment_count, load_escrow, store_escrow, DataKey,
-    Escrow, EscrowState, Milestone, MilestoneSet, MilestoneSpec, MilestoneStatus, ReleaseSchedule,
-    ReleaseType,
+    bump_escrow, bump_milestones, get_count, has_release_approval, increment_count, load_escrow,
+    load_release_condition, mark_release_approval, store_escrow, store_release_condition, DataKey,
+    Escrow, EscrowState, Milestone, MilestoneSet, MilestoneSpec, MilestoneStatus, ReleaseCondition,
+    ReleaseSchedule, ReleaseType,
 };
 
 use astroid_interfaces::UpgradeableInterface;
@@ -218,6 +252,35 @@ pub fn calculate_claimable_amount(escrow: &Escrow, current_time: u64) -> Result<
 pub struct OverrideSignature {
     pub public_key: BytesN<32>,
     pub signature: BytesN<64>,
+}
+
+/// Creation arguments for an escrow that additionally requires multi-party
+/// sign-off before any funds reach the recipient.
+///
+/// Grouped into a single struct (like [`MilestoneSpec`]) because the plain
+/// creation entrypoints already carry eleven arguments; adding two more inline
+/// would make the ABI unreadable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseConditionConfig {
+    pub sender: Address,
+    pub recipient: Address,
+    pub arbiter: Address,
+    pub assets: Vec<AssetAmount>,
+    pub deadline: u64,
+    pub grace_period: u64,
+    pub refund_window: u64,
+    pub memo: String,
+    /// Pre-configured ed25519 keys for the signature-override release path; an
+    /// empty set with a `0` threshold disables it.
+    pub override_signers: Vec<BytesN<32>>,
+    pub override_threshold: u32,
+    /// Counterparties allowed to approve a release. An empty set disables the
+    /// condition, which then requires a `0` `approval_threshold`.
+    pub participants: Vec<Address>,
+    /// How many distinct participants must approve before funds may move to
+    /// the recipient.
+    pub approval_threshold: u32,
 }
 
 #[contract]
@@ -424,6 +487,109 @@ impl EscrowContract {
             (id, sender, recipient, assets),
         );
         Ok(id)
+    }
+
+    /// Create + fund an escrow that may only pay out once `approval_threshold`
+    /// distinct `participants` have signed off via [`Self::approve_release`].
+    ///
+    /// Every other creation parameter behaves exactly as in
+    /// [`Self::create_with_refund_window`], which this delegates to, so an empty
+    /// `participants` list simply yields a plain escrow (and then demands a `0`
+    /// threshold).
+    ///
+    /// The condition is deliberately *additive* to the existing authorizations:
+    /// the arbiter still has to call `release` (or enough `override_signers` still
+    /// have to sign) **and** the participants have to approve. It is not an
+    /// alternative route to the funds. Sender-side exits (`cancel`, `refund`,
+    /// `refund_timelock`, `reclaim`) are untouched, so a condition can never
+    /// strand or lock up the funder's own money.
+    pub fn create_with_release_condition(
+        env: Env,
+        config: ReleaseConditionConfig,
+    ) -> Result<u64, Error> {
+        // Validate the condition before pulling any tokens, so a bad
+        // participant set can never move funds.
+        Self::validate_release_condition(&config.participants, config.approval_threshold)?;
+        let id = Self::create_with_refund_window(
+            env.clone(),
+            config.sender,
+            config.recipient,
+            config.arbiter,
+            config.assets,
+            config.deadline,
+            config.grace_period,
+            config.refund_window,
+            config.memo,
+            config.override_signers,
+            config.override_threshold,
+        )?;
+        if !config.participants.is_empty() {
+            store_release_condition(
+                &env,
+                id,
+                &ReleaseCondition {
+                    participants: config.participants,
+                    threshold: config.approval_threshold,
+                    approvals: 0,
+                },
+            );
+        }
+        Ok(id)
+    }
+
+    /// Sign off on releasing escrow `id` to its recipient, as one of the
+    /// escrow's `participants`. Returns the number of distinct approvals
+    /// recorded so far.
+    ///
+    /// The caller authorizes with its own Soroban account signature
+    /// (`require_auth`), so an approval can only ever be recorded by the
+    /// participant itself — no relayer may vote on its behalf. Participants are
+    /// recorded as a set: a repeat approval from the same party fails with
+    /// [`Error::AlreadySigned`] and never inflates the count.
+    pub fn approve_release(env: Env, caller: Address, id: u64) -> Result<u32, Error> {
+        caller.require_auth();
+        let escrow = load_escrow(&env, id)?;
+        // Approvals are only meaningful while the funds are still in escrow;
+        // once the escrow has been released, refunded or closed there is
+        // nothing left to sign off on.
+        if !matches!(escrow.state, EscrowState::Funded) {
+            return Err(Error::InvalidState);
+        }
+        let mut condition = load_release_condition(&env, id).ok_or(Error::NotFound)?;
+        if !condition.participants.contains(&caller) {
+            return Err(Error::NotASigner);
+        }
+        if has_release_approval(&env, id, &caller) {
+            return Err(Error::AlreadySigned);
+        }
+        mark_release_approval(&env, id, &caller);
+        condition.approvals = checked_add(condition.approvals as i128, 1)? as u32;
+        store_release_condition(&env, id, &condition);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("approval")),
+            (id, caller, condition.approvals, condition.threshold),
+        );
+        Ok(condition.approvals)
+    }
+
+    /// Read the multi-party release condition attached to `id`, or
+    /// [`Error::NotFound`] when the escrow carries none.
+    pub fn get_release_condition(env: Env, id: u64) -> Result<ReleaseCondition, Error> {
+        load_release_condition(&env, id).ok_or(Error::NotFound)
+    }
+
+    /// The participants that have approved release of `id`, in the order they
+    /// were declared. Bounded by the participant cap, so a client gets the
+    /// whole sign-off picture in one call.
+    pub fn release_approvals(env: Env, id: u64) -> Result<Vec<Address>, Error> {
+        let condition = load_release_condition(&env, id).ok_or(Error::NotFound)?;
+        let mut approved: Vec<Address> = Vec::new(&env);
+        for participant in condition.participants.iter() {
+            if has_release_approval(&env, id, &participant) {
+                approved.push_back(participant);
+            }
+        }
+        Ok(approved)
     }
 
     /// Create a funded time-locked escrow with bullet cliff release at `unlock_time`.
@@ -697,6 +863,9 @@ impl EscrowContract {
         if amount > claimable {
             return Err(Error::InsufficientFunds);
         }
+        // Last gate before the payout: a multi-party escrow may only settle once
+        // enough distinct participants have approved.
+        Self::require_release_approvals(&env, id)?;
 
         escrow.released_amount = checked_add(escrow.released_amount, amount)?;
         if escrow.released_amount == escrow.funded_amount {
@@ -736,6 +905,11 @@ impl EscrowContract {
         if escrow.recipient != caller {
             return Err(Error::Unauthorized);
         }
+        // Settle the state first so a final escrow always reports `InvalidState`
+        // rather than a stale condition complaint.
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
 
         let now = env.ledger().timestamp();
 
@@ -755,6 +929,9 @@ impl EscrowContract {
             if claimable <= 0 {
                 return Err(Error::TimeLockActive);
             }
+            // Last gate before the payout: a multi-party escrow may only settle
+            // once enough distinct participants have approved.
+            Self::require_release_approvals(&env, id)?;
 
             escrow.released_amount = checked_add(escrow.released_amount, claimable)?;
             if escrow.released_amount == escrow.funded_amount {
@@ -789,6 +966,7 @@ impl EscrowContract {
             if now < Self::grace_end(&escrow)? {
                 return Err(Error::TimeLockActive);
             }
+            Self::require_release_approvals(&env, id)?;
             escrow.state = EscrowState::Released;
             store_escrow(&env, id, &escrow);
             let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
@@ -897,6 +1075,10 @@ impl EscrowContract {
         if release_amount > remaining {
             return Err(Error::InvalidAmount);
         }
+        // Last gate before the payout: a multi-party escrow may only settle once
+        // enough distinct participants have approved. Escrows without a
+        // condition are unaffected.
+        Self::require_release_approvals(&env, id)?;
 
         // Issue #307 — the release settles the escrow in full: the entire
         // remaining custody balance moves to the recipient and the escrow
@@ -1009,6 +1191,10 @@ impl EscrowContract {
         if seen.len() < escrow.override_threshold {
             return Err(Error::ThresholdNotMet);
         }
+        // The signature override is an alternative *arbiter*, not an alternative
+        // to the multi-party condition: on an escrow configured with participants
+        // the sign-off must be recorded in addition to the signatures.
+        Self::require_release_approvals(&env, id)?;
 
         escrow.override_nonce = nonce;
         let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
@@ -1454,6 +1640,13 @@ impl EscrowContract {
         )?;
         let remaining = checked_sub(total_amount, set.released_amount)?;
         let payout = if unreleased == 1 { remaining } else { gross };
+        // A phased payout is still a payout, so this path deliberately has no
+        // multi-party gate: the two creation entrypoints are mutually exclusive
+        // (`deposit_with_milestones` never records a release condition, and
+        // `create_with_release_condition` never installs milestones), so
+        // `load_release_condition` is always empty here. If milestone creation
+        // ever grows condition support, add `Self::require_release_approvals`
+        // and a dedicated `MilestoneError` code in the same change.
 
         let primary_asset = escrow.assets.get_unchecked(0).asset.clone();
         token::TokenClient::new(&env, &primary_asset).transfer(
@@ -1973,6 +2166,55 @@ impl EscrowContract {
     fn emit_token_change(env: &Env, token: &Address, action: Symbol) {
         env.events()
             .publish((symbol_short!("escrow"), action), token.clone());
+    }
+
+    /// Validate a participant set and its threshold, mirroring
+    /// [`Self::validate_override_config`]: either both empty/zero (no condition
+    /// recorded), or a non-empty, size-capped, duplicate-free participant set with
+    /// a threshold in `[1, participants.len()]`.
+    fn validate_release_condition(
+        participants: &Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        if participants.is_empty() {
+            if threshold != 0 {
+                return Err(Error::InvalidThreshold);
+            }
+            return Ok(());
+        }
+        if participants.len() > MAX_SIGNERS {
+            return Err(Error::TooManySigners);
+        }
+        if threshold == 0 || threshold > participants.len() {
+            return Err(Error::InvalidThreshold);
+        }
+        for i in 0..participants.len() {
+            let p = participants.get_unchecked(i);
+            for j in (i + 1)..participants.len() {
+                if participants.get_unchecked(j) == p {
+                    return Err(Error::InvalidInput);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse recipient settlement until the escrow's configured number of
+    /// distinct participants has authorized the release. Escrows without a
+    /// condition carry no such key, so they settle exactly as before.
+    ///
+    /// Every caller invokes this as its *last* check, immediately before the
+    /// first state mutation or token transfer. The condition can therefore only
+    /// ever prevent a payout that would otherwise have gone through — it never
+    /// masks a more specific pre-existing error (an expired deadline, a time
+    /// lock, a double release), and a failing call touches no extra storage.
+    fn require_release_approvals(env: &Env, id: u64) -> Result<(), Error> {
+        if let Some(condition) = load_release_condition(env, id) {
+            if condition.approvals < condition.threshold {
+                return Err(Error::ThresholdNotMet);
+            }
+        }
+        Ok(())
     }
 
     /// Validate an override signer set + threshold: either both empty/zero
