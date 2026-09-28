@@ -351,6 +351,174 @@ impl PolicyCombinationStrategy {
     }
 }
 
+/// Why one policy rule refused a transaction (Issue #314).
+///
+/// Every refusal used to collapse onto a single `PolicyDenied`: a caller that
+/// wanted to react differently to "over the single-transaction ceiling" than to
+/// "destination is not on the approved list" had to decode the contract's
+/// violation event to tell them apart. The rule walk now returns this reason
+/// directly through [`PolicyContract::evaluate_policy`], and
+/// [`PolicyContract::check_transfer`] maps it onto the exact error code it has
+/// always returned, so the wire behaviour of existing callers is unchanged.
+///
+/// Discriminants are part of the public ABI and MUST NOT be reordered or reused
+/// once released.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PolicyDenialReason {
+    /// The policy is switched off; every spend is refused.
+    Disabled = 0,
+    /// The policy's expiry has passed.
+    Expired = 1,
+    /// The recipient is on the protocol blocklist.
+    RecipientBlacklisted = 2,
+    /// The recipient is on the merchant blocklist.
+    MerchantBlacklisted = 3,
+    /// The policy enforces its approved destination directory and the recipient
+    /// is not in it.
+    RecipientNotWhitelisted = 4,
+    /// The amount exceeds the policy's single-transaction ceiling
+    /// (`Policy::max_amount`).
+    AboveMaxTransactionLimit = 5,
+    /// The policy pins a single allowed recipient and this is not it.
+    RecipientNotAllowed = 6,
+    /// The policy pins a single allowed asset and this is not it.
+    AssetNotAllowed = 7,
+    /// The asset is on the policy's asset deny list.
+    AssetBlacklisted = 8,
+    /// The policy enforces its asset allow-list and the asset is not in it.
+    AssetNotWhitelisted = 9,
+    /// The spend would breach the per-`(policy, asset)` allowance.
+    AllowanceExceeded = 10,
+    /// The per-`(policy, asset)` allowance has lapsed.
+    AllowanceExpired = 11,
+    /// The policy's composite rule tree evaluated to `false`.
+    CompositeRuleDenied = 12,
+    /// The policy's registered rule stack evaluated to `false`.
+    RuleStackDenied = 13,
+}
+
+impl PolicyDenialReason {
+    /// The error `check_transfer` reports for this refusal. Each mapping
+    /// preserves the code that gate returned before the rule walk was made
+    /// granular, so an existing caller sees no change.
+    pub fn to_error(self) -> Error {
+        match self {
+            PolicyDenialReason::Disabled
+            | PolicyDenialReason::Expired
+            | PolicyDenialReason::RecipientNotWhitelisted
+            | PolicyDenialReason::AboveMaxTransactionLimit
+            | PolicyDenialReason::RecipientNotAllowed
+            | PolicyDenialReason::AssetNotAllowed
+            | PolicyDenialReason::AssetBlacklisted
+            | PolicyDenialReason::CompositeRuleDenied
+            | PolicyDenialReason::RuleStackDenied => Error::PolicyDenied,
+            PolicyDenialReason::RecipientBlacklisted => Error::PolicyRecipientRestricted,
+            PolicyDenialReason::MerchantBlacklisted => Error::PolicyMerchantBlocked,
+            PolicyDenialReason::AssetNotWhitelisted => Error::AssetNotAuthorized,
+            PolicyDenialReason::AllowanceExceeded => Error::AllowanceExceeded,
+            PolicyDenialReason::AllowanceExpired => Error::AllowanceExpired,
+        }
+    }
+
+    /// The stable short symbol carried by the `PolicyViolation` event for this
+    /// refusal. Off-chain consumers key on these strings, so they are frozen
+    /// alongside the numeric discriminants.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyDenialReason::Disabled => "disabled",
+            PolicyDenialReason::Expired => "expired",
+            PolicyDenialReason::RecipientBlacklisted => "blacklisted",
+            PolicyDenialReason::MerchantBlacklisted => "merchant_blocked",
+            PolicyDenialReason::RecipientNotWhitelisted => "not_whitelisted",
+            PolicyDenialReason::AboveMaxTransactionLimit => "above_max",
+            PolicyDenialReason::RecipientNotAllowed => "bad_recipient",
+            PolicyDenialReason::AssetNotAllowed => "bad_asset",
+            PolicyDenialReason::AssetBlacklisted => "asset_blacklisted",
+            PolicyDenialReason::AssetNotWhitelisted => "asset_not_whitelisted",
+            PolicyDenialReason::AllowanceExceeded => "allowance_exceeded",
+            PolicyDenialReason::AllowanceExpired => "allowance_expired",
+            PolicyDenialReason::CompositeRuleDenied => "rule_denied",
+            PolicyDenialReason::RuleStackDenied => "rules_denied",
+        }
+    }
+
+    /// Whether the gate that produced this reason already published its own
+    /// violation event. The allowance gate reports its refusal itself (so
+    /// `check_allowance` and `update_allowance`, which persist the outcome,
+    /// keep their event), so the rule walk must not publish it a second time.
+    fn is_self_reported(self) -> bool {
+        matches!(
+            self,
+            PolicyDenialReason::AllowanceExceeded | PolicyDenialReason::AllowanceExpired
+        )
+    }
+}
+
+/// The verdict of one policy evaluation (Issue #314).
+///
+/// Modelled as a sum type rather than an `Option<PolicyDenialReason>` because a
+/// `#[contracttype]` cannot encode `Option` of a custom contracttype enum: the
+/// SDK's `Option` conversion needs an infallible `From<&T> for ScVal`, which a
+/// derived enum does not provide (the registry's `BoundHash` exists for exactly
+/// the same reason). The two states are exhaustive and the discriminant of the
+/// `Denied` case carries which rule refused.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyVerdict {
+    /// Every rule passed.
+    Allowed,
+    /// One rule refused the transfer; the payload names which.
+    Denied(PolicyDenialReason),
+}
+
+/// The outcome of evaluating one transaction against a policy (Issue #314).
+///
+/// `verdict` is the decision; it is [`PolicyVerdict::Denied`] exactly when a rule
+/// refused the transfer, and the payload then names the first rule that did.
+/// `max_transaction_amount` echoes the single-transaction ceiling in force
+/// (`0` = no ceiling) so a caller that was refused for
+/// [`PolicyDenialReason::AboveMaxTransactionLimit`] can size a retry without a
+/// second read.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyDecision {
+    pub verdict: PolicyVerdict,
+    pub max_transaction_amount: i128,
+}
+
+impl PolicyDecision {
+    /// A passing decision under a ceiling of `max_transaction_amount`.
+    fn allow(max_transaction_amount: i128) -> Self {
+        PolicyDecision {
+            verdict: PolicyVerdict::Allowed,
+            max_transaction_amount,
+        }
+    }
+
+    /// A refusal naming the rule that produced it.
+    fn deny(reason: PolicyDenialReason, max_transaction_amount: i128) -> Self {
+        PolicyDecision {
+            verdict: PolicyVerdict::Denied(reason),
+            max_transaction_amount,
+        }
+    }
+
+    /// Whether the transaction was permitted.
+    pub fn allowed(&self) -> bool {
+        matches!(self.verdict, PolicyVerdict::Allowed)
+    }
+
+    /// The rule that refused the transaction, or `None` when it was permitted.
+    pub fn reason(&self) -> Option<PolicyDenialReason> {
+        match self.verdict {
+            PolicyVerdict::Allowed => None,
+            PolicyVerdict::Denied(reason) => Some(reason),
+        }
+    }
+}
+
 /// On-chain representation of a registered policy.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -708,21 +876,27 @@ impl PolicyContract {
     /// Returns Ok(()) if allowed, or AssetNotAuthorized if the whitelist is
     /// enabled and the asset is not present.
     pub fn validate_asset(env: Env, policy_id: String, asset: Address) -> Result<(), Error> {
-        let enabled_key = DataKey::AssetWhitelistEnabled(policy_id.clone());
-        let whitelist_enabled: bool = env
-            .storage()
-            .persistent()
-            .get(&enabled_key)
-            .unwrap_or(false);
-        if !whitelist_enabled {
-            return Ok(());
-        }
-        let key = DataKey::AssetWhitelist(policy_id.clone(), asset.clone());
-        if !env.storage().persistent().has(&key) {
+        if Self::asset_whitelist_denied(&env, &policy_id, &asset) {
             events_policy_violation(&env, &policy_id, "asset_not_whitelisted");
             return Err(Error::AssetNotAuthorized);
         }
         Ok(())
+    }
+
+    /// Pure membership probe behind the asset allow-list gate: `true` when the
+    /// policy enforces its asset allow-list and `asset` is not in it. Publishes
+    /// nothing, so the modular rule walk can report the denial once.
+    fn asset_whitelist_denied(env: &Env, policy_id: &String, asset: &Address) -> bool {
+        let whitelist_enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetWhitelistEnabled(policy_id.clone()))
+            .unwrap_or(false);
+        whitelist_enabled
+            && !env
+                .storage()
+                .persistent()
+                .has(&DataKey::AssetWhitelist(policy_id.clone(), asset.clone()))
     }
 
     /// Add an address to the restricted blacklist (owner only).
@@ -1058,22 +1232,28 @@ impl PolicyContract {
         policy_id: &String,
         recipient: &Address,
     ) -> Result<(), Error> {
+        if Self::recipient_whitelist_denied(env, policy_id, recipient) {
+            events_policy_violation(env, policy_id, "not_whitelisted");
+            return Err(Error::PolicyDenied);
+        }
+        Ok(())
+    }
+
+    /// Pure membership probe behind the recipient whitelist gate: `true` when
+    /// the policy enforces its approved destination directory and `recipient` is
+    /// not in it. Publishes nothing, so the modular rule walk can report the
+    /// denial once at the boundary.
+    fn recipient_whitelist_denied(env: &Env, policy_id: &String, recipient: &Address) -> bool {
         let enabled: bool = env
             .storage()
             .persistent()
             .get(&DataKey::RecipientWhitelistEnabled(policy_id.clone()))
             .unwrap_or(false);
-        if !enabled {
-            return Ok(());
-        }
-        if !env.storage().persistent().has(&DataKey::RecipientWhitelist(
-            policy_id.clone(),
-            recipient.clone(),
-        )) {
-            events_policy_violation(env, policy_id, "not_whitelisted");
-            return Err(Error::PolicyDenied);
-        }
-        Ok(())
+        enabled
+            && !env.storage().persistent().has(&DataKey::RecipientWhitelist(
+                policy_id.clone(),
+                recipient.clone(),
+            ))
     }
 
     /// Short alias of [`PolicyContract::set_recipient_whitelist_enabled`].
@@ -1299,6 +1479,46 @@ impl PolicyContract {
             Self::persist_spend(&env, &allowance, amount);
         }
         Ok(())
+    }
+
+    // --- granular rule evaluation (Issue #314) ---
+
+    /// Evaluate `payload` against a policy and return the granular decision:
+    /// whether the transfer is permitted, and — when it is not — exactly which
+    /// rule refused it.
+    ///
+    /// This is the read-only counterpart of `check_transfer`: same rules, same
+    /// order, same violation event, but the refusal is reported as a
+    /// [`PolicyDenialReason`] instead of being collapsed onto `PolicyDenied`. A
+    /// keeper, a wallet building a pre-flight confirmation screen or an
+    /// off-chain simulator can therefore tell a transaction over the
+    /// single-transaction ceiling
+    /// ([`PolicyDenialReason::AboveMaxTransactionLimit`]) from an unapproved
+    /// destination ([`PolicyDenialReason::RecipientNotWhitelisted`] or
+    /// [`PolicyDenialReason::RecipientNotAllowed`]) without decoding events.
+    ///
+    /// Errors are reserved for malformed input and broken state: a non-positive
+    /// `amount` is [`Error::InvalidAmount`], an unknown `policy_id` is
+    /// [`Error::NotFound`], and a rule tree that cannot be read is
+    /// [`Error::InvalidInput`]. A policy refusal itself is never an `Err`.
+    ///
+    /// Nothing is persisted: the allowance the spend would consume is only
+    /// computed, so a dry run can be repeated freely.
+    pub fn evaluate_policy(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<PolicyDecision, Error> {
+        // Zero and negative amounts are malformed requests, not policy
+        // denials: they never reach the rule walk.
+        require_positive_amount(payload.amount)?;
+        let decision = Self::evaluate_policy_decision(&env, &policy_id, &payload)?;
+        // A refusal is observable here exactly as it is through
+        // `check_transfer`: one `PolicyViolation` event naming the rule.
+        if let Some(reason) = decision.reason() {
+            Self::report_denial(&env, &policy_id, reason);
+        }
+        Ok(decision)
     }
 
     // --- multi-asset spending requests ---
@@ -1721,10 +1941,19 @@ impl PolicyContract {
         amounts: &Vec<AssetAmount>,
     ) -> Result<(Map<Address, i128>, Vec<AssetAllowance>), Error> {
         let totals = Self::aggregate_amounts(env, amounts)?;
-        let (policy, mut rule_context) = Self::check_policy_gates(env, policy_id, recipient)?;
+        let policy = Self::load(env, policy_id)?;
+        let mut rule_context = RuleEvaluationContext::default();
+        // The recipient- and policy-level rules are the same for every leg, so
+        // they run once; only the per-asset rules repeat per leg.
+        if let Some(reason) =
+            Self::screen_recipient_rules(env, policy_id, &policy, recipient, &mut rule_context)?
+        {
+            Self::report_denial(env, policy_id, reason);
+            return Err(reason.to_error());
+        }
         let mut updated = Vec::new(env);
         for (asset, total) in totals.iter() {
-            if let Some(allowance) = Self::check_asset_gates(
+            let (allowance, denial) = Self::screen_asset_rules(
                 env,
                 &policy,
                 policy_id,
@@ -1732,88 +1961,87 @@ impl PolicyContract {
                 recipient,
                 total,
                 &mut rule_context,
-            )? {
+            )?;
+            if let Some(reason) = denial {
+                Self::report_denial(env, policy_id, reason);
+                return Err(reason.to_error());
+            }
+            if let Some(allowance) = allowance {
                 updated.push_back(allowance);
             }
         }
         Ok((totals, updated))
     }
 
-    /// Asset-independent gates: the policy exists, is enabled, the recipient
-    /// is not blocked or outside the recipient whitelist and the policy has
-    /// not expired. Blocklist checks run before any allowance, asset or amount
-    /// evaluation (Issue #32). Returns the policy plus a rule-evaluation
-    /// context seeded with the blocklist results, so rule leaves reuse them
-    /// instead of re-reading storage.
-    fn check_policy_gates(
+    /// The recipient- and policy-level rules, in the order the violation
+    /// events have always reported them: enabled → recipient blocklist →
+    /// merchant blocklist → recipient whitelist → expiry.
+    ///
+    /// Returns `Ok(None)` when every rule passes, or the first rule that refused
+    /// the transfer. Blocklist membership is cached on `context`, so the
+    /// composite rule leaves reuse it instead of re-reading storage. Publishes
+    /// nothing: the boundary reports the refusal once (Issue #314).
+    fn screen_recipient_rules(
         env: &Env,
         policy_id: &String,
+        policy: &Policy,
         recipient: &Address,
-    ) -> Result<(Policy, RuleEvaluationContext), Error> {
-        let policy = Self::load(env, policy_id)?;
+        context: &mut RuleEvaluationContext,
+    ) -> Result<Option<PolicyDenialReason>, Error> {
         // Disabled policies deny every spend.
         if !policy.enabled {
-            events_policy_violation(env, policy_id, "disabled");
-            return Err(Error::PolicyDenied);
+            return Ok(Some(PolicyDenialReason::Disabled));
         }
-        // --- Blocklist checks (Issue #32) — evaluated first ---
-        let recipient_blacklisted = env
-            .storage()
-            .persistent()
-            .has(&DataKey::Blacklist(recipient.clone()));
-        if recipient_blacklisted {
-            events_policy_violation(env, policy_id, "blacklisted");
-            return Err(Error::PolicyRecipientRestricted);
+        // Blocklist checks (Issue #32) — evaluated first, so a compromised or
+        // malicious address is rejected before any allowance, asset or amount
+        // work is done.
+        if context.recipient_blacklisted(env, recipient) {
+            return Ok(Some(PolicyDenialReason::RecipientBlacklisted));
         }
-        let merchant_blacklisted = env
-            .storage()
-            .persistent()
-            .has(&DataKey::MerchantBlacklist(recipient.clone()));
-        if merchant_blacklisted {
-            events_policy_violation(env, policy_id, "merchant_blocked");
-            return Err(Error::PolicyMerchantBlocked);
+        if context.merchant_blacklisted(env, recipient) {
+            return Ok(Some(PolicyDenialReason::MerchantBlacklisted));
         }
-        // --- Recipient whitelist: approved destinations only (Issue #63) ---
-        // Runs with the other recipient gates and fails closed: an enabled
-        // whitelist with no entries denies every destination.
-        Self::check_recipient_whitelist(env, policy_id, recipient)?;
+        // Recipient whitelist: approved destinations only (Issue #63). Runs
+        // with the other recipient gates and fails closed: an enabled whitelist
+        // with no entries denies every destination.
+        if Self::recipient_whitelist_denied(env, policy_id, recipient) {
+            return Ok(Some(PolicyDenialReason::RecipientNotWhitelisted));
+        }
         if policy.expires_at != 0 && env.ledger().timestamp() >= policy.expires_at {
-            events_policy_violation(env, policy_id, "expired");
-            return Err(Error::PolicyDenied);
+            return Ok(Some(PolicyDenialReason::Expired));
         }
-        let rule_context = RuleEvaluationContext {
-            recipient_blacklisted: Some(recipient_blacklisted),
-            merchant_blacklisted: Some(merchant_blacklisted),
-        };
-        Ok((policy, rule_context))
+        Ok(None)
     }
 
-    /// Per-asset gates for `amount` of `asset`, evaluated against that asset's
-    /// own rules only. Returns the allowance record as it would be after the
-    /// spend (see [`Self::consume_allowance`]).
-    fn check_asset_gates(
+    /// The per-asset rules for one spend of `amount` of `asset`, in order:
+    /// single-transaction ceiling → allowed recipient → allowed asset → asset
+    /// deny list → asset allow-list → allowance → composite rule → rule stack.
+    ///
+    /// Returns the allowance record as it would be after the spend (not yet
+    /// persisted, see [`Self::consume_allowance`]) together with the first rule
+    /// that refused it, if any.
+    fn screen_asset_rules(
         env: &Env,
         policy: &Policy,
         policy_id: &String,
         asset: &Address,
         recipient: &Address,
         amount: i128,
-        rule_context: &mut RuleEvaluationContext,
-    ) -> Result<Option<AssetAllowance>, Error> {
+        context: &mut RuleEvaluationContext,
+    ) -> Result<(Option<AssetAllowance>, Option<PolicyDenialReason>), Error> {
+        // The single-transaction ceiling: `max_amount` is the largest amount a
+        // single transfer may move (0 = no ceiling).
         if policy.max_amount != 0 && amount > policy.max_amount {
-            events_policy_violation(env, policy_id, "above_max");
-            return Err(Error::PolicyDenied);
+            return Ok((None, Some(PolicyDenialReason::AboveMaxTransactionLimit)));
         }
         if let Some(allow_recip) = &policy.allowed_recipient {
             if allow_recip != recipient {
-                events_policy_violation(env, policy_id, "bad_recipient");
-                return Err(Error::PolicyDenied);
+                return Ok((None, Some(PolicyDenialReason::RecipientNotAllowed)));
             }
         }
         if let Some(allow_asset) = &policy.allowed_asset {
             if allow_asset != asset {
-                events_policy_violation(env, policy_id, "bad_asset");
-                return Err(Error::PolicyDenied);
+                return Ok((None, Some(PolicyDenialReason::AssetNotAllowed)));
             }
         }
         // The asset deny list wins over every allow gate, so blacklisting an
@@ -1823,44 +2051,114 @@ impl PolicyContract {
             .persistent()
             .has(&DataKey::AssetBlacklist(policy_id.clone(), asset.clone()))
         {
-            events_policy_violation(env, policy_id, "asset_blacklisted");
-            return Err(Error::PolicyDenied);
+            return Ok((None, Some(PolicyDenialReason::AssetBlacklisted)));
         }
-        // Check asset whitelist (Issue #37)
-        Self::validate_asset(env.clone(), policy_id.clone(), asset.clone())?;
+        // Asset allow-list (Issue #37).
+        if Self::asset_whitelist_denied(env, policy_id, asset) {
+            return Ok((None, Some(PolicyDenialReason::AssetNotWhitelisted)));
+        }
         // Multi-token allowance gate: reject a spend that would breach the
         // per-(policy, asset) allowance. An unset allowance is unrestricted.
-        let allowance = Self::consume_allowance(env, policy_id, asset, amount)?;
-        // --- Composite rule evaluation ---
-        // The context carries the blocklist results from
-        // `check_policy_gates`, so `RecipientBlacklisted` /
-        // `MerchantBlacklisted` leaves reuse them instead of re-reading
-        // storage on every node.
+        // The allowance gate publishes its own violation event, which is why
+        // the reason it yields is flagged `self_reported`.
+        let allowance = match Self::consume_allowance(env, policy_id, asset, amount) {
+            Ok(allowance) => allowance,
+            Err(Error::AllowanceExpired) => {
+                return Ok((None, Some(PolicyDenialReason::AllowanceExpired)))
+            }
+            Err(Error::AllowanceExceeded) => {
+                return Ok((None, Some(PolicyDenialReason::AllowanceExceeded)))
+            }
+            Err(other) => return Err(other),
+        };
         let payload = TransactionPayload {
             asset: asset.clone(),
             recipient: recipient.clone(),
             amount,
         };
-        let rule_result =
-            Self::evaluate_composite_rule_with_context(env, policy_id, &payload, rule_context)?;
-        if !rule_result {
-            events_policy_violation(env, policy_id, "rule_denied");
-            return Err(Error::PolicyDenied);
+        // Composite rule evaluation: the context carries the blocklist results
+        // from `screen_recipient_rules`, so `RecipientBlacklisted` /
+        // `MerchantBlacklisted` leaves reuse them instead of re-reading storage
+        // on every node.
+        if !Self::evaluate_composite_rule_with_context(env, policy_id, &payload, context)? {
+            return Ok((None, Some(PolicyDenialReason::CompositeRuleDenied)));
         }
-        // --- Multi-rule stack: evaluation respects the policy's combination strategy ---
-        // For All strategy: every registered rule must pass (existing behavior)
-        // For Any strategy: at least one rule must pass
+        // Multi-rule stack: evaluation respects the policy's combination
+        // strategy. For `All` every registered rule must pass; for `Any` at
+        // least one must.
         if !Self::evaluate_policy_rules_with_context(
             env,
             policy_id,
             &payload,
-            rule_context,
+            context,
             policy.rule_combination_strategy,
         )? {
-            events_policy_violation(env, policy_id, "rules_denied");
-            return Err(Error::PolicyDenied);
+            return Ok((None, Some(PolicyDenialReason::RuleStackDenied)));
         }
-        Ok(allowance)
+        Ok((allowance, None))
+    }
+
+    /// Walk every rule for a single transfer and report the granular decision.
+    ///
+    /// This is the one modular evaluation path behind `check_transfer`, the
+    /// dry-run [`Self::evaluate_policy`] and the multi-asset spend evaluation,
+    /// so all three can never disagree about which rule refused a transaction.
+    /// A refusal is a decision, not an error; only malformed input or broken
+    /// state surfaces as `Err`.
+    fn evaluate_policy_decision(
+        env: &Env,
+        policy_id: &String,
+        payload: &TransactionPayload,
+    ) -> Result<PolicyDecision, Error> {
+        let policy = Self::load(env, policy_id)?;
+        let max_transaction_amount = policy.max_amount;
+        let mut context = RuleEvaluationContext::default();
+        if let Some(reason) = Self::screen_recipient_rules(
+            env,
+            policy_id,
+            &policy,
+            &payload.recipient,
+            &mut context,
+        )? {
+            return Ok(PolicyDecision::deny(reason, max_transaction_amount));
+        }
+        let (_, denial) = Self::screen_asset_rules(
+            env,
+            &policy,
+            policy_id,
+            &payload.asset,
+            &payload.recipient,
+            payload.amount,
+            &mut context,
+        )?;
+        match denial {
+            Some(reason) => Ok(PolicyDecision::deny(reason, max_transaction_amount)),
+            None => Ok(PolicyDecision::allow(max_transaction_amount)),
+        }
+    }
+
+    /// Publish the violation event for a denial, unless the rule that produced it
+    /// already reported itself (see [`PolicyDenialReason::is_self_reported`]).
+    fn report_denial(env: &Env, policy_id: &String, reason: PolicyDenialReason) {
+        if !reason.is_self_reported() {
+            events_policy_violation(env, policy_id, reason.as_str());
+        }
+    }
+
+    /// Map a granular decision onto the error `check_transfer` has always
+    /// reported, publishing the violation event exactly once.
+    fn enforce_decision(
+        env: &Env,
+        policy_id: &String,
+        decision: &PolicyDecision,
+    ) -> Result<(), Error> {
+        match decision.reason() {
+            None => Ok(()),
+            Some(reason) => {
+                Self::report_denial(env, policy_id, reason);
+                Err(reason.to_error())
+            }
+        }
     }
 }
 
@@ -1875,6 +2173,12 @@ impl PolicyInterface for PolicyContract {
     /// the same family: while a policy enforces its approved destination
     /// directory, an untrusted recipient is denied with
     /// [`Error::PolicyDenied`].
+    ///
+    /// The rules themselves live in one modular walk (Issue #314), and this
+    /// entrypoint maps its decision onto the error code each rule has always
+    /// reported, so existing callers see no change. Callers that want the
+    /// granular reason instead of the collapsed code can dry-run
+    /// [`PolicyContract::evaluate_policy`], which uses the identical walk.
     fn check_transfer(
         env: Env,
         policy_id: String,
@@ -1885,17 +2189,13 @@ impl PolicyInterface for PolicyContract {
         // A transfer moves a strictly positive amount; zero and negative
         // requests are malformed and never reach the policy gates.
         require_positive_amount(amount)?;
-        let (policy, mut rule_context) = Self::check_policy_gates(&env, &policy_id, &recipient)?;
-        Self::check_asset_gates(
-            &env,
-            &policy,
-            &policy_id,
-            &asset,
-            &recipient,
+        let payload = TransactionPayload {
+            asset,
+            recipient,
             amount,
-            &mut rule_context,
-        )?;
-        Ok(())
+        };
+        let decision = Self::evaluate_policy_decision(&env, &policy_id, &payload)?;
+        Self::enforce_decision(&env, &policy_id, &decision)
     }
 }
 
