@@ -614,7 +614,12 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
-        let balance = checked_add(Self::asset_balance_internal(&env, &asset), amount)?;
+        // The running balance the structured event reports is derived from the
+        // holding just written (`balance == total_in - total_out`), which is one
+        // persistent read fewer than reading the recorded balance back — and a
+        // fee-on-transfer token cannot inflate it, because it is the amount that
+        // arrived, not the amount requested, that the holding credited.
+        let balance = Self::recorded_balance(&h);
         Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
@@ -819,11 +824,15 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &asset, &holding);
-        let balance = checked_sub(Self::asset_balance_internal(&env, &asset), amount)?;
+        // Derived from the holding already in hand, so the withdrawal pays no
+        // extra persistent read for the balance it reports and can never emit
+        // one that disagrees with the ledger it just debited.
+        let balance = Self::recorded_balance(&holding);
         Self::store_asset_balance(&env, &asset, balance);
+        // One `TransferExecuted` (legacy topic) plus the canonical schema below:
+        // the same event used to be published twice per withdrawal.
         events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         Self::transfer_out(&env, &asset, &to, amount)?;
-        events::transfer_executed(&env, &t.admin, &to, &asset, amount);
         events::publish(
             &env,
             events::ContractEvent::TransferExecuted {
@@ -924,6 +933,11 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, total)?;
         holding.total_out = checked_add(holding.total_out, total)?;
         Self::store_holding(&env, &asset, &holding);
+        // The recorded per-asset balance backs the structured deposit and
+        // withdrawal events, so a batch payout debits it exactly as a single
+        // withdrawal does. Without this the balance the *next* deposit or
+        // withdrawal reports would still count the funds this batch paid out.
+        Self::store_asset_balance(&env, &asset, Self::recorded_balance(&holding));
 
         let token_client = token::TokenClient::new(&env, &asset);
         let custody = env.current_contract_address();
@@ -1262,12 +1276,18 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
-    /// Current recorded balance for `asset` (0 when the asset never moved).
-    fn asset_balance_internal(env: &Env, asset: &Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AssetBalance(asset.clone()))
-            .unwrap_or(0)
+    /// The running per-asset balance implied by `holding`: what the structured
+    /// deposit and withdrawal events report for the asset.
+    ///
+    /// That balance is the holding's remaining total, because every movement
+    /// debits or credits `total_in` by exactly the amount that moved. Deriving it
+    /// from the holding the caller already has, rather than reading the recorded
+    /// entry back, costs one persistent read fewer on each of the three value
+    /// paths and leaves no room for the two to drift — a batch payout does not
+    /// emit a per-asset balance of its own, so it is exactly the path where a
+    /// stale copy would have gone unnoticed.
+    fn recorded_balance(holding: &Holding) -> i128 {
+        holding.total_in
     }
 
     /// Persist the per-asset balance used by the structured deposit and
