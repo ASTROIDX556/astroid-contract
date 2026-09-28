@@ -725,37 +725,6 @@ impl ProposalContract {
         Ok(proposal)
     }
 
-    pub fn state(env: Env, id: u64) -> Result<ProposalState, Error> {
-        Ok(Self::load(&env, id)?.state)
-    }
-
-    /// Whether the proposal's deadline has been reached on the current ledger
-    /// (and it therefore has a deadline at all). Lets a client check before
-    /// spending a transaction on a stale proposal.
-    pub fn is_expired(env: Env, id: u64) -> Result<bool, Error> {
-        Ok(Self::load(&env, id)?.is_expired(&env))
-    }
-
-    /// The prerequisite proposal ids this proposal declares.
-    pub fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
-        Ok(Self::load(&env, id)?.dependencies)
-    }
-
-    /// Whether the proposal has completed its action — `Executed` or `Closed`
-    /// (the only terminal states reachable from a successful run). This is the
-    /// completion check downstream contracts should read before chaining onto a
-    /// proposal, so dependency resolution needs no private state.
-    pub fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
-        Ok(Self::load(&env, id)?.state.has_executed())
-    }
-
-    /// Whether every prerequisite has executed — the same question `execute`
-    /// asks, exposed so callers can check before spending a transaction on it.
-    pub fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
-        let proposal = Self::load(&env, id)?;
-        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
-    }
-
     /// The vote bars this proposal's tally must clear before `execute` will
     /// run: its configured `threshold`, the participation quorum
     /// ([`PROPOSAL_QUORUM_PERCENT`]% of the approver allow-list, integer
