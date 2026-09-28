@@ -3116,3 +3116,455 @@ fn modules_registered_before_this_feature_still_upgrade() {
     assert_eq!(h.client.get_version(&ModuleKind::Wallet, &1), h.v1);
     assert_eq!(h.client.get_version(&ModuleKind::Wallet, &2), h.v2);
 }
+
+// ---------------------------------------------------------------------------
+// The registry's own version upgrade map (Issue #206)
+// ---------------------------------------------------------------------------
+//
+// Replacing the registry's code is a two-part operation, and only the first
+// part is a contract decision: the swap itself is `update_current_contract_wasm`
+// on a hash that has to exist in the ledger's contract-code map, which no
+// `cargo test` environment can provide (CI's test job never builds the Wasm).
+// So the swap is not exercised here, and these tests cover everything the
+// contract decides *about* it — target resolution, ordering, and the guarantee
+// that a refusal writes nothing — through `validate_registry_upgrade` (which
+// runs the identical plan, without a signature or a code swap) and through the
+// refusals `upgrade` itself reports before it reaches the swap.
+
+/// A registry wired to upgrade itself: it authorizes its own code and has
+/// published three `Organization` versions (v1–v3) against itself, each bound to
+/// its own approved hash. This is the canonical arrangement — the registry is the
+/// registry.
+struct SelfHarness {
+    env: Env,
+    client: RegistryContractClient<'static>,
+    admin: Address,
+    /// The version the registry is left standing on, for the tests that need a
+    /// registry that is already past its first upgrade.
+    h1: BytesN<32>,
+    h2: BytesN<32>,
+    h3: BytesN<32>,
+}
+
+fn setup_self() -> SelfHarness {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    // The registry authorizes its own code, so the approval gate is a cross-call
+    // back into this contract.
+    client.set_upgrade_authority(&admin, &admin, &id);
+
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Organization, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Organization, 2);
+    let h3 = approved_hash(&env, &client, &admin, ModuleKind::Organization, 3);
+    for (version, code) in [(1u32, &h1), (2, &h2), (3, &h3)] {
+        client.register_version(
+            &admin,
+            &ModuleKind::Organization,
+            &version,
+            &impl_address(&env),
+            code,
+        );
+    }
+
+    SelfHarness {
+        env,
+        client,
+        admin,
+        h1,
+        h2,
+        h3,
+    }
+}
+
+/// Stand the registry on `version`, the state a completed self-upgrade leaves
+/// behind: instance storage outlives the code swap, so the recorded version is
+/// still standing after the new code takes over.
+fn stand_on(h: &SelfHarness, version: u32) {
+    h.env.as_contract(&h.client.address, || {
+        h.env
+            .storage()
+            .instance()
+            .set(&DataKey::RegistryVersion, &version);
+    });
+}
+
+#[test]
+fn a_self_upgrade_resolves_a_published_hash_to_its_version() {
+    let h = setup_self();
+    // Deployed before the key existed: standing at the start of its own path.
+    assert_eq!(h.client.get_registry_version(), 0);
+    for (code, version) in [(&h.h1, 1u32), (&h.h2, 2), (&h.h3, 3)] {
+        assert_eq!(h.client.validate_registry_upgrade(code), version);
+    }
+    // The dry run is read-only: it resolved all three without moving anything.
+    assert_eq!(h.client.get_registry_version(), 0);
+}
+
+#[test]
+fn the_self_upgrade_path_advances_and_never_repeats() {
+    let h = setup_self();
+    stand_on(&h, 2);
+    assert_eq!(h.client.get_registry_version(), 2);
+
+    // Forward still resolves...
+    assert_eq!(h.client.validate_registry_upgrade(&h.h3), 3);
+    // ...and nothing at or behind the running version does. v1 and v2 are
+    // published, approved and perfectly valid; the registry is simply past them.
+    for behind in [&h.h1, &h.h2] {
+        assert_eq!(
+            h.client.try_validate_registry_upgrade(behind),
+            Err(Ok(Error::CircularUpgrade))
+        );
+    }
+    // The version it already runs is the degenerate case of the same rule: a
+    // "move" that changes no code.
+    stand_on(&h, 3);
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&h.h3),
+        Err(Ok(Error::CircularUpgrade))
+    );
+}
+
+#[test]
+fn approved_code_the_registry_never_published_is_not_an_upgrade_target() {
+    let h = setup_self();
+    // The approval the shared gate checks on its own: a hash on the approved
+    // list, with no version behind it. Approval is not progression, so the
+    // upgrade map has to carry its weight before the registry will move.
+    let unpublished = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Organization, 9);
+    assert!(h
+        .client
+        .is_wasm_approved(&ModuleKind::Organization, &unpublished));
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&unpublished),
+        Err(Ok(Error::NotFound))
+    );
+    // And the write path says the same, rather than swapping code in.
+    assert_eq!(
+        h.client.try_upgrade(&h.admin, &unpublished),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(h.client.get_registry_version(), 0);
+}
+
+#[test]
+fn code_published_for_another_kind_is_not_a_registry_upgrade_target() {
+    let h = setup_self();
+    // The same code, published and approved as a wallet implementation. The
+    // registry resolves targets within its own kind, so this is not a version of
+    // the registry no matter how well it is otherwise attested.
+    let wallet_code = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Wallet, 5);
+    h.client.register_version(
+        &h.admin,
+        &ModuleKind::Wallet,
+        &1,
+        &impl_address(&h.env),
+        &wallet_code,
+    );
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&wallet_code),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn one_hash_published_twice_resolves_to_the_newest_version() {
+    let h = setup_self();
+    // Republishing existing code under a fresh version is legitimate — it is how
+    // a rebuild that hashes the same, or a redeployment, is recorded — and the
+    // registry must read it as the newest version carrying that code, which is
+    // the only reading consistent with a path that only ever goes forward.
+    h.client.register_version(
+        &h.admin,
+        &ModuleKind::Organization,
+        &4,
+        &impl_address(&h.env),
+        &h.h1,
+    );
+    assert_eq!(h.client.validate_registry_upgrade(&h.h1), 4);
+    // A registry already past that version is being offered a downgrade, and the
+    // newest binding is the one that says so.
+    stand_on(&h, 5);
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&h.h1),
+        Err(Ok(Error::CircularUpgrade))
+    );
+}
+
+#[test]
+fn a_published_record_naming_an_account_is_refused_as_a_target() {
+    let h = setup_self();
+    // The upgrade map is the registry's own record of what it deploys, so a
+    // record naming an account is malformed and must not be laundered into an
+    // accepted upgrade target by the fact that its hash is approved.
+    let account = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Organization, 7);
+    h.client.register_version(
+        &h.admin,
+        &ModuleKind::Organization,
+        &4,
+        &account_address(&h.env),
+        &account,
+    );
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&account),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn a_registry_with_nothing_published_has_no_upgrade_target() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    client.set_upgrade_authority(&admin, &admin, &id);
+    let code = approved_hash(&env, &client, &admin, ModuleKind::Organization, 1);
+
+    // Approved, but there is no `Organization` version to resolve it against.
+    assert_eq!(
+        client.try_validate_registry_upgrade(&code),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(client.get_registry_version(), 0);
+}
+
+#[test]
+fn the_registry_upgrade_scan_is_bounded_by_a_window_of_published_versions() {
+    let h = setup_self();
+    // Fill the map well past the scan window so the bound is observable rather
+    // than incidental: `MAX_UPGRADE_SCAN` versions is the whole search, which
+    // keeps one upgrade's cost a function of the protocol's constant and not of
+    // how large a version number an admin chose to publish.
+    let top = 70u32;
+    let window = 64u32;
+    let far = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Organization, 11);
+    let recent = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Organization, 12);
+    for version in 4..=top {
+        let code = if version == 4 {
+            far.clone()
+        } else {
+            recent.clone()
+        };
+        h.client.register_version(
+            &h.admin,
+            &ModuleKind::Organization,
+            &version,
+            &impl_address(&h.env),
+            &code,
+        );
+    }
+    // The newest versions are inside the window and resolve normally.
+    assert_eq!(h.client.validate_registry_upgrade(&recent), top);
+    // v4 is `top - 4` versions back, past the window, so the registry will not
+    // walk the whole range to find it and reports it as unnamed. Publishing the
+    // version you intend to install is the remedy, and it is also what a rolling
+    // deployment does first.
+    assert!(top - 4 > top - window, "v4 must be outside the scan window");
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&far),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn a_stranger_cannot_upgrade_the_registry() {
+    let h = setup_self();
+    let stranger = Address::generate(&h.env);
+    // The very next published version, so the only thing standing in the way is
+    // the caller: the refusal proves authorization is settled before the map is
+    // consulted, not after.
+    assert_eq!(h.client.validate_registry_upgrade(&h.h3), 3);
+    assert_eq!(
+        h.client.try_upgrade(&stranger, &h.h3),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.get_registry_version(), 0);
+}
+
+#[test]
+fn an_unapproved_hash_is_refused_before_the_map_is_consulted() {
+    let h = setup_self();
+    // Neither approved nor published. Both gates would refuse it, and the order
+    // is what off-chain consumers decode: an unapproved hash is a permission
+    // failure (`Unauthorized`), not a missing version.
+    let stranger_code = hash(&h.env, 42);
+    assert_eq!(
+        h.client.try_upgrade(&h.admin, &stranger_code),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn validating_a_self_upgrade_is_read_only_and_needs_no_signature() {
+    // An env with nothing mocked at all: only a read-only call can succeed in
+    // it, which is what makes this a test of the auth-free property. The state a
+    // deployed registry already holds is written through the contract's own
+    // storage, since the entrypoints that would establish it need a signature
+    // too.
+    let env = Env::default();
+    let id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &id);
+    let admin = Address::generate(&env);
+    let code = hash(&env, 1);
+    // Built outside the frame: registering a contract inside one is not a thing
+    // the host allows.
+    let implementation = impl_address(&env);
+    env.as_contract(&id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(
+            &DataKey::ApprovedWasm(ModuleKind::Organization, code.clone()),
+            &true,
+        );
+        env.storage().persistent().set(
+            &DataKey::VersionRecord(ModuleKind::Organization, 1),
+            &VersionRecord {
+                address: implementation,
+                hash: BoundHash::Bound(code.clone()),
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::LatestVersion(ModuleKind::Organization), &1u32);
+    });
+
+    assert_eq!(client.validate_registry_upgrade(&code), 1);
+    // The write path needs a signature, and gets none: the host refuses at the
+    // authorization gate before the contract is entered.
+    assert!(client.try_upgrade(&admin, &code).is_err());
+    assert_eq!(client.get_registry_version(), 0);
+}
+
+#[test]
+fn a_downgrade_refused_by_the_write_path_leaves_the_recorded_version_alone() {
+    let h = setup_self();
+    stand_on(&h, 3);
+    for behind in [&h.h1, &h.h2, &h.h3] {
+        assert_eq!(
+            h.client.try_upgrade(&h.admin, behind),
+            Err(Ok(Error::CircularUpgrade))
+        );
+    }
+    // Every refusal reported the same code the dry run would, and none of them
+    // touched the high-water mark.
+    assert_eq!(h.client.get_registry_version(), 3);
+}
+
+#[test]
+fn a_frozen_registry_can_still_replace_its_own_code() {
+    let h = setup_self();
+    let org = String::from_str(&h.env, "acme");
+    h.client.register_org(&h.admin, &org, &h.admin);
+    h.client.freeze(&h.admin, &org);
+
+    stand_on(&h, 1);
+    // The freeze stops org-scoped writes. It deliberately does not stop the
+    // registry replacing its own code: a registry that could not be repaired
+    // during an incident would be the one contract nobody could fix. A forward
+    // target still resolves...
+    assert_eq!(h.client.validate_registry_upgrade(&h.h3), 3);
+    // ...and the ordering rule is still enforced while frozen, so being frozen
+    // buys no way to roll the registry backwards either.
+    assert_eq!(
+        h.client.try_upgrade(&h.admin, &h.h1),
+        Err(Ok(Error::CircularUpgrade))
+    );
+    assert_eq!(h.client.get_registry_version(), 1);
+}
+
+#[test]
+fn the_registry_version_is_reported_per_contract() {
+    let h = setup_self();
+    // A second registry instance is on its own path entirely: moving one must
+    // not move the other, and neither may inherit the other's pin.
+    let other = Env::default();
+    other.mock_all_auths();
+    let other_id = other.register_contract(None, RegistryContract);
+    let other_client = RegistryContractClient::new(&other, &other_id);
+
+    stand_on(&h, 2);
+    assert_eq!(h.client.get_registry_version(), 2);
+    assert_eq!(other_client.get_registry_version(), 0);
+}
+
+// --- module registration: the organization must exist (Issue #206) ---
+
+#[test]
+fn a_module_cannot_be_registered_for_an_organization_that_does_not_exist() {
+    let (env, client, admin) = setup();
+    let ghost = String::from_str(&env, "ghost");
+    let wallet = Address::generate(&env);
+
+    // Every permission that can register a module is defined against a recorded
+    // owner, and this organization has none — so the protocol admin is refused
+    // too. A record here would route an organization's traffic with no party
+    // accountable for it, not even the admin, who can repoint it at will.
+    assert_eq!(
+        client.try_register_module(&admin, &ghost, &ModuleKind::Wallet, &wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_remove_module(&admin, &ghost, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        client.try_get_module_address(&ghost, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn the_protocol_admin_may_still_manage_a_registered_organization() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // The organization check runs ahead of the admin short circuit, so this is
+    // the case worth pinning: an admin over an organization that *does* exist is
+    // still allowed to manage its modules.
+    client.register_module(&admin, &org, &ModuleKind::Wallet, &wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+    client.remove_module(&admin, &org, &ModuleKind::Wallet);
+    assert_eq!(
+        client.try_lookup(&org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn module_registration_demands_the_owners_own_signature() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // A stranger is refused on the recorded owner, whatever they sign.
+    assert_eq!(
+        client.try_register_module(&stranger, &org, &ModuleKind::Wallet, &wallet),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+
+    // The owner's signature was required for exactly this invocation — the
+    // signature is what ties the call to the account the registry holds as the
+    // organization's owner.
+    let auths = env.auths();
+    let (signer, invocation) = auths.last().expect("registration must require auth");
+    assert_eq!(signer, &owner);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, function, _args)) => {
+            assert_eq!(contract, &client.address);
+            assert_eq!(function, &Symbol::new(&env, "register_module"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
