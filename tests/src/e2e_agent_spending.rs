@@ -19,10 +19,9 @@
 //! variants and assert on the deterministic [`Error`] codes.
 
 use astroid_budget::{BudgetContract, BudgetContractClient, Period};
-use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState};
-use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
+use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState, ReleaseConditionConfig};
 use astroid_policy::{PolicyContract, PolicyContractClient};
-use astroid_proposal::{ProposalContract, ProposalContractClient};
+use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
@@ -638,6 +637,168 @@ fn escrow_constraints_are_enforced_end_to_end() {
     assert_eq!(h.wallet.balance(&wallet_id, &h.asset), 20_000);
 }
 
+/// Build a multi-party escrow config: the treasury funds it, the multisig
+/// arbitrates, and settlement needs `threshold` sign-offs from `participants`.
+fn multi_party_config(
+    h: &Harness,
+    amount: i128,
+    participants: &Vec<Address>,
+    threshold: u32,
+    deadline: u64,
+    grace_period: u64,
+    memo: &str,
+) -> ReleaseConditionConfig {
+    ReleaseConditionConfig {
+        sender: h.treasury.address.clone(),
+        recipient: h.recipient.clone(),
+        arbiter: h.multisig.clone(),
+        assets: vec![
+            &h.env,
+            AssetAmount {
+                asset: h.asset.clone(),
+                amount,
+            },
+        ],
+        deadline,
+        grace_period,
+        refund_window: 0,
+        memo: string(h, memo),
+        override_signers: Vec::new(&h.env),
+        override_threshold: 0,
+        participants: participants.clone(),
+        approval_threshold: threshold,
+    }
+}
+
+/// A collaborative settlement — buyer agent, seller agent and a third-party
+/// validator oracle — pays the beneficiary only once two of the three have
+/// signed off, and the arbiter alone is not enough.
+#[test]
+fn multi_party_escrow_release_needs_distinct_participant_sign_off() {
+    let h = setup();
+    let _wallet_id = fund_agent_wallet(&h, 20_000);
+    let amount = 10_000;
+
+    // Buyer agent, seller agent and an independent validator oracle.
+    let validator = Address::generate(&h.env);
+    let parties: Vec<Address> = vec![
+        &h.env,
+        h.org_owner.clone(),
+        h.agent.clone(),
+        validator.clone(),
+    ];
+    let config = multi_party_config(
+        &h,
+        amount,
+        &parties,
+        2,
+        START + 86_400,
+        0,
+        "collaborative settlement",
+    );
+    let escrow_id = h.escrow.create_with_release_condition(&config);
+    assert_eq!(token_balance(&h, &h.escrow.address), amount);
+    assert_eq!(h.escrow.get_release_condition(&escrow_id).approvals, 0);
+
+    // The arbiter on its own cannot pay out: nobody has signed off.
+    let res = h.escrow.try_release(&h.multisig, &escrow_id, &amount);
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(token_balance(&h, &h.recipient), 0);
+
+    // A principal outside the participant set cannot lend its vote.
+    let res = h.escrow.try_approve_release(&h.recipient, &escrow_id);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+    assert_eq!(h.escrow.get_release_condition(&escrow_id).approvals, 0);
+
+    // One sign-off is recorded, and the same party cannot be counted twice.
+    assert_eq!(h.escrow.approve_release(&h.org_owner, &escrow_id), 1);
+    let res = h.escrow.try_approve_release(&h.org_owner, &escrow_id);
+    assert_eq!(res, Err(Ok(Error::AlreadySigned)));
+    assert_eq!(h.escrow.get_release_condition(&escrow_id).approvals, 1);
+    assert_eq!(h.escrow.release_approvals(&escrow_id).len(), 1);
+
+    // A partial sign-off is still not enough, whatever the arbiter does.
+    let res = h.escrow.try_release(&h.multisig, &escrow_id, &amount);
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(token_balance(&h, &h.escrow.address), amount);
+
+    // The validator oracle is the deciding second signature.
+    assert_eq!(h.escrow.approve_release(&validator, &escrow_id), 2);
+    h.escrow.release(&h.multisig, &escrow_id, &amount);
+
+    assert_eq!(h.escrow.get(&escrow_id).state, EscrowState::Released);
+    assert_eq!(token_balance(&h, &h.recipient), amount);
+    assert_eq!(token_balance(&h, &h.escrow.address), 0);
+    assert_eq!(
+        h.escrow.release_approvals(&escrow_id),
+        vec![&h.env, h.org_owner.clone(), validator]
+    );
+
+    // A settled escrow accepts no further sign-off and cannot be paid twice.
+    let res = h.escrow.try_approve_release(&h.agent, &escrow_id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    let res = h.escrow.try_release(&h.multisig, &escrow_id, &amount);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(token_balance(&h, &h.recipient), amount);
+}
+
+/// A multi-party condition may delay a payout but must never lock up the
+/// funder's money: a timed-out escrow with an unreachable threshold still refunds
+/// the treasury.
+#[test]
+fn multi_party_escrow_timeout_refund_overrides_pending_approvals() {
+    let h = setup();
+    let _wallet_id = fund_agent_wallet(&h, 20_000);
+    let amount = 10_000;
+    let deadline = START + 1_000;
+    let grace = 500;
+    let validator = Address::generate(&h.env);
+
+    let parties: Vec<Address> = vec![
+        &h.env,
+        h.org_owner.clone(),
+        h.agent.clone(),
+        validator.clone(),
+    ];
+    // Three participants, three approvals required — and only one party is ever
+    // going to sign, so this escrow can never be released.
+    let config = multi_party_config(
+        &h,
+        amount,
+        &parties,
+        3,
+        deadline,
+        grace,
+        "timed-out collaborative settlement",
+    );
+    let escrow_id = h.escrow.create_with_release_condition(&config);
+    assert_eq!(h.escrow.approve_release(&h.org_owner, &escrow_id), 1);
+    assert_eq!(token_balance(&h, &h.escrow.address), amount);
+
+    // During the grace window the counterparty may still settle, so nobody can
+    // reclaim yet.
+    h.env.ledger().with_mut(|l| l.timestamp = deadline);
+    let res = h.escrow.try_refund(&h.treasury.address, &escrow_id);
+    assert_eq!(res, Err(Ok(Error::GraceActive)));
+
+    // Once the grace period has elapsed the sender reclaims regardless of the
+    // outstanding sign-off.
+    h.env.ledger().with_mut(|l| l.timestamp = deadline + grace);
+    h.escrow.refund(&h.treasury.address, &escrow_id);
+
+    assert_eq!(h.escrow.get(&escrow_id).state, EscrowState::Refunded);
+    assert_eq!(token_balance(&h, &h.escrow.address), 0);
+    assert_eq!(token_balance(&h, &h.recipient), 0);
+    // The approval that was recorded before the timeout is left intact for the
+    // audit trail, it simply never mattered.
+    assert_eq!(h.escrow.get_release_condition(&escrow_id).approvals, 1);
+
+    // The arbiter cannot resurrect the escrow after the refund.
+    let res = h.escrow.try_release(&h.multisig, &escrow_id, &amount);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(token_balance(&h, &h.recipient), 0);
+}
+
 /// Time-locked escrow custody: the beneficiary cannot withdraw before the
 /// unlock time, only after maturity.
 #[test]
@@ -785,4 +946,79 @@ fn registry_links_the_deployed_modules() {
         assert_eq!(h.registry.lookup(&string(&h, ORG), &kind), addr);
     }
     assert!(h.registry.verify_owner(&string(&h, ORG), &h.org_owner));
+}
+
+// ---------------------------------------------------------------------------
+// Proposal timelock enforcement (issue #295)
+// ---------------------------------------------------------------------------
+
+/// The deployed proposal contract enforces its timelock end to end: a
+/// proposal that reaches the approval threshold may not be executed before
+/// `approved_at + timelock` (premature attempts fail with the protocol-wide
+/// [`Error::TimelockNotExpired`] code and change nothing), execution succeeds
+/// exactly at the release instant, and the executed state is observable
+/// through the contract's own views and the registry.
+#[test]
+fn proposal_timelock_gates_execution_end_to_end() {
+    let h = setup();
+
+    // The harness deployed the proposal contract and registered it in the
+    // registry; resolve it through the registry like a real integrator.
+    let proposal_id = h.registry.lookup(&string(&h, ORG), &ModuleKind::Proposal);
+    let proposal = ProposalContractClient::new(&h.env, &proposal_id);
+
+    // Configure a 100-second timelock (the contract is fresh in this env).
+    proposal.initialize(&100);
+    assert_eq!(h.env.ledger().timestamp(), START);
+
+    let proposer = h.org_owner.clone();
+    let approvers: Vec<Address> = vec![&h.env, h.admin.clone(), h.agent.clone(), proposer.clone()];
+    let pid = proposal.create(
+        &proposer,
+        &string(&h, ORG),
+        &string(&h, "wallet-1"),
+        &string(&h, "policy-1"),
+        &approvers,
+        &vec![&h.env],
+        &2,
+        &Vec::new(&h.env),
+        &(START + 30 * 86_400),
+        &0,
+    );
+
+    // Pending before any vote.
+    assert_eq!(proposal.state(&pid), ProposalState::Pending);
+
+    // One approval is not enough for the threshold of 2 — still pending.
+    proposal.approve(&h.admin, &pid);
+    assert_eq!(proposal.state(&pid), ProposalState::Pending);
+
+    // Reaching the threshold flips the state and stamps the timelock start.
+    proposal.approve(&h.agent, &pid);
+    assert_eq!(proposal.state(&pid), ProposalState::Approved);
+    assert!(!proposal.is_executed(&pid));
+    assert_eq!(proposal.get(&pid).approved_at, START);
+
+    // Executing immediately — long before the timelock releases — is refused
+    // with the deterministic code and leaves the proposal untouched.
+    let res = proposal.try_execute(&proposer, &pid);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(proposal.state(&pid), ProposalState::Approved);
+
+    // One second before the release instant the gate is still closed.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 99);
+    let res = proposal.try_execute(&proposer, &pid);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(proposal.state(&pid), ProposalState::Approved);
+
+    // At exactly `approved_at + timelock` the gate opens: the `can_execute`
+    // view agrees with the entrypoint, and execution completes into the
+    // terminal executed state.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert!(proposal.can_execute(&pid));
+    proposal.execute(&proposer, &pid);
+    assert_eq!(proposal.state(&pid), ProposalState::Executed);
+    assert!(proposal.is_executed(&pid));
+    // Execution is one-shot: the gate closes again behind the proposal.
+    assert!(!proposal.can_execute(&pid));
 }

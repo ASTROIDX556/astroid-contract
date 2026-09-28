@@ -14,7 +14,7 @@ use astroid_shared::types::AssetAmount;
 
 use crate::{
     EscrowContract, EscrowContractClient, EscrowState, MilestoneSpec, MilestoneStatus,
-    OverrideSignature, ReleaseSchedule, ReleaseType,
+    OverrideSignature, ReleaseConditionConfig, ReleaseSchedule, ReleaseType,
 };
 
 const START: u64 = 1_000;
@@ -156,6 +156,54 @@ fn milestone_spec(env: &Env, description: &str, bps: u32) -> MilestoneSpec {
         description: String::from_str(env, description),
         release_bps: bps,
     }
+}
+
+/// Build a [`ReleaseConditionConfig`] over `assets` with the
+/// signature-override path disabled and the refund window left unbounded.
+fn release_condition_config(
+    h: &Harness,
+    assets: &Vec<AssetAmount>,
+    participants: &Vec<Address>,
+    threshold: u32,
+    deadline: u64,
+) -> ReleaseConditionConfig {
+    ReleaseConditionConfig {
+        sender: h.sender.clone(),
+        recipient: h.recipient.clone(),
+        arbiter: h.arbiter.clone(),
+        assets: assets.clone(),
+        deadline,
+        grace_period: GRACE,
+        refund_window: 0,
+        memo: String::from_str(&h.env, "multi-party"),
+        override_signers: no_signers(h),
+        override_threshold: 0,
+        participants: participants.clone(),
+        approval_threshold: threshold,
+    }
+}
+
+/// Create + fund a multi-party escrow that pays out only after `threshold`
+/// distinct approvals out of `participants`.
+fn create_multi_party(
+    h: &Harness,
+    assets: &Vec<AssetAmount>,
+    participants: &Vec<Address>,
+    threshold: u32,
+    deadline: u64,
+) -> u64 {
+    let config = release_condition_config(h, assets, participants, threshold, deadline);
+    h.client.create_with_release_condition(&config)
+}
+
+/// `threshold` fresh counterparties standing in for the buyer, seller and
+/// validator-oracle agents of a collaborative settlement.
+fn counterparties(env: &Env, count: u32) -> Vec<Address> {
+    let mut out: Vec<Address> = Vec::new(env);
+    for _ in 0..count {
+        out.push_back(Address::generate(env));
+    }
+    out
 }
 
 // --- Core multi-asset tests ---
@@ -2791,4 +2839,365 @@ fn initialize_is_one_shot() {
         Err(Ok(Error::AlreadyInitialized))
     );
     assert_eq!(h.client.admin(), h.admin);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #323: multi-party release conditions
+// ---------------------------------------------------------------------------
+
+/// The arbiter's release is refused until `threshold` distinct participants
+/// have signed off, and the funds stay in custody the whole time.
+#[test]
+fn multi_party_release_waits_for_the_approval_threshold() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 3);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+
+    // No sign-off at all: the arbiter cannot pay out.
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    // A partial approval is still not enough.
+    assert_eq!(h.client.approve_release(&parties.get_unchecked(0), &id), 1);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    // The second, distinct sign-off clears the gate.
+    assert_eq!(h.client.approve_release(&parties.get_unchecked(2), &id), 2);
+    h.client.release(&h.arbiter, &id, &5_000);
+
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+    assert_eq!(h.client.get_release_condition(&id).approvals, 2);
+    assert_eq!(
+        h.client.release_approvals(&id),
+        vec![&h.env, parties.get_unchecked(0), parties.get_unchecked(2)]
+    );
+}
+
+/// A party can only be counted once: a repeat approval is refused and never
+/// moves the escrow closer to its threshold.
+#[test]
+fn multi_party_approvals_reject_duplicates_from_the_same_party() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+
+    let buyer = parties.get_unchecked(0);
+    assert_eq!(h.client.approve_release(&buyer, &id), 1);
+    assert_eq!(
+        h.client.try_approve_release(&buyer, &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(
+        h.client.try_approve_release(&buyer, &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.get_release_condition(&id).approvals, 1);
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    // Only a genuinely different party can reach the threshold.
+    h.client.approve_release(&parties.get_unchecked(1), &id);
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+}
+
+/// Only the configured counterparties may sign off; the arbiter, the sender and
+/// random outsiders are all rejected.
+#[test]
+fn multi_party_approval_rejects_anyone_outside_the_participant_set() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+
+    for outsider in [&h.arbiter, &h.sender, &h.recipient] {
+        assert_eq!(
+            h.client.try_approve_release(outsider, &id),
+            Err(Ok(Error::NotASigner))
+        );
+    }
+    assert_eq!(h.client.get_release_condition(&id).approvals, 0);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+}
+
+/// The participant authorizes the approval itself: a third party (or nobody at
+/// all) cannot record a sign-off on its behalf, and the recorded authorization
+/// is bound to this `approve_release` invocation.
+#[test]
+fn multi_party_approval_demands_the_participants_own_signature() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 1, START + 10_000);
+    let buyer = parties.get_unchecked(0);
+
+    h.client.approve_release(&buyer, &id);
+    assert_eq!(
+        h.env.auths(),
+        std::vec![(
+            buyer.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    h.client.address.clone(),
+                    Symbol::new(&h.env, "approve_release"),
+                    (buyer.clone(), id).into_val(&h.env),
+                )),
+                sub_invocations: std::vec![],
+            }
+        )]
+    );
+
+    // Drop the blanket mock: naming the participant as `caller` is not enough
+    // for someone else to vote for it.
+    h.env.set_auths(&[]);
+    assert!(matches!(
+        h.client.try_approve_release(&buyer, &id),
+        Err(Err(_))
+    ));
+
+    // A signature from a different account does not stand in either.
+    let relayer = Address::generate(&h.env);
+    assert!(matches!(
+        h.client
+            .mock_auths(&[MockAuth {
+                address: &relayer,
+                invoke: &MockAuthInvoke {
+                    contract: &h.client.address,
+                    fn_name: "approve_release",
+                    args: (buyer.clone(), id).into_val(&h.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_approve_release(&buyer, &id),
+        Err(Err(_))
+    ));
+    assert_eq!(h.client.get_release_condition(&id).approvals, 1);
+}
+
+/// The sign-off never takes effect twice: once the escrow has settled there is
+/// nothing left to approve.
+#[test]
+fn multi_party_approval_is_refused_once_the_escrow_settles() {
+    let h = setup(10_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let released = create_multi_party(&h, &one_asset(&h, 4_000), &parties, 1, START + 10_000);
+    let refunded = create_multi_party(&h, &one_asset(&h, 6_000), &parties, 1, DEADLINE);
+
+    h.client
+        .approve_release(&parties.get_unchecked(0), &released);
+    h.client.release(&h.arbiter, &released, &4_000);
+    assert_eq!(
+        h.client
+            .try_approve_release(&parties.get_unchecked(1), &released),
+        Err(Ok(Error::InvalidState))
+    );
+
+    at(&h, DEADLINE + GRACE);
+    h.client.refund(&h.sender, &refunded);
+    assert_eq!(
+        h.client
+            .try_approve_release(&parties.get_unchecked(0), &refunded),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(h.client.get(&refunded).state, EscrowState::Refunded);
+}
+
+/// A condition must never be able to strand the funder's money: the sender-side
+/// exits stay open while approvals are still outstanding.
+#[test]
+fn multi_party_timeout_refund_overrides_a_pending_condition() {
+    let h = setup(10_000, 0);
+    let parties = counterparties(&h.env, 3);
+    // All three need three approvals out of three, and only one party ever
+    // signs — so no payout is ever possible for any of them.
+    let refunded = create_multi_party(&h, &one_asset(&h, 4_000), &parties, 3, DEADLINE);
+    let reclaimed = create_multi_party(&h, &one_asset(&h, 3_000), &parties, 3, DEADLINE);
+    let cancelled = create_multi_party(&h, &one_asset(&h, 3_000), &parties, 3, DEADLINE);
+    h.client
+        .approve_release(&parties.get_unchecked(0), &refunded);
+    assert_eq!(balances(&h), (0, 0, 10_000));
+
+    // `cancel` is open to either party before the deadline, with no sign-off.
+    h.client.cancel(&h.arbiter, &cancelled);
+    assert_eq!(h.client.get(&cancelled).state, EscrowState::Refunded);
+    assert_eq!(balances(&h), (3_000, 0, 7_000));
+
+    // A refund opens once the grace period has fully elapsed, even with the
+    // sign-off still outstanding.
+    at(&h, DEADLINE + GRACE - 1);
+    assert_eq!(
+        h.client.try_refund(&h.sender, &refunded),
+        Err(Ok(Error::GraceActive))
+    );
+    at(&h, DEADLINE + GRACE);
+    h.client.refund(&h.sender, &refunded);
+    assert_eq!(h.client.get(&refunded).state, EscrowState::Refunded);
+
+    // `reclaim` reaches the same funds post-grace, again with no sign-off.
+    h.client.reclaim(&h.sender, &reclaimed);
+    assert_eq!(h.client.get(&reclaimed).state, EscrowState::Refunded);
+
+    // Every token is back with the funder and the recipient was never paid.
+    assert_eq!(balances(&h), (10_000, 0, 0));
+    assert_eq!(h.client.release_approvals(&refunded).len(), 1);
+    assert_eq!(h.client.release_approvals(&reclaimed).len(), 0);
+    assert_eq!(h.client.release_approvals(&cancelled).len(), 0);
+}
+
+/// The recipient's own claim path is gated too, so an unmet condition cannot be
+/// side-stepped by pulling the funds directly.
+#[test]
+fn multi_party_condition_gates_the_recipients_own_claim() {
+    let h = setup(5_000, 0);
+    let parties = counterparties(&h.env, 2);
+    let id = create_multi_party(&h, &one_asset(&h, 5_000), &parties, 2, DEADLINE);
+
+    // Before the deadline an unscheduled escrow reports the time lock first.
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // Once claiming would otherwise be allowed, the unmet condition is what
+    // stops it.
+    at(&h, DEADLINE + GRACE);
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    h.client.approve_release(&parties.get_unchecked(0), &id);
+    h.client.approve_release(&parties.get_unchecked(1), &id);
+    assert_eq!(h.client.claim(&h.recipient, &id), 5_000);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+}
+
+/// The signature override is an alternative arbiter, not a way around the
+/// condition: valid override signatures alone still do not pay out.
+#[test]
+fn multi_party_condition_gates_the_signature_override() {
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let parties = counterparties(&h.env, 2);
+    let mut config =
+        release_condition_config(&h, &one_asset(&h, 5_000), &parties, 2, START + 10_000);
+    config.override_signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
+    config.override_threshold = 2;
+    let id = h.client.create_with_release_condition(&config);
+
+    let nonce = 1u64;
+    let sigs = vec![
+        &h.env,
+        sign_override(&h, &kp1, id, nonce),
+        sign_override(&h, &kp2, id, nonce),
+    ];
+    assert_eq!(
+        h.client.try_override_release(&id, &nonce, &sigs),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balances(&h), (0, 0, 5_000));
+
+    h.client.approve_release(&parties.get_unchecked(0), &id);
+    h.client.approve_release(&parties.get_unchecked(1), &id);
+    h.client.override_release(&id, &nonce, &sigs);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balances(&h), (0, 5_000, 0));
+}
+
+/// A bad participant set is refused before any tokens are pulled, and an empty
+/// set is a plain escrow rather than an error.
+#[test]
+fn create_with_release_condition_rejects_bad_participant_sets() {
+    let h = setup(5_000, 0);
+    let one = counterparties(&h.env, 1);
+    let two = counterparties(&h.env, 2);
+    let deadline = START + 10_000;
+    let try_create = |participants: &Vec<Address>, threshold: u32| {
+        h.client
+            .try_create_with_release_condition(&release_condition_config(
+                &h,
+                &one_asset(&h, 1_000),
+                participants,
+                threshold,
+                deadline,
+            ))
+    };
+
+    // A threshold of zero would mean "releasable immediately".
+    assert_eq!(try_create(&two, 0), Err(Ok(Error::InvalidThreshold)));
+    // More signatures demanded than participants exist.
+    assert_eq!(try_create(&one, 2), Err(Ok(Error::InvalidThreshold)));
+    // No participants but a non-zero threshold is contradictory.
+    assert_eq!(
+        try_create(&Vec::new(&h.env), 1),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    // The same party twice must not count as two votes.
+    let duplicated = vec![&h.env, one.get_unchecked(0), one.get_unchecked(0)];
+    assert_eq!(try_create(&duplicated, 2), Err(Ok(Error::InvalidInput)));
+    // Participant sets are capped for gas safety, like signer sets.
+    let too_many = counterparties(&h.env, astroid_shared::constants::MAX_SIGNERS + 1);
+    assert_eq!(try_create(&too_many, 1), Err(Ok(Error::TooManySigners)));
+
+    // Nothing moved and nothing was written: the funder keeps every token.
+    assert_eq!(balances(&h), (5_000, 0, 0));
+    assert_eq!(h.client.try_get(&1), Err(Ok(Error::NotFound)));
+
+    // The empty set is the documented "no condition" case, and behaves exactly
+    // like a plain escrow.
+    let id = try_create(&Vec::new(&h.env), 0).unwrap().unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(
+        h.client.try_get_release_condition(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_release_approvals(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_approve_release(&one.get_unchecked(0), &id),
+        Err(Ok(Error::NotFound))
+    );
+    h.client.release(&h.arbiter, &id, &1_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 1_000);
+}
+
+/// Escrows created through the plain entrypoints are completely unaffected: they
+/// report no condition and settle without any sign-off.
+#[test]
+fn escrows_without_a_condition_carry_no_release_condition() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), DEADLINE, GRACE);
+
+    assert_eq!(
+        h.client.try_get_release_condition(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_release_approvals(&id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_approve_release(&h.arbiter, &id),
+        Err(Ok(Error::NotFound))
+    );
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balances(&h), (0, 5_000, 0));
 }

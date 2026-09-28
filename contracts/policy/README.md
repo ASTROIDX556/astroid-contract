@@ -5,7 +5,7 @@ Policy contract — hash-verified enforcement of financial rules.
 The backend manages human-readable policy JSON (e.g. `{ maxAmount: 25000, recipients: [...], window: {...} }`). This contract stores only:
 
 - a SHA-256 `config_hash` of that JSON (tamper-evidence),
-- a small set of scalar gates that are cheap to check on-chain (`max_amount`, `allowed_recipient`, `allowed_asset`, `expires_at`).
+- a small set of scalar gates that are cheap to check on-chain (`max_amount`, `allowed_recipient`, `allowed_asset`, `expires_at`, and the daily operating time window).
 
 The [`check_transfer`](src/lib.rs) entry point evaluates a proposed transfer
 against a named policy and returns [`Error::PolicyDenied`] when any gate fails.
@@ -36,11 +36,31 @@ While enforcement is active the gate fails closed: an empty whitelist denies
 every recipient. With enforcement off the gate is a no-op, so existing policies
 are unaffected until governance opts in.
 
+## Transfer time windows
+
+Agents should only spend during approved operating hours. The owner confines a
+policy to a daily window in ledger time:
+
+- `set_transfer_window` — set `start_time` / `end_time` (seconds since
+  midnight UTC) repeating every `window_days` seconds (owner-gated).
+  `window_days == 0` clears the restriction; the window may wrap over
+  midnight (e.g. `22:00 → 06:00`).
+- `get_transfer_window` — read back `(start_time, end_time, window_days)`.
+
+While a window is configured, `check_transfer` denies a transaction whose time
+of day — always `env.ledger().timestamp()`, never caller input — falls outside
+`[start_time, end_time)` with `Error::PolicyDenied` and an `outside_window`
+violation event. The start is inclusive, the end exclusive; a zero-length
+window (`start == end`) fails closed and allows no time at all. Policies
+created before this feature default to no window and behave exactly as before.
+
 ## Operations
 
 - `register_policy` — install a new policy.
 - `rotate_policy` — replace hash + max threshold (owner-gated).
 - `set_enabled` — disable (deny-all) or re-enable.
+- `set_transfer_window` — restrict transfers to a daily operating window
+  (owner-gated).
 - `check_transfer` (via [`PolicyInterface`]) — called by treasury / wallet.
 - `set_allowance` / `set_recurring_allowance` — per-(policy, asset) spending
   allowance; with `window_seconds > 0` it is a rate limit of `limit` per fixed
@@ -69,6 +89,7 @@ are unaffected until governance opts in.
 
 - `("policy", "registd")` on registration.
 - `("policy", "rotated")` on rotation.
+- `("policy", "timewin")` on operating-window changes.
 - `("policy", "wl_mode")` / `("policy", "wl_add")` / `("policy", "wl_rem")` on
   recipient whitelist edits.
 - `("policy", "violation")` on every denial, with a short `Symbol` reason.

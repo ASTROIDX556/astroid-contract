@@ -1575,3 +1575,67 @@ fn vote_bars_hold_at_the_approver_cap_and_do_not_overflow() {
     h.client.execute(&h.proposer, &win);
     assert_eq!(h.client.state(&win), ProposalState::Executed);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-Sig Threshold Verification & Double-Voting Prevention Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multisig_threshold_verification_and_double_voting_prevention() {
+    let h = setup(5);
+    // 5 approvers, threshold = 3
+    let id = create(&h, 3, 5_000);
+
+    // First voter approves
+    let count1 = h.client.approve(&h.approvers[0], &id);
+    assert_eq!(count1, 1);
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+
+    // Duplicate vote attempt by same approver must be rejected with AlreadySigned
+    let dup_res = h.client.try_approve(&h.approvers[0], &id);
+    assert_eq!(dup_res, Err(Ok(Error::AlreadySigned)));
+
+    // Second voter approves (tally = 2, still below threshold 3)
+    let count2 = h.client.approve(&h.approvers[1], &id);
+    assert_eq!(count2, 2);
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+
+    // Execution request fails because proposal is not yet approved
+    let exec_res1 = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(exec_res1, Err(Ok(Error::ProposalNotApproved)));
+
+    // Third distinct voter approves (tally = 3, meets threshold 3, quorum 3, majority 3)
+    let count3 = h.client.approve(&h.approvers[2], &id);
+    assert_eq!(count3, 3);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Execution now succeeds atomically
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execution_rejected_when_approval_tally_below_threshold() {
+    let h = setup(5);
+    // Proposal requiring threshold of 4 approvals out of 5 approvers
+    let id = create(&h, 4, 10_000);
+
+    // 3 out of 5 approvers vote (1 short of threshold 4)
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    h.client.approve(&h.approvers[2], &id);
+
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+
+    // Execution is rejected since proposal remains Pending (not Approved)
+    let res = h.client.try_execute(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::ProposalNotApproved)));
+
+    // Fourth approval completes threshold requirement
+    h.client.approve(&h.approvers[3], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Now execution succeeds
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
