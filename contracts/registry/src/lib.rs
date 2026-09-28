@@ -1635,7 +1635,7 @@ impl UpgradeableInterface for RegistryContract {
         // approval list for the reason given above.
         caller.require_auth();
         let authority = astroid_interfaces::upgrade::get_authority(&env)?;
-        if &authority.admin != &caller {
+        if authority.admin != caller {
             return Err(Error::Unauthorized);
         }
         ensure!(
