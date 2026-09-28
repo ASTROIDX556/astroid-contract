@@ -112,9 +112,7 @@ fn balance(h: &Harness, who: &Address) -> i128 {
 /// Move the ledger past `deadline + grace_period`, the instant at which the
 /// arbiter's release path closes and the sender's refund paths open.
 fn past_grace(h: &Harness, deadline: u64) {
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = deadline + GRACE);
+    h.env.ledger().with_mut(|l| l.timestamp = deadline + GRACE);
 }
 
 /// Whether the host event log recorded a structured [`ContractEvent`]
@@ -156,18 +154,19 @@ fn escrow_release_lifecycle_moves_funds_to_recipient() {
     assert_eq!(balance(&h, &h.sender), 0);
 
     // Creation emits both the legacy tuple event and the structured one.
-    assert!(emitted(&h, &ContractEvent::EscrowCreated {
-        escrow_id: id,
-        sender: h.sender.clone(),
-        recipient: h.recipient.clone(),
-        assets: assets(&h),
-        deadline,
-    }));
+    assert!(emitted(
+        &h,
+        &ContractEvent::EscrowCreated {
+            escrow_id: id,
+            sender: h.sender.clone(),
+            recipient: h.recipient.clone(),
+            assets: assets(&h),
+            deadline,
+        }
+    ));
 
     // Only the arbiter may release.
-    let res = h
-        .escrow
-        .try_release(&h.stranger, &id, &AMOUNT);
+    let res = h.escrow.try_release(&h.stranger, &id, &AMOUNT);
     assert_eq!(res, Err(Ok(astroid_shared::errors::Error::Unauthorized)));
 
     // Release inside the window pays the recipient in full.
@@ -175,11 +174,14 @@ fn escrow_release_lifecycle_moves_funds_to_recipient() {
     assert_eq!(h.escrow.get(&id).state, EscrowState::Released);
     assert_eq!(balance(&h, &h.recipient), AMOUNT);
     assert_eq!(balance(&h, &h.escrow.address), 0);
-    assert!(emitted(&h, &ContractEvent::EscrowReleased {
-        escrow_id: id,
-        recipient: h.recipient.clone(),
-        assets: assets(&h),
-    }));
+    assert!(emitted(
+        &h,
+        &ContractEvent::EscrowReleased {
+            escrow_id: id,
+            recipient: h.recipient.clone(),
+            assets: assets(&h),
+        }
+    ));
 
     // A released escrow is terminal for value movement: close records it.
     h.escrow.close(&h.arbiter, &id);
@@ -202,9 +204,7 @@ fn escrow_expired_refund_returns_funds_to_depositor() {
     let res = h.escrow.try_refund(&h.sender, &id);
     assert_eq!(res, Err(Ok(astroid_shared::errors::Error::TimeLockActive)));
 
-    h.env
-        .ledger()
-        .with_mut(|l| l.timestamp = deadline + 1);
+    h.env.ledger().with_mut(|l| l.timestamp = deadline + 1);
     let res = h.escrow.try_refund(&h.sender, &id);
     assert_eq!(res, Err(Ok(astroid_shared::errors::Error::GraceActive)));
 
@@ -225,11 +225,14 @@ fn escrow_expired_refund_returns_funds_to_depositor() {
     assert_eq!(h.escrow.get(&id).state, EscrowState::Refunded);
     assert_eq!(balance(&h, &h.sender), AMOUNT);
     assert_eq!(balance(&h, &h.escrow.address), 0);
-    assert!(emitted(&h, &ContractEvent::EscrowRefunded {
-        escrow_id: id,
-        sender: h.sender.clone(),
-        assets: assets(&h),
-    }));
+    assert!(emitted(
+        &h,
+        &ContractEvent::EscrowRefunded {
+            escrow_id: id,
+            sender: h.sender.clone(),
+            assets: assets(&h),
+        }
+    ));
 
     h.escrow.close(&h.sender, &id);
     assert_eq!(h.escrow.get(&id).state, EscrowState::Closed);
@@ -248,11 +251,14 @@ fn escrow_reclaim_after_grace_needs_no_expired_marker() {
     assert_eq!(h.escrow.get(&id).state, EscrowState::Refunded);
     assert_eq!(balance(&h, &h.sender), AMOUNT);
     assert_eq!(balance(&h, &h.escrow.address), 0);
-    assert!(emitted(&h, &ContractEvent::EscrowRefunded {
-        escrow_id: id,
-        sender: h.sender.clone(),
-        assets: assets(&h),
-    }));
+    assert!(emitted(
+        &h,
+        &ContractEvent::EscrowRefunded {
+            escrow_id: id,
+            sender: h.sender.clone(),
+            assets: assets(&h),
+        }
+    ));
 }
 
 /// `is_refundable` mirrors the on-chain rule so clients need not recompute

@@ -667,7 +667,13 @@ impl EscrowContract {
         );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("init_tl")),
-            (id, sender.clone(), recipient.clone(), assets.clone(), unlock_time),
+            (
+                id,
+                sender.clone(),
+                recipient.clone(),
+                assets.clone(),
+                unlock_time,
+            ),
         );
         events::publish(
             &env,
@@ -831,7 +837,13 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("init_tl")),
-            (id, sender.clone(), recipient.clone(), assets.clone(), unlock_time),
+            (
+                id,
+                sender.clone(),
+                recipient.clone(),
+                assets.clone(),
+                unlock_time,
+            ),
         );
         events::publish(
             &env,
@@ -877,7 +889,12 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, escrow.sender.clone(), escrow.recipient.clone(), escrow.assets.clone()),
+            (
+                id,
+                escrow.sender.clone(),
+                escrow.recipient.clone(),
+                escrow.assets.clone(),
+            ),
         );
         events::publish(
             &env,
