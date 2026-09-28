@@ -61,6 +61,13 @@
 //! | the target address is a contract                    | `InvalidInput`         |
 //! | the target address is not the one already in use    | `CircularUpgrade`      |
 //!
+//! [`RegistryContract::register_module_version`] applies the same checks when a
+//! module is *registered* rather than moved: it resolves the address and the
+//! WASM hash from the version record and advances the pin in the same write, so a
+//! versioned deployment (`v1` straight from the registry) is validated at
+//! creation time, and a repoint driven through registration cannot walk backwards
+//! either.
+//!
 //! The pin is a high-water mark and version records are immutable, so a module's
 //! version sequence is strictly increasing: no upgrade can re-enter a version a
 //! module has already left, which is the cycle a rolling deployment must never
@@ -803,6 +810,107 @@ impl RegistryContract {
         Ok(plan.to_version)
     }
 
+    /// Register `org`'s `kind` module onto a published implementation version,
+    /// resolving the address from the registry instead of taking one from the
+    /// caller.
+    ///
+    /// [`Self::register_module`] accepts whatever address the caller names, so
+    /// that path can point a module at code the registry never published or
+    /// approved. This entrypoint closes the gap for versioned deployments: both
+    /// the address and the WASM hash come from the immutable `(kind, version)`
+    /// record, and the module's version pin advances to `version`.
+    ///
+    /// The validations are exactly [`Self::upgrade_module`]'s (see the
+    /// crate-level "Upgrade paths" section), which is what makes the upgrade
+    /// path monotonic even when it is driven through registration:
+    ///
+    /// - `version` is non-zero and strictly newer than the module's existing pin
+    ///   — [`Error::CircularUpgrade`] for a version the module has already left,
+    ///   or for the one it already runs;
+    /// - the target version exists for this `kind` — [`Error::NotFound`];
+    /// - the target is bound to a WASM hash — [`Error::InvalidInput`];
+    /// - that hash is still approved for this `kind` — [`Error::Unauthorized`];
+    /// - the resolved address is a contract — [`Error::InvalidInput`].
+    ///
+    /// Registering a module that was never registered is legal and starts its
+    /// path; registering over an existing one is a validated repoint, and any
+    /// deprecation flag is cleared because the module runs a live implementation
+    /// again. On success the pointer, the pin and the events match what
+    /// [`Self::upgrade_module`] would have produced for the same target, so an
+    /// indexer sees one upgrade path whichever entrypoint drove it. Returns the
+    /// version the module now runs.
+    pub fn register_module_version(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        version: u32,
+    ) -> Result<u32, Error> {
+        Self::check_frozen(&env)?;
+        require_non_empty(&org)?;
+        caller.require_auth();
+        Self::require_module_permission(&env, &caller, &org, kind)?;
+        // Registration may create the record or replace one; either way the
+        // version path is validated against the current pointer when there is
+        // one, so a repoint can never walk backwards.
+        let current: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Module(org.clone(), kind));
+        let existed = current.is_some();
+        let plan = Self::resolve_upgrade_target(&env, &org, kind, version, current)?;
+
+        let key = DataKey::Module(org.clone(), kind);
+        env.storage().persistent().set(&key, &plan.address);
+        Self::bump(&env, &key);
+        let vkey = DataKey::ModuleVersion(org.clone(), kind);
+        env.storage().persistent().set(&vkey, &plan.to_version);
+        Self::bump(&env, &vkey);
+        let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
+        if env.storage().persistent().has(&dkey) {
+            env.storage().persistent().remove(&dkey);
+        }
+
+        astroid_shared::events::publish(
+            &env,
+            ContractEvent::RegistryModuleUpdated {
+                org: org.clone(),
+                kind,
+                address: plan.address.clone(),
+            },
+        );
+        env.events().publish(
+            (
+                symbol_short!("module"),
+                symbol_short!("register"),
+                org.clone(),
+                kind,
+            ),
+            plan.address.clone(),
+        );
+        // A repoint moves an existing module, so it is reported as an upgrade
+        // too: consumers that only track `RegistryModuleUpgraded` see the same
+        // history as they would have through `upgrade_module`.
+        if existed {
+            astroid_shared::events::publish(
+                &env,
+                ContractEvent::RegistryModuleUpgraded {
+                    org: org.clone(),
+                    kind,
+                    from_version: plan.from_version,
+                    to_version: plan.to_version,
+                    address: plan.address.clone(),
+                    wasm_hash: plan.hash.clone(),
+                },
+            );
+            env.events().publish(
+                (symbol_short!("module"), symbol_short!("upgrade")),
+                (org, kind, plan.to_version),
+            );
+        }
+        Ok(plan.to_version)
+    }
+
     /// Run every check [`Self::upgrade_module`] would run and return the address
     /// the module would be moved to, writing nothing.
     ///
@@ -1047,6 +1155,25 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Module(org.clone(), kind))
             .ok_or(Error::NotFound)?;
+        Self::resolve_upgrade_target(env, org, kind, target_version, Some(current))
+    }
+
+    /// The version-path checks shared by [`Self::upgrade_module`] and
+    /// [`Self::register_module_version`].
+    ///
+    /// `current` is the address the module runs today, or `None` when the record
+    /// does not exist yet (a versioned registration). Everything else — the
+    /// non-zero target, the monotonic ordering against the pin, the published
+    /// version record, its bound-and-approved hash and the contract-address
+    /// check — is identical on both paths, so the two entrypoints can never
+    /// disagree about whether a target is reachable.
+    fn resolve_upgrade_target(
+        env: &Env,
+        org: &String,
+        kind: ModuleKind,
+        target_version: u32,
+        current: Option<Address>,
+    ) -> Result<UpgradePlan, Error> {
         // Version `0` is never a valid record (`register_version` refuses it), so
         // it can only be an uninitialized read.
         ensure!(target_version != 0, Error::InvalidInput);
@@ -1086,8 +1213,11 @@ impl RegistryContract {
         );
         // A "move" onto the contract the module already runs is the degenerate
         // cycle: it changes no code and no routing, so it is refused rather than
-        // silently recorded as progress.
-        ensure!(record.address != current, Error::CircularUpgrade);
+        // silently recorded as progress. A versioned registration of a module
+        // that does not exist yet has nothing to compare against.
+        if let Some(current) = current {
+            ensure!(record.address != current, Error::CircularUpgrade);
+        }
 
         Ok(UpgradePlan {
             from_version,
