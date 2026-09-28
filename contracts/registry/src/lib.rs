@@ -191,6 +191,10 @@ enum DataKey {
     Frozen,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
+    /// Pending version-upgrade proposal: kind -> UpgradeProposal.
+    UpgradeProposal(ModuleKind),
+    /// Immutable historical log of upgrade-lifecycle actions (instance).
+    UpgradeAuditLog,
     /// The published `Organization` version whose code this contract is
     /// currently running (instance).
     ///
@@ -204,6 +208,68 @@ enum DataKey {
     /// [`RegistryContract::upgrade`], and only ever with a value strictly
     /// greater than the one it read.
     RegistryVersion,
+}
+
+/// A pending version-upgrade proposal for one [`ModuleKind`]: the `(version,
+/// wasm_hash, address)` triple an authorized caller wants committed into the
+/// version table, plus who proposed it and when it expires.
+///
+/// The record is keyed by kind alone — one proposal per kind at a time — so a
+/// kind's upgrade path is always unambiguous and a hostile proposal cannot hide
+/// behind a second, conflicting one.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposal {
+    /// The version number this proposal would occupy in the version table.
+    pub version: u32,
+    /// The Wasm hash of the proposed implementation.
+    pub wasm_hash: BytesN<32>,
+    /// The contract address the implementation is expected to be deployed at.
+    pub address: Address,
+    /// The organization the proposal was made under. Recorded so the org's
+    /// owner can reject (or withdraw via the proposer) a proposal they no
+    /// longer want without relying on the protocol admin.
+    pub org: String,
+    /// Who proposed the upgrade (an org owner or the protocol admin).
+    pub proposer: Address,
+    /// Unix timestamp after which the proposal can no longer be committed.
+    pub expires_at: u64,
+}
+
+/// What kind of upgrade-lifecycle action an [`UpgradeAuditRecord`] captures.
+/// Discriminants are part of the public ABI and MUST NOT be reordered or
+/// reused once released.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpgradeAction {
+    /// A `(version, wasm_hash, address)` triple was proposed for a kind.
+    Proposed = 0,
+    /// A pending proposal was committed into the version table.
+    Committed = 1,
+    /// A pending proposal was rejected or withdrawn by its proposer.
+    Rejected = 2,
+}
+// NOTE: refused upgrade attempts (unauthorized actor, downgrade, identical-WASM
+// re-proposal, …) are deliberately *not* logged. A Soroban invocation is
+// atomic: every storage write and event of a call that returns an error is
+// rolled back, so an audit entry written on the failure path could never be
+// observed on-chain. Refusals stay visible off-chain as reverted transactions
+// carrying their error code; the on-chain trail records successful lifecycle
+// actions only.
+
+/// One immutable entry in the registry's historical upgrade log (Issue #300):
+/// who did what to which version of a module kind, and when. Records are
+/// appended on every successful propose/commit/reject and never edited or
+/// removed; refused attempts revert atomically (see [`UpgradeAction`]) so the
+/// log only ever contains actions that took effect. The log itself is a ring
+/// buffer capped at [`MAX_UPGRADE_AUDIT_ENTRIES`] entries of instance storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeAuditRecord {
+    /// Which lifecycle action was taken.
+    pub action: UpgradeAction,
+    /// The typed audit payload shared with the emitted event.
+    pub audit: UpgradeAudit,
 }
 
 /// A delegated administrative role over one organization's registry records.
@@ -1559,6 +1625,45 @@ impl RegistryContract {
     }
 
     // --- internal helpers ---
+
+    // --- upgrade audit trail (Issue #300) ---
+
+    /// Read the audit log (most recent entry first).
+    fn upgrade_log(env: &Env) -> Vec<UpgradeAuditRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeAuditLog)
+            .unwrap_or_else(|| vec![env])
+    }
+
+    /// Append `record` to the immutable audit log, newest first, dropping the
+    /// oldest entry once the ring buffer reaches [`MAX_UPGRADE_AUDIT_ENTRIES`].
+    ///
+    /// Only called on the success paths of the upgrade lifecycle; a Soroban
+    /// invocation is atomic, so had the surrounding call failed this write
+    /// would be rolled back along with everything else it did.
+    fn append_audit(env: &Env, action: UpgradeAction, audit: &UpgradeAudit) {
+        let mut log = Self::upgrade_log(env);
+        log.push_front(UpgradeAuditRecord {
+            action,
+            audit: audit.clone(),
+        });
+        while log.len() > MAX_UPGRADE_AUDIT_ENTRIES {
+            log.pop_back();
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeAuditLog, &log);
+    }
+
+    /// Read the pending upgrade proposal for `kind`, if one is stored. The
+    /// only consumer of the raw record besides the upgrade flow itself, so the
+    /// expiry check lives at the flow's commit path rather than here.
+    fn pending_proposal(env: &Env, kind: &ModuleKind) -> Option<UpgradeProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeProposal(*kind))
+    }
 
     /// Validate the upgrade of `org`'s `kind` module to `target_version` and
     /// return everything the caller needs to carry it out. Moves nothing, so
