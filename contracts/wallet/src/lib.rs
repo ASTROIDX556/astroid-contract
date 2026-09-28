@@ -33,7 +33,8 @@
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
 //! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
-//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`.
+//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`,
+//! `set_rate_limit`, `clear_rate_limit`.
 //!
 //! ## Pre-execution policy hook
 //!
@@ -66,6 +67,24 @@
 //! velocity ceiling is independent of the policy bypass: excusing a wallet
 //! from the org policy does not lift its own ceiling.
 //!
+//! ## Sliding-window rate limits
+//!
+//! Velocity ceilings bound one asset's outflow but say nothing about how many
+//! transactions a wallet emits, so a compromised agent can still spray many
+//! small spends, or spread value across several assets, without tripping a
+//! per-asset ceiling. A wallet [`Role::Admin`] can therefore set a per-wallet
+//! rate limit ([`WalletContract::set_rate_limit`]): at most `max_volume` may
+//! leave the wallet and at most `max_count` outbound transactions may be issued
+//! within a rolling window of `window_seconds`, counted across every asset and
+//! across `transfer`, `withdraw` and validated batch actions.
+//!
+//! The window is tracked as [`RATE_LIMIT_BUCKETS`] ledger-time buckets in one
+//! fixed-size record per wallet, overwritten in place, so usage never grows the
+//! ledger footprint. A breach fails with [`Error::RateLimitExceeded`] and
+//! nothing moves; rejected spends revert with the invocation, so they never
+//! consume allowance. Setting `window_seconds == 0` disables the limit, and a
+//! `0` cap means "unlimited" for that dimension.
+//!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted`, `WalletPaused`,
 //! `WalletUnpaused` (shared schema) plus wallet-scoped state-change events.
 //! Access control is role-based (see [`access`]). Every wallet has an owner,
@@ -90,7 +109,7 @@
 //! plus wallet-scoped state-change and role-administration events.
 
 use crate::access::Role;
-use astroid_interfaces::{BudgetClient, PolicyClient, UpgradeableInterface};
+use astroid_interfaces::{BudgetClient, PolicyClient, RegistryClient, UpgradeableInterface};
 use astroid_shared::constants;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
@@ -100,10 +119,12 @@ use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events;
 use astroid_shared::math::{checked_add, SafeAdd, SafeSub};
-use astroid_shared::types::ResourceState;
-use astroid_shared::validation::require_positive_amount;
+pub use astroid_shared::types::WalletData;
+use astroid_shared::types::{ModuleId, ModuleKind, ResourceState};
+use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
+    Vec,
 };
 
 pub mod access;
@@ -137,6 +158,22 @@ enum DataKey {
     /// (persistent). One fixed-size record per limited (wallet, asset), always
     /// overwritten in place, so usage never grows the ledger footprint.
     VelocityUsage(u64, Address),
+    /// Rate-limit config: wallet id -> RateLimitConfig (persistent). A missing
+    /// entry means rate limiting is off.
+    RateLimit(u64),
+    /// Rolling rate usage: wallet id -> RateUsage (persistent). One fixed-size
+    /// record per limited wallet, always overwritten in place.
+    RateLimitUsage(u64),
+    /// Registry contract for dynamic policy/budget resolution (instance).
+    Registry,
+    /// Organization slug for registry lookups (instance).
+    Org,
+    /// Re-entrancy lock flag (instance).
+    ReentrancyLock,
+    /// Default budget envelope id for single transfers (instance).
+    DefaultBudgetId,
+    /// Per-asset budget envelope id: asset -> budget_id (persistent).
+    AssetBudgetId(Address),
 }
 
 /// Number of equal sub-buckets a velocity window is divided into. Spends are
@@ -168,12 +205,49 @@ pub struct VelocityUsage {
     pub spent: soroban_sdk::Vec<i128>,
 }
 
-/// Stored wallet record. `owner` controls the wallet; `state` gates operations.
+/// Number of equal sub-buckets a rate-limit window is divided into. Outbound
+/// activity is bucketed by ledger time; a bucket's volume and transaction count
+/// count against the limit until the bucket slides out of the trailing window.
+pub const RATE_LIMIT_BUCKETS: u32 = 4;
+
+/// A wallet's rate limit: at most `max_volume` may leave the wallet and at most
+/// `max_count` outbound transactions may be issued within the rolling window of
+/// `window_seconds`. A `0` cap means "unlimited" for that dimension;
+/// `window_seconds == 0` disables the limit entirely.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WalletData {
-    pub owner: Address,
-    pub state: ResourceState,
+pub struct RateLimitConfig {
+    /// Ceiling on the total outbound volume inside the window, across every
+    /// asset and path. `0` = unlimited.
+    pub max_volume: i128,
+    /// Ceiling on the number of outbound transactions inside the window. `0` =
+    /// unlimited.
+    pub max_count: u32,
+    /// Window length in seconds; `0` disables the limit. Otherwise a positive
+    /// multiple of [`RATE_LIMIT_BUCKETS`].
+    pub window_seconds: u64,
+}
+
+/// Outbound activity recorded per bucket for one wallet.
+///
+/// `volume[i]` and `count[i]` describe bucket number `bucket - i`, where a
+/// bucket number is `ledger_timestamp / (window_seconds / RATE_LIMIT_BUCKETS)`.
+/// Both vectors always hold exactly [`RATE_LIMIT_BUCKETS`] entries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateUsage {
+    pub bucket: u64,
+    pub volume: soroban_sdk::Vec<i128>,
+    pub count: soroban_sdk::Vec<u32>,
+}
+
+/// Public snapshot of a wallet's outbound activity in the active rate-limit
+/// window: total volume and transaction count.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitStatus {
+    pub volume: i128,
+    pub count: u32,
 }
 
 /// A single sub-call to be executed as part of a batch. `contract_addr` is the
@@ -350,9 +424,9 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Guardian, &guardian);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("guardian")),
-            guardian,
+        events::publish(
+            &env,
+            events::ContractEvent::WalletGuardianChanged { guardian },
         );
         Ok(())
     }
@@ -408,7 +482,6 @@ impl WalletContract {
         Self::bump_wallet(&env, id);
         env.storage().instance().set(&DataKey::WalletCount, &count);
         Self::bump_instance(&env);
-        events::wallet_created(&env, id, &owner);
         events::publish(
             &env,
             events::ContractEvent::WalletCreated {
@@ -428,9 +501,9 @@ impl WalletContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Policy, &policy);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("policy")),
-            (caller, policy),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletPolicyConfigured { policy },
         );
         Ok(())
     }
@@ -443,10 +516,7 @@ impl WalletContract {
         }
         env.storage().instance().remove(&DataKey::Policy);
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("policy")),
-            (caller, "cleared"),
-        );
+        events::publish(&env, events::ContractEvent::WalletPolicyCleared);
         Ok(())
     }
 
@@ -482,9 +552,9 @@ impl WalletContract {
             env.storage().persistent().remove(&key);
         }
         Self::bump_instance(&env);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("pol_byp")),
-            (wallet_id, bypass),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletPolicyBypassChanged { wallet_id, bypass },
         );
         Ok(())
     }
@@ -539,9 +609,14 @@ impl WalletContract {
         };
         env.storage().persistent().set(&lkey, &limit);
         Self::bump_persistent(&env, &lkey);
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("velocity")),
-            (wallet_id, asset, max_amount, window_seconds),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletVelocityLimitSet {
+                wallet_id,
+                asset,
+                max_amount,
+                window_seconds,
+            },
         );
         Ok(())
     }
@@ -561,9 +636,9 @@ impl WalletContract {
         env.storage()
             .persistent()
             .remove(&DataKey::VelocityUsage(wallet_id, asset.clone()));
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("velocity")),
-            (wallet_id, asset, "cleared"),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletVelocityLimitCleared { wallet_id, asset },
         );
         Ok(())
     }
@@ -585,6 +660,120 @@ impl WalletContract {
             };
         let usage = Self::rolled_velocity_usage(&env, wallet_id, &asset, &limit);
         Self::velocity_total(&usage)
+    }
+
+    /// Set a wallet's sliding-window rate limit ([`Role::Admin`]): at most
+    /// `max_volume` may leave the wallet and at most `max_count` outbound
+    /// transactions may be issued within any rolling window of
+    /// `window_seconds`, counted across every asset and across `transfer`,
+    /// `withdraw` and validated batch actions. Agents cannot change it.
+    ///
+    /// `max_volume` must not be negative ([`Error::InvalidInput`]), and
+    /// `window_seconds`, when non-zero, must be a positive multiple of
+    /// [`RATE_LIMIT_BUCKETS`] ([`Error::InvalidInput`]). `window_seconds == 0`
+    /// disables the limit; a `0` cap means "unlimited" for that dimension.
+    /// Changing `window_seconds` re-buckets time, so recorded usage restarts
+    /// from zero.
+    pub fn set_rate_limit(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        max_volume: i128,
+        max_count: u32,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        ensure!(
+            wallet.state != ResourceState::Archived,
+            Error::WalletArchived
+        );
+        ensure!(max_volume >= 0, Error::InvalidInput);
+        let config_key = DataKey::RateLimit(wallet_id);
+        let usage_key = DataKey::RateLimitUsage(wallet_id);
+        if window_seconds == 0 {
+            // Disabling drops both records: an unlimited wallet carries no
+            // usage, so a later re-enable starts from a clean window.
+            env.storage().persistent().remove(&config_key);
+            env.storage().persistent().remove(&usage_key);
+        } else {
+            let buckets = RATE_LIMIT_BUCKETS as u64;
+            ensure!(
+                window_seconds >= buckets && window_seconds % buckets == 0,
+                Error::InvalidInput
+            );
+            let previous: Option<RateLimitConfig> = env.storage().persistent().get(&config_key);
+            if previous.map(|previous| previous.window_seconds) != Some(window_seconds) {
+                env.storage().persistent().remove(&usage_key);
+            }
+            let config = RateLimitConfig {
+                max_volume,
+                max_count,
+                window_seconds,
+            };
+            env.storage().persistent().set(&config_key, &config);
+            Self::bump_persistent(&env, &config_key);
+        }
+        events::publish(
+            &env,
+            events::ContractEvent::WalletRateLimitSet {
+                wallet_id,
+                max_volume,
+                max_count,
+                window_seconds,
+            },
+        );
+        Ok(())
+    }
+
+    /// Remove a wallet's rate limit ([`Role::Admin`]), deleting its usage record
+    /// too. [`Error::NotFound`] when none is set.
+    pub fn clear_rate_limit(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        let config_key = DataKey::RateLimit(wallet_id);
+        ensure!(env.storage().persistent().has(&config_key), Error::NotFound);
+        env.storage().persistent().remove(&config_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RateLimitUsage(wallet_id));
+        events::publish(
+            &env,
+            events::ContractEvent::WalletRateLimitCleared { wallet_id },
+        );
+        Ok(())
+    }
+
+    /// Read a wallet's rate-limit config, if any.
+    pub fn get_rate_limit(env: Env, wallet_id: u64) -> Option<RateLimitConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateLimit(wallet_id))
+    }
+
+    /// Volume and transaction count that have left the wallet within the
+    /// current rolling rate-limit window (`(0, 0)` when no limit is set).
+    pub fn get_rate_usage(env: Env, wallet_id: u64) -> Result<RateLimitStatus, Error> {
+        let config: RateLimitConfig = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::RateLimit(wallet_id))
+        {
+            Some(config) => config,
+            None => {
+                return Ok(RateLimitStatus {
+                    volume: 0,
+                    count: 0,
+                })
+            }
+        };
+        if config.window_seconds == 0 {
+            return Ok(RateLimitStatus {
+                volume: 0,
+                count: 0,
+            });
+        }
+        let usage = Self::rolled_rate_usage(&env, wallet_id, &config);
+        let (volume, count) = Self::rate_totals(&usage)?;
+        Ok(RateLimitStatus { volume, count })
     }
 
     /// Fund a wallet: pulls `amount` of `asset` from `from` into custody and
@@ -611,9 +800,14 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("deposit")),
-            (wallet_id, asset, amount),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletFunded {
+                wallet_id,
+                from,
+                asset,
+                amount,
+            },
         );
         Ok(())
     }
@@ -633,22 +827,41 @@ impl WalletContract {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
-        Self::require_active(&wallet)?;
-        // Pre-execution policy check: the configured Policy contract gets a
-        // veto over the spend before any value moves. A rejection aborts the
-        // whole invocation with the policy's own deterministic error.
-        Self::require_policy_allows(&env, wallet_id, &asset, &to, amount)?;
-        // Velocity ceiling: a spend the policy allows may still be refused
-        // for moving too much too fast. Recorded here, before the debit; any
-        // later failure reverts the invocation and the recorded usage with it.
-        Self::enforce_velocity(&env, wallet_id, &asset, amount)?;
-        Self::debit(&env, wallet_id, &asset, amount)?;
+        Self::require_active_for_transfer(&wallet)?;
+        // Pre-execution validation: reject invalid recipients before any policy
+        // or balance checks.
+        Self::validate_transfer_recipient(&env, &to)?;
+        Self::lock(&env)?;
+        // Atomic pre-execution: policy → budget → velocity, before any debit.
+        // Resolves Policy/Budget via Registry when configured, so upgrades
+        // take effect without re-wiring the wallet. Each fallible step
+        // unlocks before returning so a failed spend never leaves the
+        // contract locked (even if the host commits storage on Err).
+        if let Err(e) = Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller) {
+            Self::unlock(&env);
+            return Err(e);
+        }
+        if let Err(e) = Self::enforce_velocity(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
+        // Rate limiting counts both value and transactions, across every asset
+        // and outbound path, after the per-asset velocity ceiling.
+        if let Err(e) = Self::enforce_rate_limit(&env, wallet_id, amount, 1) {
+            Self::unlock(&env);
+            return Err(e);
+        }
+        if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
             &to,
             &amount,
         );
         events::transfer_executed(&env, &env.current_contract_address(), &to, &asset, amount);
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -667,20 +880,43 @@ impl WalletContract {
         require_positive_amount(amount)?;
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
-        Self::require_active(&wallet)?;
-        // Pre-execution policy check — withdrawals are outbound movements too.
-        Self::require_policy_allows(&env, wallet_id, &asset, &wallet.owner, amount)?;
-        Self::enforce_velocity(&env, wallet_id, &asset, amount)?;
-        Self::debit(&env, wallet_id, &asset, amount)?;
+        Self::require_active_for_transfer(&wallet)?;
+        Self::lock(&env)?;
+        if let Err(e) =
+            Self::pre_execute_checks(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
+        {
+            Self::unlock(&env);
+            return Err(e);
+        }
+        if let Err(e) = Self::enforce_velocity(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
+        // Rate limiting counts both value and transactions, across every asset
+        // and outbound path, after the per-asset velocity ceiling.
+        if let Err(e) = Self::enforce_rate_limit(&env, wallet_id, amount, 1) {
+            Self::unlock(&env);
+            return Err(e);
+        }
+        if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         token::TokenClient::new(&env, &asset).transfer(
             &env.current_contract_address(),
             &wallet.owner,
             &amount,
         );
-        env.events().publish(
-            (symbol_short!("wallet"), symbol_short!("withdraw")),
-            (wallet_id, asset, amount),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletWithdrawn {
+                wallet_id,
+                to: wallet.owner,
+                asset,
+                amount,
+            },
         );
+        Self::unlock(&env);
         Ok(())
     }
 
@@ -695,7 +931,6 @@ impl WalletContract {
 
         wallet.state = ResourceState::Frozen;
         Self::store_wallet(&env, wallet_id, &wallet);
-        events::wallet_frozen(&env, wallet_id, &caller);
         events::publish(
             &env,
             events::ContractEvent::WalletStateChanged {
@@ -772,7 +1007,8 @@ impl WalletContract {
     /// failure — a policy denial, a budget overrun, a cumulative overflow, or a
     /// failing sub-call — reverts the entire transaction, so validation and
     /// execution are atomic. On success an aggregated [`BatchReceipt`] is
-    /// returned and `("wallet", "batch_validated")` is published.
+    /// returned and a [`events::ContractEvent::WalletBatchValidated`] is
+    /// published.
     pub fn batch_execute_validated(
         env: Env,
         caller: Address,
@@ -790,8 +1026,20 @@ impl WalletContract {
             return Err(Error::InvalidInput);
         }
 
-        let policy: Option<Address> = env.storage().instance().get(&DataKey::Policy);
-        let budget: Option<Address> = env.storage().instance().get(&DataKey::Budget);
+        Self::lock(&env)?;
+        // Resolve gates once; batch actions may override per-action via ids.
+        // Single `get_modules_batch` call keeps gas to one cross-contract
+        // invocation regardless of batch size.
+        let (reg_policy, reg_budget) = match Self::resolve_gates(&env) {
+            Ok(v) => v,
+            Err(e) => {
+                Self::unlock(&env);
+                return Err(e);
+            }
+        };
+        let direct_policy: Option<Address> = env.storage().instance().get(&DataKey::Policy);
+        let direct_budget: Option<Address> = env.storage().instance().get(&DataKey::Budget);
+        let is_registry = env.storage().instance().has(&DataKey::Registry);
 
         // Phase 1 — verify every action and aggregate its value with checked
         // math so a cumulative overflow is caught before any value moves.
@@ -801,35 +1049,101 @@ impl WalletContract {
         // repeatedly reads and writes that asset's velocity records once.
         let mut velocity = VelocityGate::new(&env, wallet_id);
         for action in actions.iter() {
-            require_positive_amount(action.amount)?;
-            total_amount = checked_add(total_amount, action.amount)?;
+            if let Err(e) = require_positive_amount(action.amount) {
+                Self::unlock(&env);
+                return Err(e);
+            }
+            total_amount = match checked_add(total_amount, action.amount) {
+                Ok(v) => v,
+                Err(e) => {
+                    Self::unlock(&env);
+                    return Err(e);
+                }
+            };
 
             if !action.policy_id.is_empty() {
-                let policy_addr = policy.as_ref().ok_or(Error::InvalidInput)?;
-                Self::require_policy_check(
+                let policy_addr = if is_registry {
+                    match reg_policy.as_ref() {
+                        Some(a) => a,
+                        None => {
+                            Self::unlock(&env);
+                            return Err(Error::InvalidInput);
+                        }
+                    }
+                } else {
+                    match direct_policy.as_ref() {
+                        Some(a) => a,
+                        None => {
+                            Self::unlock(&env);
+                            return Err(Error::InvalidInput);
+                        }
+                    }
+                };
+                if let Err(e) = Self::require_policy_check(
                     &env,
+                    wallet_id,
                     policy_addr,
                     &action.policy_id,
                     &action.asset,
                     &action.recipient,
                     action.amount,
-                )?;
+                ) {
+                    Self::unlock(&env);
+                    return Err(e);
+                }
             }
 
             // The velocity ceiling is not opt-out per action: an agent cannot
             // route around it by leaving `policy_id` empty. Actions accumulate
             // against the same cached record, so a batch can never split a
             // window's allowance across actions to slip past the ceiling.
-            velocity.enforce(&env, &action.asset, action.amount)?;
+            if let Err(e) = velocity.enforce(&env, &action.asset, action.amount) {
+                Self::unlock(&env);
+                return Err(e);
+            }
 
             if !action.budget_id.is_empty() {
-                let budget_addr = budget.as_ref().ok_or(Error::InvalidInput)?;
-                budget_remaining = BudgetClient::new(&env, budget_addr).consume(
+                let budget_addr = if is_registry {
+                    match reg_budget.as_ref() {
+                        Some(a) => a,
+                        None => {
+                            Self::unlock(&env);
+                            return Err(Error::InvalidInput);
+                        }
+                    }
+                } else {
+                    match direct_budget.as_ref() {
+                        Some(a) => a,
+                        None => {
+                            Self::unlock(&env);
+                            return Err(Error::InvalidInput);
+                        }
+                    }
+                };
+                match BudgetClient::new(&env, budget_addr).try_consume(
                     &caller,
                     &action.budget_id,
                     &action.amount,
-                );
+                ) {
+                    Ok(Ok(rem)) => budget_remaining = rem,
+                    Err(Ok(e)) => {
+                        Self::unlock(&env);
+                        return Err(e.into());
+                    }
+                    Ok(Err(_)) | Err(Err(_)) => {
+                        Self::unlock(&env);
+                        return Err(Error::BudgetExceeded);
+                    }
+                }
             }
+        }
+
+        // Charge the whole batch's value and action count to the rate-limit
+        // window as one event, before any value moves; a later failure reverts
+        // the invocation and the recording with it.
+        if let Err(e) = Self::enforce_rate_limit(&env, wallet_id, total_amount, actions.len()) {
+            Self::unlock(&env);
+            return Err(e);
         }
 
         // Record the window usage validated above before any value moves; a
@@ -840,11 +1154,23 @@ impl WalletContract {
         // whole batch back if any sub-call fails.
         let mut executed: u32 = 0;
         for action in actions.into_iter() {
-            Self::execute_call(&env, &action.call)?;
+            if let Err(e) = Self::execute_call(&env, &action.call) {
+                Self::unlock(&env);
+                return Err(e);
+            }
             executed += 1;
         }
 
-        events::wallet_batch_validated(&env, wallet_id, executed, total_amount, budget_remaining);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletBatchValidated {
+                wallet_id,
+                executed,
+                total_amount,
+                budget_remaining,
+            },
+        );
+        Self::unlock(&env);
         Ok(BatchReceipt {
             executed,
             total_amount,
@@ -857,6 +1183,120 @@ impl WalletContract {
     pub fn set_budget(env: Env, caller: Address, budget: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Budget, &budget);
+        Self::bump_instance(&env);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletModuleWired {
+                module: symbol_short!("budget"),
+                address: budget,
+            },
+        );
+        Ok(())
+    }
+
+    /// Wire the registry contract for dynamic policy/budget resolution (admin only).
+    /// Once set, `transfer`/`withdraw`/`batch_execute_validated` resolve
+    /// Policy and Budget addresses via `RegistryClient` rather than the
+    /// instance-stored addresses, so upgrades to those modules take effect
+    /// without re-wiring the wallet.
+    pub fn set_registry(env: Env, caller: Address, registry: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Registry, &registry);
+        Self::bump_instance(&env);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletModuleWired {
+                module: symbol_short!("registry"),
+                address: registry,
+            },
+        );
+        Ok(())
+    }
+
+    /// Read the configured registry, if any.
+    pub fn get_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Registry)
+    }
+
+    /// Set the organization slug used for registry lookups (admin only).
+    pub fn set_org(env: Env, caller: Address, org: String) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        require_non_empty(&org)?;
+        env.storage().instance().set(&DataKey::Org, &org);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("wallet"), symbol_short!("org")), org.clone());
+        Ok(())
+    }
+
+    /// Read the configured org slug, if any.
+    pub fn get_org(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::Org)
+    }
+
+    /// Set the default budget envelope id consumed by single transfers (admin only).
+    pub fn set_default_budget_id(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        require_non_empty(&budget_id)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultBudgetId, &budget_id);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Read the default budget id, if any.
+    pub fn get_default_budget_id(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::DefaultBudgetId)
+    }
+
+    /// Clear the default budget id (admin only).
+    pub fn clear_default_budget_id(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&DataKey::DefaultBudgetId) {
+            return Err(Error::NotFound);
+        }
+        env.storage().instance().remove(&DataKey::DefaultBudgetId);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Set a per-asset budget envelope id (admin only). Takes precedence over the default.
+    pub fn set_asset_budget_id(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        budget_id: String,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        require_non_empty(&budget_id)?;
+        let key = DataKey::AssetBudgetId(asset.clone());
+        env.storage().persistent().set(&key, &budget_id);
+        Self::bump_persistent(&env, &key);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletAssetBudgetSet { asset, budget_id },
+        );
+        Ok(())
+    }
+
+    /// Read the per-asset budget id, if any.
+    pub fn get_asset_budget_id(env: Env, asset: Address) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBudgetId(asset))
+    }
+
+    /// Clear a per-asset budget id (admin only).
+    pub fn clear_asset_budget_id(env: Env, caller: Address, asset: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let key = DataKey::AssetBudgetId(asset.clone());
+        ensure!(env.storage().persistent().has(&key), Error::NotFound);
+        env.storage().persistent().remove(&key);
         Ok(())
     }
 
@@ -900,9 +1340,14 @@ impl WalletContract {
             return Err(Error::InvalidInput);
         }
         access::set_role(&env, wallet_id, &account, role);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
-            (wallet_id, account, role),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletRoleChanged {
+                wallet_id,
+                account,
+                role: Some(role.as_symbol()),
+                action: symbol_short!("granted"),
+            },
         );
         Ok(())
     }
@@ -920,9 +1365,14 @@ impl WalletContract {
     ) -> Result<(), Error> {
         Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         access::clear_role(&env, wallet_id, &account)?;
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
-            (wallet_id, account),
+        events::publish(
+            &env,
+            events::ContractEvent::WalletRoleChanged {
+                wallet_id,
+                account,
+                role: None,
+                action: symbol_short!("revoked"),
+            },
         );
         Ok(())
     }
@@ -977,44 +1427,17 @@ impl WalletContract {
 
     // --- internal helpers ---
 
-    /// Pre-execution policy hook, applied to every outbound movement.
-    ///
-    /// When an org-wide policy contract is configured and the wallet has not
-    /// been excused, the spend is submitted to `check_transfer` under the
-    /// canonical "active" policy id (the same id the treasury uses). The
-    /// generated [`PolicyClient`] maps the remote error straight through, so a
-    /// policy rejection surfaces deterministically and no value moves.
-    /// With no policy wired the hook is a no-op.
-    fn require_policy_allows(
-        env: &Env,
-        wallet_id: u64,
-        asset: &Address,
-        recipient: &Address,
-        amount: i128,
-    ) -> Result<(), Error> {
-        // Read the wired policy first. With none configured the hook is a no-op
-        // for every wallet, so the per-wallet bypass flag never has to be read
-        // at all - saving a persistent read on each movement of an unwired org.
-        let Some(policy_addr) = Self::get_policy(env.clone()) else {
-            return Ok(());
-        };
-        if Self::get_policy_bypass(env.clone(), wallet_id) {
-            return Ok(());
-        }
-        Self::require_policy_check(
-            env,
-            &policy_addr,
-            &String::from_str(env, "active"),
-            asset,
-            recipient,
-            amount,
-        )
-    }
-
     /// Map policy denials and cross-contract invocation failures to one stable
     /// wallet-facing error. Only a successful policy response authorizes spend.
+    ///
+    /// Records a [`events::ContractEvent::WalletPolicyChecked`] on the passing
+    /// path. No event is published for a denial: the invocation is about to
+    /// revert, which discards anything already published, and the policy module
+    /// emits its own [`events::ContractEvent::PolicyViolation`] for the reason
+    /// - duplicating it here would double-count every refusal.
     fn require_policy_check(
         env: &Env,
+        wallet_id: u64,
         policy_addr: &Address,
         policy_id: &String,
         asset: &Address,
@@ -1024,9 +1447,154 @@ impl WalletContract {
         match PolicyClient::new(env, policy_addr)
             .try_check_transfer(policy_id, asset, recipient, &amount)
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                events::publish(
+                    env,
+                    events::ContractEvent::WalletPolicyChecked {
+                        wallet_id,
+                        asset: asset.clone(),
+                        amount,
+                    },
+                );
+                Ok(())
+            }
             Ok(Err(_)) | Err(_) => Err(Error::PolicyDenied),
         }
+    }
+
+    /// Re-entrancy guard: refuse if a wallet entrypoint is already on the stack.
+    fn lock(env: &Env) -> Result<(), Error> {
+        let locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentrancyLock)
+            .unwrap_or(false);
+        ensure!(!locked, Error::InvalidState);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    fn unlock(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &false);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Resolve Policy and Budget addresses, preferring the Registry when
+    /// `Registry` + `Org` are configured. Uses a single `get_modules_batch`
+    /// call to fetch both in one cross-contract invocation for gas savings.
+    fn resolve_gates(env: &Env) -> Result<(Option<Address>, Option<Address>), Error> {
+        let reg: Option<Address> = env.storage().instance().get(&DataKey::Registry);
+        let org: Option<String> = env.storage().instance().get(&DataKey::Org);
+        if let (Some(reg), Some(org)) = (reg, org) {
+            let mut ids = Vec::new(env);
+            ids.push_back(ModuleId {
+                org: org.clone(),
+                kind: ModuleKind::Policy,
+            });
+            ids.push_back(ModuleId {
+                org: org.clone(),
+                kind: ModuleKind::Budget,
+            });
+            match RegistryClient::new(env, &reg).try_get_modules_batch(&ids) {
+                Ok(Ok(modules)) => {
+                    let policy = modules.get(0).unwrap().and_then(|info| {
+                        if info.deprecated {
+                            None
+                        } else {
+                            Some(info.address)
+                        }
+                    });
+                    let budget = modules.get(1).unwrap().and_then(|info| {
+                        if info.deprecated {
+                            None
+                        } else {
+                            Some(info.address)
+                        }
+                    });
+                    return Ok((policy, budget));
+                }
+                Err(Ok(e)) => return Err(e),
+                Ok(Err(_)) | Err(Err(_)) => return Err(Error::InvalidState),
+            }
+        }
+        let policy: Option<Address> = env.storage().instance().get(&DataKey::Policy);
+        let budget: Option<Address> = env.storage().instance().get(&DataKey::Budget);
+        Ok((policy, budget))
+    }
+
+    /// Budget envelope for `asset`: per-asset id takes precedence over the
+    /// default, minimizing reads when no budget is configured.
+    fn budget_id_for(env: &Env, asset: &Address) -> Option<String> {
+        if let Some(id) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, String>(&DataKey::AssetBudgetId(asset.clone()))
+        {
+            return Some(id);
+        }
+        env.storage().instance().get(&DataKey::DefaultBudgetId)
+    }
+
+    /// Consume `amount` from `budget_id` at `budget_addr`, mapping
+    /// `BudgetError` to the wallet's `Error` table so callers get a precise
+    /// code (e.g. `BudgetExceeded`, `BudgetExpired`).
+    fn consume_budget(
+        env: &Env,
+        budget_addr: &Address,
+        budget_id: &String,
+        caller: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        match BudgetClient::new(env, budget_addr).try_consume(caller, budget_id, &amount) {
+            Ok(Ok(_)) => Ok(()),
+            Err(Ok(e)) => Err(e.into()),
+            Ok(Err(_)) | Err(Err(_)) => Err(Error::BudgetExceeded),
+        }
+    }
+
+    /// Atomic pre-execution hook: policy → budget → velocity, before any
+    /// debit. If registry is configured, addresses are resolved dynamically;
+    /// otherwise falls back to instance-wired addresses. A bypassed wallet
+    /// skips the policy gate but never the budget or velocity gates.
+    fn pre_execute_checks(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+        caller: &Address,
+    ) -> Result<(), Error> {
+        let (policy_addr, budget_addr) = Self::resolve_gates(env)?;
+        // Policy gate (skipped when wallet is bypassed).
+        if let Some(policy_addr) = policy_addr.as_ref() {
+            if !Self::get_policy_bypass(env.clone(), wallet_id) {
+                Self::require_policy_check(
+                    env,
+                    wallet_id,
+                    policy_addr,
+                    &String::from_str(env, "active"),
+                    asset,
+                    recipient,
+                    amount,
+                )?;
+            }
+        }
+        // Budget gate (per-asset or default envelope).
+        if let Some(budget_addr) = budget_addr.as_ref() {
+            if let Some(budget_id) = Self::budget_id_for(env, asset) {
+                Self::consume_budget(env, budget_addr, &budget_id, caller, amount)?;
+            }
+        }
+        Ok(())
     }
 
     /// Velocity hook, applied to every outbound movement after the policy
@@ -1098,6 +1666,108 @@ impl WalletContract {
             total = total.safe_add(amount)?;
         }
         Ok(total)
+    }
+
+    /// Rate-limit hook, applied to every outbound movement after the velocity
+    /// check. With no limit configured for `wallet_id` it is a no-op. Otherwise
+    /// it rejects with [`Error::RateLimitExceeded`] when the trailing window's
+    /// volume plus `amount`, or its transaction count plus `count`, would
+    /// exceed the configured caps, and records the charge in the current bucket
+    /// when it fits.
+    fn enforce_rate_limit(
+        env: &Env,
+        wallet_id: u64,
+        amount: i128,
+        count: u32,
+    ) -> Result<(), Error> {
+        let config: RateLimitConfig = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::RateLimit(wallet_id))
+        {
+            Some(config) => config,
+            None => return Ok(()),
+        };
+        if config.window_seconds == 0 {
+            return Ok(());
+        }
+        let key = DataKey::RateLimitUsage(wallet_id);
+        let mut usage = Self::rolled_rate_usage(env, wallet_id, &config);
+        let (total_volume, total_count) = Self::rate_totals(&usage)?;
+
+        let new_count = total_count.checked_add(count).ok_or(Error::Overflow)?;
+        if config.max_count != 0 && new_count > config.max_count {
+            return Err(Error::RateLimitExceeded);
+        }
+        let new_volume = total_volume.safe_add(amount)?;
+        if config.max_volume != 0 && new_volume > config.max_volume {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        let bucket_volume = usage.volume.get(0).unwrap_or(0).safe_add(amount)?;
+        let bucket_count = usage
+            .count
+            .get(0)
+            .unwrap_or(0)
+            .checked_add(count)
+            .ok_or(Error::Overflow)?;
+        usage.volume.set(0, bucket_volume);
+        usage.count.set(0, bucket_count);
+        env.storage().persistent().set(&key, &usage);
+        Self::bump_persistent(env, &key);
+        Ok(())
+    }
+
+    /// Load the rate usage record aged to the current ledger time: buckets that
+    /// slid out of the window are dropped and bucket 0 is the current one. If
+    /// the ledger clock reads earlier than the recorded bucket, nothing is aged
+    /// out, so a clock anomaly can never free allowance.
+    fn rolled_rate_usage(env: &Env, wallet_id: u64, config: &RateLimitConfig) -> RateUsage {
+        let bucket_seconds = config.window_seconds / RATE_LIMIT_BUCKETS as u64;
+        let now_bucket = env.ledger().timestamp() / bucket_seconds;
+        let stored: Option<RateUsage> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RateLimitUsage(wallet_id));
+        let mut volume = soroban_sdk::Vec::new(env);
+        let mut count = soroban_sdk::Vec::new(env);
+        for _ in 0..RATE_LIMIT_BUCKETS {
+            volume.push_back(0i128);
+            count.push_back(0u32);
+        }
+        let bucket = match stored {
+            None => now_bucket,
+            Some(usage) => {
+                let bucket = now_bucket.max(usage.bucket);
+                let shift = bucket - usage.bucket;
+                for i in 0..RATE_LIMIT_BUCKETS {
+                    let target = i as u64 + shift;
+                    if target < RATE_LIMIT_BUCKETS as u64 {
+                        volume.set(target as u32, usage.volume.get(i).unwrap_or(0));
+                        count.set(target as u32, usage.count.get(i).unwrap_or(0));
+                    }
+                }
+                bucket
+            }
+        };
+        RateUsage {
+            bucket,
+            volume,
+            count,
+        }
+    }
+
+    /// Sum the per-bucket volume and transaction count of a rolled usage record.
+    fn rate_totals(usage: &RateUsage) -> Result<(i128, u32), Error> {
+        let mut total_volume: i128 = 0;
+        let mut total_count: u32 = 0;
+        for amount in usage.volume.iter() {
+            total_volume = total_volume.safe_add(amount)?;
+        }
+        for count in usage.count.iter() {
+            total_count = total_count.checked_add(count).ok_or(Error::Overflow)?;
+        }
+        Ok((total_volume, total_count))
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
@@ -1198,6 +1868,7 @@ impl WalletContract {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn require_active(wallet: &WalletData) -> Result<(), Error> {
         ensure!(wallet.state != ResourceState::Frozen, Error::WalletFrozen);
         ensure!(wallet.state != ResourceState::Paused, Error::WalletPaused);
@@ -1205,6 +1876,35 @@ impl WalletContract {
             wallet.state != ResourceState::Archived,
             Error::WalletArchived
         );
+        Ok(())
+    }
+
+    /// Like `require_active` but returns wallet-state-specific errors for
+    /// non-Active states to give transfer-specific error codes.
+    fn require_active_for_transfer(wallet: &WalletData) -> Result<(), Error> {
+        match wallet.state {
+            ResourceState::Frozen => Err(Error::WalletFrozen),
+            ResourceState::Paused => Err(Error::WalletPaused),
+            ResourceState::Archived => Err(Error::WalletArchived),
+            ResourceState::Active => Ok(()),
+        }
+    }
+
+    /// Validate that the transfer recipient is a valid address (not zero address
+    /// and not the contract itself).
+    fn validate_transfer_recipient(env: &Env, recipient: &Address) -> Result<(), Error> {
+        // Reject zero address (all zeros)
+        let zero_addr = Address::from_string(&String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if recipient == &zero_addr {
+            return Err(Error::InvalidInput);
+        }
+        // Reject self-transfer to the wallet contract
+        if recipient == &env.current_contract_address() {
+            return Err(Error::InvalidInput);
+        }
         Ok(())
     }
 

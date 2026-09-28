@@ -50,6 +50,7 @@ fn setup<'a>(env: &Env, owner: &Address) -> PolicyContractClient<'a> {
         &None,
         &None,
         &0,
+        &None,
     );
     client
 }
@@ -103,6 +104,7 @@ fn allowlist_recipient_enforced() {
         &Some(allowed.clone()),
         &None,
         &0,
+        &None,
     );
 
     // Allowed recipient passes
@@ -602,6 +604,7 @@ fn allowance_setup<'a>(env: &'a Env, owner: &Address) -> PolicyContractClient<'a
         &None,
         &None,
         &0,
+        &None,
     );
     client
 }
@@ -809,6 +812,7 @@ fn composite_setup<'a>(env: &'a Env, owner: &Address) -> PolicyContractClient<'a
         &None,
         &None,
         &0,
+        &None,
     );
     client
 }
@@ -1764,6 +1768,7 @@ fn blacklist_is_scoped_to_its_policy() {
         &None,
         &None,
         &0,
+        &None,
     );
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
@@ -2180,6 +2185,7 @@ fn multi_asset_request_runs_the_policy_gates() {
         &None,
         &Some(only.clone()),
         &0,
+        &None,
     );
 
     // An asset outside `allowed_asset` sinks the whole request.
@@ -3028,6 +3034,7 @@ fn multi_rule_stack_is_scoped_to_its_policy() {
         &None,
         &None,
         &0,
+        &None,
     );
     let asset = Address::generate(&env);
     let recip = Address::generate(&env);
@@ -3068,6 +3075,7 @@ fn whitelist_setup<'a>(env: &'a Env, owner: &Address, policy_id: &str) -> Policy
         &None,
         &None,
         &0,
+        &None,
     );
     client
 }
@@ -3264,6 +3272,7 @@ fn recipient_whitelist_is_scoped_per_policy() {
         &None,
         &None,
         &0,
+        &None,
     );
     let asset = Address::generate(&env);
     let vendor = Address::generate(&env);
@@ -3429,4 +3438,387 @@ fn short_form_whitelist_api_manages_entries() {
         p.try_check_transfer(&pid, &asset, &a, &1),
         Err(Ok(Error::PolicyDenied))
     );
+}
+
+// --- Policy Combination Strategies (All vs Any) ---
+
+#[test]
+fn rule_combination_all_requires_all_rules_to_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "all_strategy");
+    let recipient = Address::generate(&env);
+    let other_recipient = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    // Register policy with All strategy (explicit)
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &1000,
+        &None,
+        &None,
+        &0,
+        &Some(crate::PolicyCombinationStrategy::All),
+    );
+
+    // Add two rules: max 500 AND allowed recipient
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, recipient.clone(), &env),
+    );
+
+    // Transfer to allowed recipient with amount within limits: both rules pass
+    assert!(p.try_check_transfer(&pid, &asset, &recipient, &400).is_ok());
+
+    // Transfer to allowed recipient with amount exceeding rule limit: first rule fails
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recipient, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Transfer to different recipient with amount within limits: second rule fails
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &other_recipient, &400),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Transfer to different recipient with amount exceeding limit: both fail
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &other_recipient, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn rule_combination_all_backward_compatible_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "default_all");
+    let recipient = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    // Register policy without specifying strategy (defaults to All)
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &1000,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+
+    // Add two rules
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 500, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, recipient.clone(), &env),
+    );
+
+    // Verify both rules are enforced (All strategy behavior)
+    assert!(p.try_check_transfer(&pid, &asset, &recipient, &400).is_ok());
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recipient, &600),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn rule_combination_any_requires_at_least_one_rule_to_pass() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "any_strategy");
+    let allowed_recipient_1 = Address::generate(&env);
+    let allowed_recipient_2 = Address::generate(&env);
+    let blocked_recipient = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    // Register policy with Any strategy
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &1000,
+        &None,
+        &None,
+        &0,
+        &Some(crate::PolicyCombinationStrategy::Any),
+    );
+
+    // Add two rules: allowed recipient 1 OR allowed recipient 2
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, allowed_recipient_1.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, allowed_recipient_2.clone(), &env),
+    );
+
+    // Transfer to recipient matching first rule: passes
+    assert!(p
+        .try_check_transfer(&pid, &asset, &allowed_recipient_1, &100)
+        .is_ok());
+
+    // Transfer to recipient matching second rule: passes
+    assert!(p
+        .try_check_transfer(&pid, &asset, &allowed_recipient_2, &100)
+        .is_ok());
+
+    // Transfer to recipient matching neither rule: fails
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &blocked_recipient, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn rule_combination_any_with_no_rules_allows_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "any_no_rules");
+    let recipient = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    // Register policy with Any strategy but NO rules
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &1000,
+        &None,
+        &None,
+        &0,
+        &Some(crate::PolicyCombinationStrategy::Any),
+    );
+
+    // Transfer should be allowed (permissive default for Any with no rules)
+    assert!(p.try_check_transfer(&pid, &asset, &recipient, &100).is_ok());
+}
+
+#[test]
+fn rule_combination_any_with_complex_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "any_complex");
+    let asset = Address::generate(&env);
+
+    // Create three recipients
+    let recipient_1 = Address::generate(&env);
+    let recipient_2 = Address::generate(&env);
+    let recipient_3 = Address::generate(&env);
+
+    // Register policy with Any strategy
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &10000,
+        &None,
+        &None,
+        &0,
+        &Some(crate::PolicyCombinationStrategy::Any),
+    );
+
+    // Add three rules with different recipients
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, recipient_1.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, recipient_2.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, recipient_3.clone(), &env),
+    );
+
+    // Any recipient in the rules should be allowed
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recipient_1, &100)
+        .is_ok());
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recipient_2, &100)
+        .is_ok());
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recipient_3, &100)
+        .is_ok());
+
+    // A recipient not in any rule should be denied
+    let unknown = Address::generate(&env);
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &unknown, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn set_rule_combination_strategy_changes_behavior() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "strategy_change");
+    let recipient_1 = Address::generate(&env);
+    let recipient_2 = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    // Register policy with All strategy
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &1000,
+        &None,
+        &None,
+        &0,
+        &Some(crate::PolicyCombinationStrategy::All),
+    );
+
+    // Add two conflicting recipient rules
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, recipient_1.clone(), &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, recipient_2.clone(), &env),
+    );
+
+    // With All strategy: recipient_1 fails second rule
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recipient_1, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Switch to Any strategy
+    p.set_rule_combination_strategy(&owner, &pid, &crate::PolicyCombinationStrategy::Any);
+
+    // Now recipient_1 should pass (it matches first rule)
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recipient_1, &100)
+        .is_ok());
+
+    // Switch back to All strategy
+    p.set_rule_combination_strategy(&owner, &pid, &crate::PolicyCombinationStrategy::All);
+
+    // recipient_1 should fail again
+    assert_eq!(
+        p.try_check_transfer(&pid, &asset, &recipient_1, &100),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn set_rule_combination_strategy_requires_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "strategy_auth");
+
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &1000,
+        &None,
+        &None,
+        &0,
+        &Some(crate::PolicyCombinationStrategy::All),
+    );
+
+    // Stranger cannot change strategy
+    assert_eq!(
+        p.try_set_rule_combination_strategy(
+            &stranger,
+            &pid,
+            &crate::PolicyCombinationStrategy::Any
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Owner can change strategy
+    assert!(p
+        .try_set_rule_combination_strategy(&owner, &pid, &crate::PolicyCombinationStrategy::Any)
+        .is_ok());
+}
+
+#[test]
+fn rule_combination_any_short_circuits_on_first_pass() {
+    // Verify that Any strategy stops evaluating once a rule passes (gas efficiency)
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let pid = String::from_str(&env, "any_short_circuit");
+    let allowed_recipient = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    p.register_policy(
+        &owner,
+        &pid,
+        &BytesN::from_array(&env, &[42; 32]),
+        &1000,
+        &None,
+        &None,
+        &0,
+        &Some(crate::PolicyCombinationStrategy::Any),
+    );
+
+    // Add three rules; first will pass
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_addr_tree(RuleOp::AllowedRecipient, allowed_recipient.clone(), &env),
+    );
+    // These would fail but shouldn't be evaluated due to short-circuit
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 1, &env),
+    );
+    p.add_policy_rule(
+        &owner,
+        &pid,
+        &single_amount_tree(RuleOp::MaxAmount, 0, &env),
+    );
+
+    // Even though amount 100 fails rules 2 and 3, rule 1 passes so transfer is allowed
+    assert!(p
+        .try_check_transfer(&pid, &asset, &allowed_recipient, &100)
+        .is_ok());
 }

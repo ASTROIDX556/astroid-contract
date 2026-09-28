@@ -8,6 +8,9 @@ use crate::{
 use astroid_shared::constants::{
     MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
 };
+    BoundHash, DataKey, RegistryContract, RegistryContractClient, RegistryRole, VersionRecord,
+};
+use astroid_shared::constants::{MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use soroban_sdk::testutils::{storage::Persistent as _, Address as _, AuthorizedFunction, Ledger};
@@ -1721,4 +1724,1438 @@ fn unapproved_wasm_cannot_be_removed() {
     // Revoking a hash that was never approved is `NotFound`, not a silent no-op.
     let res = client.try_remove_approved_wasm(&admin, &ModuleKind::Wallet, &hash(&env, 7));
     assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade-map storage-read optimization (Issue #319)
+//
+// Persistent reads dominate gas. `get_versions_batch` must minimize them by
+// caching the first read of each distinct (kind, version) — including `None`
+// for a missing key — and serving duplicates from an in-memory `Vec` bounded
+// by `MAX_REGISTRY_BATCH`. The same read-once, TTL-once semantics as
+// `get_version` must hold: a distinct key's TTL is extended once per
+// invocation when the record exists and never for a missing key. Overall fee
+// and TTL extended only once.
+
+fn versions_batch(
+    env: &Env,
+    client: &RegistryContractClient,
+    ids: &[(ModuleKind, u32)],
+) -> Vec<Option<Address>> {
+    let mut vids = Vec::new(env);
+    for (kind, version) in ids.iter() {
+        vids.push_back(crate::VersionId {
+            kind: *kind,
+            version: *version,
+        });
+    }
+    client.get_versions_batch(&vids)
+}
+
+fn version_ttl(env: &Env, client: &RegistryContractClient, kind: ModuleKind, version: u32) -> u32 {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::VersionRecord(kind, version))
+    })
+}
+
+#[test]
+fn versions_batch_returns_every_registered_version_in_request_order() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+
+    // Deliberately not in registration order.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[(ModuleKind::Wallet, 2), (ModuleKind::Wallet, 1)],
+    );
+    assert_eq!(result, vec![&env, Some(v2), Some(v1)]);
+}
+
+#[test]
+fn versions_batch_reports_missing_versions_as_none_in_place() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 99), // never registered
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2), // kind registered, version missing
+        ],
+    );
+    assert_eq!(result, vec![&env, None, Some(v1), None]);
+}
+
+#[test]
+fn versions_batch_of_only_missing_versions_is_all_none() {
+    let (env, client, _admin) = setup();
+    let result = versions_batch(
+        &env,
+        &client,
+        &[(ModuleKind::Wallet, 1), (ModuleKind::Wallet, 2)],
+    );
+    assert_eq!(result, vec![&env, None, None]);
+}
+
+#[test]
+fn empty_versions_batch_returns_empty_list() {
+    let (env, client, _admin) = setup();
+    let empty = crate::VersionId {
+        kind: ModuleKind::Wallet,
+        version: 1,
+    };
+    // Construct an explicitly empty Vec<VersionId>.
+    let ids: Vec<crate::VersionId> = Vec::new(&env);
+    assert_eq!(client.get_versions_batch(&ids), Vec::new(&env));
+    // Also through helper with no ids.
+    assert_eq!(versions_batch(&env, &client, &[]), Vec::new(&env));
+    let _ = empty;
+}
+
+#[test]
+fn versions_batch_at_the_size_limit_succeeds() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        ids.push_back(crate::VersionId {
+            kind: ModuleKind::Wallet,
+            version: 1,
+        });
+    }
+    let result = client.get_versions_batch(&ids);
+    assert_eq!(result.len(), MAX_REGISTRY_BATCH);
+    assert!(result.iter().all(|a| a == Some(v1.clone())));
+}
+
+#[test]
+fn versions_batch_over_the_size_limit_is_rejected_before_any_read() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..=MAX_REGISTRY_BATCH {
+        ids.push_back(crate::VersionId {
+            kind: ModuleKind::Wallet,
+            version: 1,
+        });
+    }
+    assert_eq!(
+        client.try_get_versions_batch(&ids),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn versions_batch_answers_duplicate_ids_at_every_position() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+
+    // Wallet v1 appears three times, interleaved with v2 and missing keys.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 1),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(v1.clone()),
+            Some(v2.clone()),
+            Some(v1.clone()),
+            None,
+            None,
+            Some(v1)
+        ]
+    );
+}
+
+#[test]
+fn versions_batch_agrees_with_single_version_lookups() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let vp = Address::generate(&env);
+    let hp = approved_hash(&env, &client, &admin, ModuleKind::Policy, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Policy, &1, &vp, &hp);
+
+    let kinds_versions = [
+        (ModuleKind::Wallet, 1), // present
+        (ModuleKind::Wallet, 2), // missing
+        (ModuleKind::Policy, 1), // present, different kind same version
+        (ModuleKind::Policy, 2), // missing
+        (ModuleKind::Escrow, 1), // kind never registered
+    ];
+    let mut vids = Vec::new(&env);
+    for (k, v) in kinds_versions.iter() {
+        vids.push_back(crate::VersionId {
+            kind: *k,
+            version: *v,
+        });
+    }
+    let batch = client.get_versions_batch(&vids);
+    assert_eq!(batch.len(), vids.len());
+    for (vid, entry) in vids.iter().zip(batch.iter()) {
+        let single = client.try_get_version(&vid.kind, &vid.version);
+        match entry {
+            None => assert_eq!(single, Err(Ok(Error::NotFound))),
+            Some(addr) => assert_eq!(single, Ok(Ok(addr.clone()))),
+        }
+    }
+}
+
+#[test]
+fn versions_batch_deduplicates_reads_and_bumps_once_per_distinct_key() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+
+    // Age the version records past the bump threshold so a read would extend
+    // them only if the TTL bump is actually performed.
+    env.ledger().with_mut(|l| l.sequence_number += 2 * 17_280);
+    let aged_v1 = version_ttl(&env, &client, ModuleKind::Wallet, 1);
+    let aged_v2 = version_ttl(&env, &client, ModuleKind::Wallet, 2);
+    assert!(aged_v1 < PERSISTENT_BUMP_AMOUNT);
+    assert!(aged_v2 < PERSISTENT_BUMP_AMOUNT);
+
+    // Batch with duplicates: v1 appears three times, v2 once, and a missing
+    // key twice. Only the distinct present keys should have their TTL
+    // extended, each exactly once.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 99),
+            (ModuleKind::Wallet, 1),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(v1.clone()),
+            Some(v2.clone()),
+            Some(v1.clone()),
+            None,
+            None,
+            Some(v1.clone())
+        ]
+    );
+    // A present distinct key is extended exactly once, same as a single
+    // `get_version` call — not once per duplicate entry.
+    assert_eq!(
+        version_ttl(&env, &client, ModuleKind::Wallet, 1),
+        PERSISTENT_BUMP_AMOUNT
+    );
+    assert_eq!(
+        version_ttl(&env, &client, ModuleKind::Wallet, 2),
+        PERSISTENT_BUMP_AMOUNT
+    );
+
+    // A missing key has no TTL entry to extend (and the cache never bumps a
+    // missing key), so the second batch does not create one.
+    env.as_contract(&client.address, || {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::VersionRecord(ModuleKind::Wallet, 99)));
+    });
+
+    // Verify `get_version` extends the same way, so the batch matches the
+    // single-lookup policy.
+    env.ledger().with_mut(|l| l.sequence_number += 2 * 17_280);
+    client.get_version(&ModuleKind::Wallet, &1);
+    assert_eq!(
+        version_ttl(&env, &client, ModuleKind::Wallet, 1),
+        PERSISTENT_BUMP_AMOUNT
+    );
+}
+
+#[test]
+fn versions_batch_missing_keys_never_bump_and_are_cached() {
+    let (env, client, _admin) = setup();
+    // No versions registered; every key is missing.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 2),
+        ],
+    );
+    assert_eq!(result, vec![&env, None, None, None, None]);
+    // Missing keys have no storage entry, so no TTL exists to extend.
+    env.as_contract(&client.address, || {
+        for v in [1u32, 2u32] {
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&crate::DataKey::VersionRecord(ModuleKind::Wallet, v)));
+        }
+    });
+}
+
+#[test]
+fn versions_batch_same_number_different_kind_is_distinct() {
+    let (env, client, admin) = setup();
+    let w1 = Address::generate(&env);
+    let p1 = Address::generate(&env);
+    let hw = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let hp = approved_hash(&env, &client, &admin, ModuleKind::Policy, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &w1, &hw);
+    client.register_version(&admin, &ModuleKind::Policy, &1, &p1, &hp);
+
+    // Same version number, different kind — distinct keys, distinct addresses.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Policy, 1),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Policy, 1),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![&env, Some(w1.clone()), Some(p1.clone()), Some(w1), Some(p1)]
+    );
+}
+
+#[test]
+fn versions_batch_initial_deployment_state_is_empty_and_stable() {
+    let (env, client, _admin) = setup();
+    // Fresh deployment: no versions at all, including version 0 which can
+    // never be registered.
+    assert_eq!(
+        versions_batch(&env, &client, &[(ModuleKind::Wallet, 0)]),
+        vec![&env, None]
+    );
+    assert_eq!(versions_batch(&env, &client, &[]), Vec::new(&env));
+    // Still empty after probing.
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn versions_batch_non_existent_version_keys_are_stable() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+
+    // A registered kind still reports NotFound for an absent version; the
+    // batch mirrors that per entry.
+    assert_eq!(
+        versions_batch(&env, &client, &[(ModuleKind::Wallet, 2)]),
+        vec![&env, None]
+    );
+    assert_eq!(
+        versions_batch(
+            &env,
+            &client,
+            &[(ModuleKind::Wallet, 1), (ModuleKind::Wallet, 2)]
+        ),
+        vec![&env, Some(v1.clone()), None]
+    );
+}
+
+#[test]
+fn versions_batch_circular_upgrade_paths_do_not_loop() {
+    let (env, client, admin) = setup();
+    // Simulate Wallet v1 -> v2 -> v3 upgrade chain, then a caller that walks
+    // it with duplicates (e.g. verifying v1, v2, v1 again). The batch must
+    // answer each position without looping or re-reading.
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let v3 = Address::generate(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    let h3 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 3);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3, &h3);
+
+    // Walk v1 -> v2 -> v3 -> v1 -> v2 (circular walk pattern).
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 3),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(v1.clone()),
+            Some(v2.clone()),
+            Some(v3.clone()),
+            Some(v1),
+            Some(v2)
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #240: consolidated upgrade-map storage layout.
+//
+// `Version` (address) and `VersionWasm` (hash) were two persistent entries per
+// version. They are now one `VersionRecord`. These tests pin the new layout,
+// the fallback that keeps pre-consolidation entries readable, and the storage
+// access patterns the consolidation was meant to improve.
+// ---------------------------------------------------------------------------
+
+/// Whether the contract holds a persistent entry under `key`.
+fn has_entry(env: &Env, client: &RegistryContractClient, key: &DataKey) -> bool {
+    env.as_contract(&client.address, || env.storage().persistent().has(key))
+}
+
+#[test]
+fn register_version_stores_one_entry_per_version() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    // Exactly one entry, holding the address and the hash together.
+    assert!(has_entry(
+        &env,
+        &client,
+        &DataKey::VersionRecord(ModuleKind::Wallet, 1)
+    ));
+    // The split layout is not written at all: no bare-address entry alongside
+    // the record, so a populated upgrade map holds one entry per version
+    // instead of two.
+    assert!(!has_entry(
+        &env,
+        &client,
+        &DataKey::Version(ModuleKind::Wallet, 1)
+    ));
+    // And the record is self-contained: both halves answer from it alone.
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), addr);
+    assert_eq!(client.get_version_wasm(&ModuleKind::Wallet, &1), h);
+}
+
+#[test]
+fn register_version_entry_count_does_not_grow_with_versions() {
+    // Ten versions cost ten entries. Before the consolidation the same ten
+    // versions cost twenty (address + hash each), so the ledger footprint of the
+    // upgrade map halves.
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    for v in 1..=10u32 {
+        let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, v as u8);
+        client.register_version(&admin, &ModuleKind::Wallet, &v, &addr, &h);
+    }
+    let mut records = 0;
+    for v in 1..=10u32 {
+        if has_entry(
+            &env,
+            &client,
+            &DataKey::VersionRecord(ModuleKind::Wallet, v),
+        ) {
+            records += 1;
+        }
+        // No version fell back to the split layout.
+        assert!(!has_entry(
+            &env,
+            &client,
+            &DataKey::Version(ModuleKind::Wallet, v)
+        ));
+    }
+    assert_eq!(records, 10);
+}
+
+#[test]
+fn a_legacy_entry_still_blocks_re_registration_of_its_pair() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    // Occupy the pair in the pre-consolidation layout.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 1), &addr);
+    });
+
+    // The legacy entry counts as taken, so it cannot be silently republished
+    // with different code.
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // A different pair is still free.
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &addr, &h);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &2), addr);
+}
+
+#[test]
+fn legacy_entries_answer_the_batch_query_too() {
+    let (env, client, admin) = setup();
+    let legacy_addr = Address::generate(&env);
+    let current_addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 7);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 1), &legacy_addr);
+    });
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &current_addr, &h);
+
+    // A batch mixes the pre-consolidation entry with a current one.
+    let result = versions_batch(
+        &env,
+        &client,
+        &[
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 2),
+            (ModuleKind::Wallet, 1),
+            (ModuleKind::Wallet, 99),
+        ],
+    );
+    assert_eq!(
+        result,
+        vec![
+            &env,
+            Some(legacy_addr.clone()),
+            Some(current_addr),
+            Some(legacy_addr),
+            None
+        ]
+    );
+}
+
+#[test]
+fn verify_version_costs_less_than_reading_the_record_twice() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    // `verify_version` needs the address and its bound hash, which the
+    // consolidated record answers in one read. Reaching the same two facts
+    // through the single-purpose getters costs one read each.
+    let before = env.budget().cpu_instruction_cost();
+    let verified = client.verify_version(&ModuleKind::Wallet, &1, &h);
+    let verify_cost = env.budget().cpu_instruction_cost() - before;
+
+    let before = env.budget().cpu_instruction_cost();
+    let address = client.get_version(&ModuleKind::Wallet, &1);
+    let wasm = client.get_version_wasm(&ModuleKind::Wallet, &1);
+    let split_cost = env.budget().cpu_instruction_cost() - before;
+
+    assert_eq!(verified, addr);
+    assert_eq!((address, wasm), (addr, h));
+    assert!(
+        verify_cost < split_cost,
+        "consolidated read ({verify_cost}) should beat one read per field ({split_cost})"
+    );
+}
+
+#[test]
+fn versions_batch_cost_scales_with_distinct_keys_not_requested_entries() {
+    let (env, client, admin) = setup();
+    let addr = Address::generate(&env);
+    // One registered key, requested many times.
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h);
+
+    let mut repeated = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        repeated.push_back(crate::VersionId {
+            kind: ModuleKind::Wallet,
+            version: 1,
+        });
+    }
+    let before = env.budget().cpu_instruction_cost();
+    let dup = client.get_versions_batch(&repeated);
+    let dup_cost = env.budget().cpu_instruction_cost() - before;
+
+    // The same number of entries, but all distinct, so every one is a real
+    // ledger read plus TTL extension. A different kind keeps this batch from
+    // colliding with the single key above.
+    let mut distinct = Vec::new(&env);
+    for v in 1..=MAX_REGISTRY_BATCH {
+        let hv = approved_hash(&env, &client, &admin, ModuleKind::Policy, v as u8);
+        client.register_version(&admin, &ModuleKind::Policy, &v, &addr, &hv);
+        distinct.push_back(crate::VersionId {
+            kind: ModuleKind::Policy,
+            version: v,
+        });
+    }
+    let before = env.budget().cpu_instruction_cost();
+    let all = client.get_versions_batch(&distinct);
+    let distinct_cost = env.budget().cpu_instruction_cost() - before;
+
+    // Duplicates are answered from the per-invocation cache, so an identical
+    // request shape costs markedly less than the one that must touch the ledger
+    // once per entry.
+    assert!(
+        dup_cost < distinct_cost,
+        "duplicates {dup_cost} vs distinct {distinct_cost}"
+    );
+
+    let mut all_some = Vec::new(&env);
+    for _ in 0..MAX_REGISTRY_BATCH {
+        all_some.push_back(Some(addr.clone()));
+    }
+    assert_eq!(dup, all_some);
+    assert_eq!(all, all_some);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #249: upgrade path validation and version compatibility.
+//
+// The version map publishes immutable `(kind, version)` records; an organization
+// reaches one of them by moving a module pointer, which is what
+// `upgrade_module` does. These tests pin the whole path: what a valid upgrade
+// looks like, every way an invalid target is refused, and the invariant that
+// makes the path acyclic — a module's version sequence only ever increases.
+// ---------------------------------------------------------------------------
+
+/// A contract address to publish as a version's implementation: the upgrade path
+/// refuses to point a module at anything that is not a contract, so a target
+/// has to be one.
+fn impl_address(env: &Env) -> Address {
+    env.register_contract(None, RegistryContract)
+}
+
+/// A genuine account-format address (strkey `G...`). Soroban's test address
+/// generator mints contract-format addresses, so the account side of the
+/// contract-address check needs a real one.
+fn account_address(env: &Env) -> Address {
+    Address::from_string(&String::from_str(
+        env,
+        "GAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSH7S",
+    ))
+}
+
+/// A registry with `acme` registered, three published `Wallet` versions (v1, v2,
+/// v3 — each a contract bound to its own approved hash) and the organization's
+/// `Wallet` module sitting on v1, registered by address exactly as every module
+/// predating validated upgrades was.
+struct PathHarness {
+    env: Env,
+    client: RegistryContractClient<'static>,
+    admin: Address,
+    org: String,
+    owner: Address,
+    /// The three published implementations.
+    v1: Address,
+    v2: Address,
+    v3: Address,
+    /// The approved hash each version is bound to.
+    h2: BytesN<32>,
+    h3: BytesN<32>,
+}
+
+fn setup_path() -> PathHarness {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let v1 = impl_address(&env);
+    let v2 = impl_address(&env);
+    let v3 = impl_address(&env);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    let h3 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 3);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h2);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3, &h3);
+
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &v1);
+
+    PathHarness {
+        env,
+        client,
+        admin,
+        org,
+        owner,
+        v1,
+        v2,
+        v3,
+        h2,
+        h3,
+    }
+}
+
+/// The current version pin for `h`'s wallet module.
+fn pin(h: &PathHarness) -> u32 {
+    h.client.get_module_version(&h.org, &ModuleKind::Wallet)
+}
+
+/// The address `h`'s wallet module currently routes to.
+fn pointed_at(h: &PathHarness) -> Address {
+    h.client.lookup(&h.org, &ModuleKind::Wallet)
+}
+
+#[test]
+fn an_upgrade_moves_the_module_onto_a_published_version() {
+    let h = setup_path();
+    assert_eq!(pointed_at(&h), h.v1);
+    // Registered by address and never upgraded: the pin reads as the start of
+    // the path, not as a failure.
+    assert_eq!(pin(&h), 0);
+    // The pre-flight resolves the target without touching anything.
+    assert_eq!(
+        h.client.validate_upgrade(&h.org, &ModuleKind::Wallet, &2),
+        h.v2
+    );
+    assert_eq!(pin(&h), 0);
+    assert_eq!(pointed_at(&h), h.v1);
+
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        2
+    );
+
+    assert_eq!(pointed_at(&h), h.v2);
+    assert_eq!(pin(&h), 2);
+    // The version record itself is immutable: an upgrade moves the pointer, it
+    // does not republish the version.
+    assert_eq!(h.client.get_version(&ModuleKind::Wallet, &2), h.v2);
+    assert_eq!(h.client.get_version_wasm(&ModuleKind::Wallet, &2), h.h2);
+    // ...and the implementation the module left is still resolvable, so a
+    // consumer pinned to v1 keeps getting v1.
+    assert_eq!(h.client.get_version(&ModuleKind::Wallet, &1), h.v1);
+}
+
+#[test]
+fn an_upgrade_path_rolls_forward_one_version_at_a_time() {
+    let h = setup_path();
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3),
+        3
+    );
+    assert_eq!(pointed_at(&h), h.v3);
+    assert_eq!(pin(&h), 3);
+    // The module now runs exactly the code v3 was published with.
+    assert_eq!(h.client.get_version_wasm(&ModuleKind::Wallet, &3), h.h3);
+    // Each step changed the contract the module runs: no silent no-op got
+    // recorded as progress.
+    assert_ne!(h.v1, h.v2);
+    assert_ne!(h.v2, h.v3);
+}
+
+#[test]
+fn the_first_validated_upgrade_may_skip_ahead() {
+    let h = setup_path();
+    // An unpinned module is at the start of its path, so the newest published
+    // version is a legal first step — nothing forces it through every version.
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3),
+        3
+    );
+    assert_eq!(pointed_at(&h), h.v3);
+    assert_eq!(pin(&h), 3);
+}
+
+#[test]
+fn an_upgrade_emits_the_structured_and_legacy_events() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+
+    let want_topic: Val = Symbol::new(&h.env, "RegistryModuleUpgraded").into_val(&h.env);
+    let event = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .find(|(_id, topics, _data)| topics.contains(want_topic))
+        .expect("RegistryModuleUpgraded must be emitted");
+    assert_eq!(event.0, h.client.address);
+    // `from_version` is 0 for a module that had never been upgraded, so a log
+    // reader can tell a first step from a later one.
+    let data: (String, ModuleKind, u32, u32, Address, BytesN<32>) = event.2.into_val(&h.env);
+    assert_eq!(
+        data,
+        (
+            h.org.clone(),
+            ModuleKind::Wallet,
+            0,
+            2,
+            h.v2.clone(),
+            h.h2.clone()
+        )
+    );
+
+    // The legacy tuple-topic event is still published for existing consumers.
+    let legacy: Vec<Val> = (symbol_short!("module"), symbol_short!("upgrade")).into_val(&h.env);
+    assert!(h
+        .env
+        .events()
+        .all()
+        .iter()
+        .any(|(_id, topics, _data)| topics == legacy));
+}
+
+#[test]
+fn a_refused_upgrade_writes_nothing_and_emits_no_event() {
+    let h = setup_path();
+    // v2's code is no longer approved, so the target fails verification.
+    h.client
+        .remove_approved_wasm(&h.admin, &ModuleKind::Wallet, &h.h2);
+
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // The pointer and the pin are exactly where they were.
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+    let want_topic: Val = Symbol::new(&h.env, "RegistryModuleUpgraded").into_val(&h.env);
+    assert!(!h
+        .env
+        .events()
+        .all()
+        .iter()
+        .any(|(_id, topics, _data)| topics.contains(want_topic)));
+}
+
+#[test]
+fn an_upgrade_to_an_unpublished_version_is_not_found() {
+    let h = setup_path();
+    // Never registered by anyone.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &99),
+        Err(Ok(Error::NotFound))
+    );
+    // A gap in the published sequence is still a gap.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &4),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn an_upgrade_target_must_belong_to_the_modules_own_kind() {
+    let h = setup_path();
+    // A perfectly good Policy version is not a Wallet target: the version map is
+    // keyed by kind, and a Wallet module may only land on a Wallet version.
+    let policy_v9 = impl_address(&h.env);
+    let hp = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Policy, 9);
+    h.client
+        .register_version(&h.admin, &ModuleKind::Policy, &9, &policy_v9, &hp);
+
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &9),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn version_zero_is_not_an_upgrade_target() {
+    let h = setup_path();
+    // 0 can never be a registered version, so it is a malformed request rather
+    // than a missing one.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &0),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn a_version_with_no_bound_hash_is_refused_as_a_target() {
+    let h = setup_path();
+    // A record published before hashes were bound: there is no code to verify,
+    // which is exactly what this path exists to rule out.
+    let legacy = impl_address(&h.env);
+    env_as_contract(&h, |env| {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version(ModuleKind::Wallet, 4), &legacy);
+    });
+
+    // The version itself still resolves for the legacy read paths...
+    assert_eq!(h.client.get_version(&ModuleKind::Wallet, &4), legacy);
+    // ...but it cannot become a module's code.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &4),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        h.client
+            .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &4),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+}
+
+/// Run `f` as the registry contract, the way the contract's own code would see
+/// its storage. Used to plant records a deployment would already hold.
+fn env_as_contract<F: FnOnce(&Env)>(h: &PathHarness, f: F) {
+    h.env.as_contract(&h.client.address, || f(&h.env));
+}
+
+#[test]
+fn a_target_that_is_not_a_contract_is_refused() {
+    let h = setup_path();
+    // An account address: a version may name one, but routing a module to it
+    // would leave the module permanently uncallable.
+    let account = account_address(&h.env);
+    let h5 = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Wallet, 5);
+    h.client
+        .register_version(&h.admin, &ModuleKind::Wallet, &5, &account, &h5);
+
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &5),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn an_upgrade_cannot_repeat_the_version_it_already_runs() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    assert_eq!(pin(&h), 2);
+
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::CircularUpgrade))
+    );
+    assert_eq!(pointed_at(&h), h.v2);
+    assert_eq!(pin(&h), 2);
+}
+
+#[test]
+fn an_upgrade_cannot_walk_back_to_an_earlier_version() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+    assert_eq!(pointed_at(&h), h.v3);
+
+    // v2 is published, approved and perfectly valid — it is simply behind the
+    // module now, so returning to it would close the loop v1 → v3 → v2 → v3.
+    for behind in [1u32, 2] {
+        assert_eq!(
+            h.client
+                .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &behind),
+            Err(Ok(Error::CircularUpgrade))
+        );
+        assert_eq!(
+            h.client
+                .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &behind),
+            Err(Ok(Error::CircularUpgrade))
+        );
+    }
+    assert_eq!(pointed_at(&h), h.v3);
+    assert_eq!(pin(&h), 3);
+}
+
+#[test]
+fn an_upgrade_onto_the_running_contract_is_refused() {
+    let h = setup_path();
+    // The module is already on v1's implementation, so "upgrading" it to v1
+    // changes neither the code nor the routing. It is forward of the (empty)
+    // pin, so the address check is what refuses it.
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &1),
+        Err(Ok(Error::CircularUpgrade))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn an_upgrade_needs_a_module_that_is_already_registered() {
+    let h = setup_path();
+    // The validated path moves an existing registration; it is not a way to
+    // create one, which stays `register_module`'s job.
+    let ghost_kind = ModuleKind::Policy;
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ghost_kind, &2),
+        Err(Ok(Error::NotFound))
+    );
+
+    // A removed module is equally gone, even though its version is still live.
+    h.client
+        .remove_module(&h.owner, &h.org, &ModuleKind::Wallet);
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn only_a_role_that_reaches_the_kind_may_upgrade_it() {
+    let h = setup_path();
+    let stranger = Address::generate(&h.env);
+    let policy_manager = Address::generate(&h.env);
+    let upgrader = Address::generate(&h.env);
+    h.client.grant_role(
+        &h.owner,
+        &h.org,
+        &policy_manager,
+        &RegistryRole::PolicyManager,
+    );
+    h.client
+        .grant_role(&h.owner, &h.org, &upgrader, &RegistryRole::ModuleUpgrader);
+
+    // A stranger has no role at all...
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&stranger, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::Unauthorized))
+    );
+    // ...and a `PolicyManager` reaches Policy registrations, not the versioned
+    // Wallet path, even though an upgrade is exactly the kind of change that
+    // role is not scoped to.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&policy_manager, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::Unauthorized))
+    );
+    // Every refusal left the module alone.
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+
+    // A `ModuleUpgrader` may repoint any kind, and the owner may as well.
+    assert_eq!(
+        h.client
+            .upgrade_module(&upgrader, &h.org, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(pointed_at(&h), h.v2);
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3),
+        3
+    );
+    assert_eq!(pointed_at(&h), h.v3);
+}
+
+#[test]
+fn an_upgrade_of_an_unknown_organization_is_not_found() {
+    let h = setup_path();
+    let ghost = String::from_str(&h.env, "ghost");
+    // An unknown org has no owner and no modules, so it reports NotFound rather
+    // than a permission failure.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &ghost, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::NotFound))
+    );
+    // Even the protocol admin cannot invent one through this path.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.admin, &ghost, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn an_empty_organization_slug_is_refused() {
+    let h = setup_path();
+    let blank = String::from_str(&h.env, "");
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &blank, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        h.client
+            .try_validate_upgrade(&blank, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn a_frozen_registry_refuses_upgrades_and_validations() {
+    let h = setup_path();
+    h.client.freeze(&h.owner, &h.org);
+
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::RegistryFrozen))
+    );
+    // The pre-flight refuses too, so a keeper cannot be told an upgrade is
+    // available while the registry would refuse to record it.
+    assert_eq!(
+        h.client
+            .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::RegistryFrozen))
+    );
+    // The pointer and the pin are untouched. Routing is frozen too, so the
+    // recorded address is read through the getter that stays open.
+    assert_eq!(
+        h.client.get_module_address(&h.org, &ModuleKind::Wallet),
+        h.v1
+    );
+    assert_eq!(pin(&h), 0);
+
+    h.client.unfreeze(&h.owner, &h.org);
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(pointed_at(&h), h.v2);
+}
+
+#[test]
+fn validation_predicts_every_refusal_of_the_write_path() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+
+    // With the module on v2, each of these is refused — and the dry run must
+    // report the very code the upgrade would have reported, in the same order.
+    let cases = [
+        (0u32, Error::InvalidInput),
+        (99, Error::NotFound),
+        (2, Error::CircularUpgrade),
+        (1, Error::CircularUpgrade),
+    ];
+    for (version, expected) in cases {
+        assert_eq!(
+            h.client
+                .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &version),
+            Err(Ok(expected)),
+            "validate_upgrade({version})"
+        );
+        assert_eq!(
+            h.client
+                .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &version),
+            Err(Ok(expected)),
+            "upgrade_module({version})"
+        );
+    }
+    // None of the attempts moved anything.
+    assert_eq!(pointed_at(&h), h.v2);
+    assert_eq!(pin(&h), 2);
+}
+
+#[test]
+fn validation_is_read_only_and_needs_no_signature() {
+    // An env with no mocked auth at all: only a read-only call can succeed in
+    // it, which is what makes this a test of the auth-free property.
+    let env = Env::default();
+    let id = env.register_contract(None, RegistryContract);
+    let client = RegistryContractClient::new(&env, &id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let org = String::from_str(&env, "acme");
+    let v1 = impl_address(&env);
+    let v2 = impl_address(&env);
+    let code = BytesN::from_array(&env, &[2; 32]);
+    // Write the records a deployed registry would already hold.
+    env.as_contract(&id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Org(org.clone()), &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Module(org.clone(), ModuleKind::Wallet), &v1);
+        env.storage().persistent().set(
+            &DataKey::VersionRecord(ModuleKind::Wallet, 2),
+            &VersionRecord {
+                address: v2.clone(),
+                hash: BoundHash::Bound(code.clone()),
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovedWasm(ModuleKind::Wallet, code), &true);
+    });
+
+    assert_eq!(client.validate_upgrade(&org, &ModuleKind::Wallet, &2), v2);
+    // The write path needs a signature, and gets none.
+    assert!(client
+        .try_upgrade_module(&admin, &org, &ModuleKind::Wallet, &2)
+        .is_err());
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), v1);
+    assert_eq!(client.get_module_version(&org, &ModuleKind::Wallet), 0);
+}
+
+#[test]
+fn an_upgrade_demands_the_callers_signature() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+
+    // The owner's signature was required for exactly this invocation.
+    let auths = h.env.auths();
+    let (signer, invocation) = auths.last().expect("the upgrade must require auth");
+    assert_eq!(signer, &h.owner);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, function, _args)) => {
+            assert_eq!(contract, &h.client.address);
+            assert_eq!(function, &Symbol::new(&h.env, "upgrade_module"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+fn an_upgrade_clears_a_deprecation_flag() {
+    let h = setup_path();
+    h.client
+        .deprecate_module(&h.admin, &h.org, &ModuleKind::Wallet);
+    assert_eq!(
+        h.client.try_lookup(&h.org, &ModuleKind::Wallet),
+        Err(Ok(Error::ModuleDeprecated))
+    );
+
+    // Upgrading is the cure for a deprecated module: the implementation it just
+    // left must not keep the new address unroutable.
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    assert!(!h.client.is_module_deprecated(&h.org, &ModuleKind::Wallet));
+    assert_eq!(pointed_at(&h), h.v2);
+}
+
+#[test]
+fn pins_are_reported_per_module() {
+    let h = setup_path();
+    // Unpinned, and distinct from "no such module".
+    assert_eq!(pin(&h), 0);
+    assert_eq!(
+        h.client.try_get_module_version(&h.org, &ModuleKind::Policy),
+        Err(Ok(Error::NotFound))
+    );
+    let ghost = String::from_str(&h.env, "ghost");
+    assert_eq!(
+        h.client.try_get_module_version(&ghost, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    assert_eq!(pin(&h), 2);
+    // Another kind in the same org is untouched, and so is another org.
+    assert_eq!(
+        h.client.try_get_module_version(&h.org, &ModuleKind::Policy),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn each_organization_keeps_its_own_upgrade_path() {
+    let h = setup_path();
+    let other = String::from_str(&h.env, "globex");
+    let other_owner = Address::generate(&h.env);
+    h.client.register_org(&h.admin, &other, &other_owner);
+    h.client
+        .register_module(&other_owner, &other, &ModuleKind::Wallet, &h.v1);
+
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+    assert_eq!(pin(&h), 3);
+    // `globex` is still on v1 with an empty path: one organization's upgrade
+    // says nothing about another's.
+    assert_eq!(h.client.get_module_version(&other, &ModuleKind::Wallet), 0);
+    assert_eq!(
+        h.client
+            .upgrade_module(&other_owner, &other, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(h.client.get_module_version(&other, &ModuleKind::Wallet), 2);
+    assert_eq!(h.client.lookup(&other, &ModuleKind::Wallet), h.v2);
+}
+
+#[test]
+fn re_registering_by_address_starts_a_new_upgrade_path() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+    assert_eq!(pin(&h), 3);
+
+    // Pointing the module at a fresh implementation by hand discards the old
+    // path: the pin described code this module no longer runs, and keeping it
+    // would make the module refuse versions it never actually left behind.
+    let fresh = impl_address(&h.env);
+    h.client
+        .register_module(&h.owner, &h.org, &ModuleKind::Wallet, &fresh);
+    assert_eq!(pointed_at(&h), fresh);
+    assert_eq!(pin(&h), 0);
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &1),
+        1
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 1);
+}
+
+#[test]
+fn removing_a_module_forgets_its_upgrade_path() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    h.client
+        .remove_module(&h.owner, &h.org, &ModuleKind::Wallet);
+    // The pin never outlives the record it describes.
+    assert_eq!(
+        h.client.try_get_module_version(&h.org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+
+    let fresh = impl_address(&h.env);
+    h.client
+        .register_module(&h.owner, &h.org, &ModuleKind::Wallet, &fresh);
+    assert_eq!(pin(&h), 0);
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &1),
+        1
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+}
+
+#[test]
+fn an_upgrade_extends_the_records_it_writes() {
+    let h = setup_path();
+    // Age every record the upgrade touches past the bump threshold.
+    h.env.ledger().with_mut(|l| l.sequence_number += 2 * 17_280);
+    let module_ttl = || {
+        h.env.as_contract(&h.client.address, || {
+            h.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Module(h.org.clone(), ModuleKind::Wallet))
+        })
+    };
+    let pin_ttl = || {
+        h.env.as_contract(&h.client.address, || {
+            h.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::ModuleVersion(h.org.clone(), ModuleKind::Wallet))
+        })
+    };
+    let aged_module = module_ttl();
+    assert!(aged_module < PERSISTENT_BUMP_AMOUNT);
+
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+
+    // The module record and the new pin are both kept alive by the same bump, so
+    // they can never expire apart and leave a module that exists but whose
+    // ordering guard has silently reset.
+    assert_eq!(module_ttl(), PERSISTENT_BUMP_AMOUNT);
+    assert_eq!(pin_ttl(), PERSISTENT_BUMP_AMOUNT);
+    // The version record the target was resolved from is extended too, as any
+    // successful read of it does.
+    assert_eq!(
+        version_ttl(&h.env, &h.client, ModuleKind::Wallet, 2),
+        PERSISTENT_BUMP_AMOUNT
+    );
+}
+
+#[test]
+fn modules_registered_before_this_feature_still_upgrade() {
+    // A deployment whose modules were all registered by address: no
+    // `ModuleVersion` entry exists anywhere, and none is required for the
+    // validated path to work.
+    let h = setup_path();
+    env_as_contract(&h, |env| {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::ModuleVersion(h.org.clone(), ModuleKind::Wallet)));
+    });
+    assert_eq!(pin(&h), 0);
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(pin(&h), 2);
+    // The pre-existing layouts are untouched: the module still answers the
+    // legacy address getter, and no version record moved.
+    assert_eq!(
+        h.client.get_module_address(&h.org, &ModuleKind::Wallet),
+        h.v2
+    );
+    assert_eq!(h.client.get_version(&ModuleKind::Wallet, &1), h.v1);
+    assert_eq!(h.client.get_version(&ModuleKind::Wallet, &2), h.v2);
 }

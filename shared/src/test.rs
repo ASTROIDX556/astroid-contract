@@ -2,7 +2,7 @@
 //! Unit tests for the shared math, validation and constant helpers.
 
 use crate::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS};
-use crate::errors::Error;
+use crate::errors::{Error, MilestoneError, MILESTONE_ERROR_CODES};
 use crate::math::{
     checked_abs, checked_add, checked_add_u64, checked_balance_add, checked_balance_sub,
     checked_div, checked_div_u64, checked_mul, checked_mul_u64, checked_neg, checked_rem,
@@ -974,7 +974,7 @@ const RETIRED_CODES: [u32; 3] = [25, 26, 65];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 50] = [
+const EXPECTED_CODES: [(Error, u32); 52] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -996,17 +996,19 @@ const EXPECTED_CODES: [(Error, u32); 50] = [
     // --- Registry (30-39) ---
     (Error::RegistryFrozen, 30),
     (Error::ModuleDeprecated, 31),
+    (Error::CircularUpgrade, 32),
     // --- Budget (40-44) ---
     (Error::BudgetExceeded, 40),
     (Error::BudgetFrozen, 41),
     (Error::BudgetArchived, 42),
     (Error::AssetNotAuthorized, 43),
     (Error::BudgetExpired, 44),
-    // --- Wallet (50-53) ---
+    // --- Wallet (50-54) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
     (Error::WalletPaused, 52),
     (Error::InvalidState, 53),
+    (Error::RateLimitExceeded, 54),
     // --- Multisig / approvals (61-69, 90-92) ---
     (Error::ThresholdNotMet, 61),
     (Error::AlreadySigned, 62),
@@ -1084,7 +1086,7 @@ fn error_code_bands_are_ascending() {
         (20, 29),
         (30, 39),
         (40, 44),
-        (50, 53),
+        (50, 54),
         (60, 69),
         (70, 79),
         (90, 92),
@@ -1134,7 +1136,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let wallet = Error::ALL
         .iter()
-        .filter(|e| (50..54).contains(&e.code()))
+        .filter(|e| (50..55).contains(&e.code()))
         .count();
     let multisig = Error::ALL
         .iter()
@@ -1157,9 +1159,9 @@ fn error_domains_do_not_overlap() {
         .filter(|e| (20..30).contains(&e.code()))
         .count();
 
-    assert_eq!(registry, 2, "registry band 30-39");
+    assert_eq!(registry, 3, "registry band 30-39");
     assert_eq!(budget, 5, "budget band 40-44");
-    assert_eq!(wallet, 4, "wallet band 50-53");
+    assert_eq!(wallet, 5, "wallet band 50-54");
     assert_eq!(multisig, 11, "multisig bands 61-69 and 90-92");
     assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 3, "escrow band 80-82");
@@ -1187,4 +1189,68 @@ fn unknown_error_codes_are_never_decoded() {
     // being guessed at.
     let unknown = soroban_sdk::Error::from_contract_error(4_294_967_295);
     assert!(Error::try_from(unknown).is_err());
+}
+
+#[test]
+fn milestone_error_codes_are_frozen_and_unique() {
+    // A milestone refusal that is really a generic failure must decode to the
+    // exact canonical number, so a consumer's existing handler still matches.
+    assert_eq!(MilestoneError::NotFound.code(), Error::NotFound.code());
+    assert_eq!(
+        MilestoneError::Unauthorized.code(),
+        Error::Unauthorized.code()
+    );
+    assert_eq!(
+        MilestoneError::InvalidInput.code(),
+        Error::InvalidInput.code()
+    );
+    assert_eq!(MilestoneError::Overflow.code(), Error::Overflow.code());
+    assert_eq!(
+        MilestoneError::InvalidAmount.code(),
+        Error::InvalidAmount.code()
+    );
+    assert_eq!(
+        MilestoneError::InvalidState.code(),
+        Error::InvalidState.code()
+    );
+    // The two milestone-only codes are the next free slots after the escrow
+    // band (80-82) and must never be reassigned.
+    assert_eq!(MilestoneError::InvalidMilestone.code(), 86);
+    assert_eq!(MilestoneError::MilestoneAlreadyCompleted.code(), 87);
+
+    let declared = [
+        MilestoneError::NotFound,
+        MilestoneError::Unauthorized,
+        MilestoneError::InvalidInput,
+        MilestoneError::Overflow,
+        MilestoneError::InvalidAmount,
+        MilestoneError::InvalidState,
+        MilestoneError::InvalidMilestone,
+        MilestoneError::MilestoneAlreadyCompleted,
+    ];
+    assert_eq!(declared.len(), MILESTONE_ERROR_CODES.len());
+    for (variant, code) in declared.iter().zip(MILESTONE_ERROR_CODES) {
+        assert_eq!(variant.code(), code, "{:?} must keep its code", variant);
+        assert_ne!(code, 0, "{:?} may not take the reserved code 0", variant);
+        assert!(
+            !RETIRED_CODES.contains(&code),
+            "{:?} was assigned retired code {}",
+            variant,
+            code
+        );
+    }
+    // Every code is unique, so a failure is attributable to one variant.
+    for (i, code) in MILESTONE_ERROR_CODES.iter().enumerate() {
+        assert!(
+            !MILESTONE_ERROR_CODES[i + 1..].contains(code),
+            "duplicate milestone code {}",
+            code
+        );
+    }
+    // A contract returning any variant round-trips as that exact number.
+    for variant in declared {
+        let host = soroban_sdk::Error::from(variant);
+        assert_eq!(host.get_code(), variant.code());
+        assert_eq!(MilestoneError::try_from(host), Ok(variant));
+    }
 }
