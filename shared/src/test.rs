@@ -974,7 +974,7 @@ const RETIRED_CODES: [u32; 3] = [25, 26, 65];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 50] = [
+const EXPECTED_CODES: [(Error, u32); 52] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -996,17 +996,19 @@ const EXPECTED_CODES: [(Error, u32); 50] = [
     // --- Registry (30-39) ---
     (Error::RegistryFrozen, 30),
     (Error::ModuleDeprecated, 31),
+    (Error::CircularUpgrade, 32),
     // --- Budget (40-44) ---
     (Error::BudgetExceeded, 40),
     (Error::BudgetFrozen, 41),
     (Error::BudgetArchived, 42),
     (Error::AssetNotAuthorized, 43),
     (Error::BudgetExpired, 44),
-    // --- Wallet (50-53) ---
+    // --- Wallet (50-54) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
     (Error::WalletPaused, 52),
     (Error::InvalidState, 53),
+    (Error::RateLimitExceeded, 54),
     // --- Multisig / approvals (61-69, 90-92) ---
     (Error::ThresholdNotMet, 61),
     (Error::AlreadySigned, 62),
@@ -1084,7 +1086,7 @@ fn error_code_bands_are_ascending() {
         (20, 29),
         (30, 39),
         (40, 44),
-        (50, 53),
+        (50, 54),
         (60, 69),
         (70, 79),
         (90, 92),
@@ -1134,7 +1136,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let wallet = Error::ALL
         .iter()
-        .filter(|e| (50..54).contains(&e.code()))
+        .filter(|e| (50..55).contains(&e.code()))
         .count();
     let multisig = Error::ALL
         .iter()
@@ -1157,9 +1159,9 @@ fn error_domains_do_not_overlap() {
         .filter(|e| (20..30).contains(&e.code()))
         .count();
 
-    assert_eq!(registry, 2, "registry band 30-39");
+    assert_eq!(registry, 3, "registry band 30-39");
     assert_eq!(budget, 5, "budget band 40-44");
-    assert_eq!(wallet, 4, "wallet band 50-53");
+    assert_eq!(wallet, 5, "wallet band 50-54");
     assert_eq!(multisig, 11, "multisig bands 61-69 and 90-92");
     assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 3, "escrow band 80-82");

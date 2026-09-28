@@ -11,16 +11,28 @@
 //! test in `shared/src/test.rs`:
 //!
 //! 1. **Explicit and unique** — every variant carries a hand-written
-//!    discriminant (the `#[contracterror]` expansion rejects implicit ones), and
-//!    no two variants share a code.
+//!    discriminant, and no two variants share a code.
 //! 2. **Non-overlapping domains** — each contract's codes occupy a distinct
 //!    numeric range, so a code can be attributed to exactly one contract.
 //! 3. **Never reused** — a retired code stays empty forever, so a stale
 //!    integrator can never decode a fresh failure as a retired meaning.
+//!
+//! The protocol-wide table deliberately holds more cases than Soroban's
+//! `#[contracterror]` spec admits (`VecM<.., 50>`), so the enum is annotated
+//! `#[contracterror(export = false)]` to skip only the optional `contractspecv0`
+//! metadata section; every code, its name and its numeric value are unaffected,
+//! and the conversions to [`soroban_sdk::Error`] remain derived. Contract-specific
+//! codes that do not belong in the shared numeric bands live in their own tables
+//! ([`BudgetError`], [`MilestoneError`]).
 
 use soroban_sdk::contracterror;
 
-#[contracterror]
+// `export = false`: the spec XDR for an error enum is limited to 50 cases
+// (`ScSpecUdtErrorEnumV0.cases: VecM<_, 50>`), while the workspace references
+// more than 50 distinct codes, so spec generation would not compile. Only the
+// optional `contractspecv0` metadata section is skipped — every code, its
+// name and its numeric value are unaffected.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
@@ -59,6 +71,13 @@ pub enum Error {
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
     ModuleDeprecated = 31,
+    /// CIRCULAR_UPGRADE: a module upgrade would move a module's pointer onto
+    /// the implementation it already runs, or back onto one it has already left
+    /// — closing a loop in the upgrade path instead of advancing it (Issue #249).
+    /// Distinct from [`Error::InvalidInput`] so deployment tooling that walks
+    /// upgrade paths can tell a cycle apart from a malformed request and stop
+    /// walking rather than retrying.
+    CircularUpgrade = 32,
 
     // --- Budget (40-44) ---
     BudgetExceeded = 40,
@@ -72,11 +91,16 @@ pub enum Error {
     AssetNotAuthorized = 43,
     BudgetExpired = 44,
 
-    // --- Wallet (50-53) ---
+    // --- Wallet (50-54) ---
     WalletFrozen = 50,
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    /// RATE_LIMIT_EXCEEDED: an outbound transaction would exceed the wallet's
+    /// configured rate limit (maximum outbound volume and/or transaction count
+    /// within the active sliding window). Nothing moves; the spend may succeed
+    /// once earlier activity ages out of the window.
+    RateLimitExceeded = 54,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
@@ -141,7 +165,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 50] = [
+    pub const ALL: [Error; 52] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -163,17 +187,19 @@ impl Error {
         // --- Registry (30-39) ---
         Error::RegistryFrozen,
         Error::ModuleDeprecated,
+        Error::CircularUpgrade,
         // --- Budget (40-44) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
         Error::BudgetArchived,
         Error::AssetNotAuthorized,
         Error::BudgetExpired,
-        // --- Wallet (50-53) ---
+        // --- Wallet (50-54) ---
         Error::WalletFrozen,
         Error::WalletArchived,
         Error::WalletPaused,
         Error::InvalidState,
+        Error::RateLimitExceeded,
         // --- Multisig / approvals (61-69, 90-92) ---
         Error::ThresholdNotMet,
         Error::AlreadySigned,
