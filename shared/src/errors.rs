@@ -405,6 +405,7 @@ impl Error {
             // --- Registry (30-39) ---
             Error::RegistryFrozen => "REGISTRY_FROZEN",
             Error::ModuleDeprecated => "MODULE_DEPRECATED",
+            Error::CircularUpgrade => "CIRCULAR_UPGRADE",
             // --- Budget (40-44) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
