@@ -1635,3 +1635,82 @@ fn threshold_voting_exact_boundary_transitions_state() {
     assert!(proposal.executed);
     assert_eq!(proposal.approval_weight, 5);
 }
+
+// ---------------------------------------------------------------------------
+// Multisig quorum weight adjustments with timelock protection tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn weight_update_timelock_creation_queuing_premature_failure_and_success() {
+    let h = setup(&[2, 2], 3);
+    h.env.ledger().set_timestamp(1_000);
+
+    // 1. Propose signer weight update
+    let prop_id = h
+        .client
+        .propose_weight_change(&h.signers[0], &h.signers[1], &5);
+
+    // 2. Queuing state verification: verify change is queued with eta = proposed_at + MIN_TIMELOCK_DELAY
+    let pending = h.client.get_pending_change(&prop_id);
+    assert_eq!(pending.proposer, h.signers[0]);
+    assert_eq!(
+        pending.change,
+        GovernanceChange::SignerWeight(h.signers[1].clone(), 5)
+    );
+    assert_eq!(pending.proposed_at, 1_000);
+    assert_eq!(pending.eta, 1_000 + MIN_TIMELOCK_DELAY);
+    assert!(!pending.executed);
+
+    // 3. Premature execution failure: attempting to execute before timelock expires fails with TIMELOCK_NOT_EXPIRED
+    advance(&h, MIN_TIMELOCK_DELAY - 1);
+    let res = h
+        .client
+        .try_execute_threshold_change(&h.signers[0], &prop_id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+
+    // Verify weight remains unchanged prematurely
+    let signers_before = h.client.get_signers();
+    assert!(signers_before
+        .iter()
+        .any(|s| s.address == h.signers[1] && s.weight == 2));
+
+    // 4. Successful post-timelock execution: advance timestamp to eta and execute successfully
+    advance(&h, 1);
+    h.client.execute_threshold_change(&h.signers[0], &prop_id);
+
+    let pending_after = h.client.get_pending_change(&prop_id);
+    assert!(pending_after.executed);
+
+    let signers_after = h.client.get_signers();
+    assert!(signers_after
+        .iter()
+        .any(|s| s.address == h.signers[1] && s.weight == 5));
+}
+
+#[test]
+fn quorum_modification_proposal_enforces_timelock_delay() {
+    let h = setup(&[2, 2], 3);
+    h.env.ledger().set_timestamp(10_000);
+
+    // Propose a proposal with quorum/weight action and unlock_at = 0
+    let prop_id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("weight"),
+        &payload(&h.env),
+        &0,
+    );
+
+    let prop = h.client.get_proposal(&prop_id);
+    assert_eq!(prop.unlock_at, 10_000 + MIN_TIMELOCK_DELAY);
+
+    h.client.approve(&h.signers[1], &prop_id);
+
+    // Premature execution returns TimelockNotExpired
+    let res = h.client.try_execute(&h.signers[0], &prop_id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+
+    // Post-timelock execution succeeds
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute(&h.signers[0], &prop_id);
+    assert!(h.client.get_proposal(&prop_id).executed);
+}
