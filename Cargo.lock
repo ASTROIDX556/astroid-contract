@@ -127,7 +127,9 @@ name = "astroid-treasury"
 version = "0.1.0"
 dependencies = [
  "astroid-interfaces",
+ "astroid-registry",
  "astroid-shared",
+ "astroid-wallet",
  "soroban-sdk",
 ]
 
