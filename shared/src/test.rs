@@ -2,7 +2,9 @@
 //! Unit tests for the shared math, validation and constant helpers.
 
 use crate::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS};
-use crate::errors::{Error, MilestoneError, MILESTONE_ERROR_CODES};
+use crate::errors::{
+    BudgetError, Error, MilestoneError, BUDGET_ERROR_CODES, MILESTONE_ERROR_CODES,
+};
 use crate::math::{
     checked_abs, checked_add, checked_add_u64, checked_balance_add, checked_balance_sub,
     checked_div, checked_div_u64, checked_mul, checked_mul_u64, checked_neg, checked_rem,
@@ -1217,18 +1219,8 @@ fn milestone_error_codes_are_frozen_and_unique() {
     assert_eq!(MilestoneError::InvalidMilestone.code(), 86);
     assert_eq!(MilestoneError::MilestoneAlreadyCompleted.code(), 87);
 
-    let declared = [
-        MilestoneError::NotFound,
-        MilestoneError::Unauthorized,
-        MilestoneError::InvalidInput,
-        MilestoneError::Overflow,
-        MilestoneError::InvalidAmount,
-        MilestoneError::InvalidState,
-        MilestoneError::InvalidMilestone,
-        MilestoneError::MilestoneAlreadyCompleted,
-    ];
-    assert_eq!(declared.len(), MILESTONE_ERROR_CODES.len());
-    for (variant, code) in declared.iter().zip(MILESTONE_ERROR_CODES) {
+    assert_eq!(MilestoneError::ALL.len(), MILESTONE_ERROR_CODES.len());
+    for (variant, code) in MilestoneError::ALL.iter().zip(MILESTONE_ERROR_CODES) {
         assert_eq!(variant.code(), code, "{:?} must keep its code", variant);
         assert_ne!(code, 0, "{:?} may not take the reserved code 0", variant);
         assert!(
@@ -1247,9 +1239,489 @@ fn milestone_error_codes_are_frozen_and_unique() {
         );
     }
     // A contract returning any variant round-trips as that exact number.
-    for variant in declared {
+    for variant in MilestoneError::ALL {
         let host = soroban_sdk::Error::from(variant);
         assert_eq!(host.get_code(), variant.code());
         assert_eq!(MilestoneError::try_from(host), Ok(variant));
     }
+}
+
+#[test]
+fn budget_error_table_is_frozen() {
+    // `ALL` is the enumeration this audit walks, so a variant added to (or
+    // removed from) the enum without a matching entry in `BUDGET_ERROR_CODES`
+    // fails here instead of slipping an undocumented code onto the wire.
+    assert_eq!(BudgetError::ALL.len(), BUDGET_ERROR_CODES.len());
+    for (variant, expected) in BudgetError::ALL.iter().zip(BUDGET_ERROR_CODES) {
+        assert_eq!(
+            variant.code(),
+            expected,
+            "{:?} must keep its published code",
+            variant
+        );
+    }
+}
+
+#[test]
+fn budget_error_codes_are_frozen_and_unique() {
+    for (i, code) in BUDGET_ERROR_CODES.iter().enumerate() {
+        // The host reports a contract error of `0` as "no error", so no variant
+        // may ever take that value.
+        assert_ne!(*code, 0, "code 0 is reserved by the host");
+        // Compare against every later code: a duplicate makes a budget refusal
+        // unattributable off chain, and `BudgetError` has a distinct code (45)
+        // that nothing else may shadow.
+        for other in &BUDGET_ERROR_CODES[i + 1..] {
+            assert_ne!(
+                other, code,
+                "code {} is claimed twice in the budget table",
+                code
+            );
+        }
+        assert!(
+            !RETIRED_CODES.contains(code),
+            "retired code {} reissued in the budget table",
+            code
+        );
+    }
+
+    // A contract returning any variant round-trips as that exact number, so an
+    // off-chain consumer decodes it back to the same variant.
+    for variant in BudgetError::ALL {
+        let host = soroban_sdk::Error::from(variant);
+        assert_eq!(host.get_code(), variant.code());
+        assert_eq!(BudgetError::try_from(host), Ok(variant));
+    }
+
+    // The ten mirrored codes are wire-compatible with the canonical table, so a
+    // consumer's existing `Error` handler still fires. `BudgetNotActive` (45) is
+    // the one budget-only code, and it folds onto `Error::BudgetExpired` on the
+    // way back — asserted here so that lossy conversion is deliberate rather
+    // than accidental.
+    for variant in BudgetError::ALL {
+        let canonical = Error::from(variant);
+        if variant == BudgetError::BudgetNotActive {
+            assert_eq!(canonical, Error::BudgetExpired);
+        } else {
+            assert_eq!(
+                canonical.code(),
+                variant.code(),
+                "{:?} must decode to the same number in the canonical table",
+                variant
+            );
+        }
+    }
+}
+
+/// Every variant the three error tables expose must carry a code that is
+/// non-zero, not a retired slot, and — within its own table — claimed by no
+/// other variant. Uniqueness is per table on purpose: the budget and milestone
+/// tables deliberately mirror canonical codes, so a code shared *between*
+/// tables is the wire compatibility the protocol relies on, whereas a code
+/// shared *within* a table is a failure nothing can attribute.
+#[test]
+fn every_public_error_variant_has_a_unique_code() {
+    // Canonical table.
+    assert_unique_codes(Error::ALL.iter().map(|e| e.code()));
+    // Budget table.
+    assert_unique_codes(BudgetError::ALL.iter().map(|e| e.code()));
+    // Milestone table.
+    assert_unique_codes(MilestoneError::ALL.iter().map(|e| e.code()));
+
+    // No variant of any table may take a retired slot, and no table may claim
+    // the reserved code 0.
+    for code in Error::ALL
+        .iter()
+        .map(|e| e.code())
+        .chain(BudgetError::ALL.iter().map(|e| e.code()))
+        .chain(MilestoneError::ALL.iter().map(|e| e.code()))
+    {
+        assert_ne!(code, 0, "code 0 is reserved by the host");
+        assert!(
+            !RETIRED_CODES.contains(&code),
+            "retired code {} was reissued",
+            code
+        );
+    }
+}
+
+/// Walk one table's codes, asserting each is non-zero and not already claimed by
+/// an earlier entry in the same table.
+fn assert_unique_codes<I: Iterator<Item = u32>>(codes: I) {
+    // The tables are small and fixed-size, so an O(n^2) walk over the
+    // accumulated codes is cheaper than allocating a set.
+    let mut seen = [0u32; MAX_AUDITED_CODES];
+    for (count, code) in codes.enumerate() {
+        assert_ne!(code, 0, "code 0 is reserved by the host");
+        for previous in &seen[..count] {
+            assert_ne!(
+                *previous, code,
+                "code {} is claimed by more than one error variant",
+                code
+            );
+        }
+        assert!(
+            count < seen.len(),
+            "error table grew past the audit's capacity"
+        );
+        seen[count] = code;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error-table lint (Issue #244)
+//
+// A missing doc comment, a wire name that drifts out of `UPPER_SNAKE_CASE`, or a
+// discriminant left implicit is invisible to the compiler: the crate still
+// builds, the tests still pass, and the codes are still as deterministic as they
+// were. The only thing that catches them is reading the source, so the routine
+// below parses `errors.rs` at test time and enforces the documentation and
+// naming conventions on every variant of every error table in the crate.
+// ---------------------------------------------------------------------------
+
+/// This file, verbatim. Reading the source is what makes the documentation rule
+/// enforceable; the compiler cannot see a missing doc comment.
+const ERROR_SOURCE: &str = include_str!("errors.rs");
+
+/// The upper bound on the codes and wire names the audits below can remember.
+/// The largest table declares 51 variants; the slack keeps an in-progress table
+/// from failing on capacity alone.
+const MAX_AUDITED_CODES: usize = 64;
+
+/// The upper bound on the `#[contracterror]` tables the scan tracks. Three exist
+/// today; the slack means a new one is reported as "extend the audit" rather
+/// than as a capacity failure.
+const MAX_ERROR_TABLES: usize = 8;
+
+/// A `#[contracterror]` variant exactly as `errors.rs` declares it.
+#[derive(Clone, Copy)]
+struct DeclaredVariant {
+    /// The table it belongs to: `Error`, `BudgetError` or `MilestoneError`.
+    table: &'static str,
+    /// The variant's Rust name, as written in the source. Used in failure
+    /// messages; the published name is the variant's `wire_name()`, which is
+    /// checked separately because it is a method, not a declaration.
+    name: &'static str,
+    /// The discriminant, as written in the source.
+    code: u32,
+    /// 1-based line number, so a failure points at the declaration.
+    line: usize,
+    /// Whether a `///` doc comment precedes the declaration.
+    documented: bool,
+}
+
+/// `UPPER_SNAKE_CASE`: ASCII capitals, digits and underscores, starting with a
+/// capital and free of leading, trailing or doubled underscores. This is the
+/// form the Astroid SDK, API and dashboard key their message catalogues off, so
+/// a variant whose wire name is `NotFound` instead of `NOT_FOUND` is a silent
+/// mismatch for every consumer of that catalogue.
+fn is_upper_snake_case(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    if name.starts_with('_') || name.ends_with('_') || name.contains("__") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Walk every `#[contracterror]` table in `errors.rs`, in source order, calling
+/// `on_variant` once per declared variant and `on_table` once per table with the
+/// number of variants that table declares.
+///
+/// The scan is deliberately literal rather than clever: it recognises exactly
+/// the layout `errors.rs` uses — one `Name = <decimal>,` per line, with
+/// attributes and `//` / `///` comments on their own lines — and panics with a
+/// pointed message on anything else, so a reformat shows up as an actionable
+/// failure instead of silently skipping a variant.
+fn scan_error_tables(
+    on_variant: &mut impl FnMut(DeclaredVariant),
+    on_table: &mut impl FnMut(&'static str, usize),
+) {
+    // 1. Find the `#[contracterror]` enums. The attribute may carry arguments
+    //    (`#[contracterror(export = false)]`), so match on the prefix only. The
+    //    `#[derive]` / `#[repr]` lines in between belong to the same item and
+    //    must not end the search.
+    let mut tables: [(&'static str, usize); MAX_ERROR_TABLES] = [("", 0); MAX_ERROR_TABLES];
+    let mut table_count = 0usize;
+    let mut awaiting_contracterror = false;
+    for (index, line) in ERROR_SOURCE.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[contracterror") {
+            awaiting_contracterror = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("pub enum ") {
+            if awaiting_contracterror {
+                assert!(
+                    table_count < tables.len(),
+                    "more error tables than this audit knows about — extend it"
+                );
+                tables[table_count] = (rest.trim_end_matches('{').trim(), index + 1);
+                table_count += 1;
+            }
+            // The attribute never carries over to the next item.
+            awaiting_contracterror = false;
+            continue;
+        }
+        if awaiting_contracterror
+            && !(trimmed.is_empty() || trimmed.starts_with("///") || trimmed.starts_with("#["))
+        {
+            awaiting_contracterror = false;
+        }
+    }
+    assert!(
+        table_count > 0,
+        "the scan found no #[contracterror] table in errors.rs — the source layout \
+         this audit depends on has changed"
+    );
+
+    // 2. Walk each table's body. A table's variants are the lines between its
+    //    `pub enum` and the first line that is exactly `}`: these enums hold no
+    //    nested items, so that brace is unambiguous.
+    for (table, header_line) in &tables[..table_count] {
+        let mut documented = false;
+        let mut variants = 0usize;
+        for (offset, line) in ERROR_SOURCE.lines().skip(*header_line).enumerate() {
+            let line_number = header_line + offset + 1;
+            let trimmed = line.trim();
+            if line == "}" {
+                break;
+            }
+            if trimmed.is_empty() {
+                // A blank line ends a doc run: a `///` block above a blank line
+                // documents that block, not the variant below it.
+                documented = false;
+                continue;
+            }
+            if trimmed.starts_with("///") {
+                documented = true;
+                continue;
+            }
+            if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                // Plain and attribute lines do not interrupt a doc run.
+                continue;
+            }
+            // Whatever is left is a variant declaration: `Name = <decimal>,`.
+            let declaration = trimmed.strip_suffix(',').unwrap_or_else(|| {
+                panic!(
+                    "errors.rs:{line_number}: expected `Name = <code>,` inside \
+                     `{table}`, found `{trimmed}`"
+                )
+            });
+            let (name, code) = declaration.split_once('=').unwrap_or_else(|| {
+                panic!(
+                    "errors.rs:{line_number}: `{trimmed}` has no explicit discriminant \
+                     in `{table}` — write `{trimmed} = <code>,` so the wire value is \
+                     hand-written and reviewable"
+                )
+            });
+            let name = name.trim();
+            let code = code.trim();
+            let parsed: u32 = code.parse().unwrap_or_else(|_| {
+                panic!(
+                    "errors.rs:{line_number}: `{name}` must carry a plain decimal \
+                     discriminant, found `{code}`"
+                )
+            });
+            variants += 1;
+            on_variant(DeclaredVariant {
+                table,
+                name,
+                code: parsed,
+                line: line_number,
+                documented,
+            });
+            documented = false;
+        }
+        assert!(
+            variants > 0,
+            "`{table}` declares no variants this audit could read — the source \
+             layout this audit depends on has changed"
+        );
+        on_table(table, variants);
+    }
+}
+
+#[test]
+fn error_variants_are_documented() {
+    // The point of the exercise: an off-chain consumer decodes a `u32` and a
+    // name, never a Rust doc comment, so this comment *is* the specification of
+    // when the code is emitted. An undocumented variant is a code nobody can
+    // explain.
+    let mut checked = 0usize;
+    scan_error_tables(
+        &mut |variant| {
+            assert!(
+                variant.documented,
+                "errors.rs:{}: `{}::{}` has no doc comment — say what triggers it",
+                variant.line, variant.table, variant.name
+            );
+            assert_ne!(
+                variant.code, 0,
+                "errors.rs:{}: `{}::{}` takes the reserved code 0; the host reports a \
+                 contract error of 0 as \"no error\"",
+                variant.line, variant.table, variant.name
+            );
+            checked += 1;
+        },
+        &mut |_, _| {},
+    );
+    // Every table declared three variants or more, so a scan that visited
+    // nothing cannot pass.
+    assert!(
+        checked > 0,
+        "the documentation scan visited no variants at all"
+    );
+}
+
+#[test]
+fn error_tables_declared_in_source_match_the_audited_tables() {
+    // `on_table` is called once per table, so this compares per table: a new
+    // variant in one table cannot hide behind the grand total staying stable.
+    let expected = [
+        ("Error", Error::ALL.len()),
+        ("BudgetError", BudgetError::ALL.len()),
+        ("MilestoneError", MILESTONE_ERROR_CODES.len()),
+    ];
+    let mut seen: [&str; MAX_ERROR_TABLES] = [""; MAX_ERROR_TABLES];
+    let mut seen_count = 0usize;
+    scan_error_tables(&mut |_| {}, &mut |table, declared| {
+        assert!(
+            seen_count < seen.len(),
+            "more error tables than this audit knows about — extend it"
+        );
+        seen[seen_count] = table;
+        seen_count += 1;
+        let audited = expected
+            .iter()
+            .find(|(name, _)| *name == table)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{table}` is a new #[contracterror] table in errors.rs — add \
+                         it to this audit and give it an `ALL`/code constant of its own"
+                )
+            });
+        assert_eq!(
+            declared, audited.1,
+            "`{table}` declares {declared} variants in errors.rs but the audited \
+                 table enumerates {} — update both in the same change",
+            audited.1
+        );
+    });
+    assert_eq!(
+        seen_count,
+        expected.len(),
+        "this audit covers {} tables but errors.rs has {}: {:?}",
+        expected.len(),
+        seen_count,
+        &seen[..seen_count]
+    );
+}
+
+#[test]
+fn error_wire_names_are_upper_snake_case_and_unique() {
+    // The published name must be UPPER_SNAKE_CASE and must identify exactly one
+    // variant within its table, so an off-chain message catalogue keyed on it
+    // cannot be ambiguous.
+    fn assert_wire_names<I: Iterator<Item = &'static str>>(table: &str, names: I) {
+        let mut seen = [""; MAX_AUDITED_CODES];
+        for (count, name) in names.enumerate() {
+            assert!(
+                is_upper_snake_case(name),
+                "{table}: wire name `{name}` is not UPPER_SNAKE_CASE"
+            );
+            assert!(
+                !seen[..count].contains(&name),
+                "{table}: wire name `{name}` is used by more than one variant"
+            );
+            assert!(count < seen.len(), "{table}: too many variants to audit");
+            seen[count] = name;
+        }
+    }
+
+    assert_wire_names("Error", Error::ALL.iter().map(|e| e.wire_name()));
+    assert_wire_names(
+        "BudgetError",
+        BudgetError::ALL.iter().map(|e| e.wire_name()),
+    );
+    assert_wire_names(
+        "MilestoneError",
+        MilestoneError::ALL.iter().map(|e| e.wire_name()),
+    );
+}
+
+#[test]
+fn mirrored_tables_share_the_canonical_wire_names() {
+    // A variant that mirrors a canonical code must also mirror its name, or the
+    // two tables would decode one number to two different identifiers.
+    for variant in BudgetError::ALL {
+        let canonical = Error::from(variant);
+        if variant == BudgetError::BudgetNotActive {
+            // The one budget-only code: it has no canonical counterpart.
+            assert_eq!(variant.wire_name(), "BUDGET_NOT_ACTIVE");
+            continue;
+        }
+        assert_eq!(
+            variant.wire_name(),
+            canonical.wire_name(),
+            "{:?} mirrors its canonical code but not its wire name",
+            variant
+        );
+    }
+
+    for variant in MilestoneError::ALL {
+        if matches!(
+            variant,
+            MilestoneError::InvalidMilestone | MilestoneError::MilestoneAlreadyCompleted
+        ) {
+            // The two milestone-only codes have no canonical counterpart.
+            continue;
+        }
+        let canonical = Error::from(variant);
+        assert_eq!(
+            variant.code(),
+            canonical.code(),
+            "{:?} must mirror its canonical code",
+            variant
+        );
+        assert_eq!(
+            variant.wire_name(),
+            canonical.wire_name(),
+            "{:?} must mirror its canonical wire name",
+            variant
+        );
+    }
+}
+
+#[test]
+fn error_enums_implement_the_traits_the_sdk_requires() {
+    // A `#[contracterror]` enum is only usable across a contract boundary if it is
+    // `Copy`/`Clone` (passed by value through `Result`), `Debug` (for the
+    // `panic!` messages and test output), `Eq`/`PartialEq` (for the `assert_eq!`
+    // the whole suite is built on) and convertible from `soroban_sdk::Error`
+    // (the generated `TryFrom`, which is how a wire code is decoded back into a
+    // variant). `Ord`/`PartialOrd` keep the tables orderable for the off-chain
+    // catalogues. Asserting the bounds here turns a dropped `#[derive]` into a
+    // compile error in this module rather than a surprise at the first call site
+    // that happens to need it.
+    fn assert_contracterror_traits<T>()
+    where
+        T: Copy
+            + Clone
+            + core::fmt::Debug
+            + Eq
+            + PartialEq
+            + PartialOrd
+            + Ord
+            + TryFrom<soroban_sdk::Error>,
+    {
+    }
+
+    assert_contracterror_traits::<Error>();
+    assert_contracterror_traits::<BudgetError>();
+    assert_contracterror_traits::<MilestoneError>();
 }
