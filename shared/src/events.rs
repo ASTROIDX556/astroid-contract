@@ -65,6 +65,21 @@ pub enum ContractEvent {
         address: Address,
         wasm_hash: BytesN<32>,
     },
+    /// The registry replaced its own code with a newer published implementation
+    /// (Issue #206).
+    ///
+    /// `from_version` is `0` for a registry that was deployed before the upgrade
+    /// map was tracking its own version, so a consumer can tell the first
+    /// validated self-upgrade apart from a later one. `to_version` is the
+    /// published `Organization` version the target hash is bound to — the
+    /// registry resolved it from its upgrade map, it was never caller-supplied,
+    /// and it is strictly greater than `from_version`, so this event is the
+    /// audit trail that the registry's own version never went backwards.
+    RegistryUpgraded {
+        from_version: u32,
+        to_version: u32,
+        wasm_hash: BytesN<32>,
+    },
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
@@ -276,6 +291,16 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "RegistryModuleUpgraded"),),
                 (org, kind, from_version, to_version, address, wasm_hash),
+            );
+        }
+        ContractEvent::RegistryUpgraded {
+            from_version,
+            to_version,
+            wasm_hash,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryUpgraded"),),
+                (from_version, to_version, wasm_hash),
             );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
