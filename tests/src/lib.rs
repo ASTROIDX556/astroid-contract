@@ -34,3 +34,5 @@ pub mod registry_batch;
 pub mod registry_upgrade;
 #[cfg(test)]
 pub mod treasury_transfer_auth;
+#[cfg(test)]
+pub mod treasury_withdrawal_time_lock;
