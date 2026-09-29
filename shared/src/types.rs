@@ -16,6 +16,20 @@ pub struct AssetAmount {
     pub amount: i128,
 }
 
+/// A per-asset balance as reported by a custody contract (Issue #293).
+///
+/// The balance counterpart of [`AssetAmount`], shared rather than redefined per
+/// contract so every "what is held of this asset" answer — the treasury's
+/// `balances` view today, any other custody contract tomorrow — decodes as the
+/// same `#[contracttype]` for off-chain consumers. `balance` is in the token's
+/// smallest unit and is the live custody balance, not a requested amount.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetBalance {
+    pub asset: Address,
+    pub balance: i128,
+}
+
 /// Coarse lifecycle state shared by wallets and other stateful resources.
 /// Individual contracts may narrow which transitions are legal.
 #[contracttype]

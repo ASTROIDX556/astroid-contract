@@ -721,3 +721,6 @@ impl From<MilestoneError> for Error {
         }
     }
 }
+
+/// Alias for the canonical protocol contract error type [`Error`].
+pub type ContractError = Error;

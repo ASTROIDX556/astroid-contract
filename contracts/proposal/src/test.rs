@@ -2,7 +2,7 @@
 extern crate std;
 
 use crate::{ProposalContract, ProposalContractClient, ProposalState, VoteBars};
-use astroid_shared::constants::MAX_DEPENDENCIES;
+use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
 use soroban_sdk::{vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
@@ -1638,4 +1638,178 @@ fn execution_rejected_when_approval_tally_below_threshold() {
     // Now execution succeeds
     h.client.execute(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn prune_requires_a_passed_deadline() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    assert_eq!(
+        h.client.try_prune_expired(&id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    // A proposal without a deadline can never be pruned.
+    let never = create(&h, 2, 0);
+    assert_eq!(
+        h.client.try_prune_expired(&never),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn prune_settles_and_purges_a_stale_proposal() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    advance(&h, 6, 6_000);
+    h.client.prune_expired(&id);
+    assert!(emitted(&h.env, "expired"));
+    assert!(emitted(&h.env, "pruned"));
+    assert!(emitted(&h.env, "cleaned"));
+    assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+    // Repeat pruning returns NotFound because storage was purged
+    assert_eq!(h.client.try_prune_expired(&id), Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn prune_purges_the_record_and_its_approval_flags() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    advance(&h, 6, 6_000);
+    h.client.prune_expired(&id);
+
+    assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        h.client.try_approve(&h.approvers[1], &id),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn prune_expired_refunds_deposit_to_proposer() {
+    let h = setup(3);
+    let token = deposit_token(&h);
+    let id = create_with_deposit(&h, 2, 5_000, &token);
+    assert_eq!(
+        soroban_sdk::token::TokenClient::new(&h.env, &token).balance(&h.proposer),
+        0
+    );
+
+    advance(&h, 6, 6_000);
+    h.client.prune_expired(&id);
+
+    // Deposit is refunded on pruning
+    assert_eq!(
+        soroban_sdk::token::TokenClient::new(&h.env, &token).balance(&h.proposer),
+        DEPOSIT
+    );
+    assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn permissionless_pruning_by_any_caller() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    advance(&h, 6, 6_000);
+
+    // Prune triggered permissionlessly by third party
+    let _stranger = Address::generate(&h.env);
+    // ProposalContract::prune_expired does not require caller auth
+    h.client.prune_expired(&id);
+    assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn post_expiration_execution_rejection_and_storage_pruning() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Advance time past expiration deadline
+    advance(&h, 6, 6_000);
+    assert!(h.client.is_expired(&id));
+    assert!(!h.client.can_execute(&id));
+
+    // Execution attempt settles proposal as Expired and refuses execution
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert!(!h.client.is_executed(&id));
+
+    // Clean up / prune from persistent storage
+    h.client.prune_expired(&id);
+    assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+
+    // Post-pruning execution fails with NotFound
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn prune_expired_batch_cleans_eligible_and_skips_ineligible() {
+    let h = setup(3);
+    let p1 = create(&h, 2, 5_000);
+    let p2 = create(&h, 2, 10_000); // not yet expired at t=6_000
+    let p3 = create(&h, 2, 5_000);
+    let non_existent = 999u64;
+
+    advance(&h, 6, 6_000);
+
+    let batch = vec![&h.env, p1, p2, p3, non_existent];
+    let pruned_count = h.client.prune_expired_batch(&batch);
+    assert_eq!(pruned_count, 2);
+
+    // p1 and p3 were pruned
+    assert_eq!(h.client.try_get(&p1), Err(Ok(Error::NotFound)));
+    assert_eq!(h.client.try_get(&p3), Err(Ok(Error::NotFound)));
+    // p2 is still alive and Pending
+    assert_eq!(h.client.state(&p2), ProposalState::Pending);
+}
+
+#[test]
+fn prune_expired_batch_size_limits() {
+    let h = setup(3);
+    let empty = vec![&h.env];
+    assert_eq!(h.client.prune_expired_batch(&empty), 0);
+
+    let mut oversized = vec![&h.env];
+    for _ in 0..(MAX_PRUNE_BATCH + 1) {
+        oversized.push_back(1);
+    }
+    assert_eq!(
+        h.client.try_prune_expired_batch(&oversized),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn prune_expired_range_cleans_consecutive_records() {
+    let h = setup(3);
+    let p1 = create(&h, 2, 5_000);
+    let p2 = create(&h, 2, 5_000);
+    let p3 = create(&h, 2, 5_000);
+
+    advance(&h, 6, 6_000);
+
+    // Prune range [p1, p1 + 3)
+    let pruned = h.client.prune_expired_range(&p1, &3);
+    assert_eq!(pruned, 3);
+
+    assert_eq!(h.client.try_get(&p1), Err(Ok(Error::NotFound)));
+    assert_eq!(h.client.try_get(&p2), Err(Ok(Error::NotFound)));
+    assert_eq!(h.client.try_get(&p3), Err(Ok(Error::NotFound)));
+
+    // Limit 0 or oversized fails
+    assert_eq!(
+        h.client.try_prune_expired_range(&1, &0),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        h.client.try_prune_expired_range(&1, &(MAX_PRUNE_BATCH + 1)),
+        Err(Ok(Error::InvalidInput))
+    );
 }
