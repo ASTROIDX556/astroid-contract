@@ -26,6 +26,7 @@
 //! | [`TreasuryInterface`]      | `astroid-treasury`       | `TreasuryClient`     |
 //! | [`MultisigInterface`]      | `astroid-multisig`       | `MultisigClient`     |
 //! | [`ProposalInterface`]      | `astroid-proposal`       | `ProposalClient`     |
+//! | [`EscrowInterface`]        | `astroid-escrow`         | `EscrowClient`       |
 //! | [`UpgradeableInterface`]   | all eight contracts      | `UpgradeableClient`  |
 //!
 //! Every fallible method returns the canonical [`Error`] so a cross-contract
@@ -47,9 +48,10 @@ use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind, WalletData};
 use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env, String, Vec};
 
 /// Version of the interface surface declared in this crate. Bump it whenever a
-/// trait gains, loses or changes a method so off-chain clients built against
-/// an older definition can detect the drift.
-pub const INTERFACE_VERSION: u32 = 2;
+/// trait gains, loses or changes a method — or a new trait is declared, as
+/// [`EscrowInterface`] was (Issue #293) — so off-chain clients built against an
+/// older definition can detect the drift.
+pub const INTERFACE_VERSION: u32 = 3;
 
 /// Wallet operations and views available to cross-contract callers.
 #[contractclient(name = "WalletClient")]
@@ -226,6 +228,39 @@ pub trait MultisigInterface {
 
     /// The weighted approval threshold currently in force.
     fn get_threshold(env: Env) -> Result<u32, Error>;
+}
+
+/// Escrow lifecycle read surface. An escrow holds one party's funds until a
+/// release condition, schedule or refund rule is met, so wallets, budgets and
+/// off-chain monitors need to ask the escrow contract what it may still pay out
+/// without depending on the escrow crate (PRD Doc 7 §Escrow).
+///
+/// Only primitive answers cross this boundary. An escrow's full record carries
+/// the escrow crate's own `#[contracttype]`s, whereas a caller deciding whether
+/// to fund, claim, reclaim or merely display an escrow needs the amounts and the
+/// state predicates below — so those, and not the record, are what the shared
+/// client is for.
+#[contractclient(name = "EscrowClient")]
+pub trait EscrowInterface {
+    /// Number of escrows created so far, i.e. the id the next `create` takes.
+    fn escrow_count(env: Env) -> u64;
+
+    /// Timestamp at which the escrow's refund window closes, or `0` when the
+    /// window has no upper bound.
+    fn refund_window_closes_at(env: Env, id: u64) -> Result<u64, Error>;
+
+    /// Whether the escrow's funds may be reclaimed at the current ledger time:
+    /// still held, grace elapsed and refund window still open.
+    fn is_refundable(env: Env, id: u64) -> Result<bool, Error>;
+
+    /// Amount claimable right now under the escrow's release schedule.
+    fn get_claimable_amount(env: Env, id: u64) -> Result<i128, Error>;
+
+    /// Amount vested so far under the escrow's release schedule.
+    fn get_vested_amount(env: Env, id: u64) -> Result<i128, Error>;
+
+    /// Whether the release schedule has matured at the current ledger time.
+    fn is_unlocked(env: Env, id: u64) -> Result<bool, Error>;
 }
 
 /// Registry-gated upgrade surface shared by every member contract. The

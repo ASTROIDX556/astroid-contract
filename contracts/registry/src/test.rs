@@ -3421,3 +3421,332 @@ fn versioned_registration_agrees_with_the_upgrade_validation() {
         Err(Ok(Error::CircularUpgrade))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Multi-admin and multisig authorization checks (Issue #224)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_admin_add_remove_and_get_admins() {
+    let (env, client, admin1) = setup();
+    let admin2 = Address::generate(&env);
+    let admin3 = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    // Initial admin is present
+    let initial_admins = client.get_admins();
+    assert_eq!(initial_admins.len(), 1);
+    assert!(initial_admins.contains(&admin1));
+    assert_eq!(client.get_admin(), admin1);
+    assert!(client.is_authorized_admin(&admin1));
+    assert!(!client.is_authorized_admin(&stranger));
+
+    // Stranger cannot add an admin
+    assert_eq!(
+        client.try_add_admin(&stranger, &admin2),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin1 adds Admin2
+    client.add_admin(&admin1, &admin2);
+    let admins = client.get_admins();
+    assert_eq!(admins.len(), 2);
+    assert!(admins.contains(&admin1));
+    assert!(admins.contains(&admin2));
+    assert!(client.is_authorized_admin(&admin2));
+
+    // Adding duplicate admin fails
+    assert_eq!(
+        client.try_add_admin(&admin1, &admin2),
+        Err(Ok(Error::AlreadyExists))
+    );
+
+    // Admin2 can add Admin3
+    client.add_admin(&admin2, &admin3);
+    assert_eq!(client.get_admins().len(), 3);
+
+    // Stranger cannot remove an admin
+    assert_eq!(
+        client.try_remove_admin(&stranger, &admin3),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Removing non-existent admin fails
+    assert_eq!(
+        client.try_remove_admin(&admin1, &stranger),
+        Err(Ok(Error::NotFound))
+    );
+
+    // Admin2 removes Admin3
+    client.remove_admin(&admin2, &admin3);
+    let admins_after_remove = client.get_admins();
+    assert_eq!(admins_after_remove.len(), 2);
+    assert!(!admins_after_remove.contains(&admin3));
+    assert!(!client.is_authorized_admin(&admin3));
+
+    // Removing primary admin rotates primary to the remaining admin
+    client.remove_admin(&admin2, &admin1);
+    assert_eq!(client.get_admin(), admin2);
+    assert_eq!(client.get_admins().len(), 1);
+    assert!(!client.is_authorized_admin(&admin1));
+
+    // Cannot remove the last remaining admin
+    assert_eq!(
+        client.try_remove_admin(&admin2, &admin2),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn multisig_configuration_and_lifecycle() {
+    let (env, client, admin) = setup();
+    let multisig = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    assert_eq!(client.get_multisig(), None);
+    assert!(!client.is_authorized_admin(&multisig));
+
+    // Stranger cannot configure multisig
+    assert_eq!(
+        client.try_set_multisig(&stranger, &multisig),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin configures multisig
+    client.set_multisig(&admin, &multisig);
+    assert_eq!(client.get_multisig(), Some(multisig.clone()));
+    assert!(client.is_authorized_admin(&multisig));
+
+    // Multisig can administer registry (e.g. add an admin)
+    let new_admin = Address::generate(&env);
+    client.add_admin(&multisig, &new_admin);
+    assert!(client.get_admins().contains(&new_admin));
+
+    // Stranger cannot remove multisig
+    assert_eq!(
+        client.try_remove_multisig(&stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin removes multisig
+    client.remove_multisig(&admin);
+    assert_eq!(client.get_multisig(), None);
+    assert!(!client.is_authorized_admin(&multisig));
+
+    // Removing when absent fails
+    assert_eq!(client.try_remove_multisig(&admin), Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn multi_admin_and_multisig_wasm_hash_management() {
+    let (env, client, admin) = setup();
+    let admin2 = Address::generate(&env);
+    let multisig = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.add_admin(&admin, &admin2);
+    client.set_multisig(&admin, &multisig);
+
+    let h1 = hash(&env, 101);
+    let h2 = hash(&env, 102);
+
+    // Unauthorized callers cannot approve Wasm hashes
+    assert_eq!(
+        client.try_add_approved_wasm(&stranger, &ModuleKind::Wallet, &h1),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(!client.is_wasm_approved(&ModuleKind::Wallet, &h1));
+
+    // Secondary admin can approve Wasm hash
+    client.add_approved_wasm(&admin2, &ModuleKind::Wallet, &h1);
+    assert!(client.is_wasm_approved(&ModuleKind::Wallet, &h1));
+
+    // Multisig can approve Wasm hash
+    client.add_approved_wasm(&multisig, &ModuleKind::Organization, &h2);
+    assert!(client.is_wasm_approved(&ModuleKind::Organization, &h2));
+
+    // Stranger cannot remove approved Wasm hash
+    assert_eq!(
+        client.try_remove_approved_wasm(&stranger, &ModuleKind::Wallet, &h1),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Secondary admin can remove approved Wasm hash
+    client.remove_approved_wasm(&admin2, &ModuleKind::Wallet, &h1);
+    assert!(!client.is_wasm_approved(&ModuleKind::Wallet, &h1));
+
+    // Multisig can remove approved Wasm hash
+    client.remove_approved_wasm(&multisig, &ModuleKind::Organization, &h2);
+    assert!(!client.is_wasm_approved(&ModuleKind::Organization, &h2));
+
+    // Removed admin loses authorization to manage Wasm hashes
+    client.remove_admin(&admin, &admin2);
+    assert_eq!(
+        client.try_add_approved_wasm(&admin2, &ModuleKind::Wallet, &h1),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn multi_admin_and_multisig_register_version() {
+    let (env, client, admin) = setup();
+    let admin2 = Address::generate(&env);
+    let multisig = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.add_admin(&admin, &admin2);
+    client.set_multisig(&admin, &multisig);
+
+    let h1 = hash(&env, 111);
+    let h2 = hash(&env, 112);
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &h1);
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &h2);
+
+    let v1_addr = Address::generate(&env);
+    let v2_addr = Address::generate(&env);
+
+    // Stranger cannot register version
+    assert_eq!(
+        client.try_register_version(&stranger, &ModuleKind::Wallet, &1, &v1_addr, &h1),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin2 registers v1
+    client.register_version(&admin2, &ModuleKind::Wallet, &1, &v1_addr, &h1);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), v1_addr);
+
+    // Multisig registers v2
+    client.register_version(&multisig, &ModuleKind::Wallet, &2, &v2_addr, &h2);
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &2), v2_addr);
+
+    // Removed admin cannot register version
+    client.remove_admin(&admin, &admin2);
+    let v3_addr = Address::generate(&env);
+    let h3 = hash(&env, 113);
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &h3);
+    assert_eq!(
+        client.try_register_version(&admin2, &ModuleKind::Wallet, &3, &v3_addr, &h3),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn multi_admin_and_multisig_contract_upgrade_authorization() {
+    let h = setup_upgrade();
+    let admin2 = Address::generate(&h.env);
+    let multisig = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+
+    // Bootstrap upgrade authority on member
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+
+    // Configure admin2 and multisig on member
+    h.member.add_admin(&h.admin, &admin2);
+    h.member.set_multisig(&h.admin, &multisig);
+
+    let h1 = hash(&h.env, 201);
+    let h2 = hash(&h.env, 202);
+
+    // Stranger attempting upgrade is rejected with Unauthorized at Gate 1
+    assert_eq!(
+        h.member.try_upgrade(&stranger, &h1),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin2 is authorized at Gate 1; if hash is unapproved, rejected with Unauthorized
+    assert_eq!(
+        h.member.try_upgrade(&admin2, &h1),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Member approves Wasm hash for Organization
+    h.member
+        .add_approved_wasm(&admin2, &ModuleKind::Organization, &h1);
+
+    // Admin2 passes Gate 1 (auth and approval); fails at Gate 2 (NotFound in version map)
+    assert_eq!(h.member.try_upgrade(&admin2, &h1), Err(Ok(Error::NotFound)));
+
+    // Multisig passes Gate 1: if hash unapproved, Unauthorized
+    assert_eq!(
+        h.member.try_upgrade(&multisig, &h2),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Multisig approves Wasm hash h2
+    h.member
+        .add_approved_wasm(&multisig, &ModuleKind::Organization, &h2);
+
+    // Multisig passes Gate 1; reaches Gate 2 (NotFound in version map)
+    assert_eq!(
+        h.member.try_upgrade(&multisig, &h2),
+        Err(Ok(Error::NotFound))
+    );
+
+    // Removing admin2 revokes their upgrade authorization; fails at Gate 1 even for approved hash
+    h.member.remove_admin(&h.admin, &admin2);
+    assert_eq!(
+        h.member.try_upgrade(&admin2, &h1),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Removing multisig revokes multisig upgrade authorization
+    h.member.remove_multisig(&h.admin);
+    assert_eq!(
+        h.member.try_upgrade(&multisig, &h2),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn multi_admin_and_multisig_module_upgrade_authorization() {
+    let (env, client, admin) = setup();
+    let admin2 = Address::generate(&env);
+    let multisig = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.add_admin(&admin, &admin2);
+    client.set_multisig(&admin, &multisig);
+
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let mod_v1 = env.register_contract(None, RegistryContract);
+    let mod_v2 = env.register_contract(None, RegistryContract);
+    let mod_v3 = env.register_contract(None, RegistryContract);
+    let h1 = hash(&env, 1);
+    let h2 = hash(&env, 2);
+    let h3 = hash(&env, 3);
+
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &h1);
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &h2);
+    client.add_approved_wasm(&admin, &ModuleKind::Wallet, &h3);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &mod_v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &mod_v2, &h2);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &mod_v3, &h3);
+
+    // Register module v1
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &mod_v1);
+
+    // Stranger cannot upgrade module
+    assert_eq!(
+        client.try_upgrade_module(&stranger, &org, &ModuleKind::Wallet, &2),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin2 can upgrade module
+    assert_eq!(
+        client.upgrade_module(&admin2, &org, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), mod_v2);
+
+    // Multisig can upgrade module
+    assert_eq!(
+        client.upgrade_module(&multisig, &org, &ModuleKind::Wallet, &3),
+        3
+    );
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), mod_v3);
+}
