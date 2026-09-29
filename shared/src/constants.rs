@@ -62,6 +62,9 @@ pub const MAX_BATCH_PAYMENTS: u32 = 32;
 /// this caps the footprint of a single `get_modules_batch` invocation.
 pub const MAX_REGISTRY_BATCH: u32 = 10;
 
+/// Upper bound on how many proposals a single prune batch or range scan may process.
+pub const MAX_PRUNE_BATCH: u32 = 32;
+
 /// Upper bound on how many distinct assets a single escrow agreement may hold.
 pub const MAX_ESCROW_ASSETS: u32 = 10;
 

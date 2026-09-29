@@ -11,9 +11,11 @@
 //! - [`events`]     — helpers that publish the standardized cross-cutting events
 //!   the Astroid backend subscribes to.
 //! - [`types`]      — `#[contracttype]` values reused by multiple contracts.
-//! - [`math`]       — checked `i128`/`u64` arithmetic and balance validation
-//!   (`SafeAdd`/`SafeSub`/`SafeMul`/`SafeDiv`, `validate_sufficient_balance`,
-//!   `SafeBalance`; never wraps, returns deterministic [`Error`]s).
+//! - [`math`]       — checked `i128`/`u128`/`u64` arithmetic, balance validation
+//!   and batch allowance verification (`SafeAdd`/`SafeSub`/`SafeMul`/`SafeDiv`,
+//!   `validate_sufficient_balance`, `SafeBalance`, `verify_batch_allowance`,
+//!   `checked_batch_allowance`, `checked_batch_calculation`; never wraps,
+//!   returns deterministic [`Error`]s).
 //! - [`token`]      — overflow-safe `token::TokenClient` transfer wrappers that
 //!   return deterministic [`Error`]s instead of trapping.
 //! - [`balance`]    — multi-currency balance accounting helpers for SAC/XLM:
@@ -32,7 +34,7 @@ pub mod token;
 pub mod types;
 pub mod validation;
 
-pub use errors::Error;
+pub use errors::{ContractError, Error};
 
 #[cfg(test)]
 mod test;
