@@ -104,9 +104,13 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::{BudgetError, Error};
 use astroid_shared::events::ContractEvent;
-use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_rem, checked_sub};
+use astroid_shared::math::{
+    calculate_budget_rollover, checked_add, checked_div, checked_mul, checked_rem, checked_sub,
+};
 use astroid_shared::types::ResourceState;
-use astroid_shared::validation::{require_non_empty, require_positive_amount};
+use astroid_shared::validation::{
+    require_non_empty, require_non_negative_amount, require_positive_amount,
+};
 use astroid_shared::{constants, events};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
@@ -152,6 +156,9 @@ pub struct Budget {
     /// (0 = uncapped, configured via `set_recurrence`). Applied in addition to
     /// [`Budget::rollover_cap`] — the effective cap is the smaller of the two.
     pub rollover_max_bps: i128,
+    /// Percentage of unspent allowance from period N to carry over into period N+1,
+    /// in basis points (1 bp = 0.01%, 10_000 = 100%).
+    pub rollover_bps: i128,
     /// Whether the budget allows spending beyond its limit (deficit).
     pub allow_deficit: bool,
     /// Accumulated deficit carried from prior periods.
@@ -171,6 +178,14 @@ pub struct AssetBudget {
     /// Window length in seconds; 0 means the limit never auto-resets.
     pub window_seconds: u64,
     pub window_start: u64,
+    /// Whether unspent allowance carries into the next period on rollover.
+    pub rollover_enabled: bool,
+    /// Accumulated unspent allowance carried from prior periods (rollover).
+    pub rollover_credit: i128,
+    /// Percentage of unspent allowance to roll over, in basis points (1 bp = 0.01%, 10_000 = 100%).
+    pub rollover_bps: i128,
+    /// Upper bound on `rollover_credit` (0 = uncapped).
+    pub max_rollover_cap: i128,
 }
 /// Result of the pure rollover calculation
 /// ([`BudgetContract::calculate_rollover`]) for a budget at one instant.
@@ -247,6 +262,12 @@ impl BudgetContract {
         )
     }
     /// Extended allocation with deficit support (Issue #35).
+    ///
+    /// `allow_deficit` requires a period that actually recurs — `Daily`,
+    /// `Weekly` or `Monthly`. It is rejected for [`Period::None`] and for
+    /// [`Period::Custom`], because a `Custom` budget has no interval until
+    /// `set_recurrence` supplies one, so it has no next window for the
+    /// overspend to be carried into and no way to repay it.
     pub fn allocate_with_deficit(
         env: Env,
         owner: Address,
@@ -301,6 +322,43 @@ impl BudgetContract {
         )
     }
 
+    /// Allocate a budget with an optional explicit rollover configuration (owner-gated).
+    ///
+    /// `rollover_bps` specifies the percentage (in basis points) of unspent funds
+    /// to carry over into the next period (e.g. 5_000 for 50%).
+    /// `max_rollover_cap` sets an upper bound on accumulated rollover credit (0 = uncapped).
+    pub fn allocate_with_rollover(
+        env: Env,
+        owner: Address,
+        budget_id: String,
+        limit: i128,
+        period: Period,
+        rollover_enabled: bool,
+        rollover_bps: i128,
+        max_rollover_cap: i128,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::require_valid_limit(max_rollover_cap)?;
+        Self::require_valid_limit(rollover_bps)?;
+        if rollover_bps > BPS_DENOMINATOR {
+            return Err(Error::InvalidInput);
+        }
+        let start_at = env.ledger().timestamp();
+        Self::allocate_internal(
+            env,
+            owner,
+            budget_id,
+            limit,
+            period,
+            rollover_enabled,
+            rollover_bps,
+            max_rollover_cap,
+            false,
+            start_at,
+            expires_at,
+        )
+    }
+
     fn allocate_at(
         env: Env,
         owner: Address,
@@ -312,17 +370,68 @@ impl BudgetContract {
         start_at: u64,
         expires_at: u64,
     ) -> Result<(), Error> {
+        let rollover_bps = if rollover_enabled { BPS_DENOMINATOR } else { 0 };
+        Self::allocate_internal(
+            env,
+            owner,
+            budget_id,
+            limit,
+            period,
+            rollover_enabled,
+            rollover_bps,
+            0,
+            allow_deficit,
+            start_at,
+            expires_at,
+        )
+    }
+
+    fn allocate_internal(
+        env: Env,
+        owner: Address,
+        budget_id: String,
+        limit: i128,
+        period: Period,
+        rollover_enabled: bool,
+        rollover_bps: i128,
+        rollover_cap: i128,
+        allow_deficit: bool,
+        start_at: u64,
+        expires_at: u64,
+    ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&budget_id)?;
         Self::require_valid_limit(limit)?;
+        Self::require_valid_limit(rollover_cap)?;
+        Self::require_valid_limit(rollover_bps)?;
+        if rollover_bps > BPS_DENOMINATOR {
+            return Err(Error::InvalidInput);
+        }
         let now = env.ledger().timestamp();
         // A budget that is already expired at creation, or expires before it
         // starts, could never be spent.
         if expires_at != 0 && (expires_at <= now || expires_at <= start_at) {
             return Err(Error::InvalidInput);
         }
-        // Deficit carryforward only makes sense with a recurring period.
-        if allow_deficit && period == Period::None {
+        // Deficit carryforward only makes sense with a recurring period: the
+        // overspend has to land in a *next* window to be repaid out of, and
+        // `window_transition` is the only place that records it. So the test is
+        // "does this budget recur?", asked through the same `window_of` the
+        // state machine uses, not a match on `Period` alone.
+        //
+        // `Period::Custom` is the case that matters. Until `set_recurrence`
+        // supplies an interval a `Custom` budget stores `period_seconds == 0`,
+        // which makes it exactly as non-recurring as `Period::None` — yet
+        // admitting it here let the first overspend run away. With no window to
+        // roll over, `window_transition` returns before reaching its deficit
+        // branch, so `deficit_amount` stayed 0 while `spent` ran past the
+        // limit. `consume` grants the overspend on `allow_deficit &&
+        // deficit_amount == 0`, so that stayed true forever: every further
+        // `consume` was permitted and `remaining` fell without bound, with no
+        // deficit ever booked to repay. Creation always stores
+        // `period_seconds: 0`, so the interval argument is 0 here by
+        // construction.
+        if allow_deficit && Self::window_of(period, 0).is_none() {
             return Err(Error::InvalidInput);
         }
         let key = DataKey::Budget(budget_id.clone());
@@ -340,8 +449,9 @@ impl BudgetContract {
             window_start: start_at,
             rollover_enabled,
             rollover_credit: 0,
-            rollover_cap: 0,
+            rollover_cap,
             rollover_max_bps: 0,
+            rollover_bps,
             allow_deficit,
             deficit_amount: 0,
             expires_at,
@@ -416,6 +526,11 @@ impl BudgetContract {
         budget.rollover_enabled = rollover_enabled;
         budget.rollover_cap = rollover_cap;
         budget.rollover_max_bps = rollover_max_bps;
+        if rollover_enabled && budget.rollover_bps == 0 {
+            budget.rollover_bps = BPS_DENOMINATOR;
+        } else if !rollover_enabled {
+            budget.rollover_bps = 0;
+        }
         if !rollover_enabled {
             budget.rollover_credit = 0;
         } else if budget.rollover_credit > 0 {
@@ -438,6 +553,45 @@ impl BudgetContract {
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("recurring")),
             (budget_id, period, period_seconds, rollover_cap),
+        );
+        Ok(())
+    }
+
+    /// Configure rollover accounting parameters for a budget (owner-gated).
+    pub fn set_rollover_config(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        rollover_enabled: bool,
+        rollover_bps: i128,
+        max_rollover_cap: i128,
+    ) -> Result<(), Error> {
+        Self::require_valid_limit(max_rollover_cap)?;
+        Self::require_valid_limit(rollover_bps)?;
+        if rollover_bps > BPS_DENOMINATOR {
+            return Err(Error::InvalidInput);
+        }
+        let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+        Self::require_not_expired(&env, &budget)?;
+        // Settle pending transition if due
+        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+
+        budget.rollover_enabled = rollover_enabled;
+        budget.rollover_bps = rollover_bps;
+        budget.rollover_cap = max_rollover_cap;
+        if !rollover_enabled {
+            budget.rollover_credit = 0;
+        } else if budget.rollover_credit > 0 {
+            budget.rollover_credit = Self::apply_cap(
+                budget.rollover_credit,
+                Self::effective_rollover_cap(&budget)?,
+            );
+        }
+        Self::store(&env, &budget_id, &budget);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("rollover")),
+            (budget_id, rollover_bps, max_rollover_cap),
         );
         Ok(())
     }
@@ -593,6 +747,10 @@ impl BudgetContract {
             spent: 0,
             window_seconds,
             window_start: budget.window_start.max(env.ledger().timestamp()),
+            rollover_enabled: false,
+            rollover_credit: 0,
+            rollover_bps: 0,
+            max_rollover_cap: 0,
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
@@ -602,6 +760,91 @@ impl BudgetContract {
         );
         Ok(())
     }
+
+    /// Set the recurring limit and rollover configuration for a specific token (owner-gated).
+    pub fn set_budget_limit_with_rollover(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        token: Address,
+        limit: i128,
+        window_seconds: u64,
+        rollover_enabled: bool,
+        rollover_bps: i128,
+        max_rollover_cap: i128,
+    ) -> Result<(), Error> {
+        Self::require_valid_limit(limit)?;
+        Self::require_valid_limit(max_rollover_cap)?;
+        Self::require_valid_limit(rollover_bps)?;
+        if rollover_bps > BPS_DENOMINATOR {
+            return Err(Error::InvalidInput);
+        }
+        let budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+        Self::require_not_expired(&env, &budget)?;
+        let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
+        let asset_budget = AssetBudget {
+            limit,
+            spent: 0,
+            window_seconds,
+            window_start: budget.window_start.max(env.ledger().timestamp()),
+            rollover_enabled,
+            rollover_credit: 0,
+            rollover_bps,
+            max_rollover_cap,
+        };
+        env.storage().persistent().set(&key, &asset_budget);
+        Self::bump_asset(&env, &budget_id, &token);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("set_ast")),
+            (budget_id, token, limit),
+        );
+        Ok(())
+    }
+
+    /// Configure rollover accounting parameters for a specific token's budget (owner-gated).
+    pub fn set_asset_rollover_config(
+        env: Env,
+        caller: Address,
+        budget_id: String,
+        token: Address,
+        rollover_enabled: bool,
+        rollover_bps: i128,
+        max_rollover_cap: i128,
+    ) -> Result<(), Error> {
+        Self::require_valid_limit(max_rollover_cap)?;
+        Self::require_valid_limit(rollover_bps)?;
+        if rollover_bps > BPS_DENOMINATOR {
+            return Err(Error::InvalidInput);
+        }
+        let budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_active(&budget)?;
+        Self::require_not_expired(&env, &budget)?;
+        let key = DataKey::AssetBudget(budget_id.clone(), token.clone());
+        let mut asset_budget: AssetBudget = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::AssetNotAuthorized)?;
+        Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &token, true);
+
+        asset_budget.rollover_enabled = rollover_enabled;
+        asset_budget.rollover_bps = rollover_bps;
+        asset_budget.max_rollover_cap = max_rollover_cap;
+        if !rollover_enabled {
+            asset_budget.rollover_credit = 0;
+        } else if max_rollover_cap > 0 && asset_budget.rollover_credit > max_rollover_cap {
+            asset_budget.rollover_credit = max_rollover_cap;
+        }
+        env.storage().persistent().set(&key, &asset_budget);
+        Self::bump_asset(&env, &budget_id, &token);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("ast_roll")),
+            (budget_id, token, rollover_bps, max_rollover_cap),
+        );
+        Ok(())
+    }
+
     /// Check and record spend for a specific token.
     pub fn check_and_record_spend(
         env: Env,
@@ -628,9 +871,14 @@ impl BudgetContract {
         // off the schedule) can fire afterwards.
         Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &token, true);
 
-        // Check if within limit
+        // Check if within limit (accounting for any rollover credit)
+        let capacity = if asset_budget.rollover_enabled {
+            checked_add(asset_budget.limit, asset_budget.rollover_credit)?
+        } else {
+            asset_budget.limit
+        };
         let new_spent = checked_add(asset_budget.spent, amount)?;
-        if new_spent > asset_budget.limit {
+        if new_spent > capacity {
             return Err(BudgetError::BudgetExceeded);
         }
         asset_budget.spent = new_spent;
@@ -670,7 +918,12 @@ impl BudgetContract {
         if env.ledger().timestamp() < budget.window_start {
             return Ok(0);
         }
-        checked_sub(asset_budget.limit, asset_budget.spent)
+        let capacity = if asset_budget.rollover_enabled {
+            checked_add(asset_budget.limit, asset_budget.rollover_credit)?
+        } else {
+            asset_budget.limit
+        };
+        checked_sub(capacity, asset_budget.spent)
     }
 
     /// Read-only preview of the rollover calculation for `budget_id`
@@ -722,11 +975,12 @@ impl BudgetContract {
         Ok(budget)
     }
     /// Limits and rollover caps are non-negative (0 is a valid, closed budget).
+    ///
+    /// Delegates to the shared guard so "non-negative" means the same thing
+    /// here as in the policy contract, and so both return [`Error::InvalidAmount`]
+    /// for the same input.
     fn require_valid_limit(limit: i128) -> Result<(), Error> {
-        if limit < 0 {
-            return Err(Error::InvalidAmount);
-        }
-        Ok(())
+        require_non_negative_amount(limit)
     }
     /// Archiving is terminal: no administrative change may revive a budget.
     fn require_not_archived(budget: &Budget) -> Result<(), Error> {
@@ -754,20 +1008,27 @@ impl BudgetContract {
         }
     }
 
-    /// The window length implied by a budget's period, or `None` when the
+    /// The window length implied by a period/interval pair, or `None` when the
     /// budget does not recur (one-shot, or a `Custom` period with no interval
     /// configured yet).
-    fn window_of(budget: &Budget) -> Option<u64> {
-        match budget.period {
+    ///
+    /// Takes its cadence as arguments rather than a whole [`Budget`] so that
+    /// creation-time validation can ask the *same* question the state machine
+    /// asks at runtime — see [`Self::allocate_at`], which rejects a deficit
+    /// policy on any period this returns `None` for. Deriving the guard from one
+    /// predicate is what keeps "recurring enough to carry a deficit" from
+    /// drifting away from "recurring enough for `window_transition` to fire".
+    fn window_of(period: Period, period_seconds: u64) -> Option<u64> {
+        match period {
             Period::None => None,
             Period::Daily => Some(constants::SECONDS_PER_DAY),
             Period::Weekly => Some(constants::SECONDS_PER_WEEK),
             Period::Monthly => Some(constants::SECONDS_PER_MONTH),
             Period::Custom => {
-                if budget.period_seconds == 0 {
+                if period_seconds == 0 {
                     None
                 } else {
-                    Some(budget.period_seconds)
+                    Some(period_seconds)
                 }
             }
         }
@@ -833,11 +1094,12 @@ impl BudgetContract {
     ///   `periods = 0`, `is_due = false` and the credit already carried into
     ///   the current period;
     /// - when the window has lapsed with rollover **enabled**, the carry is
-    ///   the unspent remainder of `limit + rollover_credit`, plus one full
-    ///   base limit per fully idle period inside a multi-period gap, then
-    ///   clamped once to the effective cap. Rollover does not compound:
-    ///   only the immediately preceding period contributes its remainder
-    ///   (the deliberate design behind the cap);
+    ///   the `rollover_bps` percentage of the unspent remainder of
+    ///   `limit + rollover_credit`, plus one full base limit per fully idle
+    ///   period inside a multi-period gap, then clamped once more to the
+    ///   effective cap. Rollover does not compound: only the immediately
+    ///   preceding period contributes its remainder (the deliberate design
+    ///   behind the cap);
     /// - with rollover **disabled** the carry is 0 — the unspent remainder
     ///   is dropped at the boundary;
     /// - a deficit budget whose `spent` exceeds capacity reports the over-
@@ -847,7 +1109,7 @@ impl BudgetContract {
     /// Every step uses the shared checked arithmetic, so an out-of-range
     /// value surfaces [`Error::Overflow`] rather than wrapping.
     fn calculate_rollover(budget: &Budget, now: u64) -> Result<RolloverOutcome, Error> {
-        let window = match Self::window_of(budget) {
+        let window = match Self::window_of(budget.period, budget.period_seconds) {
             Some(w) => w,
             None => {
                 return Ok(RolloverOutcome {
@@ -894,14 +1156,18 @@ impl BudgetContract {
             // allowance for the next window, and carrying it would pin the
             // budget to a permanently reduced ceiling. (`spent > capacity`
             // with `allow_deficit` is handled by the deficit arm above.)
-            let mut credit = if leftover > 0 { leftover } else { 0 };
+            let unspent = if leftover > 0 { leftover } else { 0 };
+            let cap = Self::effective_rollover_cap(budget)?;
+            // The carry is the `rollover_bps` percentage of the unspent
+            // remainder, clamped to the effective cap in the same step by the
+            // shared calculation (mirroring `window_transition`).
+            let mut credit = calculate_budget_rollover(unspent, budget.rollover_bps, cap)?;
             if periods > 1 {
                 let idle = checked_sub(periods, 1)?;
                 credit = Self::accrue_idle_periods(credit, budget, idle)?;
+                credit = Self::apply_cap(credit, cap);
             }
-            // Clamp to the effective cap = min(absolute `rollover_cap`,
-            // percentage-of-limit `rollover_max_bps`).
-            Self::apply_cap(credit, Self::effective_rollover_cap(budget)?)
+            credit
         } else {
             // Rollover disabled: the unspent remainder is dropped.
             0
@@ -952,7 +1218,7 @@ impl BudgetContract {
     /// Returns `Ok(false)` for non-recurring budgets (`Period::None`, or a
     /// `Custom` period without an interval): their window never lapses.
     fn is_window_expired(budget: &Budget, now: u64) -> Result<bool, Error> {
-        let window = match Self::window_of(budget) {
+        let window = match Self::window_of(budget.period, budget.period_seconds) {
             Some(w) => w,
             None => return Ok(false),
         };
@@ -1002,7 +1268,8 @@ impl BudgetContract {
             return Ok(());
         }
         let periods = outcome.periods as i128;
-        let window = Self::window_of(budget).ok_or(Error::InvalidInput)?;
+        let window =
+            Self::window_of(budget.period, budget.period_seconds).ok_or(Error::InvalidInput)?;
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         let spent = budget.spent;
         let went_into_deficit = budget.allow_deficit && spent > capacity;
@@ -1073,9 +1340,8 @@ impl BudgetContract {
         checked_add(credit, checked_mul(budget.limit, idle)?)
     }
 
-    /// Per-asset counterpart of [`Self::window_transition`]. Per-asset limits
-    /// have no rollover: an unspent remainder is simply dropped when the window
-    /// turns over. Persists and emits only when `publish` is set.
+    /// Per-asset counterpart of [`Self::window_transition`].
+    /// Persists and emits only when `publish` is set.
     fn asset_window_transition(
         env: &Env,
         asset_budget: &mut AssetBudget,
@@ -1092,6 +1358,22 @@ impl BudgetContract {
             return;
         }
         let periods = elapsed / asset_budget.window_seconds;
+        if asset_budget.rollover_enabled {
+            let capacity = match checked_add(asset_budget.limit, asset_budget.rollover_credit) {
+                Ok(c) => c,
+                Err(_) => asset_budget.limit,
+            };
+            let unspent = capacity.saturating_sub(asset_budget.spent).max(0);
+            let credit = calculate_budget_rollover(
+                unspent,
+                asset_budget.rollover_bps,
+                asset_budget.max_rollover_cap,
+            )
+            .unwrap_or(0);
+            asset_budget.rollover_credit = credit;
+        } else {
+            asset_budget.rollover_credit = 0;
+        }
         asset_budget.spent = 0;
         asset_budget.window_start = asset_budget
             .window_start
@@ -1102,7 +1384,14 @@ impl BudgetContract {
         );
         Self::bump_asset(env, budget_id, token);
         if publish {
-            Self::emit_asset_reset(env, budget_id, token, asset_budget.limit);
+            let amount = if asset_budget.rollover_enabled {
+                asset_budget
+                    .limit
+                    .saturating_add(asset_budget.rollover_credit)
+            } else {
+                asset_budget.limit
+            };
+            Self::emit_asset_reset(env, budget_id, token, amount);
         }
     }
 

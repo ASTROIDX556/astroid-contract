@@ -15,21 +15,21 @@ use astroid_budget::BudgetContract;
 use astroid_escrow::EscrowContract;
 use astroid_interfaces::upgrade::UpgradeAuthority;
 use astroid_interfaces::{
-    BudgetClient, BudgetInterface, MultisigClient, MultisigInterface, PolicyClient,
-    PolicyInterface, ProposalClient, ProposalInterface, ProposalState, RegistryClient,
-    RegistryInterface, TreasuryClient, TreasuryInterface, UpgradeableClient, UpgradeableInterface,
-    INTERFACE_VERSION,
+    BudgetClient, BudgetInterface, EscrowClient, EscrowInterface, MultisigClient,
+    MultisigInterface, PolicyClient, PolicyInterface, ProposalClient, ProposalInterface,
+    ProposalState, RegistryClient, RegistryInterface, TreasuryClient, TreasuryInterface,
+    UpgradeableClient, UpgradeableInterface, WalletClient, INTERFACE_VERSION,
 };
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::PolicyContract;
 use astroid_proposal::ProposalContract;
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
-use astroid_shared::types::ModuleKind;
+use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState, WalletData};
 use astroid_treasury::{TreasuryContract, TreasuryContractClient};
 use astroid_wallet::WalletContract;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{vec, Address, Env, String};
+use soroban_sdk::{token, vec, Address, Env, String};
 
 // ---------------------------------------------------------------------------
 // Compile-time compliance
@@ -41,6 +41,7 @@ fn implements_budget<T: BudgetInterface>() {}
 fn implements_treasury<T: TreasuryInterface>() {}
 fn implements_multisig<T: MultisigInterface>() {}
 fn implements_proposal<T: ProposalInterface>() {}
+fn implements_escrow<T: EscrowInterface>() {}
 fn implements_upgradeable<T: UpgradeableInterface>() {}
 
 /// Never called at runtime: it exists so the trait bounds are checked by the
@@ -53,6 +54,7 @@ fn interface_table_compiles() {
     implements_treasury::<TreasuryContract>();
     implements_multisig::<MultiSigContract>();
     implements_proposal::<ProposalContract>();
+    implements_escrow::<EscrowContract>();
 
     implements_upgradeable::<RegistryContract>();
     implements_upgradeable::<WalletContract>();
@@ -71,7 +73,31 @@ fn interface_table_compiles() {
 #[test]
 fn interface_version_is_pinned() {
     // Bumping the version is a deliberate act; this catches accidental edits.
-    assert_eq!(INTERFACE_VERSION, 1);
+    // 3 added `EscrowInterface` (Issue #293).
+    assert_eq!(INTERFACE_VERSION, 3);
+}
+
+#[test]
+fn wallet_serves_the_wallet_interface_client() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, WalletContract);
+
+    astroid_wallet::WalletContractClient::new(&env, &id).initialize(&admin);
+
+    let wallet = WalletClient::new(&env, &id);
+    let wallet_id = wallet.create_wallet(&owner);
+    assert_eq!(
+        wallet.get_wallet(&wallet_id),
+        WalletData {
+            owner,
+            state: ResourceState::Active,
+        }
+    );
+    assert_eq!(wallet.balance(&wallet_id, &Address::generate(&env)), 0);
+    assert!(!wallet.is_paused());
 }
 
 #[test]
@@ -209,6 +235,61 @@ fn proposal_serves_the_proposal_interface() {
     assert!(proposal.dependencies_met(&pid));
     // A pending proposal is never executable.
     assert!(!proposal.can_execute(&pid));
+}
+
+#[test]
+fn escrow_serves_the_escrow_interface() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+
+    let id = env.register_contract(None, EscrowContract);
+    let contract = astroid_escrow::EscrowContractClient::new(&env, &id);
+    contract.initialize(&admin);
+
+    // A fresh contract has created nothing, and an unknown id answers through
+    // the shared client with the canonical error code.
+    let escrow = EscrowClient::new(&env, &id);
+    assert_eq!(escrow.escrow_count(), 0);
+    assert_eq!(
+        escrow.try_get_claimable_amount(&404),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(escrow.try_is_unlocked(&404), Err(Ok(Error::NotFound)));
+
+    // Fund a timelock through the contract's own client, then read it back
+    // through the interface client: one entrypoint surface, two callers.
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &asset).mint(&sender, &10_000);
+    contract.approve_token(&admin, &asset);
+    let escrow_id = contract.create_timelock(
+        &sender,
+        &recipient,
+        &arbiter,
+        &vec![
+            &env,
+            AssetAmount {
+                asset: asset.clone(),
+                amount: 10_000,
+            },
+        ],
+        &1_000,
+        &String::from_str(&env, "interface compliance"),
+    );
+
+    assert_eq!(escrow.escrow_count(), 1);
+    assert_eq!(escrow.refund_window_closes_at(&escrow_id), 0);
+    assert_eq!(escrow.get_vested_amount(&escrow_id), 0);
+    assert_eq!(escrow.get_claimable_amount(&escrow_id), 0);
+    // The release clock has not reached the unlock time yet.
+    assert!(!escrow.is_unlocked(&escrow_id));
+    assert!(!escrow.is_refundable(&escrow_id));
 }
 
 #[test]

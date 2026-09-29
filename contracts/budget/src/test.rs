@@ -2289,6 +2289,399 @@ fn rollover_preview_reports_deficit_as_negative_carry() {
     assert_eq!(b.rollover_credit, 0);
 }
 
+// Issue #236: deterministic validation for amount allocations and period
+// eligibility.
+//
+// The zero/negative amount guards already existed, but the two creation
+// entrypoints that reach `allocate_at` without a `limit` of their own were not
+// exercised, and the deficit-carryforward guard tested only `Period::None` —
+// not `Period::Custom`, which is equally non-recurring until `set_recurrence`
+// supplies an interval.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deficit_is_rejected_on_every_non_recurring_period() {
+    let h = setup();
+    // `window_of` returns `None` for both, and `allocate_at` now asks that same
+    // predicate, so neither can be admitted with a deficit policy.
+    for (name, period) in [("none", Period::None), ("custom", Period::Custom)] {
+        let res = h.client.try_allocate_with_deficit(
+            &h.owner,
+            &id(&h.env, name),
+            &1_000,
+            &period,
+            &false,
+            &true, // allow_deficit
+            &0,
+        );
+        assert_eq!(res, Err(Ok(Error::InvalidInput)), "period {:?}", period);
+        // Nothing was written by the rejection.
+        let res = h.client.try_get(&id(&h.env, name));
+        assert_eq!(res, Err(Ok(Error::NotFound)), "period {:?}", period);
+    }
+}
+
+#[test]
+fn deficit_remains_available_on_every_recurring_period() {
+    let h = setup();
+    // The other side of the guard: rejecting `Custom` must not take the fixed
+    // cadences with it.
+    for (name, period, window) in [
+        ("daily", Period::Daily, 86_400u64),
+        ("weekly", Period::Weekly, 604_800),
+        ("monthly", Period::Monthly, 2_592_000),
+    ] {
+        let bid = id(&h.env, name);
+        h.client
+            .allocate_with_deficit(&h.owner, &bid, &1_000, &period, &false, &true, &0);
+        // The first overspend is admitted; the deficit is only booked once the
+        // window actually turns over, so the ledger has to reach the boundary.
+        assert_eq!(
+            h.client.consume(&h.owner, &bid, &1_200),
+            -200,
+            "{:?}",
+            period
+        );
+        // Anchored on the stored window rather than a fixed timestamp, since
+        // each iteration allocates at the ledger's current time.
+        let start = h.client.get(&bid).window_start;
+        h.env.ledger().set_timestamp(start + window);
+        h.client.rollover(&h.owner, &bid);
+        let b: Budget = h.client.get(&bid);
+        assert_eq!(b.deficit_amount, 200, "period {:?}", period);
+        assert_eq!(b.spent, 0, "period {:?}", period);
+        // The deficit is repaid out of the next period's capacity.
+        assert_eq!(h.client.remaining(&bid), 800, "period {:?}", period);
+    }
+}
+
+#[test]
+fn a_custom_period_budget_cannot_accrue_an_unrepayable_deficit() {
+    let h = setup();
+    let bid = id(&h.env, "eng");
+    // A `Custom` budget with no interval never rolls over, so an admitted
+    // deficit would have no window to be repaid from: `window_transition`
+    // returns before its deficit branch, leaving `deficit_amount` at 0 while
+    // `spent` runs past the limit, and `consume` keeps granting the overspend
+    // on `allow_deficit && deficit_amount == 0`. Rejecting the combination is
+    // what stops `remaining` from falling without bound.
+    let res = h.client.try_allocate_with_deficit(
+        &h.owner,
+        &bid,
+        &1_000,
+        &Period::Custom,
+        &false,
+        &true,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    // A `Custom` budget without a deficit policy is still creatable and still
+    // recurs once `set_recurrence` supplies an interval.
+    allocate(&h, "custom", 1_000, Period::Custom, false);
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "custom"),
+        &Period::Custom,
+        &3_600,
+        &false,
+        &0,
+        &0,
+    );
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "custom"), &1_000), 0);
+    h.env.ledger().set_timestamp(1_000 + 3_600);
+    assert_eq!(h.client.remaining(&id(&h.env, "custom")), 1_000);
+}
+
+#[test]
+fn negative_limits_are_rejected_on_every_creation_entrypoint() {
+    let h = setup();
+    let res = h.client.try_allocate_with_deficit(
+        &h.owner,
+        &id(&h.env, "a"),
+        &-1,
+        &Period::Weekly,
+        &false,
+        &true,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+
+    let res = h.client.try_allocate_scheduled(
+        &h.owner,
+        &id(&h.env, "b"),
+        &-1,
+        &Period::None,
+        &false,
+        &2_000,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+
+    // The scheduled entrypoint's own period overlap rule still applies, and is
+    // checked independently of the amount.
+    let res = h.client.try_allocate_scheduled(
+        &h.owner,
+        &id(&h.env, "c"),
+        &1_000,
+        &Period::None,
+        &false,
+        &2_000,
+        &2_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+
+    for bid in ["a", "b", "c"] {
+        let res = h.client.try_get(&id(&h.env, bid));
+        assert_eq!(res, Err(Ok(Error::NotFound)), "budget {} created", bid);
+    }
+}
+
+#[test]
+fn negative_and_zero_caps_and_limits_are_rejected_consistently() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, false);
+    let token = Address::generate(&h.env);
+
+    // `rollover_cap`, like `rollover_max_bps`, is non-negative: a negative cap
+    // would make `apply_cap` clamp credit to a negative bound.
+    let res = h.client.try_set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Daily,
+        &0,
+        &true,
+        &-1, // rollover_cap
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+    // 0 is the documented "uncapped" sentinel and stays valid.
+    h.client.set_recurrence(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &Period::Daily,
+        &0,
+        &true,
+        &0,
+        &0,
+    );
+
+    // A zero limit is a valid, closed budget — it rejects spends rather than
+    // failing to be created.
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &0, &3_600);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    // A zero limit with no window is the one-shot form; still closed, still
+    // creatable.
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &0, &0);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+}
+
+// ---------------------------------------------------------------------------
+// AI Agent Sliding Window Budget Tracking & Rate Limiting Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_agent_sliding_window_rate_limiting_and_consumption_tracking() {
+    let h = setup();
+    let agent_budget_id = id(&h.env, "ai_agent_treasury");
+    let limit = 5_000i128;
+
+    // Allocate budget for autonomous AI agent with daily sliding window
+    allocate(&h, "ai_agent_treasury", limit, Period::Daily, false);
+
+    // Agent performs smaller incremental spends within active sliding window
+    assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &1_500), 3_500);
+    assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &2_000), 1_500);
+    assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &1_500), 0);
+
+    // Total spent equals limit (5_000). Further spending breaches limit and returns BUDGET_EXCEEDED
+    let res = h.client.try_consume(&h.owner, &agent_budget_id, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    // Advance ledger timestamp past the 24-hour sliding window boundary
+    h.env.ledger().set_timestamp(1_000 + DAY);
+
+    // Sliding window auto-resets consumption totals and restores full allowance
+    assert_eq!(h.client.remaining(&agent_budget_id), limit);
+    let rem = h.client.consume(&h.owner, &agent_budget_id, &2_500);
+    assert_eq!(rem, 2_500);
+}
+
+#[test]
+fn ai_agent_sliding_window_custom_interval_rate_limiting() {
+    let h = setup();
+    let agent_budget_id = id(&h.env, "ai_agent_hourly");
+    let limit = 1_000i128;
+    let hourly_window = 3_600u64;
+
+    // Allocate custom budget and configure 1-hour recurring window
+    allocate(&h, "ai_agent_hourly", limit, Period::None, false);
+    h.client.set_recurrence(
+        &h.owner,
+        &agent_budget_id,
+        &Period::Custom,
+        &hourly_window,
+        &false,
+        &0,
+        &0,
+    );
+
+    // Agent spends up to limit inside the 1-hour window
+    assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &600), 400);
+    assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &400), 0);
+
+    // Spend exceeding limit is rejected with deterministic BudgetExceeded error
+    let res = h.client.try_consume(&h.owner, &agent_budget_id, &100);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    // 59 minutes later (still within sliding window): spend still rejected
+    h.env.ledger().set_timestamp(1_000 + 3_540);
+    let res = h.client.try_consume(&h.owner, &agent_budget_id, &100);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    // Exactly on the 1-hour boundary (3,600s): sliding window resets spend counter
+    h.env.ledger().set_timestamp(1_000 + hourly_window);
+    assert_eq!(h.client.remaining(&agent_budget_id), limit);
+    assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &500), 500);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #232: Budget rollover accounting tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn budget_rollover_with_custom_percentage_and_cap() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-rollover");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 5_000i128; // 50%
+    let max_rollover_cap = 300i128;
+
+    // Allocate budget with 50% rollover and 300 cap
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // Period 1: Spend 400. Unspent = 600.
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &400), 600);
+    assert_eq!(h.client.remaining(&budget_id), 600);
+
+    // Advance to Period 2:
+    // Unspent: 600. 50% of 600 = 300. Cap = 300. Clamped to min(300, 300) = 300.
+    // Fresh allowance = limit (1000) + rollover (300) = 1300.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_300);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 300);
+
+    // Can spend up to 1_300 in period 2
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &1_000), 300);
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &300), 0);
+    let res = h.client.try_consume(&h.owner, &budget_id, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+}
+
+#[test]
+fn budget_rollover_percentage_below_cap() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-bps-below-cap");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 2_500i128; // 25%
+    let max_rollover_cap = 500i128;
+
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // Spend 200 => Unspent = 800
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &200), 800);
+
+    // Period 2: 25% of 800 = 200. Cap is 500. 200 < 500, so credit is 200.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_200);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 200);
+}
+
+#[test]
+fn budget_rollover_clamped_by_cap() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-bps-clamped");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 5_000i128; // 50%
+    let max_rollover_cap = 200i128;
+
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // Spend 200 => Unspent = 800
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &200), 800);
+
+    // Period 2: 50% of 800 = 400. Cap is 200. 400 > 200 => clamped to 200.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_200);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 200);
+}
+
+#[test]
+fn budget_rollover_zero_unspent_and_zero_bps() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-zero-bps");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+
+    // Rollover enabled but bps = 0
+    h.client
+        .allocate_with_rollover(&h.owner, &budget_id, &limit, &period, &true, &0, &500, &0);
+
+    // Spend 200 => unspent = 800
+    h.client.consume(&h.owner, &budget_id, &200);
+    h.env.ledger().set_timestamp(1_000 + window);
+
+    // 0 bps => 0 credit
+    assert_eq!(h.client.remaining(&budget_id), 1_000);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 0);
+}
+
 #[test]
 fn rollover_preview_non_recurring_budget_is_never_due() {
     let h = setup();
@@ -2366,4 +2759,142 @@ fn rollover_preview_expired_budget_is_rejected() {
     h.env.ledger().set_timestamp(2_000);
     let res = h.client.try_rollover_preview(&id(&h.env, "eng"));
     assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+}
+
+#[test]
+fn multiple_period_rollovers_simulation() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-multi-period");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 5_000i128; // 50%
+    let max_rollover_cap = 400i128;
+
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // --- Period 1 (t = 1_000) ---
+    // Capacity = 1_000. Spend 400. Unspent = 600.
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &400), 600);
+
+    // --- Period 2 (t = 1_000 + 86_400) ---
+    // Rollover = min(600 * 50%, 400) = 300.
+    // Capacity = 1_000 + 300 = 1_300.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_300);
+    // Spend 500. Remaining unspent = 1_300 - 500 = 800.
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &500), 800);
+
+    // --- Period 3 (t = 1_000 + 2 * 86_400) ---
+    // Rollover = min(800 * 50%, 400) = min(400, 400) = 400.
+    // Capacity = 1_000 + 400 = 1_400.
+    h.env.ledger().set_timestamp(1_000 + 2 * window);
+    assert_eq!(h.client.remaining(&budget_id), 1_400);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 400);
+
+    // Spend 1_400 in full
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &1_400), 0);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &budget_id, &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+
+    // --- Period 4 (t = 1_000 + 3 * 86_400) ---
+    // Unspent was 0 => Rollover = 0.
+    // Capacity = 1_000.
+    h.env.ledger().set_timestamp(1_000 + 3 * window);
+    assert_eq!(h.client.remaining(&budget_id), 1_000);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 0);
+}
+
+#[test]
+fn set_rollover_config_dynamically() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-dynamic-rollover");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+
+    // Initially allocate without rollover
+    h.client
+        .allocate(&h.owner, &budget_id, &limit, &period, &false, &0);
+
+    // Dynamically enable rollover with 40% (4_000 bps) and cap 300
+    h.client
+        .set_rollover_config(&h.owner, &budget_id, &true, &4_000, &300);
+
+    // Spend 500 => Unspent = 500
+    h.client.consume(&h.owner, &budget_id, &500);
+
+    // Advance to Period 2: 40% of 500 = 200. Cap = 300.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_200);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 200);
+    assert_eq!(b.rollover_bps, 4_000);
+    assert_eq!(b.rollover_cap, 300);
+}
+
+#[test]
+fn per_asset_budget_rollover_accounting() {
+    let h = setup();
+    let budget_id = id(&h.env, "asset-rollover-test");
+    let token = Address::generate(&h.env);
+    let limit = 1_000i128;
+    let window_seconds = 86_400u64;
+
+    h.client
+        .allocate(&h.owner, &budget_id, &10_000, &Period::Daily, &false, &0);
+
+    // Set asset budget with 50% rollover and 300 cap
+    h.client.set_budget_limit_with_rollover(
+        &h.owner,
+        &budget_id,
+        &token,
+        &limit,
+        &window_seconds,
+        &true,
+        &5_000,
+        &300,
+    );
+
+    // Spend 400 of 1000 => unspent = 600
+    h.client
+        .check_and_record_spend(&h.owner, &budget_id, &token, &400);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 600);
+
+    // Advance to next window
+    // 50% of 600 = 300 (cap is 300) => credit = 300
+    // Total capacity = 1_000 + 300 = 1_300
+    h.env.ledger().set_timestamp(1_000 + window_seconds);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 1_300);
+    let ab = h.client.get_asset_budget(&budget_id, &token);
+    assert_eq!(ab.rollover_credit, 300);
+    assert_eq!(ab.spent, 0);
+
+    // Spend full 1300
+    h.client
+        .check_and_record_spend(&h.owner, &budget_id, &token, &1_300);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 0);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &budget_id, &token, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    // Next window: unspent was 0 => credit = 0, capacity = 1_000
+    h.env.ledger().set_timestamp(1_000 + 2 * window_seconds);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 1_000);
+    let ab = h.client.get_asset_budget(&budget_id, &token);
+    assert_eq!(ab.rollover_credit, 0);
 }

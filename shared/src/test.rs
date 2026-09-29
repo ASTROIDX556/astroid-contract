@@ -1,20 +1,28 @@
 #![cfg(test)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
 //! Unit tests for the shared math, validation and constant helpers.
 
 use crate::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS};
-use crate::errors::Error;
+use crate::errors::{
+    BudgetError, Error, MilestoneError, BUDGET_ERROR_CODES, MILESTONE_ERROR_CODES,
+};
 use crate::math::{
-    checked_abs, checked_add, checked_add_u64, checked_balance_add, checked_balance_sub,
-    checked_div, checked_div_u64, checked_mul, checked_mul_u64, checked_neg, checked_rem,
-    checked_sub, checked_sub_u64, validate_sufficient_balance, CheckedOptionExt, SafeAdd,
-    SafeBalance, SafeDiv, SafeMul, SafeSub,
+    calculate_budget_rollover, calculate_rollover_allowance, checked_abs, checked_add,
+    checked_add_u128, checked_add_u64, checked_balance_add, checked_balance_sub,
+    checked_batch_allowance, checked_batch_calculation, checked_batch_calculation_with_multipliers,
+    checked_div, checked_div_u128, checked_div_u64, checked_mul, checked_mul_u128, checked_mul_u64,
+    checked_neg, checked_rem, checked_sub, checked_sub_u128, checked_sub_u64,
+    compute_budget_rollover, validate_batch_allowance, validate_sufficient_balance,
+    verify_batch_allowance, verify_batch_allowance_aggregate, verify_batch_allowance_iter,
+    verify_batch_allowance_pairs, verify_batch_allowance_with_multipliers, BatchAmount,
+    CheckedOptionExt, ContractError, SafeAdd, SafeBalance, SafeDiv, SafeMul, SafeSub,
 };
 use crate::validation::{
     require_non_negative_amount, require_not_expired, require_positive_amount,
-    require_time_reached, require_within_amount_bounds,
+    require_time_reached, require_within_amount_bounds, verify_quorum,
 };
-use soroban_sdk::testutils::Ledger;
-use soroban_sdk::Env;
+use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::{Address, Env};
 
 // ---------------------------------------------------------------------------
 // checked_add
@@ -436,6 +444,89 @@ fn safe_balance_trait_delegates() {
     assert_eq!(1i128.safe_credit(-1), Err(Error::InvalidAmount));
 }
 
+// ---------------------------------------------------------------------------
+// Batch allowance verification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_allowance_suite_in_test_module() {
+    // ContractError alias is usable and equal to Error
+    let err: ContractError = Error::AllowanceExceeded;
+    assert_eq!(err, ContractError::AllowanceExceeded);
+
+    // BatchAmount trait constants and methods
+    assert_eq!(<i128 as BatchAmount>::ZERO, 0);
+    assert_eq!(<u128 as BatchAmount>::ZERO, 0);
+    assert!((-1i128).is_negative());
+    assert!(!0i128.is_negative());
+    assert!(!0u128.is_negative());
+
+    // u128 checked arithmetic helpers
+    assert_eq!(checked_add_u128(1, 2), Ok(3));
+    assert_eq!(checked_sub_u128(3, 1), Ok(2));
+    assert_eq!(checked_mul_u128(2, 3), Ok(6));
+    assert_eq!(checked_div_u128(6, 2), Ok(3));
+
+    // Single limit verification
+    let amounts = [50i128, 75, 125];
+    assert_eq!(verify_batch_allowance(&amounts, &[250i128]), Ok(250));
+    assert_eq!(checked_batch_allowance(&amounts, &[250i128]), Ok(250));
+    assert_eq!(checked_batch_calculation(&amounts, &[250i128]), Ok(250));
+    assert_eq!(validate_batch_allowance(&amounts, &[250i128]), Ok(()));
+
+    // Exceeded single limit
+    assert_eq!(
+        verify_batch_allowance(&amounts, &[249i128]),
+        Err(Error::AllowanceExceeded)
+    );
+
+    // Pairwise verification
+    let limits = [50i128, 100, 150];
+    assert_eq!(verify_batch_allowance(&amounts, &limits), Ok(250));
+    assert_eq!(
+        verify_batch_allowance(&[51i128, 75, 125], &limits),
+        Err(Error::AllowanceExceeded)
+    );
+
+    // Multipliers
+    let unit_prices = [10i128, 25];
+    let quantities = [4i128, 2]; // 40 + 50 = 90
+    assert_eq!(
+        verify_batch_allowance_with_multipliers(&unit_prices, &quantities, &[90i128]),
+        Ok(90)
+    );
+    assert_eq!(
+        checked_batch_calculation_with_multipliers(&unit_prices, &quantities, &[90i128]),
+        Ok(90)
+    );
+    assert_eq!(
+        verify_batch_allowance_with_multipliers(&unit_prices, &quantities, &[89i128]),
+        Err(Error::AllowanceExceeded)
+    );
+
+    // Overflow protection
+    assert_eq!(
+        verify_batch_allowance(&[i128::MAX, 1], &[i128::MAX]),
+        Err(Error::Overflow)
+    );
+    assert_eq!(
+        verify_batch_allowance_with_multipliers(&[i128::MAX], &[2], &[i128::MAX]),
+        Err(Error::Overflow)
+    );
+
+    // Iterators
+    let pairs = [(10i128, 20i128), (30, 40)];
+    assert_eq!(verify_batch_allowance_pairs(pairs), Ok(40));
+    assert_eq!(
+        verify_batch_allowance_aggregate([10i128, 20, 30], 60),
+        Ok(60)
+    );
+    assert_eq!(
+        verify_batch_allowance_iter([10i128, 20], [10i128, 20]),
+        Ok(30)
+    );
+}
+
 #[test]
 fn amount_validation() {
     assert_eq!(require_positive_amount(1), Ok(()));
@@ -482,6 +573,98 @@ fn time_validation() {
     assert_eq!(
         require_time_reached(&env, 2_000),
         Err(Error::TimelockNotExpired)
+    );
+}
+
+#[test]
+fn quorum_validation_helper_tests() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+
+    // 1. Exact threshold met
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[2, 3],
+            &[s1.clone(), s2.clone()],
+            5
+        ),
+        Ok(())
+    );
+
+    // 2. Exceeding threshold met
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[2, 4],
+            &[s1.clone(), s2.clone()],
+            5
+        ),
+        Ok(())
+    );
+
+    // 3. Threshold not met
+    assert_eq!(
+        verify_quorum(&[s1.clone(), s2.clone()], &[2, 2], &[s1.clone()], 3),
+        Err(Error::ThresholdNotMet)
+    );
+
+    // 4. Duplicate signers in approval list rejected
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[2, 3],
+            &[s1.clone(), s1.clone()],
+            4
+        ),
+        Err(Error::AlreadySigned)
+    );
+
+    // 5. Duplicate signers in signer set rejected
+    assert_eq!(
+        verify_quorum(&[s1.clone(), s1.clone()], &[2, 3], &[s1.clone()], 2),
+        Err(Error::InvalidInput)
+    );
+
+    // 6. Empty signers or empty approvals with threshold > 0
+    assert_eq!(
+        verify_quorum(&[], &[], &[s1.clone()], 1),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        verify_quorum(&[s1.clone()], &[1], &[], 1),
+        Err(Error::ThresholdNotMet)
+    );
+
+    // 7. Mismatched signers and weights lengths
+    assert_eq!(
+        verify_quorum(&[s1.clone(), s2.clone()], &[2], &[s1.clone()], 1),
+        Err(Error::InvalidInput)
+    );
+
+    // 8. Zero threshold rejected
+    assert_eq!(
+        verify_quorum(&[s1.clone()], &[2], &[s1.clone()], 0),
+        Err(Error::InvalidThreshold)
+    );
+
+    // 9. Non-signer in approval list
+    assert_eq!(
+        verify_quorum(&[s1.clone()], &[2], &[s3.clone()], 1),
+        Err(Error::NotASigner)
+    );
+
+    // 10. Weight overflow prevention
+    assert_eq!(
+        verify_quorum(
+            &[s1.clone(), s2.clone()],
+            &[u32::MAX, 1],
+            &[s1.clone(), s2.clone()],
+            u32::MAX
+        ),
+        Err(Error::Overflow)
     );
 }
 
@@ -953,4 +1136,866 @@ mod token_wrappers {
             soroban_sdk::Error::from_type_and_code(ScErrorType::Budget, ScErrorCode::ExceededLimit);
         assert_eq!(map_token_error(budget), Error::InvalidState);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Error-code audit
+//
+// The code table is the public ABI shared by all eight contracts, so these
+// tests are the guard rail that keeps it deterministic. They are deliberately
+// exhaustive rather than sampled: a single renumbered or duplicated code
+// silently breaks every off-chain consumer, and no runtime test of a business
+// rule would notice.
+// ---------------------------------------------------------------------------
+
+/// Codes that were once assigned to a variant and have been retired. They must
+/// stay empty forever so a stale integrator can never decode a fresh failure
+/// as a retired meaning.
+const RETIRED_CODES: [u32; 3] = [25, 26, 65];
+
+/// The published code for every variant, written out by hand. This is the
+/// audit record: it is deliberately *not* derived from the enum, because a
+/// table derived from the thing it is meant to police cannot detect a
+/// renumbering.
+const EXPECTED_CODES: [(Error, u32); 52] = [
+    // --- Generic / lifecycle (1-6) ---
+    (Error::NotFound, 1),
+    (Error::AlreadyExists, 2),
+    (Error::Unauthorized, 3),
+    (Error::InvalidInput, 4),
+    (Error::NotInitialized, 5),
+    (Error::AlreadyInitialized, 6),
+    // --- Value / arithmetic (10-12) ---
+    (Error::InsufficientFunds, 10),
+    (Error::Overflow, 11),
+    (Error::InvalidAmount, 12),
+    // --- Policy (20-29) ---
+    (Error::PolicyDenied, 20),
+    (Error::EmergencyLock, 21),
+    (Error::PolicyRecipientRestricted, 22),
+    (Error::PolicyMerchantBlocked, 23),
+    (Error::PolicyCategoryRestricted, 24),
+    (Error::VelocityLimitExceeded, 27),
+    // --- Registry (30-39) ---
+    (Error::RegistryFrozen, 30),
+    (Error::ModuleDeprecated, 31),
+    (Error::CircularUpgrade, 32),
+    // --- Budget (40-44) ---
+    (Error::BudgetExceeded, 40),
+    (Error::BudgetFrozen, 41),
+    (Error::BudgetArchived, 42),
+    (Error::AssetNotAuthorized, 43),
+    (Error::BudgetExpired, 44),
+    // --- Wallet (50-54) ---
+    (Error::WalletFrozen, 50),
+    (Error::WalletArchived, 51),
+    (Error::WalletPaused, 52),
+    (Error::InvalidState, 53),
+    (Error::RateLimitExceeded, 54),
+    // --- Multisig / approvals (61-69, 90-92) ---
+    (Error::ThresholdNotMet, 61),
+    (Error::AlreadySigned, 62),
+    (Error::NotASigner, 63),
+    (Error::InvalidThreshold, 64),
+    (Error::TooManySigners, 66),
+    (Error::BatchCallFailed, 67),
+    (Error::InvalidNonce, 68),
+    (Error::InvalidSignerWeight, 69),
+    (Error::InsufficientWeight, 90),
+    (Error::TimelockNotExpired, 91),
+    (Error::UnauthorizedModification, 92),
+    // --- Proposal (71-79) ---
+    (Error::ProposalExpired, 71),
+    (Error::InvalidProposalState, 72),
+    (Error::ProposalNotApproved, 73),
+    (Error::NotAnApprover, 74),
+    (Error::CancellationWindowClosed, 75),
+    (Error::PrerequisiteNotMet, 78),
+    (Error::CircularDependencyDetected, 79),
+    // --- Escrow (80-82) ---
+    (Error::EscrowExpired, 80),
+    (Error::TimeLockActive, 81),
+    (Error::GraceActive, 82),
+    // --- Treasury (83-85) ---
+    (Error::AllowanceExceeded, 83),
+    (Error::AllowanceExpired, 84),
+    (Error::TreasuryPaused, 85),
+];
+
+#[test]
+fn error_code_table_is_frozen() {
+    // Every reachable variant is accounted for: `ALL` is the enumeration the
+    // audit walks, so a mismatch here means a variant was added to (or removed
+    // from) the enum without updating the audited table.
+    assert_eq!(Error::ALL.len(), EXPECTED_CODES.len());
+    for (variant, expected) in EXPECTED_CODES {
+        assert_eq!(
+            variant.code(),
+            expected,
+            "{:?} must keep its published code",
+            variant
+        );
+    }
+}
+
+#[test]
+fn error_codes_are_unique_and_never_overlap() {
+    for (i, variant) in Error::ALL.iter().enumerate() {
+        let code = variant.code();
+        assert_ne!(code, 0, "{:?} may not take the reserved code 0", variant);
+        // Compare against every later variant: two variants sharing a code is
+        // the failure mode that makes a failure unattributable off chain.
+        for other in &Error::ALL[i + 1..] {
+            assert_ne!(
+                other.code(),
+                code,
+                "code {} is claimed by both {:?} and {:?}",
+                code,
+                variant,
+                other
+            );
+        }
+    }
+}
+
+#[test]
+fn error_code_bands_are_ascending() {
+    // Each contract's band is declared ascending, so a variant dropped into the
+    // wrong block — the usual symptom of an accidental renumber — shows up as
+    // a non-ascending band rather than passing silently.
+    let bands: [(u32, u32); 9] = [
+        (1, 6),
+        (10, 12),
+        (20, 29),
+        (30, 39),
+        (40, 44),
+        (50, 54),
+        (60, 69),
+        (70, 79),
+        (90, 92),
+    ];
+    for (low, high) in bands {
+        let mut previous: Option<u32> = None;
+        for variant in Error::ALL {
+            if variant.code() < low || variant.code() > high {
+                continue;
+            }
+            if let Some(prev) = previous {
+                assert!(
+                    prev < variant.code(),
+                    "band {low}-{high} is not ascending: {prev} then {}",
+                    variant.code()
+                );
+            }
+            previous = Some(variant.code());
+        }
+    }
+}
+
+#[test]
+fn retired_error_codes_are_never_reused() {
+    for (variant, code) in EXPECTED_CODES {
+        assert!(
+            !RETIRED_CODES.contains(&code),
+            "{:?} was assigned retired code {}",
+            variant,
+            code
+        );
+    }
+}
+
+#[test]
+fn error_domains_do_not_overlap() {
+    // Each contract's codes live in their own numeric band, so a code observed
+    // on chain attributes to exactly one contract. The generic 1-6 and value
+    // 10-12 bands are shared by design and excluded.
+    let registry = Error::ALL
+        .iter()
+        .filter(|e| (30..40).contains(&e.code()))
+        .count();
+    let budget = Error::ALL
+        .iter()
+        .filter(|e| (40..45).contains(&e.code()))
+        .count();
+    let wallet = Error::ALL
+        .iter()
+        .filter(|e| (50..55).contains(&e.code()))
+        .count();
+    let multisig = Error::ALL
+        .iter()
+        .filter(|e| (60..70).contains(&e.code()) || (90..93).contains(&e.code()))
+        .count();
+    let proposal = Error::ALL
+        .iter()
+        .filter(|e| (70..80).contains(&e.code()))
+        .count();
+    let escrow = Error::ALL
+        .iter()
+        .filter(|e| (80..83).contains(&e.code()))
+        .count();
+    let treasury = Error::ALL
+        .iter()
+        .filter(|e| (83..86).contains(&e.code()))
+        .count();
+    let policy = Error::ALL
+        .iter()
+        .filter(|e| (20..30).contains(&e.code()))
+        .count();
+
+    assert_eq!(registry, 3, "registry band 30-39");
+    assert_eq!(budget, 5, "budget band 40-44");
+    assert_eq!(wallet, 5, "wallet band 50-54");
+    assert_eq!(multisig, 11, "multisig bands 61-69 and 90-92");
+    assert_eq!(proposal, 7, "proposal band 71-79");
+    assert_eq!(escrow, 3, "escrow band 80-82");
+    assert_eq!(treasury, 3, "treasury band 83-85");
+    assert_eq!(policy, 6, "policy band 20-29");
+}
+
+#[test]
+fn error_codes_round_trip_through_the_host_error() {
+    // A contract returning `Err(Error::X)` reaches the caller as a
+    // `soroban_sdk::Error` carrying `X.code()`. The generated `TryFrom` must
+    // map every code back to its variant, otherwise the consumer sees a code it
+    // cannot attribute.
+    for variant in Error::ALL {
+        let host = soroban_sdk::Error::from(variant);
+        assert_eq!(host.get_code(), variant.code());
+        assert_eq!(Error::try_from(host), Ok(variant));
+    }
+}
+
+#[test]
+fn unknown_error_codes_are_never_decoded() {
+    // A code outside the table (e.g. emitted by a future contract version an
+    // old consumer has not learned yet) must stay an opaque error rather than
+    // being guessed at.
+    let unknown = soroban_sdk::Error::from_contract_error(4_294_967_295);
+    assert!(Error::try_from(unknown).is_err());
+}
+
+#[test]
+fn milestone_error_codes_are_frozen_and_unique() {
+    // A milestone refusal that is really a generic failure must decode to the
+    // exact canonical number, so a consumer's existing handler still matches.
+    assert_eq!(MilestoneError::NotFound.code(), Error::NotFound.code());
+    assert_eq!(
+        MilestoneError::Unauthorized.code(),
+        Error::Unauthorized.code()
+    );
+    assert_eq!(
+        MilestoneError::InvalidInput.code(),
+        Error::InvalidInput.code()
+    );
+    assert_eq!(MilestoneError::Overflow.code(), Error::Overflow.code());
+    assert_eq!(
+        MilestoneError::InvalidAmount.code(),
+        Error::InvalidAmount.code()
+    );
+    assert_eq!(
+        MilestoneError::InvalidState.code(),
+        Error::InvalidState.code()
+    );
+    // The two milestone-only codes are the next free slots after the escrow
+    // band (80-82) and must never be reassigned.
+    assert_eq!(MilestoneError::InvalidMilestone.code(), 86);
+    assert_eq!(MilestoneError::MilestoneAlreadyCompleted.code(), 87);
+
+    assert_eq!(MilestoneError::ALL.len(), MILESTONE_ERROR_CODES.len());
+    for (variant, code) in MilestoneError::ALL.iter().zip(MILESTONE_ERROR_CODES) {
+        assert_eq!(variant.code(), code, "{:?} must keep its code", variant);
+        assert_ne!(code, 0, "{:?} may not take the reserved code 0", variant);
+        assert!(
+            !RETIRED_CODES.contains(&code),
+            "{:?} was assigned retired code {}",
+            variant,
+            code
+        );
+    }
+    // Every code is unique, so a failure is attributable to one variant.
+    for (i, code) in MILESTONE_ERROR_CODES.iter().enumerate() {
+        assert!(
+            !MILESTONE_ERROR_CODES[i + 1..].contains(code),
+            "duplicate milestone code {}",
+            code
+        );
+    }
+    // A contract returning any variant round-trips as that exact number.
+    for variant in MilestoneError::ALL {
+        let host = soroban_sdk::Error::from(variant);
+        assert_eq!(host.get_code(), variant.code());
+        assert_eq!(MilestoneError::try_from(host), Ok(variant));
+    }
+}
+
+#[test]
+fn budget_error_table_is_frozen() {
+    // `ALL` is the enumeration this audit walks, so a variant added to (or
+    // removed from) the enum without a matching entry in `BUDGET_ERROR_CODES`
+    // fails here instead of slipping an undocumented code onto the wire.
+    assert_eq!(BudgetError::ALL.len(), BUDGET_ERROR_CODES.len());
+    for (variant, expected) in BudgetError::ALL.iter().zip(BUDGET_ERROR_CODES) {
+        assert_eq!(
+            variant.code(),
+            expected,
+            "{:?} must keep its published code",
+            variant
+        );
+    }
+}
+
+#[test]
+fn budget_error_codes_are_frozen_and_unique() {
+    for (i, code) in BUDGET_ERROR_CODES.iter().enumerate() {
+        // The host reports a contract error of `0` as "no error", so no variant
+        // may ever take that value.
+        assert_ne!(*code, 0, "code 0 is reserved by the host");
+        // Compare against every later code: a duplicate makes a budget refusal
+        // unattributable off chain, and `BudgetError` has a distinct code (45)
+        // that nothing else may shadow.
+        for other in &BUDGET_ERROR_CODES[i + 1..] {
+            assert_ne!(
+                other, code,
+                "code {} is claimed twice in the budget table",
+                code
+            );
+        }
+        assert!(
+            !RETIRED_CODES.contains(code),
+            "retired code {} reissued in the budget table",
+            code
+        );
+    }
+
+    // A contract returning any variant round-trips as that exact number, so an
+    // off-chain consumer decodes it back to the same variant.
+    for variant in BudgetError::ALL {
+        let host = soroban_sdk::Error::from(variant);
+        assert_eq!(host.get_code(), variant.code());
+        assert_eq!(BudgetError::try_from(host), Ok(variant));
+    }
+
+    // The ten mirrored codes are wire-compatible with the canonical table, so a
+    // consumer's existing `Error` handler still fires. `BudgetNotActive` (45) is
+    // the one budget-only code, and it folds onto `Error::BudgetExpired` on the
+    // way back — asserted here so that lossy conversion is deliberate rather
+    // than accidental.
+    for variant in BudgetError::ALL {
+        let canonical = Error::from(variant);
+        if variant == BudgetError::BudgetNotActive {
+            assert_eq!(canonical, Error::BudgetExpired);
+        } else {
+            assert_eq!(
+                canonical.code(),
+                variant.code(),
+                "{:?} must decode to the same number in the canonical table",
+                variant
+            );
+        }
+    }
+}
+
+/// Every variant the three error tables expose must carry a code that is
+/// non-zero, not a retired slot, and — within its own table — claimed by no
+/// other variant. Uniqueness is per table on purpose: the budget and milestone
+/// tables deliberately mirror canonical codes, so a code shared *between*
+/// tables is the wire compatibility the protocol relies on, whereas a code
+/// shared *within* a table is a failure nothing can attribute.
+#[test]
+fn every_public_error_variant_has_a_unique_code() {
+    // Canonical table.
+    assert_unique_codes(Error::ALL.iter().map(|e| e.code()));
+    // Budget table.
+    assert_unique_codes(BudgetError::ALL.iter().map(|e| e.code()));
+    // Milestone table.
+    assert_unique_codes(MilestoneError::ALL.iter().map(|e| e.code()));
+
+    // No variant of any table may take a retired slot, and no table may claim
+    // the reserved code 0.
+    for code in Error::ALL
+        .iter()
+        .map(|e| e.code())
+        .chain(BudgetError::ALL.iter().map(|e| e.code()))
+        .chain(MilestoneError::ALL.iter().map(|e| e.code()))
+    {
+        assert_ne!(code, 0, "code 0 is reserved by the host");
+        assert!(
+            !RETIRED_CODES.contains(&code),
+            "retired code {} was reissued",
+            code
+        );
+    }
+}
+
+/// Walk one table's codes, asserting each is non-zero and not already claimed by
+/// an earlier entry in the same table.
+fn assert_unique_codes<I: Iterator<Item = u32>>(codes: I) {
+    // The tables are small and fixed-size, so an O(n^2) walk over the
+    // accumulated codes is cheaper than allocating a set.
+    let mut seen = [0u32; MAX_AUDITED_CODES];
+    for (count, code) in codes.enumerate() {
+        assert_ne!(code, 0, "code 0 is reserved by the host");
+        for previous in &seen[..count] {
+            assert_ne!(
+                *previous, code,
+                "code {} is claimed by more than one error variant",
+                code
+            );
+        }
+        assert!(
+            count < seen.len(),
+            "error table grew past the audit's capacity"
+        );
+        seen[count] = code;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error-table lint (Issue #244)
+//
+// A missing doc comment, a wire name that drifts out of `UPPER_SNAKE_CASE`, or a
+// discriminant left implicit is invisible to the compiler: the crate still
+// builds, the tests still pass, and the codes are still as deterministic as they
+// were. The only thing that catches them is reading the source, so the routine
+// below parses `errors.rs` at test time and enforces the documentation and
+// naming conventions on every variant of every error table in the crate.
+// ---------------------------------------------------------------------------
+
+/// This file, verbatim. Reading the source is what makes the documentation rule
+/// enforceable; the compiler cannot see a missing doc comment.
+const ERROR_SOURCE: &str = include_str!("errors.rs");
+
+/// The upper bound on the codes and wire names the audits below can remember.
+/// The largest table declares 51 variants; the slack keeps an in-progress table
+/// from failing on capacity alone.
+const MAX_AUDITED_CODES: usize = 64;
+
+/// The upper bound on the `#[contracterror]` tables the scan tracks. Three exist
+/// today; the slack means a new one is reported as "extend the audit" rather
+/// than as a capacity failure.
+const MAX_ERROR_TABLES: usize = 8;
+
+/// A `#[contracterror]` variant exactly as `errors.rs` declares it.
+#[derive(Clone, Copy)]
+struct DeclaredVariant {
+    /// The table it belongs to: `Error`, `BudgetError` or `MilestoneError`.
+    table: &'static str,
+    /// The variant's Rust name, as written in the source. Used in failure
+    /// messages; the published name is the variant's `wire_name()`, which is
+    /// checked separately because it is a method, not a declaration.
+    name: &'static str,
+    /// The discriminant, as written in the source.
+    code: u32,
+    /// 1-based line number, so a failure points at the declaration.
+    line: usize,
+    /// Whether a `///` doc comment precedes the declaration.
+    documented: bool,
+}
+
+/// `UPPER_SNAKE_CASE`: ASCII capitals, digits and underscores, starting with a
+/// capital and free of leading, trailing or doubled underscores. This is the
+/// form the Astroid SDK, API and dashboard key their message catalogues off, so
+/// a variant whose wire name is `NotFound` instead of `NOT_FOUND` is a silent
+/// mismatch for every consumer of that catalogue.
+fn is_upper_snake_case(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    if name.starts_with('_') || name.ends_with('_') || name.contains("__") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Walk every `#[contracterror]` table in `errors.rs`, in source order, calling
+/// `on_variant` once per declared variant and `on_table` once per table with the
+/// number of variants that table declares.
+///
+/// The scan is deliberately literal rather than clever: it recognises exactly
+/// the layout `errors.rs` uses — one `Name = <decimal>,` per line, with
+/// attributes and `//` / `///` comments on their own lines — and panics with a
+/// pointed message on anything else, so a reformat shows up as an actionable
+/// failure instead of silently skipping a variant.
+fn scan_error_tables(
+    on_variant: &mut impl FnMut(DeclaredVariant),
+    on_table: &mut impl FnMut(&'static str, usize),
+) {
+    // 1. Find the `#[contracterror]` enums. The attribute may carry arguments
+    //    (`#[contracterror(export = false)]`), so match on the prefix only. The
+    //    `#[derive]` / `#[repr]` lines in between belong to the same item and
+    //    must not end the search.
+    let mut tables: [(&'static str, usize); MAX_ERROR_TABLES] = [("", 0); MAX_ERROR_TABLES];
+    let mut table_count = 0usize;
+    let mut awaiting_contracterror = false;
+    for (index, line) in ERROR_SOURCE.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[contracterror") {
+            awaiting_contracterror = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("pub enum ") {
+            if awaiting_contracterror {
+                assert!(
+                    table_count < tables.len(),
+                    "more error tables than this audit knows about — extend it"
+                );
+                tables[table_count] = (rest.trim_end_matches('{').trim(), index + 1);
+                table_count += 1;
+            }
+            // The attribute never carries over to the next item.
+            awaiting_contracterror = false;
+            continue;
+        }
+        if awaiting_contracterror
+            && !(trimmed.is_empty() || trimmed.starts_with("///") || trimmed.starts_with("#["))
+        {
+            awaiting_contracterror = false;
+        }
+    }
+    assert!(
+        table_count > 0,
+        "the scan found no #[contracterror] table in errors.rs — the source layout \
+         this audit depends on has changed"
+    );
+
+    // 2. Walk each table's body. A table's variants are the lines between its
+    //    `pub enum` and the first line that is exactly `}`: these enums hold no
+    //    nested items, so that brace is unambiguous.
+    for (table, header_line) in &tables[..table_count] {
+        let mut documented = false;
+        let mut variants = 0usize;
+        for (offset, line) in ERROR_SOURCE.lines().skip(*header_line).enumerate() {
+            let line_number = header_line + offset + 1;
+            let trimmed = line.trim();
+            if line == "}" {
+                break;
+            }
+            if trimmed.is_empty() {
+                // A blank line ends a doc run: a `///` block above a blank line
+                // documents that block, not the variant below it.
+                documented = false;
+                continue;
+            }
+            if trimmed.starts_with("///") {
+                documented = true;
+                continue;
+            }
+            if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                // Plain and attribute lines do not interrupt a doc run.
+                continue;
+            }
+            // Whatever is left is a variant declaration: `Name = <decimal>,`.
+            let declaration = trimmed.strip_suffix(',').unwrap_or_else(|| {
+                panic!(
+                    "errors.rs:{line_number}: expected `Name = <code>,` inside \
+                     `{table}`, found `{trimmed}`"
+                )
+            });
+            let (name, code) = declaration.split_once('=').unwrap_or_else(|| {
+                panic!(
+                    "errors.rs:{line_number}: `{trimmed}` has no explicit discriminant \
+                     in `{table}` — write `{trimmed} = <code>,` so the wire value is \
+                     hand-written and reviewable"
+                )
+            });
+            let name = name.trim();
+            let code = code.trim();
+            let parsed: u32 = code.parse().unwrap_or_else(|_| {
+                panic!(
+                    "errors.rs:{line_number}: `{name}` must carry a plain decimal \
+                     discriminant, found `{code}`"
+                )
+            });
+            variants += 1;
+            on_variant(DeclaredVariant {
+                table,
+                name,
+                code: parsed,
+                line: line_number,
+                documented,
+            });
+            documented = false;
+        }
+        assert!(
+            variants > 0,
+            "`{table}` declares no variants this audit could read — the source \
+             layout this audit depends on has changed"
+        );
+        on_table(table, variants);
+    }
+}
+
+#[test]
+fn error_variants_are_documented() {
+    // The point of the exercise: an off-chain consumer decodes a `u32` and a
+    // name, never a Rust doc comment, so this comment *is* the specification of
+    // when the code is emitted. An undocumented variant is a code nobody can
+    // explain.
+    let mut checked = 0usize;
+    scan_error_tables(
+        &mut |variant| {
+            assert!(
+                variant.documented,
+                "errors.rs:{}: `{}::{}` has no doc comment — say what triggers it",
+                variant.line, variant.table, variant.name
+            );
+            assert_ne!(
+                variant.code, 0,
+                "errors.rs:{}: `{}::{}` takes the reserved code 0; the host reports a \
+                 contract error of 0 as \"no error\"",
+                variant.line, variant.table, variant.name
+            );
+            checked += 1;
+        },
+        &mut |_, _| {},
+    );
+    // Every table declared three variants or more, so a scan that visited
+    // nothing cannot pass.
+    assert!(
+        checked > 0,
+        "the documentation scan visited no variants at all"
+    );
+}
+
+#[test]
+fn error_tables_declared_in_source_match_the_audited_tables() {
+    // `on_table` is called once per table, so this compares per table: a new
+    // variant in one table cannot hide behind the grand total staying stable.
+    let expected = [
+        ("Error", Error::ALL.len()),
+        ("BudgetError", BudgetError::ALL.len()),
+        ("MilestoneError", MILESTONE_ERROR_CODES.len()),
+    ];
+    let mut seen: [&str; MAX_ERROR_TABLES] = [""; MAX_ERROR_TABLES];
+    let mut seen_count = 0usize;
+    scan_error_tables(&mut |_| {}, &mut |table, declared| {
+        assert!(
+            seen_count < seen.len(),
+            "more error tables than this audit knows about — extend it"
+        );
+        seen[seen_count] = table;
+        seen_count += 1;
+        let audited = expected
+            .iter()
+            .find(|(name, _)| *name == table)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{table}` is a new #[contracterror] table in errors.rs — add \
+                         it to this audit and give it an `ALL`/code constant of its own"
+                )
+            });
+        assert_eq!(
+            declared, audited.1,
+            "`{table}` declares {declared} variants in errors.rs but the audited \
+                 table enumerates {} — update both in the same change",
+            audited.1
+        );
+    });
+    assert_eq!(
+        seen_count,
+        expected.len(),
+        "this audit covers {} tables but errors.rs has {}: {:?}",
+        expected.len(),
+        seen_count,
+        &seen[..seen_count]
+    );
+}
+
+#[test]
+fn error_wire_names_are_upper_snake_case_and_unique() {
+    // The published name must be UPPER_SNAKE_CASE and must identify exactly one
+    // variant within its table, so an off-chain message catalogue keyed on it
+    // cannot be ambiguous.
+    fn assert_wire_names<I: Iterator<Item = &'static str>>(table: &str, names: I) {
+        let mut seen = [""; MAX_AUDITED_CODES];
+        for (count, name) in names.enumerate() {
+            assert!(
+                is_upper_snake_case(name),
+                "{table}: wire name `{name}` is not UPPER_SNAKE_CASE"
+            );
+            assert!(
+                !seen[..count].contains(&name),
+                "{table}: wire name `{name}` is used by more than one variant"
+            );
+            assert!(count < seen.len(), "{table}: too many variants to audit");
+            seen[count] = name;
+        }
+    }
+
+    assert_wire_names("Error", Error::ALL.iter().map(|e| e.wire_name()));
+    assert_wire_names(
+        "BudgetError",
+        BudgetError::ALL.iter().map(|e| e.wire_name()),
+    );
+    assert_wire_names(
+        "MilestoneError",
+        MilestoneError::ALL.iter().map(|e| e.wire_name()),
+    );
+}
+
+#[test]
+fn mirrored_tables_share_the_canonical_wire_names() {
+    // A variant that mirrors a canonical code must also mirror its name, or the
+    // two tables would decode one number to two different identifiers.
+    for variant in BudgetError::ALL {
+        let canonical = Error::from(variant);
+        if variant == BudgetError::BudgetNotActive {
+            // The one budget-only code: it has no canonical counterpart.
+            assert_eq!(variant.wire_name(), "BUDGET_NOT_ACTIVE");
+            continue;
+        }
+        assert_eq!(
+            variant.wire_name(),
+            canonical.wire_name(),
+            "{:?} mirrors its canonical code but not its wire name",
+            variant
+        );
+    }
+
+    for variant in MilestoneError::ALL {
+        if matches!(
+            variant,
+            MilestoneError::InvalidMilestone | MilestoneError::MilestoneAlreadyCompleted
+        ) {
+            // The two milestone-only codes have no canonical counterpart.
+            continue;
+        }
+        let canonical = Error::from(variant);
+        assert_eq!(
+            variant.code(),
+            canonical.code(),
+            "{:?} must mirror its canonical code",
+            variant
+        );
+        assert_eq!(
+            variant.wire_name(),
+            canonical.wire_name(),
+            "{:?} must mirror its canonical wire name",
+            variant
+        );
+    }
+}
+
+#[test]
+fn error_enums_implement_the_traits_the_sdk_requires() {
+    // A `#[contracterror]` enum is only usable across a contract boundary if it is
+    // `Copy`/`Clone` (passed by value through `Result`), `Debug` (for the
+    // `panic!` messages and test output), `Eq`/`PartialEq` (for the `assert_eq!`
+    // the whole suite is built on) and convertible from `soroban_sdk::Error`
+    // (the generated `TryFrom`, which is how a wire code is decoded back into a
+    // variant). `Ord`/`PartialOrd` keep the tables orderable for the off-chain
+    // catalogues. Asserting the bounds here turns a dropped `#[derive]` into a
+    // compile error in this module rather than a surprise at the first call site
+    // that happens to need it.
+    fn assert_contracterror_traits<T>()
+    where
+        T: Copy
+            + Clone
+            + core::fmt::Debug
+            + Eq
+            + PartialEq
+            + PartialOrd
+            + Ord
+            + TryFrom<soroban_sdk::Error>,
+    {
+    }
+
+    assert_contracterror_traits::<Error>();
+    assert_contracterror_traits::<BudgetError>();
+    assert_contracterror_traits::<MilestoneError>();
+}
+
+// ---------------------------------------------------------------------------
+// calculate_budget_rollover & calculate_rollover_allowance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn budget_rollover_happy_path() {
+    // 50% rollover (5_000 bps) of 1_000 unspent without cap
+    assert_eq!(calculate_budget_rollover(1_000, 5_000, 0), Ok(500));
+    // 25% rollover (2_500 bps) of 1_000 unspent without cap
+    assert_eq!(calculate_budget_rollover(1_000, 2_500, 0), Ok(250));
+    // 100% rollover (10_000 bps) of 1_000 unspent without cap
+    assert_eq!(calculate_budget_rollover(1_000, 10_000, 0), Ok(1_000));
+    // 0 bps => 0 rollover
+    assert_eq!(calculate_budget_rollover(1_000, 0, 0), Ok(0));
+    // 0 unspent => 0 rollover
+    assert_eq!(calculate_budget_rollover(0, 5_000, 1_000), Ok(0));
+    // Alias compute_budget_rollover matches
+    assert_eq!(compute_budget_rollover(1_000, 5_000, 0), Ok(500));
+}
+
+#[test]
+fn budget_rollover_cap_clamping() {
+    // Calculated rollover = 500, cap = 300 => clamped to 300
+    assert_eq!(calculate_budget_rollover(1_000, 5_000, 300), Ok(300));
+    // Calculated rollover = 500, cap = 600 => uncapped at 500
+    assert_eq!(calculate_budget_rollover(1_000, 5_000, 600), Ok(500));
+    // Calculated rollover = 1_000, cap = 400 => clamped to 400
+    assert_eq!(calculate_budget_rollover(1_000, 10_000, 400), Ok(400));
+}
+
+#[test]
+fn budget_rollover_input_validation() {
+    // Negative unspent is rejected
+    assert_eq!(
+        calculate_budget_rollover(-1, 5_000, 1_000),
+        Err(Error::InvalidAmount)
+    );
+    // Negative bps is rejected
+    assert_eq!(
+        calculate_budget_rollover(1_000, -1, 1_000),
+        Err(Error::InvalidAmount)
+    );
+    // Negative cap is rejected
+    assert_eq!(
+        calculate_budget_rollover(1_000, 5_000, -1),
+        Err(Error::InvalidAmount)
+    );
+    // bps > 10_000 is rejected
+    assert_eq!(
+        calculate_budget_rollover(1_000, 10_001, 1_000),
+        Err(Error::InvalidInput)
+    );
+}
+
+#[test]
+fn budget_rollover_large_values_no_overflow() {
+    // i128::MAX with 10_000 bps (100%) does not overflow
+    assert_eq!(
+        calculate_budget_rollover(i128::MAX, 10_000, 0),
+        Ok(i128::MAX)
+    );
+    // i128::MAX with 5_000 bps (50%) does not overflow
+    assert_eq!(
+        calculate_budget_rollover(i128::MAX, 5_000, 0),
+        Ok(i128::MAX / 2)
+    );
+    // i128::MAX clamped by cap
+    assert_eq!(
+        calculate_budget_rollover(i128::MAX, 10_000, 50_000),
+        Ok(50_000)
+    );
+}
+
+#[test]
+fn rollover_allowance_calculation() {
+    // base_limit = 1_000, unspent = 1_000, 50% rollover capped at 300 => 1_000 + 300 = 1_300
+    assert_eq!(
+        calculate_rollover_allowance(1_000, 1_000, 5_000, 300),
+        Ok(1_300)
+    );
+    // Negative base limit is rejected
+    assert_eq!(
+        calculate_rollover_allowance(-1, 1_000, 5_000, 300),
+        Err(Error::InvalidAmount)
+    );
+    // Overflow when adding to i128::MAX
+    assert_eq!(
+        calculate_rollover_allowance(i128::MAX, 1_000, 5_000, 300),
+        Err(Error::Overflow)
+    );
 }

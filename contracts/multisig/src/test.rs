@@ -3,7 +3,7 @@ extern crate std;
 
 use crate::{BatchCall, GovernanceChange, MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_shared::constants::{
-    GOVERNANCE_GRACE_PERIOD, MAX_BATCH_CALLS, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY,
+    GOVERNANCE_GRACE_PERIOD, MAX_BATCH_CALLS, MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY,
     THRESHOLD_CHANGE_DELAY_LEDGERS,
 };
 use astroid_shared::errors::Error;
@@ -199,6 +199,9 @@ fn non_signer_cannot_propose_or_approve() {
         .client
         .try_propose(&stranger, &symbol_short!("payment"), &payload(&h.env), &0);
     assert_eq!(res, Err(Ok(Error::NotASigner)));
+    // Approving is gated the same way, before the proposal is even loaded.
+    let res = h.client.try_approve(&stranger, &1);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
 }
 
 #[test]
@@ -278,6 +281,213 @@ fn assert_event(env: &Env, category: Symbol, action: Symbol) {
             topics.contains(want_category) && topics.contains(want_action)
         });
     assert!(found, "expected a matching event to be emitted");
+}
+
+// --- quorum edge cases (threshold verification) ---
+
+#[test]
+fn minimal_quorum_executes_with_proposer_alone() {
+    // MIN_THRESHOLD is 1, so the lightest possible configuration lets the
+    // proposer's weight alone satisfy the threshold.
+    let h = setup(&[1, 1, 1], 1);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+#[test]
+fn unanimous_quorum_requires_every_signer() {
+    // Weights 1, 1, 1 with threshold 3 == total weight: nothing short of
+    // unanimous approval reaches the threshold.
+    let h = setup(&[1, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 2);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    // The last approval lands exactly on the threshold.
+    assert_eq!(h.client.approve(&h.signers[2], &id), 3);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+#[test]
+fn quorum_boundary_is_exact_threshold_or_bust() {
+    // Weights 5, 3, 2 with threshold 10 == total weight: a weighted quorum
+    // that is one signer short must not slip through.
+    let h = setup(&[5, 3, 2], 10);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 8);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+    // 5 + 3 + 2 == 10: exactly at the threshold is enough.
+    assert_eq!(h.client.approve(&h.signers[2], &id), 10);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+#[test]
+fn duplicate_approval_cannot_stack_weight() {
+    // Weights 1, 1, 1 with threshold 3: a double approval from the same
+    // signer would fabricate the missing quorum, so the duplicate is rejected
+    // and the recorded weight is left untouched.
+    let h = setup(&[1, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 2);
+    assert_eq!(
+        h.client.try_approve(&h.signers[1], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 2);
+    // The proposer already auto-approved at proposal time, too.
+    assert_eq!(
+        h.client.try_approve(&h.signers[0], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 2);
+    // Still one weight short of the quorum.
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+}
+
+#[test]
+fn weight_sum_at_u32_max_still_verifies() {
+    // Weights u32::MAX - 1 and 1 sum to exactly u32::MAX with a threshold of
+    // u32::MAX: the checked accumulator must land on the boundary without
+    // wrapping (a wrapped sum of 0 would fail the quorum check).
+    let h = setup(&[u32::MAX - 1, 1], u32::MAX);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), u32::MAX);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+#[test]
+fn zero_threshold_rejected_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, MultiSigContract);
+    let client = MultiSigContractClient::new(&env, &contract_id);
+    let mut sv = Vec::new(&env);
+    sv.push_back(sw(&Address::generate(&env), 1));
+    sv.push_back(sw(&Address::generate(&env), 1));
+    // Below MIN_THRESHOLD: a threshold of 0 would let a proposal execute with
+    // no approval weight at all, so it is refused up front.
+    let res = client.try_initialize(&sv, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+}
+
+#[test]
+fn signer_weight_sum_overflow_rejected_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, MultiSigContract);
+    let client = MultiSigContractClient::new(&env, &contract_id);
+    let mut sv = Vec::new(&env);
+    // u32::MAX + 1 has no representable total weight: the checked accumulation
+    // refuses the signer set instead of wrapping it down to 1.
+    sv.push_back(sw(&Address::generate(&env), u32::MAX));
+    sv.push_back(sw(&Address::generate(&env), 1));
+    let res = client.try_initialize(&sv, &1);
+    assert_eq!(res, Err(Ok(Error::Overflow)));
+}
+
+#[test]
+fn max_weight_quorum_and_capacity_edge() {
+    // A lone signer holding u32::MAX weight with a threshold of u32::MAX is a
+    // valid (if extreme) quorum configuration.
+    let h = setup(&[u32::MAX], u32::MAX);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+
+    // Admitting one more signer would push the total weight past u32::MAX, so
+    // the governance change is refused rather than wrapping the capacity.
+    let extra = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_propose_signer_addition(&h.signers[0], &extra, &1),
+        Err(Ok(Error::Overflow))
+    );
+}
+
+#[test]
+fn full_capacity_unanimous_quorum_and_one_signer_too_many() {
+    // A signer set sitting exactly on MAX_SIGNERS with a unanimous threshold is
+    // the largest quorum configuration the contract admits.
+    let n = MAX_SIGNERS as usize;
+    let h = setup(&std::vec![1u32; n], MAX_SIGNERS);
+    assert_eq!(h.client.get_signers().len(), MAX_SIGNERS);
+    assert_eq!(h.client.get_total_weight(), MAX_SIGNERS);
+
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    // Every remaining signer but the last: one weight short of unanimity.
+    for i in 1..n - 1 {
+        h.client.approve(&h.signers[i], &id);
+    }
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+    // The last approval lands exactly on the threshold.
+    h.client.approve(&h.signers[n - 1], &id);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+
+    // A set already at capacity admits nobody else, on either path.
+    let extra = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_add_signer(&h.signers[0], &extra, &1),
+        Err(Ok(Error::TooManySigners))
+    );
+    assert_eq!(
+        h.client
+            .try_propose_signer_addition(&h.signers[0], &extra, &1),
+        Err(Ok(Error::TooManySigners))
+    );
+    assert!(!h.client.is_signer(&extra));
+    assert_eq!(h.client.get_signers().len(), MAX_SIGNERS);
 }
 
 // --- timelocked governance ---
@@ -893,6 +1103,30 @@ fn batch_duplicate_approvers_do_not_stack_weight() {
 }
 
 #[test]
+fn batch_unanimous_quorum_requires_every_signer() {
+    let h = setup_batch(3, 3);
+    let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
+    // Caller plus one approver is a single signature short of a quorum of 3.
+    let res = h.client.try_execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1]),
+    );
+    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(h.helper_client.get(&1), 0);
+
+    // Caller plus every remaining signer meets the threshold exactly.
+    h.client.execute_batch(
+        &h.signers[0],
+        &1,
+        &calls,
+        &approvers(&h.env, &h.signers, &[1, 2]),
+    );
+    assert_eq!(h.helper_client.get(&1), 100);
+}
+
+#[test]
 fn batch_nonce_replay_rejected() {
     let h = setup_batch(3, 2);
     let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 100)];
@@ -1086,6 +1320,18 @@ fn verify_threshold_returns_weight_above_threshold() {
         &payload(&h.env),
     );
     assert_eq!(weight, 6);
+}
+
+#[test]
+fn verify_threshold_accepts_exact_u32_max_without_duplicate_weight() {
+    let h = setup(&[u32::MAX], u32::MAX);
+    let repeated_signer = vec![&h.env, h.signers[0].clone(), h.signers[0].clone()];
+
+    assert_eq!(
+        h.client
+            .verify_threshold(&h.signers[0], &repeated_signer, &payload(&h.env)),
+        u32::MAX
+    );
 }
 
 #[test]
@@ -1388,4 +1634,83 @@ fn threshold_voting_exact_boundary_transitions_state() {
     let proposal = h.client.get_proposal(&id);
     assert!(proposal.executed);
     assert_eq!(proposal.approval_weight, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Multisig quorum weight adjustments with timelock protection tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn weight_update_timelock_creation_queuing_premature_failure_and_success() {
+    let h = setup(&[2, 2], 3);
+    h.env.ledger().set_timestamp(1_000);
+
+    // 1. Propose signer weight update
+    let prop_id = h
+        .client
+        .propose_weight_change(&h.signers[0], &h.signers[1], &5);
+
+    // 2. Queuing state verification: verify change is queued with eta = proposed_at + MIN_TIMELOCK_DELAY
+    let pending = h.client.get_pending_change(&prop_id);
+    assert_eq!(pending.proposer, h.signers[0]);
+    assert_eq!(
+        pending.change,
+        GovernanceChange::SignerWeight(h.signers[1].clone(), 5)
+    );
+    assert_eq!(pending.proposed_at, 1_000);
+    assert_eq!(pending.eta, 1_000 + MIN_TIMELOCK_DELAY);
+    assert!(!pending.executed);
+
+    // 3. Premature execution failure: attempting to execute before timelock expires fails with TIMELOCK_NOT_EXPIRED
+    advance(&h, MIN_TIMELOCK_DELAY - 1);
+    let res = h
+        .client
+        .try_execute_threshold_change(&h.signers[0], &prop_id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+
+    // Verify weight remains unchanged prematurely
+    let signers_before = h.client.get_signers();
+    assert!(signers_before
+        .iter()
+        .any(|s| s.address == h.signers[1] && s.weight == 2));
+
+    // 4. Successful post-timelock execution: advance timestamp to eta and execute successfully
+    advance(&h, 1);
+    h.client.execute_threshold_change(&h.signers[0], &prop_id);
+
+    let pending_after = h.client.get_pending_change(&prop_id);
+    assert!(pending_after.executed);
+
+    let signers_after = h.client.get_signers();
+    assert!(signers_after
+        .iter()
+        .any(|s| s.address == h.signers[1] && s.weight == 5));
+}
+
+#[test]
+fn quorum_modification_proposal_enforces_timelock_delay() {
+    let h = setup(&[2, 2], 3);
+    h.env.ledger().set_timestamp(10_000);
+
+    // Propose a proposal with quorum/weight action and unlock_at = 0
+    let prop_id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("weight"),
+        &payload(&h.env),
+        &0,
+    );
+
+    let prop = h.client.get_proposal(&prop_id);
+    assert_eq!(prop.unlock_at, 10_000 + MIN_TIMELOCK_DELAY);
+
+    h.client.approve(&h.signers[1], &prop_id);
+
+    // Premature execution returns TimelockNotExpired
+    let res = h.client.try_execute(&h.signers[0], &prop_id);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+
+    // Post-timelock execution succeeds
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute(&h.signers[0], &prop_id);
+    assert!(h.client.get_proposal(&prop_id).executed);
 }

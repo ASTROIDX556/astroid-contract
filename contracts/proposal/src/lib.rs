@@ -65,6 +65,48 @@
 //!
 //! All three bars are re-derived from the stored record on every call rather
 //! than cached, so the verdict is a pure function of on-chain state and every
+//! node agrees on it. The maths lives in [`VoteBars`] — the quorum
+//! calculation and majority check helpers ([`VoteBars::quorum_required`],
+//! [`VoteBars::majority_required`], [`VoteBars::has_majority`]) composed by
+//! [`VoteBars::for_proposal`] and applied by [`VoteBars::ensure_met`] — and
+//! the very same numbers are readable on-chain through the `vote_bars` view,
+//! so a client can report *which* bar a tally missed instead of only that
+//! execution was refused.
+//!
+//! ## Quorum and majority
+//!
+//! A bare approval threshold can be gamed — `threshold = 1` on a ten-person
+//! allow-list would execute on a single signature — so `execute` re-validates
+//! the tally against two further bars before anything fires:
+//!
+//! * **Quorum (participation).** At least [`PROPOSAL_QUORUM_PERCENT`]% of the
+//!   approver allow-list must have voted. The requirement is computed with
+//!   integer scaling only — `ceil(approvers * percent / 100)`, never
+//!   floating point — and rounded *up* so a partial vote can never round the
+//!   bar away.
+//! * **Majority (the vote itself).** The approvals must form a *strict*
+//!   majority of the allow-list: `approvals > approvers / 2`. An exact tie is
+//!   not a majority.
+//!
+//! The proposal's own configured `threshold` is re-checked as well — behind
+//! the `Approved` state gate, which already guarantees it — as defence in
+//! depth against a tally that somehow slipped below the bar it declared.
+//!
+//! Every shortfall reports the protocol-wide [`Error::ThresholdNotMet`]: a
+//! missed quorum *is* a missed threshold (the participation bar was not
+//! crossed), and the shared error enum already sits at the Stellar spec's
+//! 50-case cap for contract errors, so there is no room for a dedicated
+//! quorum code.
+//!
+//! ```text
+//! approvals < threshold              ──▶ ProposalNotApproved (state gate)
+//! approvals < quorum(allow-list)     ──▶ Error::ThresholdNotMet
+//! approvals <= allow-list / 2 (tie)  ──▶ Error::ThresholdNotMet
+//! otherwise                          ──▶ timelock / dependency gates, then run
+//! ```
+//!
+//! All three bars are re-derived from the stored record on every call rather
+//! than cached, so the verdict is a pure function of on-chain state and every
 //! node agrees on it.
 //!
 //! ## Dependency chaining
@@ -107,9 +149,10 @@
 //! ```
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
-//! `fail`, `close`, `cleanup_expired`, plus the `get`, `state`, `is_expired`,
-//! `dependencies`, `dependencies_met` and `can_execute` views. `initialize`
-//! also stores the mandatory per-proposal timelock.
+//! `fail`, `close`, `cleanup_expired`, `prune_expired`, `prune_expired_batch`,
+//! `prune_expired_range`, plus the `get`, `state`, `is_expired`,
+//! `dependencies`, `dependencies_met`, `vote_bars` and `can_execute` views.
+//! `initialize` also stores the mandatory per-proposal timelock.
 
 use astroid_interfaces::{ProposalInterface, UpgradeableInterface};
 // The lifecycle vocabulary lives in the interfaces crate so the multisig, the
@@ -119,7 +162,8 @@ use astroid_interfaces::{ProposalInterface, UpgradeableInterface};
 pub use astroid_interfaces::proposal::ProposalState;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, PROPOSAL_QUORUM_PERCENT,
+    MAX_PRUNE_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    PROPOSAL_QUORUM_PERCENT,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
@@ -194,6 +238,86 @@ impl Proposal {
         self.is_active(env)
             && self.state == ProposalState::Approved
             && require_timelock_elapsed(env, self).is_ok()
+    }
+}
+
+/// The three vote bars a tally must clear before [`ProposalContract::execute`]
+/// may fire, derived from the proposal's allow-list, its configured
+/// `threshold` and the protocol quorum percentage — see the module-level
+/// *Quorum and majority* notes.
+///
+/// Every bar is recomputed from the stored record on each check rather than
+/// cached, so the verdict is a pure function of on-chain state and every node
+/// agrees on it. The struct is a [`contracttype`] so the same bars can be
+/// read back through the [`ProposalContract::vote_bars`] view, letting a
+/// client report *which* bar a tally missed instead of only that execution
+/// was refused.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoteBars {
+    /// The approval threshold the proposal declared at creation.
+    pub threshold: u32,
+    /// Participation quorum: [`PROPOSAL_QUORUM_PERCENT`]% of the approver
+    /// allow-list, rounded **up** so a partial vote can never round the bar
+    /// away.
+    pub quorum: u32,
+    /// Strict majority: one past half of the approver allow-list. An exact
+    /// tie never reaches it.
+    pub majority: u32,
+}
+
+impl VoteBars {
+    /// All three bars for `proposal`, re-derived from its allow-list size.
+    pub fn for_proposal(proposal: &Proposal) -> Self {
+        let eligible = proposal.approvers.len();
+        Self {
+            threshold: proposal.threshold,
+            quorum: Self::quorum_required(eligible, PROPOSAL_QUORUM_PERCENT),
+            majority: Self::majority_required(eligible),
+        }
+    }
+
+    /// Quorum calculation helper: the number of approvals that makes a vote
+    /// among `eligible` voters quorate — `percent`% of the approver
+    /// allow-list, rounded **up**.
+    ///
+    /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
+    /// [`u64::div_ceil`] — never floating point, so every node derives the
+    /// identical integer. `percent` is clamped to 100, so a misconfigured
+    /// percentage can never demand more than the whole allow-list.
+    pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
+        let percent = percent.min(100);
+        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
+    }
+
+    /// Majority check helper: the smallest number of approvals that exceeds
+    /// half the allow-list — a strict majority. An exact tie (exactly half)
+    /// never reaches it.
+    pub fn majority_required(eligible: u32) -> u32 {
+        eligible / 2 + 1
+    }
+
+    /// Whether `approvals` forms a strict majority of the `eligible` voters.
+    pub fn has_majority(approvals: u32, eligible: u32) -> bool {
+        approvals >= Self::majority_required(eligible)
+    }
+
+    /// Whether a tally of `approvals` clears *every* bar — the configured
+    /// threshold, the participation quorum and the strict majority.
+    pub fn met_by(&self, approvals: u32) -> bool {
+        approvals >= self.threshold && approvals >= self.quorum && approvals >= self.majority
+    }
+
+    /// Refuse a tally that misses any bar with the protocol-wide
+    /// [`Error::ThresholdNotMet`]; a missed quorum *is* a missed threshold,
+    /// and the shared error enum is at the Stellar spec's 50-case cap, so one
+    /// code covers all three bars.
+    pub fn ensure_met(&self, approvals: u32) -> Result<(), Error> {
+        if self.met_by(approvals) {
+            Ok(())
+        } else {
+            Err(Error::ThresholdNotMet)
+        }
     }
 }
 
@@ -484,6 +608,9 @@ impl ProposalContract {
 
     /// Purge an expired proposal from storage to reclaim space.
     ///
+    /// Permissionless: anyone may trigger pruning of an expired proposal to
+    /// incentivize ledger hygiene and recover storage footprint.
+    ///
     /// Two gates, both re-read from the ledger, and both reported as
     /// [`Error::InvalidProposalState`]: the deadline must have passed (a
     /// proposal with no deadline at all can never be purged), and the proposal
@@ -492,7 +619,7 @@ impl ProposalContract {
     /// holds the proposer's funds, so a stale pending or approved proposal is
     /// first settled through the same expiry transition. The proposal's
     /// approval flags are purged along with it.
-    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+    pub fn prune_expired(env: Env, id: u64) -> Result<(), Error> {
         let mut proposal = Self::load(&env, id)?;
         Self::expire_if_due(&env, id, &mut proposal)?;
         if !proposal.is_expired(&env) {
@@ -501,15 +628,82 @@ impl ProposalContract {
         if !proposal.state.deposit_settled() {
             return Err(Error::InvalidProposalState);
         }
-        env.storage().persistent().remove(&DataKey::Proposal(id));
-        for approver in proposal.approvers.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Approval(id, approver));
-        }
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
+        Self::purge_proposal(&env, id, &proposal);
         Ok(())
+    }
+
+    /// Purge an expired proposal from storage to reclaim space.
+    ///
+    /// Preserved for backward-compatibility with existing callers; delegates
+    /// directly to [`Self::prune_expired`].
+    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+        Self::prune_expired(env, id)
+    }
+
+    /// Prune a batch of proposals by their IDs in a single transaction.
+    ///
+    /// Permissionless: anyone may trigger pruning of multiple expired proposals.
+    /// For each proposal in `proposal_ids`, if it exists and is expired with deposit
+    /// settled, its storage record and approval flags are purged.
+    /// Stale pending or approved proposals are first transitioned to `Expired` and
+    /// deposits refunded via [`Self::expire_if_due`].
+    ///
+    /// Non-existent proposals or proposals not yet eligible for pruning are skipped,
+    /// ensuring that a single live or already-pruned proposal does not abort the batch.
+    /// Returns the number of proposals successfully pruned.
+    pub fn prune_expired_batch(env: Env, proposal_ids: Vec<u64>) -> Result<u32, Error> {
+        if proposal_ids.len() > MAX_PRUNE_BATCH {
+            return Err(Error::InvalidInput);
+        }
+        let mut pruned: u32 = 0;
+        for id in proposal_ids.iter() {
+            let Ok(mut proposal) = Self::load(&env, id) else {
+                continue;
+            };
+            let _ = Self::expire_if_due(&env, id, &mut proposal);
+            if proposal.is_expired(&env) && proposal.state.deposit_settled() {
+                Self::purge_proposal(&env, id, &proposal);
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            env.events().publish(
+                (symbol_short!("proposal"), symbol_short!("pruned_b")),
+                pruned,
+            );
+        }
+        Ok(pruned)
+    }
+
+    /// Prune up to `limit` expired proposals across an ID range starting from `start_id`.
+    ///
+    /// Automatic / crank cleanup helper: scans proposal IDs `[start_id, start_id + limit)`
+    /// and purges any proposal that has expired and settled its deposit.
+    /// Returns the number of proposals successfully pruned.
+    pub fn prune_expired_range(env: Env, start_id: u64, limit: u32) -> Result<u32, Error> {
+        if limit == 0 || limit > MAX_PRUNE_BATCH {
+            return Err(Error::InvalidInput);
+        }
+        let mut pruned: u32 = 0;
+        let end_id = checked_add(start_id as i128, limit as i128)?;
+        let end_id = u64::try_from(end_id).map_err(|_| Error::Overflow)?;
+        for id in start_id..end_id {
+            let Ok(mut proposal) = Self::load(&env, id) else {
+                continue;
+            };
+            let _ = Self::expire_if_due(&env, id, &mut proposal);
+            if proposal.is_expired(&env) && proposal.state.deposit_settled() {
+                Self::purge_proposal(&env, id, &proposal);
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            env.events().publish(
+                (symbol_short!("proposal"), symbol_short!("pruned_r")),
+                pruned,
+            );
+        }
+        Ok(pruned)
     }
 
     /// Execute an approved proposal. Only the proposer may execute (the actual
@@ -527,10 +721,13 @@ impl ProposalContract {
     /// checked after the timelock so that a proposal blocked only by its chain
     /// reports the dependency rather than a less specific error.
     ///
-    /// The expiry gate runs first: an approved proposal whose deadline passed
-    /// before it was executed may not fire, and reports
-    /// [`Error::ProposalExpired`] rather than appearing merely un-executable.
-    /// Then the mandatory timelock applies — execution is refused with
+    /// The expiry gate runs first: a proposal whose deadline passed before it
+    /// was executed never fires. The call settles it instead — it records the
+    /// terminal `Expired` state, refunds the deposit and emits the `expired`
+    /// event — and returns `Ok(())` without executing, because returning an
+    /// error would roll that settlement back. Callers tell the two outcomes
+    /// apart through `state`, `is_executed` or the `expired` event; repeat
+    /// calls are no-ops. Then the mandatory timelock applies — execution is refused with
     /// [`Error::TimelockNotExpired`] until `timelock` seconds have passed
     /// since approval — and only then is the dependency chain resolved. The
     /// ordering means a premature attempt is reported as a scheduling error
@@ -636,6 +833,22 @@ impl ProposalContract {
         Ok(proposal)
     }
 
+    /// The vote bars this proposal's tally must clear before `execute` will
+    /// run: its configured `threshold`, the participation quorum
+    /// ([`PROPOSAL_QUORUM_PERCENT`]% of the approver allow-list, integer
+    /// scaled and rounded up) and a strict majority of that allow-list.
+    ///
+    /// The bars themselves never depend on the clock, but the record is read
+    /// through the same settle-first path as every other view, so the answer
+    /// is derived from exactly what `execute` would see: a client that only
+    /// gets [`Error::ThresholdNotMet`] back can use this view to tell the
+    /// caller *which* bar its tally missed.
+    pub fn vote_bars(env: Env, id: u64) -> Result<VoteBars, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(VoteBars::for_proposal(&proposal))
+    }
+
     // --- internal helpers ---
 
     /// Materialize expiry when an interaction observes a stale or already
@@ -681,34 +894,11 @@ impl ProposalContract {
         Self::bump(env, id);
     }
 
-    /// The number of approvals that makes a vote among `eligible` voters
-    /// quorate: `percent`% of the approver allow-list, rounded **up** so a
-    /// partial vote can never round the requirement away.
-    ///
-    /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
-    /// [`u64::div_ceil`] — never floating point, so every node derives the
-    /// identical integer. `percent` is clamped to 100, so a misconfigured
-    /// percentage can never demand more than the whole allow-list.
-    fn quorum_required(eligible: u32, percent: u32) -> u32 {
-        let percent = percent.min(100);
-        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
-    }
-
-    /// The smallest number of approvals that exceeds half the allow-list — a
-    /// strict majority. An exact tie (exactly half) never reaches it.
-    fn majority_required(eligible: u32) -> u32 {
-        eligible / 2 + 1
-    }
-
-    /// Whether `approvals` forms a strict majority of the `eligible` voters.
-    fn has_majority(approvals: u32, eligible: u32) -> bool {
-        approvals >= Self::majority_required(eligible)
-    }
-
     /// Refuse to execute a proposal whose tally does not clear every vote bar.
     ///
-    /// Re-derived from the stored record on each call — nothing is cached —
-    /// and checked in order of increasing strictness:
+    /// The bars are derived afresh from the stored record on each call —
+    /// nothing is cached — by [`VoteBars::for_proposal`], and checked in
+    /// order of increasing strictness:
     ///
     /// 1. the proposal's configured `threshold` (defence in depth: the
     ///    `Approved` state gate in `execute` already guarantees it);
@@ -717,22 +907,13 @@ impl ProposalContract {
     /// 3. a strict majority of the allow-list (an exact tie is not a
     ///    majority).
     ///
-    /// Every shortfall reports [`Error::ThresholdNotMet`] — a missed quorum
-    /// *is* a missed threshold, and the shared error enum is at the Stellar
-    /// spec's 50-case cap, so one protocol-wide code covers all three bars.
+    /// Every shortfall reports [`Error::ThresholdNotMet`] (see
+    /// [`VoteBars::ensure_met`]).
     ///
     /// Nothing is mutated: a refusal leaves the proposal `Approved` and free
     /// to be re-attempted, failed or cancelled.
     fn ensure_vote_valid(proposal: &Proposal) -> Result<(), Error> {
-        let eligible = proposal.approvers.len();
-        let quorum = Self::quorum_required(eligible, PROPOSAL_QUORUM_PERCENT);
-        if proposal.approvals < proposal.threshold
-            || proposal.approvals < quorum
-            || !Self::has_majority(proposal.approvals, eligible)
-        {
-            return Err(Error::ThresholdNotMet);
-        }
-        Ok(())
+        VoteBars::for_proposal(proposal).ensure_met(proposal.approvals)
     }
 
     /// Require that every prerequisite proposal has executed.
@@ -772,6 +953,19 @@ impl ProposalContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    fn purge_proposal(env: &Env, id: u64, proposal: &Proposal) {
+        env.storage().persistent().remove(&DataKey::Proposal(id));
+        for approver in proposal.approvers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Approval(id, approver));
+        }
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("pruned")), id);
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
     }
 }
 
