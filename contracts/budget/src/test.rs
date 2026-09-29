@@ -3,8 +3,6 @@ extern crate std;
 
 use crate::{AssetSpend, Budget, BudgetContract, BudgetContractClient, Period};
 use astroid_shared::constants::MAX_BATCH_TOKENS;
-use astroid_shared::errors::Error;
-use crate::{Budget, BudgetContract, BudgetContractClient, Period};
 use astroid_shared::errors::{BudgetError, Error};
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Events;
@@ -2345,6 +2343,8 @@ fn batch_spend_still_settles_windows_and_rejects_frozen_or_expired() {
         &vec![&h.env, asset_spend(&h.env, &usdc, 1)],
     );
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
 // Issue #236: deterministic validation for amount allocations and period
 // eligibility.
 //
