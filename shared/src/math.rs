@@ -943,3 +943,73 @@ mod tests {
         assert_eq!(checked_div_u128(20, 0), Err(Error::InvalidInput));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Budget rollover calculations
+// ---------------------------------------------------------------------------
+
+/// Calculate the rollover allowance for a budget period using basis points
+/// and an optional upper cap.
+///
+/// Computes `floor(unspent * rollover_bps / 10_000)` safely without `i128` overflow.
+/// If `max_rollover_cap > 0`, clamps the result to `min(credit, max_rollover_cap)`.
+/// If `max_rollover_cap == 0`, the rollover is uncapped.
+///
+/// # Errors
+/// - [`Error::InvalidAmount`] if `unspent < 0`, `rollover_bps < 0`, or `max_rollover_cap < 0`.
+/// - [`Error::InvalidInput`] if `rollover_bps > BPS_DENOMINATOR` (10_000).
+/// - [`Error::Overflow`] if intermediate arithmetic overflows.
+pub fn calculate_budget_rollover(
+    unspent: i128,
+    rollover_bps: i128,
+    max_rollover_cap: i128,
+) -> Result<i128, Error> {
+    if unspent < 0 || rollover_bps < 0 || max_rollover_cap < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if rollover_bps > crate::constants::BPS_DENOMINATOR {
+        return Err(Error::InvalidInput);
+    }
+    if unspent == 0 || rollover_bps == 0 {
+        return Ok(0);
+    }
+
+    // Split unspent into quotient and remainder with BPS_DENOMINATOR (10_000)
+    // to guarantee no i128 intermediate overflow even if unspent == i128::MAX.
+    let q = unspent.safe_div(crate::constants::BPS_DENOMINATOR)?;
+    let r = checked_rem(unspent, crate::constants::BPS_DENOMINATOR)?;
+    let whole = q.safe_mul(rollover_bps)?;
+    let part = (r.safe_mul(rollover_bps)?).safe_div(crate::constants::BPS_DENOMINATOR)?;
+    let credit = whole.safe_add(part)?;
+
+    if max_rollover_cap > 0 && credit > max_rollover_cap {
+        Ok(max_rollover_cap)
+    } else {
+        Ok(credit)
+    }
+}
+
+/// Alias for [`calculate_budget_rollover`].
+pub fn compute_budget_rollover(
+    unspent: i128,
+    rollover_bps: i128,
+    max_rollover_cap: i128,
+) -> Result<i128, Error> {
+    calculate_budget_rollover(unspent, rollover_bps, max_rollover_cap)
+}
+
+/// Compute the new period allowance by adding the rolled-over credit to the fresh period's base limit.
+///
+/// Verifies `base_limit >= 0` and uses checked arithmetic to prevent overflow.
+pub fn calculate_rollover_allowance(
+    base_limit: i128,
+    unspent: i128,
+    rollover_bps: i128,
+    max_rollover_cap: i128,
+) -> Result<i128, Error> {
+    if base_limit < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    let credit = calculate_budget_rollover(unspent, rollover_bps, max_rollover_cap)?;
+    base_limit.safe_add(credit)
+}
