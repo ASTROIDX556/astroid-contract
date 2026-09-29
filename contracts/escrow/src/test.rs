@@ -3201,3 +3201,134 @@ fn escrows_without_a_condition_carry_no_release_condition() {
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
     assert_eq!(balances(&h), (0, 5_000, 0));
 }
+
+// --- EscrowLocked alias on early-release refusals (Issue #315) ---
+//
+// Issue #315 demands `ContractError::EscrowLocked` for premature release
+// attempts. The shared error table sits at Soroban's 50-case spec limit, so
+// the alias is published as a named constant equal to `TimelockNotExpired`:
+// same code, same wire name, no ABI change. These tests pin the name, the
+// identity and the enforcement on both value-leaving release paths.
+
+use astroid_shared::errors::Error as SharedError;
+
+#[test]
+fn escrow_locked_alias_is_bit_identical_to_timelock_not_expired() {
+    // The alias is the exact same value: same discriminant, same wire name,
+    // and it compares equal to the canonical variant.
+    assert_eq!(SharedError::EscrowLocked as u32, 91);
+    assert_eq!(
+        SharedError::EscrowLocked as u32,
+        SharedError::TimelockNotExpired as u32
+    );
+    assert_eq!(SharedError::EscrowLocked, SharedError::TimelockNotExpired);
+    assert_eq!(
+        SharedError::EscrowLocked.wire_name(),
+        "TIMELOCK_NOT_EXPIRED"
+    );
+    assert_eq!(
+        SharedError::EscrowLocked.wire_name(),
+        SharedError::TimelockNotExpired.wire_name()
+    );
+}
+
+#[test]
+fn escrow_locked_refuses_release_before_unlock_and_passes_after() {
+    // Issue #315's exact scenario: a funded escrow with an unlock timestamp.
+    // Release attempts while `env.ledger().timestamp() < unlock_time` report
+    // `EscrowLocked` and move nothing; the first instant at/after the unlock
+    // timestamp succeeds.
+    let h = setup(10_000, 0);
+    let unlock_time = START + 1_000;
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 10_000),
+        &unlock_time,
+        &String::from_str(&h.env, "issue 315"),
+    );
+
+    // Strictly premature: every attempt refused with EscrowLocked.
+    for ts in [
+        START,
+        START + 1,
+        START + 500,
+        unlock_time - 2,
+        unlock_time - 1,
+    ] {
+        h.env.ledger().with_mut(|l| l.timestamp = ts);
+        assert_eq!(
+            h.client.try_release(&h.arbiter, &id, &10_000),
+            Err(Ok(Error::EscrowLocked)),
+            "release at {ts} must be refused with EscrowLocked"
+        );
+        // No funds moved, no state changed.
+        assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+        assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+        assert_eq!(balance(&h, &h.asset_a, &h.client.address), 10_000);
+    }
+
+    // At maturity the arbiter's `release` window has closed (a timelock
+    // escrow's deadline equals its unlock time), so the funds are claimed by
+    // the beneficiary instead — the successful release path is exercised by
+    // `scheduled_release_succeeds_once_the_release_time_has_passed` above.
+    h.env.ledger().with_mut(|l| l.timestamp = unlock_time);
+    assert_eq!(h.client.claim(&h.recipient, &id), 10_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 10_000);
+}
+
+#[test]
+fn escrow_locked_gates_the_signature_override_too() {
+    // The override path must not route around the time lock either: a
+    // threshold-clearing signature set is still refused with EscrowLocked
+    // before the cliff (signatures authorize *who*, not *when*).
+    let h = setup(5_000, 0);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
+    let deadline = START + 2_000;
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &deadline,
+        &0,
+        &String::from_str(&h.env, "override locked"),
+        &signers,
+        &2,
+    );
+
+    // Attach a cliff schedule that matures after several test instants.
+    let mut escrow = h.client.get(&id);
+    escrow.schedule = ReleaseSchedule {
+        release_type: ReleaseType::Cliff,
+        start_time: START,
+        cliff_time: START + 800,
+        end_time: START + 800,
+    };
+    h.env.as_contract(&h.client.address, || {
+        crate::store_escrow(&h.env, id, &escrow);
+    });
+
+    let nonce = 1u64;
+    let sigs = vec![
+        &h.env,
+        sign_override(&h, &kp1, id, nonce),
+        sign_override(&h, &kp2, id, nonce),
+    ];
+    for ts in [START + 100, START + 799] {
+        h.env.ledger().with_mut(|l| l.timestamp = ts);
+        assert_eq!(
+            h.client.try_override_release(&id, &nonce, &sigs),
+            Err(Ok(Error::EscrowLocked)),
+            "override release at {ts} must be refused with EscrowLocked"
+        );
+    }
+    // The nonce was never consumed by the refused attempts.
+    at(&h, START + 800);
+    h.client.override_release(&id, &nonce, &sigs);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}

@@ -496,6 +496,13 @@ impl ProposalContract {
         env.storage().persistent().set(&akey, &true);
         proposal.approvals = checked_add(proposal.approvals as i128, 1)? as u32;
         if proposal.approvals >= proposal.threshold {
+            // Issue #329 — every transition passes the canonical state
+            // machine; an entrypoint that fell out of sync with it aborts
+            // instead of corrupting the record.
+            assert!(
+                proposal.state.may_transition(ProposalState::Approved),
+                "approve: illegal transition"
+            );
             proposal.state = ProposalState::Approved;
             // Record the moment of approval: the timelock only starts counting
             // once, when the threshold is reached, and is re-applied verbatim
@@ -528,6 +535,11 @@ impl ProposalContract {
         if !proposal.approvers.contains(&caller) {
             return Err(Error::NotAnApprover);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Rejected),
+            "reject: illegal transition"
+        );
         proposal.state = ProposalState::Rejected;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -560,10 +572,12 @@ impl ProposalContract {
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
-        if matches!(
-            proposal.state,
-            ProposalState::Executed | ProposalState::Closed | ProposalState::Cancelled
-        ) {
+        // Issue #329 — cancelling is validated against the canonical state
+        // machine, which admits the edge only from the two live states. A
+        // `Rejected` proposal has already had its deposit refunded by
+        // `reject`; admitting `(Rejected, Cancelled)` here would refund it a
+        // second time, and a `Failed` record must stay `Failed`.
+        if !proposal.state.may_transition(ProposalState::Cancelled) {
             return Err(Error::InvalidProposalState);
         }
         if proposal.grace_period != 0 {
@@ -757,6 +771,11 @@ impl ProposalContract {
         // [`Proposal::can_execute`], so the view and the entrypoint agree.
         require_timelock_elapsed(&env, &proposal)?;
         Self::ensure_dependencies_met(&env, id, &proposal)?;
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Executed),
+            "execute: illegal transition"
+        );
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -792,6 +811,11 @@ impl ProposalContract {
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Failed),
+            "fail: illegal transition"
+        );
         proposal.state = ProposalState::Failed;
         Self::store(&env, id, &proposal);
         env.events()
@@ -818,6 +842,11 @@ impl ProposalContract {
         if proposal.state != ProposalState::Executed {
             return Err(Error::InvalidProposalState);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Closed),
+            "close: illegal transition"
+        );
         proposal.state = ProposalState::Closed;
         Self::store(&env, id, &proposal);
         env.events()
@@ -866,6 +895,12 @@ impl ProposalContract {
             return Ok(false);
         }
 
+        // Issue #329 — the expiry transition passes the canonical state
+        // machine too (it is reachable only from the two live states).
+        assert!(
+            proposal.state.may_transition(ProposalState::Expired),
+            "expire: illegal transition"
+        );
         proposal.state = ProposalState::Expired;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(env, &dep.asset).transfer(
