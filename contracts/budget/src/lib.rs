@@ -888,7 +888,13 @@ impl BudgetContract {
             // — consume rejects it — so it is handled defensively below.
             checked_sub(capacity, budget.spent)?
         } else if budget.rollover_enabled {
-            let mut credit = leftover;
+            // A negative closing balance (`spent` above `capacity`, reachable
+            // when the owner tightens the cap mid-period through
+            // `set_recurrence`) carries as zero: a shortfall is never an
+            // allowance for the next window, and carrying it would pin the
+            // budget to a permanently reduced ceiling. (`spent > capacity`
+            // with `allow_deficit` is handled by the deficit arm above.)
+            let mut credit = if leftover > 0 { leftover } else { 0 };
             if periods > 1 {
                 let idle = checked_sub(periods, 1)?;
                 credit = Self::accrue_idle_periods(credit, budget, idle)?;
@@ -1011,32 +1017,6 @@ impl BudgetContract {
             outcome.carry_over
         };
         if went_into_deficit {
-        let leftover = checked_sub(capacity, budget.spent)?;
-        if budget.rollover_enabled {
-            // A negative closing balance (`spent` above `capacity`, reachable
-            // when the owner tightens the cap mid-period through
-            // `set_recurrence`) carries as zero: a shortfall is never an
-            // allowance for the next window, and carrying it would pin the
-            // budget to a permanently reduced ceiling.
-            let mut credit = if leftover > 0 { leftover } else { 0 };
-            if periods > 1 {
-                let idle = checked_sub(periods, 1)?;
-                credit = Self::accrue_idle_periods(credit, budget, idle)?;
-            }
-            // Clamp to the effective cap = min(absolute `rollover_cap`,
-            // percentage-of-limit `rollover_max_bps`); see
-            // [`Self::effective_rollover_cap`].
-            budget.rollover_credit = Self::apply_cap(credit, Self::effective_rollover_cap(budget)?);
-        } else {
-            budget.rollover_credit = 0;
-        }
-        let spent = budget.spent;
-        // Deficit: spent exceeded capacity (base limit + rollover credit).
-        // Track it so the next period's effective limit is reduced, and drop
-        // any surplus that would otherwise mask it. `spent > capacity` with
-        // `!allow_deficit` cannot happen — consume rejects it — but is handled
-        // defensively by simply resetting the window.
-        if spent > capacity && budget.allow_deficit {
             let deficit = checked_sub(spent, capacity)?;
             budget.deficit_amount = checked_add(budget.deficit_amount, deficit)?;
         }
