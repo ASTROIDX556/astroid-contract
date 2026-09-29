@@ -2,6 +2,7 @@
 extern crate std;
 
 use crate::{ProposalContract, ProposalContractClient, ProposalState, VoteBars};
+use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
@@ -10,26 +11,44 @@ use soroban_sdk::{vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
 struct Harness {
     env: Env,
     client: ProposalContractClient<'static>,
+    multisig: Address,
     proposer: Address,
     approvers: std::vec::Vec<Address>,
 }
 
 fn setup(num_approvers: u32) -> Harness {
+    setup_with_weights(&std::vec![1; num_approvers as usize], 1, 0)
+}
+
+fn setup_with_weights(weights: &[u32], multisig_threshold: u32, timelock: u64) -> Harness {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1_000);
-    let contract_id = env.register_contract(None, ProposalContract);
-    let client = ProposalContractClient::new(&env, &contract_id);
-    client.initialize(&0);
 
-    let proposer = Address::generate(&env);
     let mut approvers = std::vec::Vec::new();
-    for _ in 0..num_approvers {
+    for _ in weights {
         approvers.push(Address::generate(&env));
     }
+    let multisig_id = env.register_contract(None, MultiSigContract);
+    let multisig = MultiSigContractClient::new(&env, &multisig_id);
+    let mut signers = Vec::new(&env);
+    for (index, address) in approvers.iter().enumerate() {
+        signers.push_back(SignerWeight {
+            address: address.clone(),
+            weight: weights[index],
+        });
+    }
+    multisig.initialize(&signers, &multisig_threshold);
+
+    let contract_id = env.register_contract(None, ProposalContract);
+    let client = ProposalContractClient::new(&env, &contract_id);
+    client.initialize(&timelock, &multisig_id);
+
+    let proposer = Address::generate(&env);
     Harness {
         env,
         client,
+        multisig: multisig_id,
         proposer,
         approvers,
     }
@@ -38,24 +57,7 @@ fn setup(num_approvers: u32) -> Harness {
 /// Like [`setup`], but with a mandatory non-zero timelock configured at
 /// initialization.
 fn setup_timelocked(num_approvers: u32, timelock: u64) -> Harness {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().set_timestamp(1_000);
-    let contract_id = env.register_contract(None, ProposalContract);
-    let client = ProposalContractClient::new(&env, &contract_id);
-    client.initialize(&timelock);
-
-    let proposer = Address::generate(&env);
-    let mut approvers = std::vec::Vec::new();
-    for _ in 0..num_approvers {
-        approvers.push(Address::generate(&env));
-    }
-    Harness {
-        env,
-        client,
-        proposer,
-        approvers,
-    }
+    setup_with_weights(&std::vec![1; num_approvers as usize], 1, timelock)
 }
 
 fn approver_vec(h: &Harness) -> Vec<Address> {
@@ -193,6 +195,121 @@ fn double_approval_rejected() {
     h.client.approve(&h.approvers[0], &id);
     let res = h.client.try_approve(&h.approvers[0], &id);
     assert_eq!(res, Err(Ok(Error::AlreadySigned)));
+}
+
+#[test]
+fn weighted_multisig_threshold_accepts_exact_and_excess_weight() {
+    let exact = setup_with_weights(&[3, 2, 1], 5, 0);
+    let exact_id = create(&exact, 2, 5_000);
+    exact.client.approve(&exact.approvers[0], &exact_id);
+    assert_eq!(exact.client.state(&exact_id), ProposalState::Pending);
+    exact.client.approve(&exact.approvers[1], &exact_id);
+    assert_eq!(exact.client.get(&exact_id).approval_weight, 5);
+    assert_eq!(exact.client.state(&exact_id), ProposalState::Approved);
+    assert!(emitted(&exact.env, "weightok"));
+
+    let excess = setup_with_weights(&[3, 2, 1], 4, 0);
+    let excess_id = create(&excess, 2, 5_000);
+    excess.client.approve(&excess.approvers[0], &excess_id);
+    excess.client.approve(&excess.approvers[1], &excess_id);
+    assert_eq!(excess.client.get(&excess_id).approval_weight, 5);
+    assert_eq!(excess.client.state(&excess_id), ProposalState::Approved);
+}
+
+#[test]
+fn proposal_waits_for_weight_threshold_and_checks_it_at_execution() {
+    let h = setup_with_weights(&[1, 2, 3], 6, 0);
+    let id = create(&h, 2, 5_000);
+
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approval_weight, 3);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.get(&id).approval_weight, 6);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn weighted_threshold_crossing_starts_the_timelock() {
+    let h = setup_with_weights(&[1, 2, 3], 6, 100);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+
+    h.env.ledger().set_timestamp(2_000);
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.get(&id).approved_at, 2_000);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    h.env.ledger().set_timestamp(2_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execution_recalculates_votes_after_signer_set_changes() {
+    let h = setup_with_weights(&[3, 2, 1], 4, 0);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.get(&id).approval_weight, 5);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    MultiSigContractClient::new(&h.env, &h.multisig)
+        .remove_signer(&h.approvers[0], &h.approvers[1]);
+
+    assert_eq!(h.client.get(&id).approvals, 1);
+    assert_eq!(h.client.get(&id).approval_weight, 3);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+}
+
+#[test]
+fn proposal_rejects_non_multisig_approvers_and_duplicate_allowlist_entries() {
+    let h = setup(3);
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_create(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &vec![&h.env, h.approvers[0].clone(), stranger],
+        &dep_vec(&h, &[]),
+        &1,
+        &vec![&h.env],
+        &0,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+
+    let res = h.client.try_create(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &vec![&h.env, h.approvers[0].clone(), h.approvers[0].clone()],
+        &dep_vec(&h, &[]),
+        &1,
+        &vec![&h.env],
+        &0,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
 }
 
 #[test]
