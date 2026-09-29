@@ -21,7 +21,7 @@
 use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState, ReleaseConditionConfig};
 use astroid_policy::{PolicyContract, PolicyContractClient};
-use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
+use astroid_proposal::{ProposalContractClient, ProposalState};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
