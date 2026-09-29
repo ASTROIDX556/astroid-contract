@@ -484,7 +484,17 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, sender, recipient, assets),
+            (id, sender.clone(), recipient.clone(), assets.clone()),
+        );
+        events::publish(
+            &env,
+            ContractEvent::EscrowCreated {
+                escrow_id: id,
+                sender,
+                recipient,
+                assets,
+                deadline,
+            },
         );
         Ok(id)
     }
@@ -657,7 +667,23 @@ impl EscrowContract {
         );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("init_tl")),
-            (id, sender, recipient, assets, unlock_time),
+            (
+                id,
+                sender.clone(),
+                recipient.clone(),
+                assets.clone(),
+                unlock_time,
+            ),
+        );
+        events::publish(
+            &env,
+            ContractEvent::EscrowCreated {
+                escrow_id: id,
+                sender,
+                recipient,
+                assets,
+                deadline: unlock_time,
+            },
         );
         Ok(id)
     }
@@ -736,13 +762,23 @@ impl EscrowContract {
             (symbol_short!("escrow"), symbol_short!("sched")),
             (
                 id,
-                sender,
-                recipient,
-                assets,
+                sender.clone(),
+                recipient.clone(),
+                assets.clone(),
                 funded_amount,
                 schedule.start_time,
                 schedule.end_time,
             ),
+        );
+        events::publish(
+            &env,
+            ContractEvent::EscrowCreated {
+                escrow_id: id,
+                sender,
+                recipient,
+                assets,
+                deadline: effective_deadline,
+            },
         );
         Ok(id)
     }
@@ -801,7 +837,23 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("init_tl")),
-            (id, sender, recipient, assets, unlock_time),
+            (
+                id,
+                sender.clone(),
+                recipient.clone(),
+                assets.clone(),
+                unlock_time,
+            ),
+        );
+        events::publish(
+            &env,
+            ContractEvent::EscrowCreated {
+                escrow_id: id,
+                sender,
+                recipient,
+                assets,
+                deadline: unlock_time,
+            },
         );
         Ok(id)
     }
@@ -837,7 +889,22 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("funded")),
-            (id, escrow.sender, escrow.recipient, escrow.assets),
+            (
+                id,
+                escrow.sender.clone(),
+                escrow.recipient.clone(),
+                escrow.assets.clone(),
+            ),
+        );
+        events::publish(
+            &env,
+            ContractEvent::EscrowCreated {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                recipient: escrow.recipient.clone(),
+                assets: escrow.assets.clone(),
+                deadline: escrow.deadline,
+            },
         );
         Ok(())
     }
@@ -1065,10 +1132,17 @@ impl EscrowContract {
             }
         }
         if now >= Self::grace_end(&escrow)? {
-            // Past the grace window the arbiter can no longer release. We do NOT
-            // persist an `Expired` transition here: returning `Err` rolls back every
-            // storage write, so the marker is set through the permissionless `expire`
-            // entrypoint and the funds are reclaimed via `refund` / `reclaim`.
+            // Issue #292 — harden the release/refund handoff: a keeper that
+            // never ran `expire` leaves the escrow sitting in `Funded` even
+            // though its settlement window has closed. Verify the deadline
+            // condition on *this* attempt instead of trusting the marker: the
+            // expired-but-unmarked record still refuses the release with
+            // [`Error::EscrowExpired`], and the permissionless `expire` /
+            // `refund` / `reclaim` paths resolve the funds back to the sender.
+            // We do NOT persist an `Expired` transition here: returning `Err`
+            // rolls back every storage write, so the marker can only be set
+            // through the `expire` entrypoint — keeping release and refund
+            // mutually exclusive.
             return Err(Error::EscrowExpired);
         }
         let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
@@ -1283,6 +1357,14 @@ impl EscrowContract {
                 }
             }
         }
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("refunded")),
             (id, caller),
@@ -1326,6 +1408,14 @@ impl EscrowContract {
                 }
             }
         }
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("ref_tl")),
             (id, caller),
@@ -1400,6 +1490,14 @@ impl EscrowContract {
                 }
             }
         }
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
         escrow.state = EscrowState::Refunded;
         store_escrow(&env, id, &escrow);
         env.events().publish(
@@ -1443,6 +1541,14 @@ impl EscrowContract {
         for a in escrow.assets.iter() {
             events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
         }
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("reclaimed")),
             (id, caller),
