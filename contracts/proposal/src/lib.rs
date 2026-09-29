@@ -721,13 +721,9 @@ impl ProposalContract {
     /// checked after the timelock so that a proposal blocked only by its chain
     /// reports the dependency rather than a less specific error.
     ///
-    /// The expiry gate runs first: a proposal whose deadline passed before it
-    /// was executed never fires. The call settles it instead — it records the
-    /// terminal `Expired` state, refunds the deposit and emits the `expired`
-    /// event — and returns `Ok(())` without executing, because returning an
-    /// error would roll that settlement back. Callers tell the two outcomes
-    /// apart through `state`, `is_executed` or the `expired` event; repeat
-    /// calls are no-ops. Then the mandatory timelock applies — execution is refused with
+    /// The expiry gate runs first: a proposal whose deadline has been reached
+    /// never fires and returns [`Error::ProposalExpired`]. Then the mandatory
+    /// timelock applies — execution is refused with
     /// [`Error::TimelockNotExpired`] until `timelock` seconds have passed
     /// since approval — and only then is the dependency chain resolved. The
     /// ordering means a premature attempt is reported as a scheduling error
@@ -735,6 +731,9 @@ impl ProposalContract {
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
+        if proposal.is_expired(&env) {
+            return Err(Error::ProposalExpired);
+        }
         if Self::expire_if_due(&env, id, &mut proposal)? {
             return Ok(());
         }

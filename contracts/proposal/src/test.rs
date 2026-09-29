@@ -657,7 +657,10 @@ fn expired_proposal_cannot_be_executed() {
     assert_eq!(h.client.state(&id), ProposalState::Approved);
 
     advance(&h, 6, 6_000);
-    h.client.execute(&h.proposer, &id);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&id), ProposalState::Expired);
     assert!(emitted(&h.env, "expired"));
 }
@@ -707,7 +710,10 @@ fn ledger_timeline_blocks_every_stale_transition() {
     assert_eq!(h.client.approve(&h.approvers[1], &id), 1);
     h.client.reject(&h.approvers[1], &id);
     h.client.cancel(&h.proposer, &id);
-    h.client.execute(&h.proposer, &id);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     h.client.fail(&h.proposer, &id);
     // Stale operations are no-ops; the vote count remains unchanged.
     assert_eq!(h.client.state(&id), ProposalState::Expired);
@@ -801,7 +807,10 @@ fn stale_prerequisite_blocks_the_dependent_chain() {
     advance(&h, 6, 6_000);
     // The prerequisite is stale: it can neither execute nor be approved, so
     // the dependent proposal stays blocked rather than inheriting a stale step.
-    h.client.execute(&h.proposer, &first);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &first),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&first), ProposalState::Expired);
 
     // Approving the dependent is unaffected by its prerequisite's expiry ...
@@ -1230,7 +1239,10 @@ fn expiry_gate_wins_over_the_timelock_gate() {
     );
 
     advance(&h, 3, 1_500); // deadline reached, delay still running
-    h.client.execute(&h.proposer, &id);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 
@@ -1513,7 +1525,7 @@ fn failed_proposal_cannot_be_executed() {
 }
 
 #[test]
-fn expired_execution_settles_once_and_never_executes() {
+fn expired_execution_returns_error_and_never_executes() {
     let h = setup(3);
     let token = deposit_token(&h);
     let tc = TokenClient::new(&h.env, &token);
@@ -1522,13 +1534,16 @@ fn expired_execution_settles_once_and_never_executes() {
     assert!(h.client.can_execute(&id));
 
     // Past the deadline the approved tally no longer matters: `execute`
-    // records `Expired` and refunds the deposit instead of executing. It
-    // returns `Ok` so that settlement is committed (an error would roll it
-    // back); the outcome is visible in the state and the `expired` event.
+    // returns ProposalExpired without executing. A state query settles the
+    // expiration and refunds the deposit.
     advance(&h, 6, 5_000);
-    assert_eq!(h.client.try_execute(&h.proposer, &id), Ok(Ok(())));
-    assert_eq!(expired_events(&h.env), 1);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(expired_events(&h.env), 0);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert_eq!(expired_events(&h.env), 1);
     assert!(!h.client.is_executed(&id));
     assert!(!h.client.can_execute(&id));
     assert_eq!(tc.balance(&h.proposer), DEPOSIT);
@@ -1537,7 +1552,10 @@ fn expired_execution_settles_once_and_never_executes() {
     // A repeat attempt is a no-op: no second refund, no second event, and
     // the proposal never becomes executed.
     let events_before = expired_events(&h.env);
-    assert_eq!(h.client.try_execute(&h.proposer, &id), Ok(Ok(())));
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(expired_events(&h.env), events_before);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
     assert!(!h.client.is_executed(&id));
@@ -1733,8 +1751,11 @@ fn post_expiration_execution_rejection_and_storage_pruning() {
     assert!(h.client.is_expired(&id));
     assert!(!h.client.can_execute(&id));
 
-    // Execution attempt settles proposal as Expired and refuses execution
-    h.client.execute(&h.proposer, &id);
+    // Execution rejects the already-expired proposal without executing.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&id), ProposalState::Expired);
     assert!(!h.client.is_executed(&id));
 
