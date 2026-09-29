@@ -1379,8 +1379,7 @@ impl TreasuryContract {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::pause_is_active(&Self::load(env), env) {
-        if Self::load(env)?.paused {
+        if Self::pause_is_active(&Self::load(env)?, env) {
             return Err(Error::TreasuryPaused);
         }
         Ok(())
@@ -1554,15 +1553,9 @@ impl TreasuryInterface for TreasuryContract {
     /// A breaker left past its window reads `false` here even before the
     /// stale flag is cleared, matching when outflows actually resume.
     fn is_paused(env: Env) -> bool {
-        let t = Self::load(&env);
-        Self::pause_is_active(&t, &env)
-    /// Whether the emergency circuit breaker is currently engaged.
-    ///
-    /// An uninitialized treasury has no breaker to engage, so this reports
-    /// `false` rather than failing. Use [`TreasuryContract::get`] when the
-    /// caller needs to distinguish "not paused" from "not initialized".
-    fn is_paused(env: Env) -> bool {
-        Self::load(&env).map(|t| t.paused).unwrap_or(false)
+        Self::load(&env)
+            .map(|t| Self::pause_is_active(&t, &env))
+            .unwrap_or(false)
     }
 }
 

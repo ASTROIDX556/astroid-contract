@@ -1554,6 +1554,8 @@ fn active_pause_still_blocks_milestones_until_lapse() {
     // The milestone disbursement resumes as soon as the window closes.
     h.client.release_next_milestone(&h.admin, &mid);
     assert_eq!(token_balance(&h, &to), 333);
+}
+
 // Issue #241: authorization on every privileged / outbound operation.
 //
 // The rest of this suite calls `env.mock_all_auths()`, so it pins the happy
