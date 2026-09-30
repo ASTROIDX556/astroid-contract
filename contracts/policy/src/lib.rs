@@ -1488,9 +1488,7 @@ impl PolicyContract {
         if policy.owner != caller {
             return Err(Error::Unauthorized);
         }
-        if rule_tree.is_empty() {
-            return Err(Error::InvalidInput);
-        }
+        validate_rule_tree(&rule_tree)?;
         let key = DataKey::CompositeRule(policy_id.clone());
         env.storage().persistent().set(&key, &rule_tree);
         env.events().publish(
