@@ -121,7 +121,7 @@
 
 use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
-    MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
+    MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD, UPGRADE_PROPOSAL_EXPIRY,
 };
 use astroid_shared::ensure;
@@ -155,6 +155,10 @@ const MAX_UPGRADE_SCAN: u32 = 64;
 enum DataKey {
     /// Protocol admin (instance).
     Admin,
+    /// Authorized multi-admin principals (instance).
+    Admins,
+    /// Designated multi-signature governance contract (instance).
+    Multisig,
     /// Organization owner: org slug -> owner address.
     Org(String),
     /// Module address: (org slug, kind) -> contract address.
@@ -461,6 +465,9 @@ impl RegistryContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin.clone());
+        env.storage().instance().set(&DataKey::Admins, &admins);
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
@@ -1504,10 +1511,32 @@ impl RegistryContract {
             .ok_or(Error::NotInitialized)
     }
 
-    /// Rotate the admin. Only the current admin may do this.
+    /// Rotate the admin. Only an authorized admin or multisig may do this.
+    /// Replaces the old primary admin with `new_admin` in the multi-admin set.
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
+        let old_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut updated_admins = Vec::new(&env);
+        for a in admins.iter() {
+            if let Some(ref old) = old_admin {
+                if &a == old {
+                    continue;
+                }
+            }
+            if a != new_admin {
+                updated_admins.push_back(a);
+            }
+        }
+        updated_admins.push_back(new_admin.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Admins, &updated_admins);
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
@@ -1516,6 +1545,128 @@ impl RegistryContract {
             new_admin,
         );
         Ok(())
+    }
+
+    /// Add an authorized administrator. Admin or multisig gated.
+    pub fn add_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let mut admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| {
+                let mut v = Vec::new(&env);
+                if let Some(admin) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+                    v.push_back(admin);
+                }
+                v
+            });
+        ensure!(admins.len() < MAX_APPROVERS, Error::InvalidInput);
+        ensure!(!admins.contains(&new_admin), Error::AlreadyExists);
+        admins.push_back(new_admin.clone());
+        env.storage().instance().set(&DataKey::Admins, &admins);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.events()
+            .publish((symbol_short!("admin"), symbol_short!("added")), new_admin);
+        Ok(())
+    }
+
+    /// Remove an authorized administrator. Admin or multisig gated.
+    /// At least one admin must remain in the authorized admin set.
+    pub fn remove_admin(env: Env, caller: Address, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| {
+                let mut v = Vec::new(&env);
+                if let Some(a) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+                    v.push_back(a);
+                }
+                v
+            });
+        ensure!(admins.contains(&admin), Error::NotFound);
+        ensure!(admins.len() > 1, Error::InvalidInput);
+
+        let mut new_admins = Vec::new(&env);
+        for a in admins.iter() {
+            if a != admin {
+                new_admins.push_back(a);
+            }
+        }
+        env.storage().instance().set(&DataKey::Admins, &new_admins);
+
+        // If the primary admin was removed, rotate DataKey::Admin to the first remaining admin.
+        if let Some(primary) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+            if primary == admin {
+                let next_primary = new_admins.get(0).unwrap();
+                env.storage().instance().set(&DataKey::Admin, &next_primary);
+            }
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.events()
+            .publish((symbol_short!("admin"), symbol_short!("removed")), admin);
+        Ok(())
+    }
+
+    /// Return all authorized multi-admin principals.
+    pub fn get_admins(env: Env) -> Result<Vec<Address>, Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| {
+                let mut v = Vec::new(&env);
+                if let Some(a) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+                    v.push_back(a);
+                }
+                v
+            });
+        Ok(admins)
+    }
+
+    /// Configure or rotate the designated multisig governance contract.
+    pub fn set_multisig(env: Env, caller: Address, multisig: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Multisig, &multisig);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("multisig")),
+            multisig,
+        );
+        Ok(())
+    }
+
+    /// Read the designated multisig governance contract, if configured.
+    pub fn get_multisig(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Multisig)
+    }
+
+    /// Remove the designated multisig governance contract.
+    pub fn remove_multisig(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&DataKey::Multisig) {
+            return Err(Error::NotFound);
+        }
+        env.storage().instance().remove(&DataKey::Multisig);
+        Ok(())
+    }
+
+    /// Check whether an address is an authorized protocol administrator or the
+    /// designated multisig governance contract.
+    pub fn is_authorized_admin(env: Env, who: Address) -> bool {
+        Self::is_admin(&env, &who)
     }
 
     /// Emergency freeze - only registered org owners can freeze.
@@ -1913,20 +2064,38 @@ impl RegistryContract {
     }
 
     fn is_admin(env: &Env, who: &Address) -> bool {
-        match env.storage().instance().get::<_, Address>(&DataKey::Admin) {
-            Some(admin) => &admin == who,
-            None => false,
+        if let Some(admin) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+            if &admin == who {
+                return true;
+            }
         }
+        if let Some(admins) = env
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::Admins)
+        {
+            if admins.contains(who) {
+                return true;
+            }
+        }
+        if let Some(multisig) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Multisig)
+        {
+            if &multisig == who {
+                return true;
+            }
+        }
+        false
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        ensure!(&admin == caller, Error::Unauthorized);
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        ensure!(Self::is_admin(env, caller), Error::Unauthorized);
         Ok(())
     }
 
@@ -2151,12 +2320,12 @@ impl UpgradeableInterface for RegistryContract {
     /// registry that could not replace its own code during an incident would be
     /// the one contract nobody could repair.
     fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
-        // Gate 1: the recorded upgrade admin's signature, then the approval for
-        // this kind — the shared rule, resolved against this contract's own
-        // approval list for the reason given above.
+        // Gate 1: the recorded upgrade admin's signature or multi-admin/multisig
+        // signature, then the approval for this kind — the shared rule, resolved
+        // against this contract's own approval list for the reason given above.
         caller.require_auth();
         let authority = astroid_interfaces::upgrade::get_authority(&env)?;
-        if authority.admin != caller {
+        if authority.admin != caller && !Self::is_admin(&env, &caller) {
             return Err(Error::Unauthorized);
         }
         ensure!(

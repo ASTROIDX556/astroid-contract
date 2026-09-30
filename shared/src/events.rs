@@ -252,11 +252,28 @@ pub enum ContractEvent {
     },
     /// A policy rejected a transfer.
     PolicyViolation { policy_id: String, reason: Symbol },
+    /// An escrow was created and funded: custody of the listed assets moved
+    /// from the sender to the contract (Issue #292).
+    EscrowCreated {
+        escrow_id: u64,
+        sender: Address,
+        recipient: Address,
+        assets: Vec<AssetAmount>,
+        deadline: u64,
+    },
     /// An escrow's held assets were released to its recipient, whether via the
     /// standard arbiter path or a signature-based manual override.
     EscrowReleased {
         escrow_id: u64,
         recipient: Address,
+        assets: Vec<AssetAmount>,
+    },
+    /// An escrow's remaining custody balance was returned to its sender,
+    /// whether via the timed-out refund paths or a pre-deadline cancellation
+    /// (Issue #292).
+    EscrowRefunded {
+        escrow_id: u64,
+        sender: Address,
         assets: Vec<AssetAmount>,
     },
     /// Gas usage telemetry for a single operation execution.
@@ -537,6 +554,18 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (org, to, asset, amount, balance),
             );
         }
+        ContractEvent::EscrowCreated {
+            escrow_id,
+            sender,
+            recipient,
+            assets,
+            deadline,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "EscrowCreated"),),
+                (escrow_id, sender, recipient, assets, deadline),
+            );
+        }
         ContractEvent::EscrowReleased {
             escrow_id,
             recipient,
@@ -545,6 +574,16 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "EscrowReleased"),),
                 (escrow_id, recipient, assets),
+            );
+        }
+        ContractEvent::EscrowRefunded {
+            escrow_id,
+            sender,
+            assets,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "EscrowRefunded"),),
+                (escrow_id, sender, assets),
             );
         }
         ContractEvent::GasTelemetry {
