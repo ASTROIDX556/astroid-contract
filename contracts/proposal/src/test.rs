@@ -774,7 +774,10 @@ fn expired_proposal_cannot_be_executed() {
     assert_eq!(h.client.state(&id), ProposalState::Approved);
 
     advance(&h, 6, 6_000);
-    h.client.execute(&h.proposer, &id);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&id), ProposalState::Expired);
     assert!(emitted(&h.env, "expired"));
 }
@@ -824,7 +827,10 @@ fn ledger_timeline_blocks_every_stale_transition() {
     assert_eq!(h.client.approve(&h.approvers[1], &id), 1);
     h.client.reject(&h.approvers[1], &id);
     h.client.cancel(&h.proposer, &id);
-    h.client.execute(&h.proposer, &id);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     h.client.fail(&h.proposer, &id);
     // Stale operations are no-ops; the vote count remains unchanged.
     assert_eq!(h.client.state(&id), ProposalState::Expired);
@@ -918,7 +924,10 @@ fn stale_prerequisite_blocks_the_dependent_chain() {
     advance(&h, 6, 6_000);
     // The prerequisite is stale: it can neither execute nor be approved, so
     // the dependent proposal stays blocked rather than inheriting a stale step.
-    h.client.execute(&h.proposer, &first);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &first),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&first), ProposalState::Expired);
 
     // Approving the dependent is unaffected by its prerequisite's expiry ...
@@ -1347,7 +1356,10 @@ fn expiry_gate_wins_over_the_timelock_gate() {
     );
 
     advance(&h, 3, 1_500); // deadline reached, delay still running
-    h.client.execute(&h.proposer, &id);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&id), ProposalState::Expired);
 }
 
@@ -1630,7 +1642,7 @@ fn failed_proposal_cannot_be_executed() {
 }
 
 #[test]
-fn expired_execution_settles_once_and_never_executes() {
+fn expired_execution_returns_error_and_never_executes() {
     let h = setup(3);
     let token = deposit_token(&h);
     let tc = TokenClient::new(&h.env, &token);
@@ -1639,13 +1651,16 @@ fn expired_execution_settles_once_and_never_executes() {
     assert!(h.client.can_execute(&id));
 
     // Past the deadline the approved tally no longer matters: `execute`
-    // records `Expired` and refunds the deposit instead of executing. It
-    // returns `Ok` so that settlement is committed (an error would roll it
-    // back); the outcome is visible in the state and the `expired` event.
+    // returns ProposalExpired without executing. A state query settles the
+    // expiration and refunds the deposit.
     advance(&h, 6, 5_000);
-    assert_eq!(h.client.try_execute(&h.proposer, &id), Ok(Ok(())));
-    assert_eq!(expired_events(&h.env), 1);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(expired_events(&h.env), 0);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
+    assert_eq!(expired_events(&h.env), 1);
     assert!(!h.client.is_executed(&id));
     assert!(!h.client.can_execute(&id));
     assert_eq!(tc.balance(&h.proposer), DEPOSIT);
@@ -1654,7 +1669,10 @@ fn expired_execution_settles_once_and_never_executes() {
     // A repeat attempt is a no-op: no second refund, no second event, and
     // the proposal never becomes executed.
     let events_before = expired_events(&h.env);
-    assert_eq!(h.client.try_execute(&h.proposer, &id), Ok(Ok(())));
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(expired_events(&h.env), events_before);
     assert_eq!(h.client.state(&id), ProposalState::Expired);
     assert!(!h.client.is_executed(&id));
@@ -1850,8 +1868,11 @@ fn post_expiration_execution_rejection_and_storage_pruning() {
     assert!(h.client.is_expired(&id));
     assert!(!h.client.can_execute(&id));
 
-    // Execution attempt settles proposal as Expired and refuses execution
-    h.client.execute(&h.proposer, &id);
+    // Execution rejects the already-expired proposal without executing.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
     assert_eq!(h.client.state(&id), ProposalState::Expired);
     assert!(!h.client.is_executed(&id));
 
@@ -1929,4 +1950,303 @@ fn prune_expired_range_cleans_consecutive_records() {
         h.client.try_prune_expired_range(&1, &(MAX_PRUNE_BATCH + 1)),
         Err(Ok(Error::InvalidInput))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #329 — state machine transitions and validation.
+//
+// The canonical transition table lives in `ProposalState::may_transition`;
+// every state-changing entrypoint validates its edge against it. These tests
+// pin the table itself and the observable behavior on both sides: legal
+// transitions proceed and emit their event, illegal ones are refused with
+// explicit contract errors and leave the record untouched.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn state_machine_admits_exactly_the_documented_edges() {
+    use astroid_interfaces::proposal::ProposalState as PS;
+
+    // Every legal edge of the lifecycle diagram.
+    let legal = [
+        (PS::Created, PS::Pending),
+        (PS::Pending, PS::Approved),
+        (PS::Pending, PS::Rejected),
+        (PS::Pending, PS::Cancelled),
+        (PS::Pending, PS::Expired),
+        (PS::Approved, PS::Executed),
+        (PS::Approved, PS::Failed),
+        (PS::Approved, PS::Cancelled),
+        (PS::Approved, PS::Expired),
+        (PS::Executed, PS::Closed),
+    ];
+    for (from, to) in legal {
+        assert!(
+            from.may_transition(to),
+            "{:?} -> {:?} must be legal",
+            from,
+            to
+        );
+    }
+
+    // Every other pair is refused — including the deposit double-spend edge
+    // (Rejected -> Cancelled) and all self-loops and backwards edges.
+    let states = [
+        PS::Created,
+        PS::Pending,
+        PS::Approved,
+        PS::Executed,
+        PS::Closed,
+        PS::Rejected,
+        PS::Cancelled,
+        PS::Expired,
+        PS::Failed,
+    ];
+    for from in states {
+        for to in states {
+            let is_legal = legal.iter().any(|&(f, t)| f == from && t == to);
+            assert_eq!(
+                from.may_transition(to),
+                is_legal,
+                "{:?} -> {:?} disagrees with the documented table",
+                from,
+                to
+            );
+        }
+    }
+}
+
+#[test]
+fn terminal_states_have_no_outgoing_transitions() {
+    use astroid_interfaces::proposal::ProposalState as PS;
+
+    let all = [
+        PS::Created,
+        PS::Pending,
+        PS::Approved,
+        PS::Executed,
+        PS::Closed,
+        PS::Rejected,
+        PS::Cancelled,
+        PS::Expired,
+        PS::Failed,
+    ];
+
+    // Fully frozen terminals: no outgoing edge at all.
+    for terminal in [
+        PS::Closed,
+        PS::Rejected,
+        PS::Cancelled,
+        PS::Expired,
+        PS::Failed,
+    ] {
+        assert!(terminal.is_terminal());
+        for next in all {
+            assert!(
+                !terminal.may_transition(next),
+                "terminal {:?} must not transition to {:?}",
+                terminal,
+                next
+            );
+        }
+    }
+
+    // `Executed` is terminal for callers but keeps exactly one tidy-up edge:
+    // closing the record. Nothing else may leave it.
+    assert!(PS::Executed.is_terminal());
+    assert!(PS::Executed.may_transition(PS::Closed));
+    for next in all.iter().filter(|s| **s != PS::Closed) {
+        assert!(
+            !PS::Executed.may_transition(*next),
+            "Executed must not transition to {:?}",
+            next
+        );
+    }
+}
+
+#[test]
+fn every_transition_emits_its_event() {
+    // Pending -> Approved -> Executed -> Closed with the matching event each
+    // time; expiry adds its own below.
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    assert!(emitted(&h.env, "created"));
+
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert!(emitted(&h.env, "approved"));
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    h.client.execute(&h.proposer, &id);
+    assert!(emitted(&h.env, "executed"));
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+
+    h.client.close(&h.proposer, &id);
+    assert!(emitted(&h.env, "closed"));
+    assert_eq!(h.client.state(&id), ProposalState::Closed);
+
+    // Pending -> Rejected and Pending -> Expired emit theirs.
+    let h2 = setup(3);
+    let id2 = create(&h2, 2, 5_000);
+    h2.client.reject(&h2.approvers[0], &id2);
+    assert!(emitted(&h2.env, "rejected"));
+
+    let h3 = setup(3);
+    let id3 = create(&h3, 2, 5_000);
+    advance(&h3, 6, 6_000);
+    h3.client.expire(&id3);
+    assert!(emitted(&h3.env, "expired"));
+}
+
+#[test]
+fn rejected_proposal_cannot_be_cancelled_double_refund_prevented() {
+    // The #329 bug: `cancel` used to admit Rejected -> Cancelled, and both
+    // transitions refund the deposit — a double spend. Cancelling a rejected
+    // proposal is now refused with InvalidProposalState.
+    let h = setup(3);
+    let token = deposit_token(&h);
+    let tc = TokenClient::new(&h.env, &token);
+    let id = create_with_deposit(&h, 2, 5_000, &token);
+    assert_eq!(tc.balance(&h.proposer), 0);
+
+    h.client.reject(&h.approvers[0], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Rejected);
+    assert_eq!(tc.balance(&h.proposer), DEPOSIT); // refunded exactly once
+
+    let res = h.client.try_cancel(&h.proposer, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidProposalState)));
+    assert_eq!(h.client.state(&id), ProposalState::Rejected); // unchanged
+    assert_eq!(tc.balance(&h.proposer), DEPOSIT); // NOT refunded twice
+}
+
+#[test]
+fn failed_proposal_cannot_be_cancelled() {
+    // Failed is terminal (a failed action must stay visible to dependents);
+    // cancelling it would also re-refund a deposit that was never taken back.
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+    h.client.fail(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+
+    assert_eq!(
+        h.client.try_cancel(&h.proposer, &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Failed);
+}
+
+#[test]
+fn approved_proposal_can_still_be_cancelled() {
+    // The legitimate escape hatch survives: cancel stays legal from the two
+    // live states (Pending and Approved).
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+    h.client.cancel(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Cancelled);
+    assert!(emitted(&h.env, "cancelled"));
+
+    // And from Pending.
+    let h2 = setup(3);
+    let id2 = create(&h2, 2, 5_000);
+    h2.client.cancel(&h2.proposer, &id2);
+    assert_eq!(h2.client.state(&id2), ProposalState::Cancelled);
+}
+
+#[test]
+fn executed_then_closed_proposal_refuses_every_late_transition() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_and_execute(&h, id);
+    h.client.close(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Closed);
+
+    // A closed record is terminal: no re-approval, rejection, cancellation,
+    // re-execution or failure.
+    assert_eq!(
+        h.client.try_approve(&h.approvers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.approvers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_cancel(&h.proposer, &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalNotApproved))
+    );
+    assert_eq!(
+        h.client.try_fail(&h.proposer, &id),
+        Err(Ok(Error::ProposalNotApproved))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Closed);
+}
+
+#[test]
+fn rejected_proposal_refuses_every_late_transition() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.reject(&h.approvers[0], &id);
+
+    // Approving a rejected proposal is invalid-state (already covered
+    // elsewhere); failing and executing it must not resurrect it either.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalNotApproved))
+    );
+    assert_eq!(
+        h.client.try_fail(&h.proposer, &id),
+        Err(Ok(Error::ProposalNotApproved))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Rejected);
+}
+
+#[test]
+fn cancelled_proposal_refuses_approval_and_rejection() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.cancel(&h.proposer, &id);
+
+    assert_eq!(
+        h.client.try_approve(&h.approvers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.approvers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Cancelled);
+}
+
+#[test]
+fn expired_proposal_refuses_rejection_and_cancellation() {
+    // Every entrypoint settles the stale record through `expire_if_due`;
+    // the requests that would mutate an expired proposal become no-ops
+    // rather than resurrecting it.
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    advance(&h, 6, 6_000);
+
+    h.client.reject(&h.approvers[0], &id); // settles Expired, no-op otherwise
+    h.client.cancel(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Expired);
+}
+
+#[test]
+fn only_the_documented_edge_leaves_pending_and_approved() {
+    // One exact grep of the matrix through the contract surface: from
+    // `Approved`, only execute / fail / cancel / expiry-settle are legal;
+    // rejecting an approved proposal is an invalid-state jump and stays one.
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    approve_to_threshold(&h, id);
+    assert_eq!(
+        h.client.try_reject(&h.approvers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
 }
