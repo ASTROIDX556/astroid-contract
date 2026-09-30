@@ -62,6 +62,9 @@ pub const MAX_BATCH_PAYMENTS: u32 = 32;
 /// this caps the footprint of a single `get_modules_batch` invocation.
 pub const MAX_REGISTRY_BATCH: u32 = 10;
 
+/// Upper bound on how many proposals a single prune batch or range scan may process.
+pub const MAX_PRUNE_BATCH: u32 = 32;
+
 /// Upper bound on how many distinct assets a single escrow agreement may hold.
 pub const MAX_ESCROW_ASSETS: u32 = 10;
 
@@ -73,3 +76,8 @@ pub const MAX_PAUSE_DURATION: u64 = SECONDS_PER_MONTH;
 /// Minimum number of ledgers that must pass before a pending multisig
 /// threshold change can be finalized (~1 day on Stellar).
 pub const THRESHOLD_CHANGE_DELAY_LEDGERS: u32 = DAY_IN_LEDGERS;
+
+/// Number of basis points that make up 100%. Protocol percentages (e.g. the
+/// budget contract's maximum rollover percentage) are carried as integer
+/// basis points (1 bp = 0.01%) so cap arithmetic stays in whole numbers.
+pub const BPS_DENOMINATOR: i128 = 10_000;

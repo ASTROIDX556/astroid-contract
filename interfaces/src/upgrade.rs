@@ -127,6 +127,31 @@ pub fn check(
     }
 }
 
+/// Replace the contract's code with `wasm_hash` and emit the shared
+/// `("upgrade", "applied")` event. The new code takes effect after the current
+/// invocation completes.
+///
+/// This is the second half of [`perform`], split out so a contract that can
+/// decide *for itself* whether the target is acceptable gets to run that
+/// decision between the two gates: call [`check`], then whatever additional
+/// validation the contract owes its own state, then this. The registry uses it
+/// that way to resolve the target through its version upgrade map and refuse a
+/// downgrade (Issue #206).
+///
+/// It performs no authorization of its own. It is only correct immediately
+/// after a successful [`check`] in the same invocation — that pairing is the
+/// caller's responsibility, and every other contract should just call
+/// [`perform`], which cannot get the order wrong.
+pub fn apply(env: &Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> Result<(), Error> {
+    env.deployer()
+        .update_current_contract_wasm(wasm_hash.clone());
+    env.events().publish(
+        (symbol_short!("upgrade"), symbol_short!("applied")),
+        (kind, wasm_hash),
+    );
+    Ok(())
+}
+
 /// Authorize and then perform the upgrade: on success the contract's code is
 /// replaced with `wasm_hash`.
 ///
@@ -140,21 +165,7 @@ pub fn perform(
     wasm_hash: BytesN<32>,
 ) -> Result<(), Error> {
     check(env, caller, kind, &wasm_hash)?;
-    apply_approved(env, kind, wasm_hash);
-    Ok(())
-}
-
-/// Apply a registry-approved upgrade after the caller has run [`check`].
-///
-/// Exposed separately for contracts that must atomically write audit state
-/// after authorization and before scheduling the executable replacement.
-pub fn apply_approved(env: &Env, kind: ModuleKind, wasm_hash: BytesN<32>) {
-    env.deployer()
-        .update_current_contract_wasm(wasm_hash.clone());
-    env.events().publish(
-        (symbol_short!("upgrade"), symbol_short!("applied")),
-        (kind, wasm_hash),
-    );
+    apply(env, kind, wasm_hash)
 }
 
 fn stored(env: &Env) -> Option<UpgradeAuthority> {
