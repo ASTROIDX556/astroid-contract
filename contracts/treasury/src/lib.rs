@@ -194,7 +194,8 @@
 use astroid_interfaces::{PolicyClient, RegistryClient, TreasuryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS,
-    MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    MAX_PAUSE_DURATION, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
@@ -1826,6 +1827,14 @@ impl TreasuryContract {
         Ok(t)
     }
 
+    /// Whether an engaged breaker is still inside its [`MAX_PAUSE_DURATION`]
+    /// window. A lapsed pause stops blocking outflows but keeps its stale
+    /// flag stored until [`Self::unpause`] clears it or [`Self::pause`]
+    /// re-engages over it.
+    fn pause_is_active(t: &Treasury, env: &Env) -> bool {
+        t.paused && env.ledger().timestamp() < t.paused_at.saturating_add(MAX_PAUSE_DURATION)
+    }
+
     /// Short-circuit an outbound value movement while the emergency circuit
     /// breaker is engaged, with the dedicated [`Error::TreasuryPaused`] code.
     ///
@@ -1839,14 +1848,6 @@ impl TreasuryContract {
     /// any external keeper to release it — if the guardian disappears mid
     /// incident, the treasury unblocks itself after the cap. A pause that
     /// must outlive the cap is the multisig-only [`Self::freeze`].
-    /// Whether an engaged breaker is still inside its [`MAX_PAUSE_DURATION`]
-    /// window. A lapsed pause stops blocking outflows but keeps its stale
-    /// flag stored until [`Self::unpause`] clears it or [`Self::pause`]
-    /// re-engages over it.
-    fn pause_is_active(t: &Treasury, env: &Env) -> bool {
-        t.paused && env.ledger().timestamp() < t.paused_at.saturating_add(MAX_PAUSE_DURATION)
-    }
-
     fn require_not_paused(env: &Env) -> Result<(), Error> {
         if Self::pause_is_active(&Self::load(env)?, env) {
             return Err(Error::TreasuryPaused);

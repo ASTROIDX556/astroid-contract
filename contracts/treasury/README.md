@@ -34,10 +34,9 @@ Deposits are exempt from 2 and 3: inbound funding stays available during an
 emergency so the treasury can be replenished while paused or frozen.
 
 A pause older than `MAX_PAUSE_DURATION` no longer blocks outflows (2 stops
-applying on its own); the stale flag is cleared by the next `pause` cycle and
-`unpause` on a lapsed breaker fails with `InvalidState`.
+applying on its own); the stale flag remains until the next `pause` re-engages
+a fresh window or `unpause` clears it and resets the recorded timestamp.
 
-## Events
 ## Registry-verified callers and reentrancy (Issue #308)
 
 Every value path (`deposit`, `withdraw`, `batch_transfer`,

@@ -7,7 +7,8 @@ use soroban_sdk::{
 };
 
 use astroid_shared::constants::{
-    GOVERNANCE_GRACE_PERIOD, MAX_BATCH_PAYMENTS, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY,
+    GOVERNANCE_GRACE_PERIOD, MAX_BATCH_PAYMENTS, MAX_PAUSE_DURATION, MAX_TIMELOCK_DELAY,
+    MIN_TIMELOCK_DELAY,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::types::Payment;
