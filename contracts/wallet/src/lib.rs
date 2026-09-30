@@ -34,7 +34,21 @@
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
 //! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
 //! `set_policy_bypass`, `batch_execute_validated`, `set_budget`,
-//! `set_rate_limit`, `clear_rate_limit`.
+//! `set_rate_limit`, `clear_rate_limit`, `custody_balance`.
+//!
+//! ## Multi-token custody verification
+//!
+//! The contract custodies any number of Stellar Asset Contract (SAC) assets at
+//! once: per-wallet balances are tracked per `(wallet, asset)` pair, so one
+//! wallet can hold several tokens without the ledgers touching. Before any
+//! outbound movement is approved, two independent checks must pass: the
+//! wallet's tracked balance covers the amount ([`Error::InsufficientFunds`]
+//! otherwise) and the contract's real on-chain custody — read through the
+//! token's SAC `balance` entry point — covers it too. The custody read fails
+//! closed ([`Error::InvalidState`] / [`Error::Unauthorized`]) when the asset
+//! is not a queryable token, so a mis-typed asset address can never pass for
+//! a zero balance. Together the checks turn a token-side refusal that would
+//! trap the invocation into a deterministic error code.
 //!
 //! ## Pre-execution policy hook
 //!
@@ -120,7 +134,8 @@ use astroid_shared::constants::{
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::{checked_add, SafeAdd, SafeSub};
+use astroid_shared::math::{checked_add, validate_sufficient_balance, SafeAdd, SafeSub};
+use astroid_shared::token::{safe_transfer, token_balance};
 pub use astroid_shared::types::WalletData;
 use astroid_shared::types::{ModuleId, ModuleKind, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
@@ -853,15 +868,23 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
+        // Preliminary allowance verification before anything is approved: the
+        // tracked ledger and the real SAC custody must each cover the amount.
+        if let Err(e) = Self::require_custody_funds(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
             Self::unlock(&env);
             return Err(e);
         }
-        token::TokenClient::new(&env, &asset).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
+        // Funds were verified above, so the token call cannot refuse for
+        // balance reasons; any remaining refusal maps to a deterministic
+        // error instead of trapping the invocation.
+        if let Err(e) = safe_transfer(&env, &asset, &env.current_contract_address(), &to, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         events::transfer_executed(&env, &env.current_contract_address(), &to, &asset, amount);
         Self::unlock(&env);
         Ok(())
@@ -900,15 +923,27 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
+        // Same preliminary allowance verification as `transfer`: tracked
+        // balance and real SAC custody both cover the amount before the
+        // debit or any token call.
+        if let Err(e) = Self::require_custody_funds(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
             Self::unlock(&env);
             return Err(e);
         }
-        token::TokenClient::new(&env, &asset).transfer(
+        if let Err(e) = safe_transfer(
+            &env,
+            &asset,
             &env.current_contract_address(),
             &wallet.owner,
-            &amount,
-        );
+            amount,
+        ) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         events::publish(
             &env,
             events::ContractEvent::WalletWithdrawn {
@@ -1464,6 +1499,14 @@ impl WalletContract {
             .unwrap_or(0)
     }
 
+    /// Read the contract's real on-chain custody of `asset` — the SAC balance
+    /// held at the contract's own address that backs every wallet's internal
+    /// bookkeeping. The read goes through the token's SAC interface and fails
+    /// closed with a deterministic error when the asset cannot be queried.
+    pub fn custody_balance(env: Env, asset: Address) -> Result<i128, Error> {
+        token_balance(&env, &asset, &env.current_contract_address())
+    }
+
     /// Whether the contract-wide circuit breaker is currently tripped.
     pub fn is_paused(env: Env) -> bool {
         Self::paused(&env)
@@ -1988,6 +2031,40 @@ impl WalletContract {
             constants::PERSISTENT_BUMP_AMOUNT,
         );
         Ok(())
+    }
+
+    /// Preliminary allowance check for every outbound movement: both the
+    /// wallet's tracked balance for `asset` and the contract's real SAC
+    /// custody must cover `amount` before the spend is approved.
+    ///
+    /// The tracked read comes first so an uninitialized (never-funded)
+    /// `(wallet, asset)` pair answers [`Error::InsufficientFunds`] exactly
+    /// like a short balance, and the custody read second so a ledger that
+    /// drifted above the tokens actually on hand cannot overdraw custody —
+    /// a condition the later token call would otherwise surface as a raw
+    /// host trap instead of a code. A zero or negative amount is refused
+    /// with [`Error::InvalidAmount`]. Pure verification: no state changes.
+    fn require_custody_funds(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let tracked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet_id, asset.clone()))
+            .unwrap_or(0);
+        validate_sufficient_balance(tracked, amount)?;
+        let custody = Self::sac_balance(env, asset)?;
+        validate_sufficient_balance(custody, amount)
+    }
+
+    /// Query the contract's own SAC balance of `asset` without trapping; a
+    /// token that cannot be queried fails closed with a deterministic code.
+    fn sac_balance(env: &Env, asset: &Address) -> Result<i128, Error> {
+        token_balance(env, asset, &env.current_contract_address())
     }
 
     fn emit_state(env: &Env, id: u64, action: soroban_sdk::Symbol) {

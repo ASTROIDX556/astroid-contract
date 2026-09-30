@@ -6,8 +6,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    PolicyContract, PolicyContractClient, RuleNode, RuleOp, RuleTree, TransactionPayload,
-    MAX_POLICY_RULES,
+    PolicyContract, PolicyContractClient, PolicyDecision, PolicyDenialReason, RuleNode, RuleOp,
+    RuleTree, TransactionPayload, MAX_POLICY_RULES,
 };
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
@@ -3811,6 +3811,264 @@ fn rule_combination_any_short_circuits_on_first_pass() {
     assert!(p
         .try_check_transfer(&pid, &asset, &allowed_recipient, &100)
         .is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Granular policy decisions (Issue #314)
+//
+// `evaluate_policy` walks the same rules as `check_transfer` but reports which
+// one refused the transaction instead of collapsing every refusal onto
+// `PolicyDenied`. These tests pin both halves of that contract: the reason each
+// rule reports, and the fact that `check_transfer`'s error codes did not move.
+// ---------------------------------------------------------------------------
+
+/// The payload `evaluate_policy` takes, built from the arguments
+/// `check_transfer` takes.
+fn transfer_payload(asset: &Address, recipient: &Address, amount: i128) -> TransactionPayload {
+    TransactionPayload {
+        asset: asset.clone(),
+        recipient: recipient.clone(),
+        amount,
+    }
+}
+
+#[test]
+fn evaluate_policy_allows_a_transfer_within_the_single_transaction_ceiling() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let decision: PolicyDecision = p.evaluate_policy(
+        &String::from_str(&env, "max_txn"),
+        &transfer_payload(&asset, &recipient, 1_000_000),
+    );
+    assert!(decision.allowed());
+    assert_eq!(decision.reason(), None);
+    // The ceiling in force is reported alongside the decision, so a caller that
+    // was refused can size a retry without a second read.
+    assert_eq!(decision.max_transaction_amount, 1_000_000);
+}
+
+#[test]
+fn evaluate_policy_names_the_single_transaction_ceiling_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let decision = p.evaluate_policy(
+        &String::from_str(&env, "max_txn"),
+        &transfer_payload(&asset, &recipient, 1_000_001),
+    );
+    assert!(!decision.allowed());
+    assert_eq!(
+        decision.reason(),
+        Some(PolicyDenialReason::AboveMaxTransactionLimit)
+    );
+    // The collapsed code is unchanged: existing callers still see PolicyDenied.
+    assert_eq!(decision.reason().unwrap().to_error(), Error::PolicyDenied);
+}
+
+#[test]
+fn evaluate_policy_names_the_unapproved_destination_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+    client.register_policy(
+        &owner,
+        &String::from_str(&env, "vendor_list"),
+        &BytesN::from_array(&env, &[7; 32]),
+        &0,
+        &Some(allowed.clone()),
+        &None,
+        &0,
+        &None,
+    );
+
+    let ok = client.evaluate_policy(
+        &String::from_str(&env, "vendor_list"),
+        &transfer_payload(&asset, &allowed, 10),
+    );
+    assert!(ok.allowed());
+    assert_eq!(ok.reason(), None);
+
+    let denied = client.evaluate_policy(
+        &String::from_str(&env, "vendor_list"),
+        &transfer_payload(&asset, &stranger, 10),
+    );
+    assert_eq!(
+        denied.reason(),
+        Some(PolicyDenialReason::RecipientNotAllowed)
+    );
+    assert_eq!(denied.reason().unwrap().as_str(), "bad_recipient");
+}
+
+#[test]
+fn evaluate_policy_names_the_recipient_whitelist_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let approved = Address::generate(&env);
+    let untrusted = Address::generate(&env);
+
+    p.add_recipient_to_whitelist(&owner, &policy_id, &approved);
+    p.set_recipient_whitelist_enabled(&owner, &policy_id, &true);
+
+    let ok = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &approved, 10));
+    assert!(ok.allowed());
+
+    let denied = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &untrusted, 10));
+    assert_eq!(
+        denied.reason(),
+        Some(PolicyDenialReason::RecipientNotWhitelisted)
+    );
+}
+
+#[test]
+fn evaluate_policy_names_the_blacklist_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let blocked = Address::generate(&env);
+
+    p.add_to_blocklist(&owner, &policy_id, &blocked);
+
+    let denied = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &blocked, 10));
+    assert_eq!(
+        denied.reason(),
+        Some(PolicyDenialReason::RecipientBlacklisted)
+    );
+    assert_eq!(
+        denied.reason().unwrap().to_error(),
+        Error::PolicyRecipientRestricted
+    );
+}
+
+#[test]
+fn evaluate_policy_names_a_disabled_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    p.set_enabled(&owner, &policy_id, &false);
+    let denied = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &recipient, 10));
+    assert_eq!(denied.reason(), Some(PolicyDenialReason::Disabled));
+}
+
+#[test]
+fn evaluate_policy_reserves_errors_for_malformed_input_and_unknown_policies() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // A policy refusal is a decision, never an `Err`...
+    assert!(p
+        .try_evaluate_policy(&policy_id, &transfer_payload(&asset, &recipient, 9_999_999))
+        .is_ok());
+    // ...while a malformed amount and an unknown policy stay errors.
+    assert_eq!(
+        p.try_evaluate_policy(&policy_id, &transfer_payload(&asset, &recipient, 0)),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        p.try_evaluate_policy(
+            &String::from_str(&env, "ghost"),
+            &transfer_payload(&asset, &recipient, 10)
+        ),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn evaluate_policy_agrees_with_check_transfer_on_every_refusal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // The dry run reports the reason, and mapping it back onto an error must
+    // reproduce exactly what the enforcement path returns.
+    let decision = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &recipient, 1_000_001));
+    let mapped = decision
+        .reason()
+        .expect("the ceiling must refuse this")
+        .to_error();
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recipient, &1_000_001),
+        Err(Ok(mapped))
+    );
+
+    // A blacklisted recipient is refused by the same rule on both paths.
+    let blocked = Address::generate(&env);
+    p.add_to_blocklist(&owner, &policy_id, &blocked);
+    let decision = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &blocked, 10));
+    let mapped = decision
+        .reason()
+        .expect("the blocklist must refuse this")
+        .to_error();
+    assert_eq!(mapped, Error::PolicyRecipientRestricted);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &blocked, &10),
+        Err(Ok(mapped))
+    );
+}
+
+#[test]
+fn evaluate_policy_reports_each_rule_exactly_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // A refusal is reported once at the boundary, not once per rule: the
+    // dry run publishes exactly the violation the enforcement path publishes
+    // (the legacy tuple topic plus the canonical schema), never an extra copy.
+    let before = env.events().all().len();
+    let decision = p.evaluate_policy(&policy_id, &transfer_payload(&asset, &recipient, 1_000_001));
+    assert!(!decision.allowed());
+    let published = env.events().all().len() - before;
+
+    let before = env.events().all().len();
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recipient, &1_000_001),
+        Err(Ok(Error::PolicyDenied))
+    );
+    let enforced = env.events().all().len() - before;
+    assert_eq!(
+        published, enforced,
+        "the dry run must report exactly what the write path reports"
+    );
 }
 
 // ---------------------------------------------------------------------------
