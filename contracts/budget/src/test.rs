@@ -2288,6 +2288,9 @@ fn rollover_preview_reports_deficit_as_negative_carry() {
     let b = h.client.get(&id(&h.env, "agent"));
     assert_eq!(b.deficit_amount, 500);
     assert_eq!(b.rollover_credit, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Multi-token allowance validation (issue #294)
 // ---------------------------------------------------------------------------
 
