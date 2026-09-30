@@ -10,7 +10,7 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
@@ -20,3 +20,7 @@ astroid-interfaces = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# Issue #308 tests deploy the real registry (to exercise the caller-verification
+# gate end to end) and the real wallet (as a registered, first-class depositor).
+astroid-registry = { path = "../registry" }
+astroid-wallet = { path = "../wallet" }

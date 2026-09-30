@@ -12,3 +12,6 @@ rust-version.workspace = true
 [dependencies]
 soroban-sdk = { workspace = true }
 astroid-shared = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
