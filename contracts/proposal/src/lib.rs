@@ -31,6 +31,57 @@
 //! same gate, so it never advertises a proposal as executable while its delay
 //! is still running.
 //!
+//! All of the delay's arithmetic and comparison lives in [`timelock`]: the
+//! release instant (`approved_at + timelock`) is derived with checked math so
+//! an unrepresentable deadline fails closed with [`Error::Overflow`] instead
+//! of wrapping into the past, and the boundary is inclusive — `now ==
+//! release_at` is already released, one second earlier is not. The
+//! `timelock`, `release_at` and `timelock_status` views expose the stored
+//! release criteria so a client can check the exact threshold before spending
+//! a transaction on an attempt that would be refused.
+//!
+//! ## Quorum and majority
+//!
+//! A bare approval threshold can be gamed — `threshold = 1` on a ten-person
+//! allow-list would execute on a single signature — so `execute` re-validates
+//! the tally against two further bars before anything fires:
+//!
+//! * **Quorum (participation).** At least [`PROPOSAL_QUORUM_PERCENT`]% of the
+//!   approver allow-list must have voted. The requirement is computed with
+//!   integer scaling only — `ceil(approvers * percent / 100)`, never
+//!   floating point — and rounded *up* so a partial vote can never round the
+//!   bar away.
+//! * **Majority (the vote itself).** The approvals must form a *strict*
+//!   majority of the allow-list: `approvals > approvers / 2`. An exact tie is
+//!   not a majority.
+//!
+//! The proposal's own configured `threshold` is re-checked as well — behind
+//! the `Approved` state gate, which already guarantees it — as defence in
+//! depth against a tally that somehow slipped below the bar it declared.
+//!
+//! Every shortfall reports the protocol-wide [`Error::ThresholdNotMet`]: a
+//! missed quorum *is* a missed threshold (the participation bar was not
+//! crossed), and the shared error enum already sits at the Stellar spec's
+//! 50-case cap for contract errors, so there is no room for a dedicated
+//! quorum code.
+//!
+//! ```text
+//! approvals < threshold              ──▶ ProposalNotApproved (state gate)
+//! approvals < quorum(allow-list)     ──▶ Error::ThresholdNotMet
+//! approvals <= allow-list / 2 (tie)  ──▶ Error::ThresholdNotMet
+//! otherwise                          ──▶ timelock / dependency gates, then run
+//! ```
+//!
+//! All three bars are re-derived from the stored record on every call rather
+//! than cached, so the verdict is a pure function of on-chain state and every
+//! node agrees on it. The maths lives in [`VoteBars`] — the quorum
+//! calculation and majority check helpers ([`VoteBars::quorum_required`],
+//! [`VoteBars::majority_required`], [`VoteBars::has_majority`]) composed by
+//! [`VoteBars::for_proposal`] and applied by [`VoteBars::ensure_met`] — and
+//! the very same numbers are readable on-chain through the `vote_bars` view,
+//! so a client can report *which* bar a tally missed instead of only that
+//! execution was refused.
+//!
 //! ## Quorum and majority
 //!
 //! A bare approval threshold can be gamed — `threshold = 1` on a ten-person
@@ -92,95 +143,47 @@
 //! agrees on whether the proposal is stale. `expires_at == 0` means the
 //! proposal never expires.
 //!
-//! Every entrypoint that would move a live proposal forward or sideways —
-//! `approve`, `reject`, `cancel`, `execute`, `fail` — re-checks the deadline
-//! against the *current* ledger immediately before mutating state, and refuses
-//! the call with [`Error::ProposalExpired`] when it has passed. The check is
-//! deliberately re-evaluated per call rather than cached on the record: a
-//! proposal created with a future deadline can still go stale before it is ever
-//! touched, and a stale proposal must not be able to change state, move its
-//! deposit or satisfy a dependent proposal's prerequisite.
-//!
-//! The deadline itself does not rewrite state — nothing runs unattended. The
-//! terminal `Expired` transition is recorded explicitly through the
-//! permissionless [`ProposalContract::expire`] (which fails with
-//! [`Error::InvalidProposalState`] until the deadline has actually passed) and
-//! the record can afterwards be purged by [`ProposalContract::cleanup_expired`].
+//! The deadline is re-evaluated against the current ledger on every call. A
+//! Any invocation that encounters a stale proposal lazily records the terminal
+//! `Expired` state, refunds the deposit, and emits an expiry event. The
+//! permissionless [`ProposalContract::expire`] remains available to settle an
+//! untouched stale proposal, and [`ProposalContract::cleanup_expired`] can
+//! purge it afterwards.
 //!
 //! ```text
 //! live (timestamp < expires_at) ──approve/execute/…──▶ normal transition
-//! stale (timestamp >= expires_at) ──any transition────▶ Error::ProposalExpired
-//! stale ──expire()──▶ Expired (deposit refunded) ──cleanup_expired()──▶ purged
+//! stale ──any interaction──────────▶ Expired (deposit refunded, event emitted)
+//! Expired ──later interaction──────▶ no-op
+//! Expired ──cleanup_expired()──────▶ purged
 //! ```
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
-//! `fail`, `close`, `cleanup_expired`, plus the `get`, `state`, `is_expired`,
-//! `dependencies`, `dependencies_met` and `can_execute` views. `initialize`
-//! also stores the mandatory per-proposal timelock.
+//! `fail`, `close`, `cleanup_expired`, `prune_expired`, `prune_expired_batch`,
+//! `prune_expired_range`, plus the `get`, `state`, `is_expired`,
+//! `dependencies`, `dependencies_met`, `vote_bars` and `can_execute` views.
+//! `initialize` also stores the mandatory per-proposal timelock.
 
-use astroid_interfaces::UpgradeableInterface;
+pub mod timelock;
+
+use astroid_interfaces::{ProposalInterface, UpgradeableInterface};
+// The lifecycle vocabulary lives in the interfaces crate so the multisig, the
+// wallet and off-chain consumers all decode the same `u32` discriminants. The
+// contract consumes the shared definition and re-exports it under its old name,
+// so existing callers keep working against a single source of truth.
+pub use astroid_interfaces::proposal::ProposalState;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, PROPOSAL_QUORUM_PERCENT,
+    MAX_PRUNE_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    PROPOSAL_QUORUM_PERCENT,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
 use astroid_shared::types::AssetAmount;
-use astroid_shared::validation::{require_non_empty, require_time_reached};
+use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
     Vec,
 };
-
-/// Proposal lifecycle state.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProposalState {
-    Created = 0,
-    Pending = 1,
-    Approved = 2,
-    Executed = 3,
-    Closed = 4,
-    Rejected = 5,
-    Cancelled = 6,
-    Expired = 7,
-    /// Approved, but the action it authorized did not go through. Terminal, and
-    /// deliberately distinct from `Executed` so a dependent proposal stays
-    /// blocked rather than inheriting a broken prerequisite.
-    Failed = 8,
-}
-
-impl ProposalState {
-    /// Whether a proposal in this state has carried out its action, and so can
-    /// satisfy a dependent proposal's prerequisite.
-    ///
-    /// `Closed` counts: it is only reachable from `Executed`, and tidying an
-    /// executed proposal away must not retroactively block its dependents.
-    pub fn has_executed(self) -> bool {
-        matches!(self, ProposalState::Executed | ProposalState::Closed)
-    }
-
-    /// Whether a proposal in this state has already returned its deposit (or
-    /// never held one), and so may be purged from storage by
-    /// [`ProposalContract::cleanup_expired`].
-    ///
-    /// `Pending` and `Approved` are excluded: a stale proposal in either state
-    /// still holds the proposer's deposit, and deleting the record would
-    /// strand it. Those states must first pass through
-    /// [`ProposalContract::expire`], which refunds the deposit as it records
-    /// the transition. `Failed` is excluded for the same custody reason — its
-    /// deposit has not been returned by any transition, so the record is kept.
-    pub fn deposit_settled(self) -> bool {
-        matches!(
-            self,
-            ProposalState::Expired
-                | ProposalState::Rejected
-                | ProposalState::Cancelled
-                | ProposalState::Executed
-                | ProposalState::Closed
-        )
-    }
-}
 
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
 /// to approve; `threshold` approvals move it to `Approved`. `dependencies` are
@@ -246,6 +249,86 @@ impl Proposal {
         self.is_active(env)
             && self.state == ProposalState::Approved
             && require_timelock_elapsed(env, self).is_ok()
+    }
+}
+
+/// The three vote bars a tally must clear before [`ProposalContract::execute`]
+/// may fire, derived from the proposal's allow-list, its configured
+/// `threshold` and the protocol quorum percentage — see the module-level
+/// *Quorum and majority* notes.
+///
+/// Every bar is recomputed from the stored record on each check rather than
+/// cached, so the verdict is a pure function of on-chain state and every node
+/// agrees on it. The struct is a [`contracttype`] so the same bars can be
+/// read back through the [`ProposalContract::vote_bars`] view, letting a
+/// client report *which* bar a tally missed instead of only that execution
+/// was refused.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoteBars {
+    /// The approval threshold the proposal declared at creation.
+    pub threshold: u32,
+    /// Participation quorum: [`PROPOSAL_QUORUM_PERCENT`]% of the approver
+    /// allow-list, rounded **up** so a partial vote can never round the bar
+    /// away.
+    pub quorum: u32,
+    /// Strict majority: one past half of the approver allow-list. An exact
+    /// tie never reaches it.
+    pub majority: u32,
+}
+
+impl VoteBars {
+    /// All three bars for `proposal`, re-derived from its allow-list size.
+    pub fn for_proposal(proposal: &Proposal) -> Self {
+        let eligible = proposal.approvers.len();
+        Self {
+            threshold: proposal.threshold,
+            quorum: Self::quorum_required(eligible, PROPOSAL_QUORUM_PERCENT),
+            majority: Self::majority_required(eligible),
+        }
+    }
+
+    /// Quorum calculation helper: the number of approvals that makes a vote
+    /// among `eligible` voters quorate — `percent`% of the approver
+    /// allow-list, rounded **up**.
+    ///
+    /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
+    /// [`u64::div_ceil`] — never floating point, so every node derives the
+    /// identical integer. `percent` is clamped to 100, so a misconfigured
+    /// percentage can never demand more than the whole allow-list.
+    pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
+        let percent = percent.min(100);
+        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
+    }
+
+    /// Majority check helper: the smallest number of approvals that exceeds
+    /// half the allow-list — a strict majority. An exact tie (exactly half)
+    /// never reaches it.
+    pub fn majority_required(eligible: u32) -> u32 {
+        eligible / 2 + 1
+    }
+
+    /// Whether `approvals` forms a strict majority of the `eligible` voters.
+    pub fn has_majority(approvals: u32, eligible: u32) -> bool {
+        approvals >= Self::majority_required(eligible)
+    }
+
+    /// Whether a tally of `approvals` clears *every* bar — the configured
+    /// threshold, the participation quorum and the strict majority.
+    pub fn met_by(&self, approvals: u32) -> bool {
+        approvals >= self.threshold && approvals >= self.quorum && approvals >= self.majority
+    }
+
+    /// Refuse a tally that misses any bar with the protocol-wide
+    /// [`Error::ThresholdNotMet`]; a missed quorum *is* a missed threshold,
+    /// and the shared error enum is at the Stellar spec's 50-case cap, so one
+    /// code covers all three bars.
+    pub fn ensure_met(&self, approvals: u32) -> Result<(), Error> {
+        if self.met_by(approvals) {
+            Ok(())
+        } else {
+            Err(Error::ThresholdNotMet)
+        }
     }
 }
 
@@ -401,13 +484,16 @@ impl ProposalContract {
     /// Approve a proposal. Caller must be on the approver allow-list and may
     /// approve only once. Reaching `threshold` transitions to `Approved`.
     ///
-    /// Refused with [`Error::ProposalExpired`] when the proposal's deadline
-    /// has passed on the current ledger, so a stale proposal can never reach
-    /// `Approved`.
+    /// If the deadline has passed, records `Expired`, refunds the deposit and
+    /// emits the expiry event without recording this vote. The unchanged
+    /// approval count is returned because returning an error would roll back
+    /// the expiry transition and its event.
     pub fn approve(env: Env, caller: Address, id: u64) -> Result<u32, Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::require_not_expired(&env, &proposal)?;
+        if Self::expire_if_due(&env, id, &mut proposal)? {
+            return Ok(proposal.approvals);
+        }
         if proposal.state != ProposalState::Pending {
             return Err(Error::InvalidProposalState);
         }
@@ -421,6 +507,13 @@ impl ProposalContract {
         env.storage().persistent().set(&akey, &true);
         proposal.approvals = checked_add(proposal.approvals as i128, 1)? as u32;
         if proposal.approvals >= proposal.threshold {
+            // Issue #329 — every transition passes the canonical state
+            // machine; an entrypoint that fell out of sync with it aborts
+            // instead of corrupting the record.
+            assert!(
+                proposal.state.may_transition(ProposalState::Approved),
+                "approve: illegal transition"
+            );
             proposal.state = ProposalState::Approved;
             // Record the moment of approval: the timelock only starts counting
             // once, when the threshold is reached, and is re-applied verbatim
@@ -444,13 +537,20 @@ impl ProposalContract {
     pub fn reject(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::require_not_expired(&env, &proposal)?;
+        if Self::expire_if_due(&env, id, &mut proposal)? {
+            return Ok(());
+        }
         if proposal.state != ProposalState::Pending {
             return Err(Error::InvalidProposalState);
         }
         if !proposal.approvers.contains(&caller) {
             return Err(Error::NotAnApprover);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Rejected),
+            "reject: illegal transition"
+        );
         proposal.state = ProposalState::Rejected;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -477,14 +577,18 @@ impl ProposalContract {
     pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::require_not_expired(&env, &proposal)?;
+        if Self::expire_if_due(&env, id, &mut proposal)? {
+            return Ok(());
+        }
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
-        if matches!(
-            proposal.state,
-            ProposalState::Executed | ProposalState::Closed | ProposalState::Cancelled
-        ) {
+        // Issue #329 — cancelling is validated against the canonical state
+        // machine, which admits the edge only from the two live states. A
+        // `Rejected` proposal has already had its deposit refunded by
+        // `reject`; admitting `(Rejected, Cancelled)` here would refund it a
+        // second time, and a `Failed` record must stay `Failed`.
+        if !proposal.state.may_transition(ProposalState::Cancelled) {
             return Err(Error::InvalidProposalState);
         }
         if proposal.grace_period != 0 {
@@ -514,65 +618,117 @@ impl ProposalContract {
     /// Mark a proposal expired if its deadline has passed. Permissionless
     /// (anyone may trigger the transition; state gate protects correctness).
     ///
-    /// This is the only transition a stale proposal may undergo. The deadline
-    /// is re-read from `env.ledger().timestamp()` here rather than trusted
-    /// from the caller: calling it before the deadline has passed fails with
-    /// [`Error::InvalidProposalState`], because the proposal has not entered
-    /// the `Expired` state and the transition does not apply. Recording the
-    /// transition refunds the proposer's deposit and closes the proposal
-    /// permanently, so it must never fire early.
+    /// This is a permissionless way to settle an untouched stale proposal. The
+    /// deadline is re-read from `env.ledger().timestamp()` here rather than
+    /// trusted from the caller: calling it before the deadline has passed
+    /// fails with [`Error::InvalidProposalState`]. Recording the transition
+    /// refunds the proposer's deposit and closes the proposal permanently.
     pub fn expire(env: Env, id: u64) -> Result<(), Error> {
         let mut proposal = Self::load(&env, id)?;
-        if !matches!(
-            proposal.state,
-            ProposalState::Pending | ProposalState::Approved
-        ) {
+        if !Self::expire_if_due(&env, id, &mut proposal)? {
             return Err(Error::InvalidProposalState);
         }
-        if !proposal.is_expired(&env) {
-            return Err(Error::InvalidProposalState);
-        }
-        proposal.state = ProposalState::Expired;
-        if let Some(dep) = proposal.deposit.first() {
-            TokenClient::new(&env, &dep.asset).transfer(
-                &env.current_contract_address(),
-                &proposal.proposer,
-                &dep.amount,
-            );
-        }
-        Self::store(&env, id, &proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("expired")), id);
         Ok(())
     }
 
     /// Purge an expired proposal from storage to reclaim space.
+    ///
+    /// Permissionless: anyone may trigger pruning of an expired proposal to
+    /// incentivize ledger hygiene and recover storage footprint.
     ///
     /// Two gates, both re-read from the ledger, and both reported as
     /// [`Error::InvalidProposalState`]: the deadline must have passed (a
     /// proposal with no deadline at all can never be purged), and the proposal
     /// must be in a state that has already settled its deposit. Purging a
     /// still-live proposal would delete the record while the contract still
-    /// holds the proposer's funds, so the caller must drive it to `Expired`
-    /// (or another deposit-returning terminal state) first. The proposal's
+    /// holds the proposer's funds, so a stale pending or approved proposal is
+    /// first settled through the same expiry transition. The proposal's
     /// approval flags are purged along with it.
-    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
-        let proposal = Self::load(&env, id)?;
+    pub fn prune_expired(env: Env, id: u64) -> Result<(), Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
         if !proposal.is_expired(&env) {
             return Err(Error::InvalidProposalState);
         }
         if !proposal.state.deposit_settled() {
             return Err(Error::InvalidProposalState);
         }
-        env.storage().persistent().remove(&DataKey::Proposal(id));
-        for approver in proposal.approvers.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Approval(id, approver));
-        }
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
+        Self::purge_proposal(&env, id, &proposal);
         Ok(())
+    }
+
+    /// Purge an expired proposal from storage to reclaim space.
+    ///
+    /// Preserved for backward-compatibility with existing callers; delegates
+    /// directly to [`Self::prune_expired`].
+    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+        Self::prune_expired(env, id)
+    }
+
+    /// Prune a batch of proposals by their IDs in a single transaction.
+    ///
+    /// Permissionless: anyone may trigger pruning of multiple expired proposals.
+    /// For each proposal in `proposal_ids`, if it exists and is expired with deposit
+    /// settled, its storage record and approval flags are purged.
+    /// Stale pending or approved proposals are first transitioned to `Expired` and
+    /// deposits refunded via [`Self::expire_if_due`].
+    ///
+    /// Non-existent proposals or proposals not yet eligible for pruning are skipped,
+    /// ensuring that a single live or already-pruned proposal does not abort the batch.
+    /// Returns the number of proposals successfully pruned.
+    pub fn prune_expired_batch(env: Env, proposal_ids: Vec<u64>) -> Result<u32, Error> {
+        if proposal_ids.len() > MAX_PRUNE_BATCH {
+            return Err(Error::InvalidInput);
+        }
+        let mut pruned: u32 = 0;
+        for id in proposal_ids.iter() {
+            let Ok(mut proposal) = Self::load(&env, id) else {
+                continue;
+            };
+            let _ = Self::expire_if_due(&env, id, &mut proposal);
+            if proposal.is_expired(&env) && proposal.state.deposit_settled() {
+                Self::purge_proposal(&env, id, &proposal);
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            env.events().publish(
+                (symbol_short!("proposal"), symbol_short!("pruned_b")),
+                pruned,
+            );
+        }
+        Ok(pruned)
+    }
+
+    /// Prune up to `limit` expired proposals across an ID range starting from `start_id`.
+    ///
+    /// Automatic / crank cleanup helper: scans proposal IDs `[start_id, start_id + limit)`
+    /// and purges any proposal that has expired and settled its deposit.
+    /// Returns the number of proposals successfully pruned.
+    pub fn prune_expired_range(env: Env, start_id: u64, limit: u32) -> Result<u32, Error> {
+        if limit == 0 || limit > MAX_PRUNE_BATCH {
+            return Err(Error::InvalidInput);
+        }
+        let mut pruned: u32 = 0;
+        let end_id = checked_add(start_id as i128, limit as i128)?;
+        let end_id = u64::try_from(end_id).map_err(|_| Error::Overflow)?;
+        for id in start_id..end_id {
+            let Ok(mut proposal) = Self::load(&env, id) else {
+                continue;
+            };
+            let _ = Self::expire_if_due(&env, id, &mut proposal);
+            if proposal.is_expired(&env) && proposal.state.deposit_settled() {
+                Self::purge_proposal(&env, id, &proposal);
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            env.events().publish(
+                (symbol_short!("proposal"), symbol_short!("pruned_r")),
+                pruned,
+            );
+        }
+        Ok(pruned)
     }
 
     /// Execute an approved proposal. Only the proposer may execute (the actual
@@ -590,10 +746,9 @@ impl ProposalContract {
     /// checked after the timelock so that a proposal blocked only by its chain
     /// reports the dependency rather than a less specific error.
     ///
-    /// The expiry gate runs first: an approved proposal whose deadline passed
-    /// before it was executed may not fire, and reports
-    /// [`Error::ProposalExpired`] rather than appearing merely un-executable.
-    /// Then the mandatory timelock applies — execution is refused with
+    /// The expiry gate runs first: a proposal whose deadline has been reached
+    /// never fires and returns [`Error::ProposalExpired`]. Then the mandatory
+    /// timelock applies — execution is refused with
     /// [`Error::TimelockNotExpired`] until `timelock` seconds have passed
     /// since approval — and only then is the dependency chain resolved. The
     /// ordering means a premature attempt is reported as a scheduling error
@@ -601,7 +756,12 @@ impl ProposalContract {
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::require_not_expired(&env, &proposal)?;
+        if proposal.is_expired(&env) {
+            return Err(Error::ProposalExpired);
+        }
+        if Self::expire_if_due(&env, id, &mut proposal)? {
+            return Ok(());
+        }
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
@@ -621,6 +781,11 @@ impl ProposalContract {
         // [`Proposal::can_execute`], so the view and the entrypoint agree.
         require_timelock_elapsed(&env, &proposal)?;
         Self::ensure_dependencies_met(&env, id, &proposal)?;
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Executed),
+            "execute: illegal transition"
+        );
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -647,13 +812,20 @@ impl ProposalContract {
     pub fn fail(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
-        Self::require_not_expired(&env, &proposal)?;
+        if Self::expire_if_due(&env, id, &mut proposal)? {
+            return Ok(());
+        }
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Failed),
+            "fail: illegal transition"
+        );
         proposal.state = ProposalState::Failed;
         Self::store(&env, id, &proposal);
         env.events()
@@ -671,12 +843,20 @@ impl ProposalContract {
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
+        if Self::expire_if_due(&env, id, &mut proposal)? {
+            return Ok(());
+        }
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
         if proposal.state != ProposalState::Executed {
             return Err(Error::InvalidProposalState);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Closed),
+            "close: illegal transition"
+        );
         proposal.state = ProposalState::Closed;
         Self::store(&env, id, &proposal);
         env.events()
@@ -687,75 +867,102 @@ impl ProposalContract {
     // --- views ---
 
     pub fn get(env: Env, id: u64) -> Result<Proposal, Error> {
-        Self::load(&env, id)
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal)
     }
 
-    pub fn state(env: Env, id: u64) -> Result<ProposalState, Error> {
-        Ok(Self::load(&env, id)?.state)
+    /// The vote bars this proposal's tally must clear before `execute` will
+    /// run: its configured `threshold`, the participation quorum
+    /// ([`PROPOSAL_QUORUM_PERCENT`]% of the approver allow-list, integer
+    /// scaled and rounded up) and a strict majority of that allow-list.
+    ///
+    /// The bars themselves never depend on the clock, but the record is read
+    /// through the same settle-first path as every other view, so the answer
+    /// is derived from exactly what `execute` would see: a client that only
+    /// gets [`Error::ThresholdNotMet`] back can use this view to tell the
+    /// caller *which* bar its tally missed.
+    pub fn vote_bars(env: Env, id: u64) -> Result<VoteBars, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(VoteBars::for_proposal(&proposal))
     }
 
-    /// Whether the proposal's deadline has been reached on the current ledger
-    /// (and it therefore has a deadline at all). Lets a client check before
-    /// spending a transaction on a stale proposal.
-    pub fn is_expired(env: Env, id: u64) -> Result<bool, Error> {
-        Ok(Self::load(&env, id)?.is_expired(&env))
+    /// The protocol-wide mandatory delay in seconds between a proposal's
+    /// approval and its execution, as stored by
+    /// [`ProposalContract::initialize`]. `0` means the delay is disabled.
+    pub fn timelock(env: Env) -> u64 {
+        timelock_delay(&env)
     }
 
-    /// The prerequisite proposal ids this proposal declares.
-    pub fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
-        Ok(Self::load(&env, id)?.dependencies)
-    }
-
-    /// Whether the proposal has completed its action — `Executed` or `Closed`
-    /// (the only terminal states reachable from a successful run). This is the
-    /// completion check downstream contracts should read before chaining onto a
-    /// proposal, so dependency resolution needs no private state.
-    pub fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
-        Ok(Self::load(&env, id)?.state.has_executed())
-    }
-
-    /// Whether every prerequisite has executed — the same question `execute`
-    /// asks, exposed so callers can check before spending a transaction on it.
-    pub fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
+    /// The ledger timestamp at which proposal `id` becomes executable: its
+    /// stored approval stamp plus the configured
+    /// [`timelock`](ProposalContract::timelock).
+    ///
+    /// `0` when the time-lock is not armed — the proposal is not approved yet,
+    /// or the delay is disabled — which is the same "nothing to wait for"
+    /// answer [`ProposalContract::timelock_status`] reports.
+    ///
+    /// Fails with [`Error::Overflow`] when the release instant cannot be
+    /// expressed as a ledger timestamp, so a misconfigured delay is visible
+    /// here rather than silently releasing the proposal early.
+    pub fn release_at(env: Env, id: u64) -> Result<u64, Error> {
         let proposal = Self::load(&env, id)?;
-        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
+        timelock::release_at(proposal.approved_at, timelock_delay(&env))
     }
 
-    /// Whether `execute` would accept this proposal on the current ledger:
-    /// live (not past its deadline), `Approved`, the tally still clearing the
-    /// quorum / threshold / majority bars, the mandatory delay since approval
-    /// elapsed, and every prerequisite executed. The conjunction of exactly
-    /// the gates `execute` applies, in the order it applies them, so a client
-    /// can check before spending a transaction on it and never get an answer
-    /// the entrypoint would then contradict.
-    pub fn can_execute(env: Env, id: u64) -> Result<bool, Error> {
+    /// The full time-lock verdict for proposal `id` on the current ledger:
+    /// its approval stamp, the delay applied, the release instant, the seconds
+    /// still to wait, and whether the cooling-off period is armed and/or has
+    /// elapsed.
+    ///
+    /// Derived through the same [`timelock`] checks `execute` applies, so a
+    /// client that polls this view learns exactly when the next attempt will
+    /// stop being refused — and never gets an answer the entrypoint would
+    /// then contradict. Unlike the other views it deliberately does not settle
+    /// an expired proposal first: the time-lock question is asked of the
+    /// stored record so a proposal that is both stale and cooling off still
+    /// reports its delay rather than hiding behind the deadline.
+    pub fn timelock_status(env: Env, id: u64) -> Result<timelock::TimeLockStatus, Error> {
         let proposal = Self::load(&env, id)?;
-        if !proposal.can_execute(&env) {
-            return Ok(false);
-        }
-        if Self::ensure_vote_valid(&proposal).is_err() {
-            return Ok(false);
-        }
-        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
+        timelock::time_lock_status(&env, proposal.approved_at, timelock_delay(&env))
     }
 
     // --- internal helpers ---
 
-    /// Refuse any interaction with a proposal whose deadline has passed on the
-    /// current ledger.
-    ///
-    /// Called at the top of every entrypoint that mutates a live proposal, so
-    /// the check always runs against `env.ledger().timestamp()` at the moment
-    /// of the call — never against a value cached when the proposal was
-    /// created or last read. Returns the dedicated
-    /// [`Error::ProposalExpired`] code, which is distinct from the generic
-    /// [`Error::InvalidProposalState`]: callers can tell "you were too late"
-    /// from "that transition is not available in this state".
-    fn require_not_expired(env: &Env, proposal: &Proposal) -> Result<(), Error> {
-        if proposal.is_expired(env) {
-            return Err(Error::ProposalExpired);
+    /// Materialize expiry when an interaction observes a stale or already
+    /// expired proposal. Returning success commits the transition, refund and
+    /// event together and makes subsequent interactions idempotent.
+    fn expire_if_due(env: &Env, id: u64, proposal: &mut Proposal) -> Result<bool, Error> {
+        if proposal.state == ProposalState::Expired {
+            return Ok(true);
         }
-        Ok(())
+        if !matches!(
+            proposal.state,
+            ProposalState::Pending | ProposalState::Approved
+        ) || !proposal.is_expired(env)
+        {
+            return Ok(false);
+        }
+
+        // Issue #329 — the expiry transition passes the canonical state
+        // machine too (it is reachable only from the two live states).
+        assert!(
+            proposal.state.may_transition(ProposalState::Expired),
+            "expire: illegal transition"
+        );
+        proposal.state = ProposalState::Expired;
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
+        Self::store(env, id, proposal);
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("expired")), id);
+        Ok(true)
     }
 
     fn load(env: &Env, id: u64) -> Result<Proposal, Error> {
@@ -772,34 +979,11 @@ impl ProposalContract {
         Self::bump(env, id);
     }
 
-    /// The number of approvals that makes a vote among `eligible` voters
-    /// quorate: `percent`% of the approver allow-list, rounded **up** so a
-    /// partial vote can never round the requirement away.
-    ///
-    /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
-    /// [`u64::div_ceil`] — never floating point, so every node derives the
-    /// identical integer. `percent` is clamped to 100, so a misconfigured
-    /// percentage can never demand more than the whole allow-list.
-    fn quorum_required(eligible: u32, percent: u32) -> u32 {
-        let percent = percent.min(100);
-        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
-    }
-
-    /// The smallest number of approvals that exceeds half the allow-list — a
-    /// strict majority. An exact tie (exactly half) never reaches it.
-    fn majority_required(eligible: u32) -> u32 {
-        eligible / 2 + 1
-    }
-
-    /// Whether `approvals` forms a strict majority of the `eligible` voters.
-    fn has_majority(approvals: u32, eligible: u32) -> bool {
-        approvals >= Self::majority_required(eligible)
-    }
-
     /// Refuse to execute a proposal whose tally does not clear every vote bar.
     ///
-    /// Re-derived from the stored record on each call — nothing is cached —
-    /// and checked in order of increasing strictness:
+    /// The bars are derived afresh from the stored record on each call —
+    /// nothing is cached — by [`VoteBars::for_proposal`], and checked in
+    /// order of increasing strictness:
     ///
     /// 1. the proposal's configured `threshold` (defence in depth: the
     ///    `Approved` state gate in `execute` already guarantees it);
@@ -808,22 +992,13 @@ impl ProposalContract {
     /// 3. a strict majority of the allow-list (an exact tie is not a
     ///    majority).
     ///
-    /// Every shortfall reports [`Error::ThresholdNotMet`] — a missed quorum
-    /// *is* a missed threshold, and the shared error enum is at the Stellar
-    /// spec's 50-case cap, so one protocol-wide code covers all three bars.
+    /// Every shortfall reports [`Error::ThresholdNotMet`] (see
+    /// [`VoteBars::ensure_met`]).
     ///
     /// Nothing is mutated: a refusal leaves the proposal `Approved` and free
     /// to be re-attempted, failed or cancelled.
     fn ensure_vote_valid(proposal: &Proposal) -> Result<(), Error> {
-        let eligible = proposal.approvers.len();
-        let quorum = Self::quorum_required(eligible, PROPOSAL_QUORUM_PERCENT);
-        if proposal.approvals < proposal.threshold
-            || proposal.approvals < quorum
-            || !Self::has_majority(proposal.approvals, eligible)
-        {
-            return Err(Error::ThresholdNotMet);
-        }
-        Ok(())
+        VoteBars::for_proposal(proposal).ensure_met(proposal.approvals)
     }
 
     /// Require that every prerequisite proposal has executed.
@@ -864,31 +1039,115 @@ impl ProposalContract {
             PERSISTENT_BUMP_AMOUNT,
         );
     }
+
+    fn purge_proposal(env: &Env, id: u64, proposal: &Proposal) {
+        env.storage().persistent().remove(&DataKey::Proposal(id));
+        for approver in proposal.approvers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Approval(id, approver));
+        }
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("pruned")), id);
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
+    }
+}
+
+/// The protocol-wide timelock in seconds, stored once by
+/// [`ProposalContract::initialize`]. `0` (the default before `initialize`
+/// runs, and an explicit `0` afterwards) disables the delay.
+fn timelock_delay(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::Timelock)
+        .unwrap_or(0)
 }
 
 /// Refuse to release a proposal until the mandatory delay between approval and
 /// execution has elapsed on the current ledger.
 ///
-/// The delay is the protocol-wide `timelock` (seconds) stored once by
-/// [`ProposalContract::initialize`]; `0` disables it, and a record stamped
-/// before any delay applied (`approved_at == 0`) has nothing to wait for.
-/// Otherwise the release instant `approved_at + timelock` is computed with the
-/// shared checked helpers and *must* be representable as a ledger timestamp:
-/// an unrepresentable instant fails closed with [`Error::Overflow`] instead of
-/// truncating into the past, which would otherwise let a proposal execute the
-/// moment it is approved. [`Proposal::can_execute`] runs the very same gate.
+/// A thin adapter onto [`timelock::require_released`]: it reads the configured
+/// delay and hands the proposal's approval stamp to the time-lock check, which
+/// owns the release-instant arithmetic, the inclusive boundary and the
+/// fail-closed overflow handling. `0` (disabled) and a record stamped before
+/// any delay applied (`approved_at == 0`) leave the time-lock unarmed and pass
+/// immediately; every premature attempt reports the deterministic
+/// [`Error::TimelockNotExpired`]. [`Proposal::can_execute`] runs the very same
+/// gate.
 fn require_timelock_elapsed(env: &Env, proposal: &Proposal) -> Result<(), Error> {
-    let timelock: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Timelock)
-        .unwrap_or(0);
-    if timelock == 0 || proposal.approved_at == 0 {
-        return Ok(());
+    timelock::require_released(env, proposal.approved_at, timelock_delay(env))
+}
+
+// ---------------------------------------------------------------------------
+// Status surface, exposed through the shared `ProposalInterface`.
+//
+// Declaring these in the trait impl (rather than an inherent one) is what makes
+// the contract's entrypoints provably match the cross-contract client other
+// contracts are generated against. Each read settles a stale proposal first,
+// so the answer always reflects the deterministic ledger clock.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl ProposalInterface for ProposalContract {
+    /// Current lifecycle state of proposal `id`.
+    fn state(env: Env, id: u64) -> Result<ProposalState, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.state)
     }
-    let release_at = checked_add(proposal.approved_at as i128, timelock as i128)?;
-    let release_at = u64::try_from(release_at).map_err(|_| Error::Overflow)?;
-    require_time_reached(env, release_at)
+
+    /// Whether the proposal's deadline has been reached on the current ledger
+    /// (and it therefore has a deadline at all). Lets a client check before
+    /// spending a transaction on a stale proposal.
+    fn is_expired(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.state == ProposalState::Expired || proposal.is_expired(&env))
+    }
+
+    /// Whether the proposal has completed its action — `Executed` or `Closed`
+    /// (the only terminal states reachable from a successful run). This is the
+    /// completion check downstream contracts should read before chaining onto a
+    /// proposal, so dependency resolution needs no private state.
+    fn is_executed(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.state.has_executed())
+    }
+
+    /// The prerequisite proposal ids this proposal declares.
+    fn dependencies(env: Env, id: u64) -> Result<Vec<u64>, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(proposal.dependencies)
+    }
+
+    /// Whether every prerequisite has executed — the same question `execute`
+    /// asks, exposed so callers can check before spending a transaction on it.
+    fn dependencies_met(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
+    }
+
+    /// Whether `execute` would accept this proposal on the current ledger:
+    /// live (not past its deadline), `Approved`, the tally still clearing the
+    /// quorum / threshold / majority bars, the mandatory delay since approval
+    /// elapsed, and every prerequisite executed. The conjunction of exactly
+    /// the gates `execute` applies, in the order it applies them, so a client
+    /// can check before spending a transaction on it and never get an answer
+    /// the entrypoint would then contradict.
+    fn can_execute(env: Env, id: u64) -> Result<bool, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        if !proposal.can_execute(&env) {
+            return Ok(false);
+        }
+        if Self::ensure_vote_valid(&proposal).is_err() {
+            return Ok(false);
+        }
+        Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())
+    }
 }
 
 // ---------------------------------------------------------------------------

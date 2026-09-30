@@ -11,8 +11,13 @@ on every outflow.
 - `set_policy(policy)` / `set_budget(budget)` — wire enforcement contracts.
 - `freeze` / `unfreeze` — emergency stop on outflows (multisig only).
 - `pause` / `unpause` — circuit breaker: guardian or multisig stops all
-  outflows (`Error::TreasuryPaused`) while deposits keep flowing in.
+  outflows (`Error::TreasuryPaused`) while deposits keep flowing in. A pause
+  lapses automatically after `MAX_PAUSE_DURATION` (one month) so a lost
+  guardian key cannot strand the treasury forever; indefinite stops must go
+  through `freeze`.
 - `set_guardian(guardian)` — rotate the account that may pause / unpause.
+- `set_registry(registry)` — wire the registry used to verify contract
+  callers (Issue #308); `None` clears the gate.
 - `allocate_budget(asset, budget_id)` — attach an envelope to an asset.
 
 ## Invariants
@@ -28,7 +33,35 @@ A withdrawal can only succeed when:
 Deposits are exempt from 2 and 3: inbound funding stays available during an
 emergency so the treasury can be replenished while paused or frozen.
 
-## Events
+A pause older than `MAX_PAUSE_DURATION` no longer blocks outflows (2 stops
+applying on its own); the stale flag remains until the next `pause` re-engages
+a fresh window or `unpause` clears it and resets the recorded timestamp.
+
+## Registry-verified callers and reentrancy (Issue #308)
+
+Every value path (`deposit`, `withdraw`, `batch_transfer`,
+`release_next_milestone`) is additionally guarded by two defenses:
+
+1. **Caller verification.** When a registry is wired (`set_registry`),
+   movement calls made *by contract addresses* must resolve to the expected
+   module record for the treasury's organization: deposits verify a contract
+   depositor against the org's `Wallet` record, outbound movements verify
+   their caller against the org's `Multisig` record. Anything else — an
+   unregistered contract, a contract registered under a different kind, a
+   frozen or otherwise unanswerable registry — is refused deterministically
+   with `UnverifiedCaller` (86). Account callers pass through to the ordinary
+   role checks, and clearing the registry restores the pre-registry
+   behaviour.
+2. **Reentrancy lock.** A flag in instance storage is engaged before the
+   first external call of a movement and released when it completes; a
+   re-entered movement finds the lock engaged and fails with `InvalidState`
+   instead of double-spending the ledger. Because the flag lives in instance
+   storage, the host rolls it back if the invocation aborts.
+
+Note that Soroban's test address generator mints contract-format addresses,
+so unit/integration tests that exercise gated flows must register their test
+admin/funder under the expected module kinds (see
+`contracts/treasury/src/test.rs` and `tests/src/gated_fund_flows.rs`).
 
 - `("treasury", "deposited")` on every deposit.
 - `("transfer", "executed")` on successful withdrawals (shared standard).
