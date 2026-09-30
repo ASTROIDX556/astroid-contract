@@ -2360,3 +2360,270 @@ fn ai_agent_sliding_window_custom_interval_rate_limiting() {
     assert_eq!(h.client.remaining(&agent_budget_id), limit);
     assert_eq!(h.client.consume(&h.owner, &agent_budget_id, &500), 500);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #232: Budget rollover accounting tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn budget_rollover_with_custom_percentage_and_cap() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-rollover");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 5_000i128; // 50%
+    let max_rollover_cap = 300i128;
+
+    // Allocate budget with 50% rollover and 300 cap
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // Period 1: Spend 400. Unspent = 600.
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &400), 600);
+    assert_eq!(h.client.remaining(&budget_id), 600);
+
+    // Advance to Period 2:
+    // Unspent: 600. 50% of 600 = 300. Cap = 300. Clamped to min(300, 300) = 300.
+    // Fresh allowance = limit (1000) + rollover (300) = 1300.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_300);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 300);
+
+    // Can spend up to 1_300 in period 2
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &1_000), 300);
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &300), 0);
+    let res = h.client.try_consume(&h.owner, &budget_id, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+}
+
+#[test]
+fn budget_rollover_percentage_below_cap() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-bps-below-cap");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 2_500i128; // 25%
+    let max_rollover_cap = 500i128;
+
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // Spend 200 => Unspent = 800
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &200), 800);
+
+    // Period 2: 25% of 800 = 200. Cap is 500. 200 < 500, so credit is 200.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_200);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 200);
+}
+
+#[test]
+fn budget_rollover_clamped_by_cap() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-bps-clamped");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 5_000i128; // 50%
+    let max_rollover_cap = 200i128;
+
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // Spend 200 => Unspent = 800
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &200), 800);
+
+    // Period 2: 50% of 800 = 400. Cap is 200. 400 > 200 => clamped to 200.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_200);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 200);
+}
+
+#[test]
+fn budget_rollover_zero_unspent_and_zero_bps() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-zero-bps");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+
+    // Rollover enabled but bps = 0
+    h.client
+        .allocate_with_rollover(&h.owner, &budget_id, &limit, &period, &true, &0, &500, &0);
+
+    // Spend 200 => unspent = 800
+    h.client.consume(&h.owner, &budget_id, &200);
+    h.env.ledger().set_timestamp(1_000 + window);
+
+    // 0 bps => 0 credit
+    assert_eq!(h.client.remaining(&budget_id), 1_000);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 0);
+}
+
+#[test]
+fn multiple_period_rollovers_simulation() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-multi-period");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+    let rollover_bps = 5_000i128; // 50%
+    let max_rollover_cap = 400i128;
+
+    h.client.allocate_with_rollover(
+        &h.owner,
+        &budget_id,
+        &limit,
+        &period,
+        &true,
+        &rollover_bps,
+        &max_rollover_cap,
+        &0,
+    );
+
+    // --- Period 1 (t = 1_000) ---
+    // Capacity = 1_000. Spend 400. Unspent = 600.
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &400), 600);
+
+    // --- Period 2 (t = 1_000 + 86_400) ---
+    // Rollover = min(600 * 50%, 400) = 300.
+    // Capacity = 1_000 + 300 = 1_300.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_300);
+    // Spend 500. Remaining unspent = 1_300 - 500 = 800.
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &500), 800);
+
+    // --- Period 3 (t = 1_000 + 2 * 86_400) ---
+    // Rollover = min(800 * 50%, 400) = min(400, 400) = 400.
+    // Capacity = 1_000 + 400 = 1_400.
+    h.env.ledger().set_timestamp(1_000 + 2 * window);
+    assert_eq!(h.client.remaining(&budget_id), 1_400);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 400);
+
+    // Spend 1_400 in full
+    assert_eq!(h.client.consume(&h.owner, &budget_id, &1_400), 0);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &budget_id, &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+
+    // --- Period 4 (t = 1_000 + 3 * 86_400) ---
+    // Unspent was 0 => Rollover = 0.
+    // Capacity = 1_000.
+    h.env.ledger().set_timestamp(1_000 + 3 * window);
+    assert_eq!(h.client.remaining(&budget_id), 1_000);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 0);
+}
+
+#[test]
+fn set_rollover_config_dynamically() {
+    let h = setup();
+    let budget_id = id(&h.env, "agent-dynamic-rollover");
+    let limit = 1_000i128;
+    let period = Period::Daily;
+    let window = 86_400u64;
+
+    // Initially allocate without rollover
+    h.client
+        .allocate(&h.owner, &budget_id, &limit, &period, &false, &0);
+
+    // Dynamically enable rollover with 40% (4_000 bps) and cap 300
+    h.client
+        .set_rollover_config(&h.owner, &budget_id, &true, &4_000, &300);
+
+    // Spend 500 => Unspent = 500
+    h.client.consume(&h.owner, &budget_id, &500);
+
+    // Advance to Period 2: 40% of 500 = 200. Cap = 300.
+    h.env.ledger().set_timestamp(1_000 + window);
+    assert_eq!(h.client.remaining(&budget_id), 1_200);
+    let b: Budget = h.client.get(&budget_id);
+    assert_eq!(b.rollover_credit, 200);
+    assert_eq!(b.rollover_bps, 4_000);
+    assert_eq!(b.rollover_cap, 300);
+}
+
+#[test]
+fn per_asset_budget_rollover_accounting() {
+    let h = setup();
+    let budget_id = id(&h.env, "asset-rollover-test");
+    let token = Address::generate(&h.env);
+    let limit = 1_000i128;
+    let window_seconds = 86_400u64;
+
+    h.client
+        .allocate(&h.owner, &budget_id, &10_000, &Period::Daily, &false, &0);
+
+    // Set asset budget with 50% rollover and 300 cap
+    h.client.set_budget_limit_with_rollover(
+        &h.owner,
+        &budget_id,
+        &token,
+        &limit,
+        &window_seconds,
+        &true,
+        &5_000,
+        &300,
+    );
+
+    // Spend 400 of 1000 => unspent = 600
+    h.client
+        .check_and_record_spend(&h.owner, &budget_id, &token, &400);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 600);
+
+    // Advance to next window
+    // 50% of 600 = 300 (cap is 300) => credit = 300
+    // Total capacity = 1_000 + 300 = 1_300
+    h.env.ledger().set_timestamp(1_000 + window_seconds);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 1_300);
+    let ab = h.client.get_asset_budget(&budget_id, &token);
+    assert_eq!(ab.rollover_credit, 300);
+    assert_eq!(ab.spent, 0);
+
+    // Spend full 1300
+    h.client
+        .check_and_record_spend(&h.owner, &budget_id, &token, &1_300);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 0);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &budget_id, &token, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+
+    // Next window: unspent was 0 => credit = 0, capacity = 1_000
+    h.env.ledger().set_timestamp(1_000 + 2 * window_seconds);
+    assert_eq!(h.client.asset_remaining(&budget_id, &token), 1_000);
+    let ab = h.client.get_asset_budget(&budget_id, &token);
+    assert_eq!(ab.rollover_credit, 0);
+}
