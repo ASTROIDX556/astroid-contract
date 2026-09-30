@@ -1039,14 +1039,11 @@ fn composite_and_one_fails() {
 }
 
 #[test]
-fn composite_and_empty_children_fails() {
+fn composite_and_empty_children_rejected_at_registration() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
-
     // AND node with children_start == children_end (empty)
     let mut tree = soroban_sdk::Vec::new(&env);
     tree.push_back(RuleNode {
@@ -1056,10 +1053,8 @@ fn composite_and_empty_children_fails() {
         children_start: 1,
         children_end: 1,
     });
-    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
-
     assert_eq!(
-        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        p.try_set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree),
         Err(Ok(Error::InvalidInput))
     );
 }
@@ -1161,14 +1156,11 @@ fn composite_or_all_fail() {
 }
 
 #[test]
-fn composite_or_empty_children_fails() {
+fn composite_or_empty_children_rejected_at_registration() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
     let p = composite_setup(&env, &owner);
-    let asset = Address::generate(&env);
-    let recip = Address::generate(&env);
-
     let mut tree = soroban_sdk::Vec::new(&env);
     tree.push_back(RuleNode {
         op: RuleOp::Or,
@@ -1177,10 +1169,8 @@ fn composite_or_empty_children_fails() {
         children_start: 1,
         children_end: 1,
     });
-    p.set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree);
-
     assert_eq!(
-        p.try_check_transfer(&String::from_str(&env, "cr"), &asset, &recip, &100),
+        p.try_set_composite_rule(&owner, &String::from_str(&env, "cr"), &tree),
         Err(Ok(Error::InvalidInput))
     );
 }

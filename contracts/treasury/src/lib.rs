@@ -219,12 +219,11 @@ pub struct Holding {
     pub budget_id: Option<String>,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AssetBalance {
-    pub asset: Address,
-    pub balance: i128,
-}
+// The per-asset balance record the `balances` view answers with lives in
+// `astroid-shared` (Issue #293): it describes a custody balance rather than
+// anything treasury-specific, so it is defined once for the whole workspace and
+// re-exported here so `astroid_treasury::AssetBalance` keeps resolving.
+pub use astroid_shared::types::AssetBalance;
 
 /// One approved asset's position, as reported by
 /// [`TreasuryContract::portfolio`]. All amounts are in the token's base units.

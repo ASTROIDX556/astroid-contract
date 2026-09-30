@@ -149,7 +149,8 @@
 //! ```
 //!
 //! Functions: `create`, `approve`, `reject`, `cancel`, `expire`, `execute`,
-//! `fail`, `close`, `cleanup_expired`, plus the `get`, `state`, `is_expired`,
+//! `fail`, `close`, `cleanup_expired`, `prune_expired`, `prune_expired_batch`,
+//! `prune_expired_range`, plus the `get`, `state`, `is_expired`,
 //! `dependencies`, `dependencies_met`, `vote_bars` and `can_execute` views.
 //! `initialize` also stores the mandatory per-proposal timelock.
 
@@ -161,7 +162,8 @@ use astroid_interfaces::{ProposalInterface, UpgradeableInterface};
 pub use astroid_interfaces::proposal::ProposalState;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, PROPOSAL_QUORUM_PERCENT,
+    MAX_PRUNE_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    PROPOSAL_QUORUM_PERCENT,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
@@ -494,6 +496,13 @@ impl ProposalContract {
         env.storage().persistent().set(&akey, &true);
         proposal.approvals = checked_add(proposal.approvals as i128, 1)? as u32;
         if proposal.approvals >= proposal.threshold {
+            // Issue #329 — every transition passes the canonical state
+            // machine; an entrypoint that fell out of sync with it aborts
+            // instead of corrupting the record.
+            assert!(
+                proposal.state.may_transition(ProposalState::Approved),
+                "approve: illegal transition"
+            );
             proposal.state = ProposalState::Approved;
             // Record the moment of approval: the timelock only starts counting
             // once, when the threshold is reached, and is re-applied verbatim
@@ -526,6 +535,11 @@ impl ProposalContract {
         if !proposal.approvers.contains(&caller) {
             return Err(Error::NotAnApprover);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Rejected),
+            "reject: illegal transition"
+        );
         proposal.state = ProposalState::Rejected;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -558,10 +572,12 @@ impl ProposalContract {
         if caller != proposal.proposer {
             return Err(Error::Unauthorized);
         }
-        if matches!(
-            proposal.state,
-            ProposalState::Executed | ProposalState::Closed | ProposalState::Cancelled
-        ) {
+        // Issue #329 — cancelling is validated against the canonical state
+        // machine, which admits the edge only from the two live states. A
+        // `Rejected` proposal has already had its deposit refunded by
+        // `reject`; admitting `(Rejected, Cancelled)` here would refund it a
+        // second time, and a `Failed` record must stay `Failed`.
+        if !proposal.state.may_transition(ProposalState::Cancelled) {
             return Err(Error::InvalidProposalState);
         }
         if proposal.grace_period != 0 {
@@ -606,6 +622,9 @@ impl ProposalContract {
 
     /// Purge an expired proposal from storage to reclaim space.
     ///
+    /// Permissionless: anyone may trigger pruning of an expired proposal to
+    /// incentivize ledger hygiene and recover storage footprint.
+    ///
     /// Two gates, both re-read from the ledger, and both reported as
     /// [`Error::InvalidProposalState`]: the deadline must have passed (a
     /// proposal with no deadline at all can never be purged), and the proposal
@@ -614,7 +633,7 @@ impl ProposalContract {
     /// holds the proposer's funds, so a stale pending or approved proposal is
     /// first settled through the same expiry transition. The proposal's
     /// approval flags are purged along with it.
-    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+    pub fn prune_expired(env: Env, id: u64) -> Result<(), Error> {
         let mut proposal = Self::load(&env, id)?;
         Self::expire_if_due(&env, id, &mut proposal)?;
         if !proposal.is_expired(&env) {
@@ -623,15 +642,82 @@ impl ProposalContract {
         if !proposal.state.deposit_settled() {
             return Err(Error::InvalidProposalState);
         }
-        env.storage().persistent().remove(&DataKey::Proposal(id));
-        for approver in proposal.approvers.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Approval(id, approver));
-        }
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
+        Self::purge_proposal(&env, id, &proposal);
         Ok(())
+    }
+
+    /// Purge an expired proposal from storage to reclaim space.
+    ///
+    /// Preserved for backward-compatibility with existing callers; delegates
+    /// directly to [`Self::prune_expired`].
+    pub fn cleanup_expired(env: Env, id: u64) -> Result<(), Error> {
+        Self::prune_expired(env, id)
+    }
+
+    /// Prune a batch of proposals by their IDs in a single transaction.
+    ///
+    /// Permissionless: anyone may trigger pruning of multiple expired proposals.
+    /// For each proposal in `proposal_ids`, if it exists and is expired with deposit
+    /// settled, its storage record and approval flags are purged.
+    /// Stale pending or approved proposals are first transitioned to `Expired` and
+    /// deposits refunded via [`Self::expire_if_due`].
+    ///
+    /// Non-existent proposals or proposals not yet eligible for pruning are skipped,
+    /// ensuring that a single live or already-pruned proposal does not abort the batch.
+    /// Returns the number of proposals successfully pruned.
+    pub fn prune_expired_batch(env: Env, proposal_ids: Vec<u64>) -> Result<u32, Error> {
+        if proposal_ids.len() > MAX_PRUNE_BATCH {
+            return Err(Error::InvalidInput);
+        }
+        let mut pruned: u32 = 0;
+        for id in proposal_ids.iter() {
+            let Ok(mut proposal) = Self::load(&env, id) else {
+                continue;
+            };
+            let _ = Self::expire_if_due(&env, id, &mut proposal);
+            if proposal.is_expired(&env) && proposal.state.deposit_settled() {
+                Self::purge_proposal(&env, id, &proposal);
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            env.events().publish(
+                (symbol_short!("proposal"), symbol_short!("pruned_b")),
+                pruned,
+            );
+        }
+        Ok(pruned)
+    }
+
+    /// Prune up to `limit` expired proposals across an ID range starting from `start_id`.
+    ///
+    /// Automatic / crank cleanup helper: scans proposal IDs `[start_id, start_id + limit)`
+    /// and purges any proposal that has expired and settled its deposit.
+    /// Returns the number of proposals successfully pruned.
+    pub fn prune_expired_range(env: Env, start_id: u64, limit: u32) -> Result<u32, Error> {
+        if limit == 0 || limit > MAX_PRUNE_BATCH {
+            return Err(Error::InvalidInput);
+        }
+        let mut pruned: u32 = 0;
+        let end_id = checked_add(start_id as i128, limit as i128)?;
+        let end_id = u64::try_from(end_id).map_err(|_| Error::Overflow)?;
+        for id in start_id..end_id {
+            let Ok(mut proposal) = Self::load(&env, id) else {
+                continue;
+            };
+            let _ = Self::expire_if_due(&env, id, &mut proposal);
+            if proposal.is_expired(&env) && proposal.state.deposit_settled() {
+                Self::purge_proposal(&env, id, &proposal);
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            env.events().publish(
+                (symbol_short!("proposal"), symbol_short!("pruned_r")),
+                pruned,
+            );
+        }
+        Ok(pruned)
     }
 
     /// Execute an approved proposal. Only the proposer may execute (the actual
@@ -649,13 +735,9 @@ impl ProposalContract {
     /// checked after the timelock so that a proposal blocked only by its chain
     /// reports the dependency rather than a less specific error.
     ///
-    /// The expiry gate runs first: a proposal whose deadline passed before it
-    /// was executed never fires. The call settles it instead — it records the
-    /// terminal `Expired` state, refunds the deposit and emits the `expired`
-    /// event — and returns `Ok(())` without executing, because returning an
-    /// error would roll that settlement back. Callers tell the two outcomes
-    /// apart through `state`, `is_executed` or the `expired` event; repeat
-    /// calls are no-ops. Then the mandatory timelock applies — execution is refused with
+    /// The expiry gate runs first: a proposal whose deadline has been reached
+    /// never fires and returns [`Error::ProposalExpired`]. Then the mandatory
+    /// timelock applies — execution is refused with
     /// [`Error::TimelockNotExpired`] until `timelock` seconds have passed
     /// since approval — and only then is the dependency chain resolved. The
     /// ordering means a premature attempt is reported as a scheduling error
@@ -663,6 +745,9 @@ impl ProposalContract {
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
+        if proposal.is_expired(&env) {
+            return Err(Error::ProposalExpired);
+        }
         if Self::expire_if_due(&env, id, &mut proposal)? {
             return Ok(());
         }
@@ -685,6 +770,11 @@ impl ProposalContract {
         // [`Proposal::can_execute`], so the view and the entrypoint agree.
         require_timelock_elapsed(&env, &proposal)?;
         Self::ensure_dependencies_met(&env, id, &proposal)?;
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Executed),
+            "execute: illegal transition"
+        );
         proposal.state = ProposalState::Executed;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
@@ -720,6 +810,11 @@ impl ProposalContract {
         if proposal.state != ProposalState::Approved {
             return Err(Error::ProposalNotApproved);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Failed),
+            "fail: illegal transition"
+        );
         proposal.state = ProposalState::Failed;
         Self::store(&env, id, &proposal);
         env.events()
@@ -746,6 +841,11 @@ impl ProposalContract {
         if proposal.state != ProposalState::Executed {
             return Err(Error::InvalidProposalState);
         }
+        // Issue #329 — every transition passes the canonical state machine.
+        assert!(
+            proposal.state.may_transition(ProposalState::Closed),
+            "close: illegal transition"
+        );
         proposal.state = ProposalState::Closed;
         Self::store(&env, id, &proposal);
         env.events()
@@ -794,6 +894,12 @@ impl ProposalContract {
             return Ok(false);
         }
 
+        // Issue #329 — the expiry transition passes the canonical state
+        // machine too (it is reachable only from the two live states).
+        assert!(
+            proposal.state.may_transition(ProposalState::Expired),
+            "expire: illegal transition"
+        );
         proposal.state = ProposalState::Expired;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(env, &dep.asset).transfer(
@@ -881,6 +987,19 @@ impl ProposalContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    fn purge_proposal(env: &Env, id: u64, proposal: &Proposal) {
+        env.storage().persistent().remove(&DataKey::Proposal(id));
+        for approver in proposal.approvers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Approval(id, approver));
+        }
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("pruned")), id);
+        env.events()
+            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
     }
 }
 
