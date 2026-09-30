@@ -450,6 +450,27 @@ impl Error {
     }
 }
 
+impl Error {
+    /// The "escrow is still time-locked" error demanded by issue #315,
+    /// published as a named alias of [`Error::TimelockNotExpired`].
+    ///
+    /// The shared error table sits at Soroban's 50-case spec limit, so a
+    /// second enum variant cannot be minted without renumbering published
+    /// codes — a breaking ABI change. The alias instead gives the escrow's
+    /// premature-release refusals the name the issue specifies (`EscrowLocked`)
+    /// while staying bit-identical on the wire: `Error::EscrowLocked as u32 ==
+    /// Error::TimelockNotExpired as u32 == 91` (`TIMELOCK_NOT_EXPIRED`), and
+    /// the two compare equal. Every early-release gate in `astroid-escrow`
+    /// returns this constant; no numeric value changed.
+    ///
+    /// Deliberately *not* listed in [`Error::ALL`]: that table enumerates the
+    /// protocol's distinct codes, and an alias adds a name, not a code — an
+    /// entry would also trip the uniqueness audit, which forbids two variants
+    /// sharing a discriminant.
+    #[allow(non_upper_case_globals)]
+    pub const EscrowLocked: Error = Error::TimelockNotExpired;
+}
+
 /// Budget spend errors, kept separate from the protocol-wide error enum so
 /// budget-specific timing errors do not exceed Soroban's 50-variant limit.
 /// Existing codes match [`Error`] exactly; code 45 is the new scheduled-start
