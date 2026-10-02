@@ -57,6 +57,11 @@ pub const MAX_BATCH_CALLS: u32 = 16;
 /// invocation (and therefore the cost of the revert when a leg fails).
 pub const MAX_BATCH_PAYMENTS: u32 = 32;
 
+/// Upper bound on how many distinct token legs a single atomic multi-token
+/// budget spend may validate at once. Each leg costs a persistent read and
+/// write, so this caps the worst-case cost of one batch invocation.
+pub const MAX_BATCH_TOKENS: u32 = 16;
+
 /// Upper bound on how many module records one registry batch lookup may read.
 /// Every id costs up to two persistent reads (record + deprecation flag), so
 /// this caps the footprint of a single `get_modules_batch` invocation.
@@ -76,6 +81,19 @@ pub const MAX_PAUSE_DURATION: u64 = SECONDS_PER_MONTH;
 /// Minimum number of ledgers that must pass before a pending multisig
 /// threshold change can be finalized (~1 day on Stellar).
 pub const THRESHOLD_CHANGE_DELAY_LEDGERS: u32 = DAY_IN_LEDGERS;
+
+/// How long a version-upgrade proposal stays valid after being proposed (one
+/// week). Stale proposals must be re-proposed rather than lying dormant
+/// indefinitely, so an old approval cannot be committed after the operators
+/// have changed their minds.
+pub const UPGRADE_PROPOSAL_EXPIRY: u64 = SECONDS_PER_WEEK;
+
+/// Upper bound on how many entries the registry's immutable upgrade audit log
+/// retains (instance storage). The log is a ring buffer: once full, the oldest
+/// entry is dropped as each new one is appended, keeping the audit trail of
+/// the most recent upgrades while capping the storage footprint of an
+/// unbounded version history.
+pub const MAX_UPGRADE_AUDIT_ENTRIES: u32 = 32;
 
 /// Number of basis points that make up 100%. Protocol percentages (e.g. the
 /// budget contract's maximum rollover percentage) are carried as integer
