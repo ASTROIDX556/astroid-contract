@@ -61,6 +61,47 @@
 //! [`Error::TreasuryPaused`] code so off-chain monitors can distinguish "we
 //! paused on purpose" from a generic state failure.
 //!
+//! ## Withdrawal time-lock (Issue #321)
+//!
+//! Every gate above constrains *how much* may move and *to whom*, but none of
+//! them introduces a delay. That leaves the treasury's sharpest edge
+//! unaddressed: a single compromised admin key is immediately monetisable,
+//! because whoever holds it can move the entire balance in one signed
+//! transaction, and no governance threshold, policy or budget can interpose if
+//! that key is alone on the multisig.
+//!
+//! [`WithdrawalTimeLock`] closes that window. High-value payouts are parked
+//! instead of settling, and the funds stay in custody and in the ledger while
+//! the organization has a chance to notice and react:
+//!
+//! ```text
+//! withdraw / batch_transfer, amount >= threshold ──▶ Error::TimelockNotExpired
+//! queue_withdrawal ──▶ pending, no value moved ──▶ cancel_withdrawal
+//!                                             └──▶ execute_withdrawal (after the delay)
+//! ```
+//!
+//! Three properties are deliberate:
+//!
+//! * **The batch path is measured on its aggregate.** A lock that only guarded
+//!   `withdraw` would be advisory: the same movement split across a batch of
+//!   small legs, or issued as several sub-threshold withdrawals, would walk
+//!   straight past it. The threshold therefore applies to what leaves the
+//!   treasury, not to how it was packaged.
+//! * **The low-value fast path is untouched.** A treasury that never configures
+//!   a time-lock resolves to the disabled default, and payouts below the
+//!   configured threshold keep settling immediately — so ordinary agent
+//!   spending is not made to wait a day for a governance control aimed at
+//!   draining the whole balance.
+//! * **Timing is read from the ledger, never the wall clock.** Every comparison
+//!   uses `env.ledger().timestamp()`, which the network controls, so no caller
+//!   can influence when a cooldown elapses. The `execute_after` boundary is
+//!   inclusive, and a request left unexecuted past its grace period
+//!   ([`GOVERNANCE_GRACE_PERIOD`]) lapses rather than becoming a standing
+//!   obligation the organization can no longer cancel in time.
+//!
+//! Queueing moves nothing, which is what makes the waiting period meaningful:
+//! the request is visible and cancellable while it is still inert.
+//!
 //! ## Registry-verified callers (Issue #308)
 //!
 //! The treasury's movement endpoints (`deposit`, `withdraw`,
@@ -144,17 +185,25 @@
 //! `init_milestone_disbursement`, `release_next_milestone`, `get`, `holding`,
 //! `is_paused`, `guardian`, `registry`, `is_approved_asset`,
 //! `approved_asset_count`, `approved_assets`, `portfolio`.
+//!
+//! Withdrawal time-lock (Issue #321): `set_withdrawal_time_lock`,
+//! `withdrawal_time_lock`, `queue_withdrawal`, `queue_batch_transfer`,
+//! `execute_withdrawal`, `cancel_withdrawal`, `pending_withdrawal`,
+//! `pending_withdrawal_count`.
 
 use astroid_interfaces::{PolicyClient, RegistryClient, TreasuryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, PERSISTENT_BUMP_AMOUNT,
+    GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS,
+    MAX_PAUSE_DURATION, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::{checked_add, checked_div, checked_mul, checked_sub};
+use astroid_shared::math::{checked_add, checked_add_u64, checked_div, checked_mul, checked_sub};
 use astroid_shared::types::{ModuleKind, Payment, ResourceState};
-use astroid_shared::validation::{require_non_empty, require_positive_amount};
+use astroid_shared::validation::{
+    require_non_empty, require_positive_amount, require_time_reached,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
 };
@@ -192,6 +241,10 @@ pub struct Treasury {
     /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
     /// funding can still arrive.
     pub paused: bool,
+    /// Ledger timestamp at which the breaker was engaged, or `0` while
+    /// disengaged. Every pause lapses automatically after
+    /// [`MAX_PAUSE_DURATION`]; see [`TreasuryContract::pause`].
+    pub paused_at: u64,
 }
 
 /// Per-asset accounting within the treasury.
@@ -267,6 +320,108 @@ pub struct Allowance {
     pub expires_at: u64,
 }
 
+/// Cooling-off configuration for high-value withdrawals (Issue #321).
+///
+/// A treasury is the one contract where a single compromised admin key is
+/// immediately monetisable: whoever holds it can move the whole balance in one
+/// signed transaction. The time-lock inserts a mandatory waiting period in
+/// front of exactly those movements, long enough for the organization to
+/// notice and react.
+///
+/// The configuration is deliberately two-dimensional:
+///
+/// ```text
+/// delay == 0                     → time-lock disabled, every outflow immediate
+/// delay  > 0, amount <  threshold → low-value fast path, immediate
+/// delay  > 0, amount >= threshold → must be queued, then executed after `delay`
+/// ```
+///
+/// Splitting the payout into sub-threshold withdrawals would otherwise make
+/// the time-lock trivially bypassable, which is why the batch path is measured
+/// on the **aggregate** payout total rather than per leg (see
+/// [`TreasuryContract::batch_transfer`]).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalTimeLock {
+    /// Cooling-off period in seconds applied to time-locked withdrawals.
+    /// `0` disables the time-lock entirely; any enabled delay must lie within
+    /// `[MIN_TIMELOCK_DELAY, MAX_TIMELOCK_DELAY]`, so the treasury can neither
+    /// be configured with a meaningless delay nor parked behind an effectively
+    /// infinite one.
+    pub delay: u64,
+    /// Minimum payout (in the asset's base units) at or above which a withdrawal
+    /// becomes time-locked. Always `0` while the time-lock is disabled.
+    pub threshold: i128,
+}
+
+impl WithdrawalTimeLock {
+    /// The default: no cooling-off period, every outflow immediate. A treasury
+    /// that has never configured a time-lock therefore behaves exactly as it did
+    /// before one existed.
+    pub fn disabled() -> Self {
+        Self {
+            delay: 0,
+            threshold: 0,
+        }
+    }
+
+    /// Whether a payout of `amount` must be time-locked. A disabled lock never
+    /// captures anything, and the comparison is inclusive so a payout landing
+    /// exactly on the threshold is captured rather than allowed through by a
+    /// single base unit.
+    pub fn applies(&self, amount: i128) -> bool {
+        self.delay > 0 && amount >= self.threshold
+    }
+}
+
+/// A withdrawal parked in its cooling-off period, waiting to be executed or
+/// cancelled (Issue #321).
+///
+/// Queueing a withdrawal moves **no value**: the amount stays in custody and in
+/// the internal ledger until [`TreasuryContract::execute_withdrawal`] pays it
+/// out. That is the whole point of the cooling-off period — a queued request is
+/// visible, cancellable and inert.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingWithdrawal {
+    /// Monotonic identifier, assigned at queue time.
+    pub id: u64,
+    /// The admin that queued the request, recorded for auditing.
+    pub requester: Address,
+    /// Token contract the withdrawal settles in.
+    pub asset: Address,
+    /// Single-recipient target. Unused when `payments` carries the batch legs.
+    pub to: Address,
+    /// Aggregate payout, in the asset's base units. Always equals the sum of
+    /// `payments` for a batch request.
+    pub amount: i128,
+    /// Batch legs for a queued [`TreasuryContract::queue_batch_transfer`];
+    /// empty for a plain queued [`TreasuryContract::queue_withdrawal`].
+    pub payments: Vec<Payment>,
+    /// Ledger timestamp at which the request was queued.
+    pub requested_at: u64,
+    /// Ledger timestamp from which the payout becomes executable. Execution
+    /// strictly at this instant is allowed; one second earlier is refused with
+    /// [`Error::TimelockNotExpired`].
+    pub execute_after: u64,
+    /// Ledger timestamp at which an unexecuted request lapses. A stale request
+    /// must be re-queued under fresh scrutiny rather than lying dormant
+    /// indefinitely and becoming executable at an arbitrary future point.
+    pub expires_at: u64,
+    /// Whether the request was terminated by [`TreasuryContract::cancel_withdrawal`].
+    pub cancelled: bool,
+    /// Whether the payout has already settled. A request may settle at most once.
+    pub executed: bool,
+}
+
+impl PendingWithdrawal {
+    /// Whether the request is still awaiting a decision: neither cancelled nor
+    /// already paid out.
+    pub fn is_pending(&self) -> bool {
+        !self.cancelled && !self.executed
+    }
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -287,6 +442,12 @@ enum DataKey {
     Milestone(u64),
     MilestoneCount,
     Allowance(AllowanceId),
+    /// Cooling-off configuration for high-value withdrawals (instance).
+    WithdrawalTimeLock,
+    /// A queued withdrawal waiting out its cooling-off period (persistent).
+    PendingWithdrawal(u64),
+    /// Id allocator for `PendingWithdrawal` (instance).
+    PendingWithdrawalCount,
 }
 
 #[contract]
@@ -326,6 +487,7 @@ impl TreasuryContract {
                 state: ResourceState::Active,
                 guardian: admin.clone(),
                 paused: false,
+                paused_at: 0,
             },
         );
         env.storage()
@@ -529,12 +691,21 @@ impl TreasuryContract {
     /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
     /// funding can still arrive. Unlike [`Self::freeze`] this does not change
     /// any structural ownership or configuration - only the pause flag moves.
+    ///
+    /// The breaker is temporary by construction: it engages with the ledger
+    /// timestamp stamped into [`Treasury::paused_at`] and lapses automatically
+    /// once [`MAX_PAUSE_DURATION`] has elapsed, after which outflows resume on
+    /// their own while the stale flag stays recorded until it is cleared. An
+    /// indefinite stop must go through the multisig-only [`Self::freeze`].
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
         let mut t = Self::require_guardian(&env, &caller)?;
-        if t.paused {
+        // Re-engaging over a breaker that has merely lapsed is fine; only a
+        // pause still inside its window is rejected as a double-toggle.
+        if Self::pause_is_active(&t, &env) {
             return Err(Error::InvalidState);
         }
         t.paused = true;
+        t.paused_at = env.ledger().timestamp();
         Self::store(&env, &t);
         events::publish(
             &env,
@@ -552,13 +723,20 @@ impl TreasuryContract {
     ///
     /// Same guardian/multisig gate as [`Self::pause`], and symmetric: an
     /// attempt to unpause a treasury that is not paused fails with
-    /// [`Error::InvalidState`] rather than silently doing nothing.
+    /// [`Error::InvalidState`] rather than silently doing nothing. Clearing
+    /// the breaker also resets [`Treasury::paused_at`], so the next
+    /// [`Self::pause`] gets a fresh [`MAX_PAUSE_DURATION`] window.
+    ///
+    /// Releasing a breaker whose window has already lapsed also succeeds: the
+    /// stale flag and [`Treasury::paused_at`] are cleared so the breaker can
+    /// be re-engaged cleanly later.
     pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
         let mut t = Self::require_guardian(&env, &caller)?;
         if !t.paused {
             return Err(Error::InvalidState);
         }
         t.paused = false;
+        t.paused_at = 0;
         Self::store(&env, &t);
         events::publish(
             &env,
@@ -737,6 +915,13 @@ impl TreasuryContract {
     ///
     /// While the circuit breaker is engaged this short-circuits with
     /// [`Error::TreasuryPaused`] before any other gate is consulted.
+    ///
+    /// When a time-lock is configured and `amount` reaches its threshold, this
+    /// call is refused with [`Error::TimelockNotExpired`] and settles nothing:
+    /// the payout must first be parked by
+    /// [`TreasuryContract::queue_withdrawal`] and then paid out by
+    /// [`TreasuryContract::execute_withdrawal`] once the cooling-off period has
+    /// elapsed. Amounts below the threshold keep settling immediately.
     pub fn withdraw(
         env: Env,
         caller: Address,
@@ -761,30 +946,54 @@ impl TreasuryContract {
         //    callers pass through to the admin check above.
         Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
 
-        // 3. Issue #308 — engage the reentrancy lock before the first
-        //    external call (policy and budget are cross-contract invocations
-        //    too) and hold it to the end of the movement.
-        Self::lock(&env)?;
+        // 3. Issue #321 — refuse to settle a high-value payout in the same
+        //    transaction that requests it. Everything below this point moves
+        //    value, so the check sits ahead of the reentrancy lock and ahead of
+        //    every external call.
+        Self::require_not_time_locked(&env, amount)?;
 
-        // 4. Policy verification — the policy contract evaluates the spend.
+        Self::settle_withdrawal(&env, &t, &caller, &asset, &to, amount)
+    }
+
+    /// The value-moving half of [`Self::withdraw`]: policy, budget, allowance,
+    /// ledger debit and the token transfer itself, under the reentrancy lock.
+    ///
+    /// Split out so that [`Self::execute_withdrawal`] can settle a queued
+    /// payout through exactly the same audited path — the only thing that
+    /// differs is that the caller's own request went through a cooling-off
+    /// period first.
+    fn settle_withdrawal(
+        env: &Env,
+        t: &Treasury,
+        caller: &Address,
+        asset: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        // Issue #308 — engage the reentrancy lock before the first
+        // external call (policy and budget are cross-contract invocations
+        // too) and hold it to the end of the movement.
+        Self::lock(env)?;
+
+        // Policy verification — the policy contract evaluates the spend.
         if let Some(policy_addr) = &t.policy {
-            PolicyClient::new(&env, policy_addr).check_transfer(
-                &String::from_str(&env, "active"),
-                &asset,
-                &to,
+            PolicyClient::new(env, policy_addr).check_transfer(
+                &String::from_str(env, "active"),
+                asset,
+                to,
                 &amount,
             );
         }
 
-        // 5. Budget consumption — aborts if the envelope lacks headroom.
-        let mut holding = Self::load_holding(&env, &asset);
+        // Budget consumption — aborts if the envelope lacks headroom.
+        let mut holding = Self::load_holding(env, asset);
         if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
-            astroid_interfaces::BudgetClient::new(&env, budget_addr)
-                .consume(&caller, budget_id, &amount);
+            astroid_interfaces::BudgetClient::new(env, budget_addr)
+                .consume(caller, budget_id, &amount);
         }
 
-        // 6. Withdrawal allowance enforcement — restrict agent-driven spends
-        //    to pre-approved periodic ceilings per (agent, recipient, asset).
+        // Withdrawal allowance enforcement — restrict agent-driven spends
+        // to pre-approved periodic ceilings per (agent, recipient, asset).
         let allowance_id = AllowanceId {
             agent: caller.clone(),
             recipient: to.clone(),
@@ -796,12 +1005,12 @@ impl TreasuryContract {
             .get::<DataKey, Allowance>(&DataKey::Allowance(allowance_id.clone()))
         {
             if al.expires_at != 0 && env.ledger().timestamp() >= al.expires_at {
-                Self::unlock(&env);
+                Self::unlock(env);
                 return Err(Error::AllowanceExpired);
             }
             let remaining = checked_sub(al.limit, al.spent)?;
             if amount > remaining {
-                Self::unlock(&env);
+                Self::unlock(env);
                 return Err(Error::AllowanceExceeded);
             }
             al.spent = checked_add(al.spent, amount)?;
@@ -810,21 +1019,21 @@ impl TreasuryContract {
                 .set(&DataKey::Allowance(allowance_id), &al);
         }
 
-        // 4. Debit the internal ledger, then move real tokens out of custody.
+        // Debit the internal ledger, then move real tokens out of custody.
         if holding.total_in < amount {
-            Self::unlock(&env);
+            Self::unlock(env);
             return Err(Error::InsufficientFunds);
         }
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
-        Self::store_holding(&env, &asset, &holding);
-        let balance = checked_sub(Self::asset_balance_internal(&env, &asset), amount)?;
-        Self::store_asset_balance(&env, &asset, balance);
-        events::transfer_executed(&env, &t.admin, &to, &asset, amount);
-        Self::transfer_out(&env, &asset, &to, amount)?;
-        events::transfer_executed(&env, &t.admin, &to, &asset, amount);
+        Self::store_holding(env, asset, &holding);
+        let balance = checked_sub(Self::asset_balance_internal(env, asset), amount)?;
+        Self::store_asset_balance(env, asset, balance);
+        events::transfer_executed(env, &t.admin, to, asset, amount);
+        Self::transfer_out(env, asset, to, amount)?;
+        events::transfer_executed(env, &t.admin, to, asset, amount);
         events::publish(
-            &env,
+            env,
             events::ContractEvent::TransferExecuted {
                 from: t.admin.clone(),
                 to: to.clone(),
@@ -833,7 +1042,7 @@ impl TreasuryContract {
             },
         );
         events::publish(
-            &env,
+            env,
             events::ContractEvent::TreasuryWithdrawn {
                 org: t.org.clone(),
                 to: to.clone(),
@@ -842,7 +1051,7 @@ impl TreasuryContract {
                 balance,
             },
         );
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
     }
 
@@ -862,6 +1071,14 @@ impl TreasuryContract {
     /// Like every other outflow it is refused with [`Error::TreasuryPaused`]
     /// while the emergency circuit breaker is engaged - a batch payout is a
     /// disbursement like any other.
+    ///
+    /// The time-lock (Issue #321) is measured on the **aggregate** payout, not
+    /// per leg: measuring per leg would let a caller walk straight past the
+    /// cooling-off period by splitting one large movement into many small ones,
+    /// which would leave the direct [`Self::withdraw`] path as the only
+    /// time-locked route and render it advisory. A batch whose total reaches
+    /// the threshold is refused with [`Error::TimelockNotExpired`] and must be
+    /// parked with [`Self::queue_batch_transfer`] instead.
     pub fn batch_transfer(
         env: Env,
         caller: Address,
@@ -887,7 +1104,7 @@ impl TreasuryContract {
         }
 
         // 2. Cumulative balance check against the recorded holding.
-        let mut holding = Self::load_holding(&env, &asset);
+        let holding = Self::load_holding(&env, &asset);
         if holding.total_in < total {
             return Err(Error::InsufficientFunds);
         }
@@ -896,35 +1113,62 @@ impl TreasuryContract {
         //    Multisig (governance) module for this organization; account
         //    callers pass through to the admin check above.
         Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+        // 4. Issue #321 — the aggregate payout, not the individual legs, decides
+        //    whether the cooling-off period applies.
+        Self::require_not_time_locked(&env, total)?;
 
-        // 4. Issue #308 — engage the reentrancy lock before the first
-        //    external call and hold it across the whole transfer loop.
-        Self::lock(&env)?;
+        Self::settle_batch(&env, &t, &caller, &asset, payments)
+    }
 
-        // 5. Policy verification — each leg is evaluated on its own, because
-        //    per-recipient and per-amount gates are what the policy encodes.
+    /// The value-moving half of [`Self::batch_transfer`]: per-leg policy, the
+    /// aggregate budget debit, the ledger debit and the transfer loop, all
+    /// under the reentrancy lock.
+    ///
+    /// Shared with [`Self::execute_withdrawal`] so a queued batch settles
+    /// through exactly the same audited path an immediate one does.
+    fn settle_batch(
+        env: &Env,
+        t: &Treasury,
+        caller: &Address,
+        asset: &Address,
+        payments: Vec<Payment>,
+    ) -> Result<(), Error> {
+        // Re-accumulate the total from the legs themselves rather than trusting
+        // a stored figure, so the amount budget is debited is always exactly the
+        // amount actually paid out.
+        let mut total: i128 = 0;
+        for payment in payments.iter() {
+            total = checked_add(total, payment.amount)?;
+        }
+
+        // Issue #308 — engage the reentrancy lock before the first external
+        // call and hold it across the whole transfer loop.
+        Self::lock(env)?;
+
+        // Policy verification — each leg is evaluated on its own, because
+        // per-recipient and per-amount gates are what the policy encodes.
         if let Some(policy_addr) = &t.policy {
-            let policy = PolicyClient::new(&env, policy_addr);
-            let policy_id = String::from_str(&env, "active");
+            let policy = PolicyClient::new(env, policy_addr);
+            let policy_id = String::from_str(env, "active");
             for payment in payments.iter() {
-                policy.check_transfer(&policy_id, &asset, &payment.recipient, &payment.amount);
+                policy.check_transfer(&policy_id, asset, &payment.recipient, &payment.amount);
             }
         }
 
-        // 6. Budget consumption — one debit for the aggregate rather than one
-        //    cross-contract call per recipient.
+        // Budget consumption — one debit for the aggregate rather than one
+        // cross-contract call per recipient.
+        let mut holding = Self::load_holding(env, asset);
         if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
-            astroid_interfaces::BudgetClient::new(&env, budget_addr)
-                .consume(&caller, budget_id, &total);
+            astroid_interfaces::BudgetClient::new(env, budget_addr)
+                .consume(caller, budget_id, &total);
         }
 
-        // 7. Debit the internal ledger once, then move real tokens per
-        //    recipient.
+        // Debit the internal ledger once, then move real tokens per recipient.
         holding.total_in = checked_sub(holding.total_in, total)?;
         holding.total_out = checked_add(holding.total_out, total)?;
-        Self::store_holding(&env, &asset, &holding);
+        Self::store_holding(env, asset, &holding);
 
-        let token_client = token::TokenClient::new(&env, &asset);
+        let token_client = token::TokenClient::new(env, asset);
         let custody = env.current_contract_address();
         let before = token_client.balance(&custody);
         if before < total {
@@ -941,7 +1185,7 @@ impl TreasuryContract {
         // A single summary event keeps the log concise; the per-recipient moves
         // are already observable as the asset contract's own transfer events.
         events::publish(
-            &env,
+            env,
             events::ContractEvent::BatchTransferExecuted {
                 from: t.admin.clone(),
                 asset: asset.clone(),
@@ -951,11 +1195,265 @@ impl TreasuryContract {
         );
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("batchpay")),
-            (asset, payments.len(), total),
+            (asset.clone(), payments.len(), total),
         );
 
-        Self::unlock(&env);
+        Self::unlock(env);
         Ok(())
+    }
+
+    // --- withdrawal time-lock (Issue #321) ---
+
+    /// Configure the cooling-off period applied to high-value withdrawals.
+    ///
+    /// ```text
+    /// delay == 0  → time-lock disabled, every outflow settles immediately
+    /// delay  > 0  → payouts of `threshold` or more must be queued first
+    /// ```
+    ///
+    /// An enabled `delay` must lie within
+    /// `[MIN_TIMELOCK_DELAY, MAX_TIMELOCK_DELAY]` — the same bounds governance
+    /// changes are held to — so the treasury cannot be configured with a delay
+    /// short enough to be worthless, nor parked behind one long enough to be a
+    /// denial of service. `threshold` must be positive whenever the lock is
+    /// enabled; a zero threshold would capture every payout, including dust.
+    ///
+    /// Configuring the lock does not disturb anything already queued: requests
+    /// parked under an earlier configuration keep their own recorded
+    /// `execute_after`.
+    pub fn set_withdrawal_time_lock(
+        env: Env,
+        caller: Address,
+        delay: u64,
+        threshold: i128,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        let config = if delay == 0 {
+            // Disabling is the zero-configuration case: nothing is captured and
+            // the threshold is normalised to `0` so the stored record is not
+            // self-contradictory.
+            WithdrawalTimeLock::disabled()
+        } else {
+            if !(MIN_TIMELOCK_DELAY..=MAX_TIMELOCK_DELAY).contains(&delay) {
+                return Err(Error::InvalidInput);
+            }
+            require_positive_amount(threshold)?;
+            WithdrawalTimeLock { delay, threshold }
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalTimeLock, &config);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("timelock")),
+            (config.delay, config.threshold),
+        );
+        Ok(())
+    }
+
+    /// The cooling-off configuration currently in force.
+    ///
+    /// A treasury that never configured one reports the disabled default rather
+    /// than failing, so off-chain monitors can probe it before `initialize` just
+    /// as they can with [`Self::registry`].
+    pub fn withdrawal_time_lock(env: Env) -> WithdrawalTimeLock {
+        Self::load_time_lock(&env)
+    }
+
+    /// Park a high-value withdrawal in its cooling-off period and return its id.
+    ///
+    /// Every gate a direct [`Self::withdraw`] clears is cleared here too — the
+    /// request is authorized and validated exactly as a payout would be — but
+    /// **no value moves**: the amount stays in custody and in the internal
+    /// ledger until [`Self::execute_withdrawal`] settles it. That is what makes
+    /// the waiting period meaningful, and it is why a queued request is visible,
+    /// cancellable and inert rather than a delayed payment already in flight.
+    ///
+    /// Refused with [`Error::InvalidInput`] when the configured time-lock does
+    /// not actually capture `amount`: queueing a payout the lock would have let
+    /// through anyway would manufacture a cooldown that governance never asked
+    /// for, and silently capturing low-value dust would strand it.
+    pub fn queue_withdrawal(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<u64, Error> {
+        require_positive_amount(amount)?;
+        Self::require_not_paused(&env)?;
+        Self::check_frozen(&env)?;
+        let t = Self::require_admin(&env, &caller)?;
+        Self::require_active(&t)?;
+        // Routing and caller verification are settled at request time, so a
+        // request that could never have been paid is never parked.
+        Self::require_approved_asset(&env, &asset)?;
+        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+        Self::require_time_lock_applies(&env, amount)?;
+
+        Self::open_pending(&env, &caller, asset, to, amount, Vec::new(&env))
+    }
+
+    /// Park a whole batch payout in its cooling-off period and return its id.
+    ///
+    /// The batch counterpart of [`Self::queue_withdrawal`], and for the same
+    /// reason: the time-lock measures the **aggregate** payout, so a batch that
+    /// reaches the threshold has to go through the same waiting period as an
+    /// equivalent single withdrawal rather than remaining an unmonitored way
+    /// around it.
+    pub fn queue_batch_transfer(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        payments: Vec<Payment>,
+    ) -> Result<u64, Error> {
+        if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
+            return Err(Error::InvalidInput);
+        }
+        Self::require_not_paused(&env)?;
+        Self::check_frozen(&env)?;
+        let t = Self::require_admin(&env, &caller)?;
+        Self::require_active(&t)?;
+
+        let mut total: i128 = 0;
+        for payment in payments.iter() {
+            require_positive_amount(payment.amount)?;
+            total = checked_add(total, payment.amount)?;
+        }
+        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+        Self::require_time_lock_applies(&env, total)?;
+
+        // `to` is not meaningful for a multi-recipient payout; the legs in
+        // `payments` are the record. The first leg's recipient is carried so the
+        // stored record is never self-contradictory for a reader that only
+        // looks at the scalar fields.
+        let to = payments.first().unwrap().recipient.clone();
+        Self::open_pending(&env, &caller, asset, to, total, payments)
+    }
+
+    /// Settle a queued withdrawal once its cooling-off period has elapsed.
+    ///
+    /// The gating is strictly deterministic against the ledger timestamp, never
+    /// wall-clock time:
+    ///
+    /// ```text
+    /// cancelled or already executed → Error::InvalidState
+    /// timestamp >= expires_at       → Error::ProposalExpired
+    /// timestamp <  execute_after    → Error::TimelockNotExpired
+    /// otherwise                     → the payout settles
+    /// ```
+    ///
+    /// The boundary itself is inclusive: executing at exactly `execute_after`
+    /// succeeds, one second earlier is refused. Executing past `expires_at` is
+    /// refused rather than honoured, so a request that was ignored through its
+    /// whole cooldown cannot be cashed in months later against a treasury whose
+    /// balances have since changed entirely.
+    pub fn execute_withdrawal(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        Self::check_frozen(&env)?;
+        let t = Self::require_admin(&env, &caller)?;
+        Self::require_active(&t)?;
+
+        let key = DataKey::PendingWithdrawal(id);
+        let mut p: PendingWithdrawal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        // Terminal states are closed to both directions: a cancelled request is
+        // never paid, and a settled one is never paid twice.
+        if !p.is_pending() {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() >= p.expires_at {
+            return Err(Error::ProposalExpired);
+        }
+        // The cooling-off period itself. `require_time_reached` reports the
+        // dedicated early-execution code shared with multisig governance changes
+        // and escrow releases, so a monitor can recognise "not yet" across every
+        // time-locked flow in the protocol.
+        require_time_reached(&env, p.execute_after)?;
+
+        // Re-check routing and caller at settlement time, not only at request
+        // time: the asset may have been de-whitelisted, or the caller may have
+        // stopped being the recorded module, during the waiting period.
+        Self::require_approved_asset(&env, &p.asset)?;
+        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+
+        // Record the settlement before the payout. If the payout aborts, the
+        // host reverts this write along with everything else, so the record
+        // cannot end up marking a payout that never happened; setting it first
+        // is what makes a second, concurrent execution impossible.
+        p.executed = true;
+        env.storage().persistent().set(&key, &p);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        if p.payments.is_empty() {
+            Self::settle_withdrawal(&env, &t, &caller, &p.asset, &p.to, p.amount)?;
+        } else {
+            Self::settle_batch(&env, &t, &caller, &p.asset, p.payments.clone())?;
+        }
+
+        env.events().publish(
+            (symbol_short!("timelock"), symbol_short!("executed")),
+            (id, p.amount),
+        );
+        Ok(())
+    }
+
+    /// Terminate a queued withdrawal, leaving the funds in the treasury.
+    ///
+    /// The escape hatch that makes the cooling-off period safe to configure: if
+    /// a request turns out to be hostile or simply stale, governance can drop
+    /// it without waiting out the delay and without the payout ever having
+    /// touched custody. A cancelled request is terminal — it can neither be
+    /// executed afterwards nor cancelled twice.
+    pub fn cancel_withdrawal(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::PendingWithdrawal(id);
+        let mut p: PendingWithdrawal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        if !p.is_pending() {
+            return Err(Error::InvalidState);
+        }
+        p.cancelled = true;
+        env.storage().persistent().set(&key, &p);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("timelock"), symbol_short!("canceled")), id);
+        Ok(())
+    }
+
+    /// A queued withdrawal by id. [`Error::NotFound`] for an id that was never
+    /// issued.
+    pub fn pending_withdrawal(env: Env, id: u64) -> Result<PendingWithdrawal, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingWithdrawal(id))
+            .ok_or(Error::NotFound)
+    }
+
+    /// How many withdrawals have ever been queued. Ids are issued from this
+    /// counter and never reused, so a cancelled or expired id is never handed
+    /// out again for a different request.
+    pub fn pending_withdrawal_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingWithdrawalCount)
+            .unwrap_or(0)
     }
 
     // --- views ---
@@ -1329,14 +1827,29 @@ impl TreasuryContract {
         Ok(t)
     }
 
+    /// Whether an engaged breaker is still inside its [`MAX_PAUSE_DURATION`]
+    /// window. A lapsed pause stops blocking outflows but keeps its stale
+    /// flag stored until [`Self::unpause`] clears it or [`Self::pause`]
+    /// re-engages over it.
+    fn pause_is_active(t: &Treasury, env: &Env) -> bool {
+        t.paused && env.ledger().timestamp() < t.paused_at.saturating_add(MAX_PAUSE_DURATION)
+    }
+
     /// Short-circuit an outbound value movement while the emergency circuit
     /// breaker is engaged, with the dedicated [`Error::TreasuryPaused`] code.
     ///
     /// Reads the flag from instance storage on every call rather than caching
     /// it, and is never called on inbound paths: deposits must keep working
     /// during a pause so recovery funding can arrive.
+    ///
+    /// The breaker also lapses here: once [`MAX_PAUSE_DURATION`] has passed
+    /// since [`Treasury::paused_at`], a still-set flag no longer blocks
+    /// outflows. This bounds the blast radius of the breaker without trusting
+    /// any external keeper to release it — if the guardian disappears mid
+    /// incident, the treasury unblocks itself after the cap. A pause that
+    /// must outlive the cap is the multisig-only [`Self::freeze`].
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::load(env)?.paused {
+        if Self::pause_is_active(&Self::load(env)?, env) {
             return Err(Error::TreasuryPaused);
         }
         Ok(())
@@ -1402,6 +1915,113 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .set(&DataKey::ReentrancyLock, &false);
+    }
+
+    // --- withdrawal time-lock internals (Issue #321) ---
+
+    /// The cooling-off configuration in force, or the disabled default when the
+    /// treasury has never set one.
+    ///
+    /// Defaulting rather than failing is what makes the feature strictly
+    /// additive: an unconfigured treasury resolves to `delay == 0`, and
+    /// `WithdrawalTimeLock::applies` is then false for every amount, so every
+    /// pre-existing outflow path behaves exactly as it did before.
+    fn load_time_lock(env: &Env) -> WithdrawalTimeLock {
+        env.storage()
+            .instance()
+            .get(&DataKey::WithdrawalTimeLock)
+            .unwrap_or_else(WithdrawalTimeLock::disabled)
+    }
+
+    /// Refuse an immediate payout of `amount` when the time-lock captures it.
+    ///
+    /// Called on both value paths *before* the reentrancy lock is taken and
+    /// before any external call, so a time-locked payout is rejected having
+    /// moved nothing and consumed nothing.
+    ///
+    /// [`Error::TimelockNotExpired`] is the deliberate code here: it is the
+    /// protocol's dedicated early-execution code, already reported by multisig
+    /// governance changes and escrow releases, so an operator sees one
+    /// consistent "this action is still inside its cooling-off period" signal
+    /// regardless of which module refused.
+    fn require_not_time_locked(env: &Env, amount: i128) -> Result<(), Error> {
+        if Self::load_time_lock(env).applies(amount) {
+            return Err(Error::TimelockNotExpired);
+        }
+        Ok(())
+    }
+
+    /// Refuse to park a payout the configured time-lock would not have
+    /// captured, so queueing cannot be used to impose a cooldown governance
+    /// never configured.
+    fn require_time_lock_applies(env: &Env, amount: i128) -> Result<(), Error> {
+        if Self::load_time_lock(env).applies(amount) {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput)
+        }
+    }
+
+    /// Record a queued withdrawal and return its id.
+    ///
+    /// Both timestamps are computed with the shared checked `u64` addition from
+    /// the ledger clock, so a configuration near `u64::MAX` surfaces as
+    /// [`Error::Overflow`] rather than wrapping into an `execute_after` already
+    /// in the past — which would turn a maximum cooldown into none at all.
+    ///
+    /// `expires_at` gives the request the same grace-period treatment
+    /// governance changes get: once a matured request is left unexecuted for
+    /// [`GOVERNANCE_GRACE_PERIOD`] it lapses and must be re-queued under fresh
+    /// scrutiny, instead of becoming a standing obligation the organization can
+    /// no longer cancel in time.
+    fn open_pending(
+        env: &Env,
+        requester: &Address,
+        asset: Address,
+        to: Address,
+        amount: i128,
+        payments: Vec<Payment>,
+    ) -> Result<u64, Error> {
+        let config = Self::load_time_lock(env);
+        let now = env.ledger().timestamp();
+        let execute_after = checked_add_u64(now, config.delay)?;
+        let expires_at = checked_add_u64(execute_after, GOVERNANCE_GRACE_PERIOD)?;
+
+        let count_key = DataKey::PendingWithdrawalCount;
+        let id: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
+        let id = id.checked_add(1).ok_or(Error::Overflow)?;
+
+        let pending = PendingWithdrawal {
+            id,
+            requester: requester.clone(),
+            asset,
+            to,
+            amount,
+            payments,
+            requested_at: now,
+            execute_after,
+            expires_at,
+            cancelled: false,
+            executed: false,
+        };
+
+        let key = DataKey::PendingWithdrawal(id);
+        env.storage().persistent().set(&key, &pending);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().instance().set(&count_key, &id);
+
+        // Announced separately from the payout it describes: a queued request
+        // is observable while it is still inert, which is the whole window an
+        // organization has to notice a hostile request and cancel it.
+        env.events().publish(
+            (symbol_short!("timelock"), symbol_short!("queued")),
+            (id, amount, execute_after),
+        );
+        Ok(id)
     }
 
     /// Registry verification for cross-contract callers (Issue #308).
@@ -1505,13 +2125,14 @@ impl TreasuryInterface for TreasuryContract {
         Self::is_asset_approved(&env, &asset)
     }
 
-    /// Whether the emergency circuit breaker is currently engaged.
-    ///
-    /// An uninitialized treasury has no breaker to engage, so this reports
-    /// `false` rather than failing. Use [`TreasuryContract::get`] when the
-    /// caller needs to distinguish "not paused" from "not initialized".
+    /// Whether the emergency circuit breaker is currently engaged — that is,
+    /// a pause is stored *and* still inside its [`MAX_PAUSE_DURATION`] window.
+    /// A breaker left past its window reads `false` here even before the
+    /// stale flag is cleared, matching when outflows actually resume.
     fn is_paused(env: Env) -> bool {
-        Self::load(&env).map(|t| t.paused).unwrap_or(false)
+        Self::load(&env)
+            .map(|t| Self::pause_is_active(&t, &env))
+            .unwrap_or(false)
     }
 }
 
