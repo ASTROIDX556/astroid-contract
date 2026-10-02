@@ -24,6 +24,17 @@ fn assert_event(env: &Env, variant: &str) {
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
+/// Count canonical `ContractEvent` emissions of the given variant symbol so
+/// tests can also assert that an event did *not* fire.
+fn count_events(env: &Env, variant: &str) -> usize {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_contract_id, topics, _data)| topics.contains(want))
+        .count()
+}
+
 fn setup() -> (Env, RegistryContractClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -3135,7 +3146,7 @@ fn has_event(env: &Env, variant: &str) -> bool {
     env.events()
         .all()
         .iter()
-        .any(|(_contract_id, topics, _data)| topics.contains(want.clone()))
+        .any(|(_contract_id, topics, _data)| topics.contains(want))
 }
 
 /// Register a second organization in `h` and return its slug, so a test can
@@ -3212,8 +3223,7 @@ fn versioned_registration_moves_an_existing_module_forward() {
         .events()
         .all()
         .iter()
-        .filter(|(_id, topics, _data)| topics.contains(want_topic.clone()))
-        .last()
+        .rfind(|(_id, topics, _data)| topics.contains(want_topic))
         .expect("RegistryModuleUpgraded must be emitted");
     // The move starts from the pin it replaced, not from zero: the upgrade path
     // is continuous across the two entrypoints.
