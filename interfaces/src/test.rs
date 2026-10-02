@@ -48,7 +48,7 @@ fn discriminants_are_distinct() {
     // value and silently corrupt every status query.
     let mut seen: Vec<u32> = Vec::new(&Env::default());
     for state in ALL_STATES.iter() {
-        let code = (*state) as u32;
+        let code = state.clone() as u32;
         assert!(!seen.contains(code), "duplicate discriminant {code}");
         seen.push_back(code);
     }
@@ -62,9 +62,9 @@ fn discriminants_are_distinct() {
 fn every_state_round_trips_through_soroban_encoding() {
     let env = Env::default();
     for state in ALL_STATES.iter() {
-        let encoded: Val = (*state).into_val(&env);
+        let encoded: Val = state.clone().into_val(&env);
         let decoded = ProposalState::try_from_val(&env, &encoded).unwrap();
-        assert_eq!(decoded, (*state));
+        assert_eq!(decoded, state.clone());
     }
 }
 
@@ -74,9 +74,9 @@ fn encoded_value_is_the_u32_discriminant() {
     // `#[contracttype]` unit enums encode as `ScVal::U32(discriminant)`; the
     // hand-built value must be indistinguishable from the derived one.
     for state in ALL_STATES.iter() {
-        let encoded: Val = (*state).into_val(&env);
+        let encoded: Val = state.clone().into_val(&env);
         let code = u32::try_from_val(&env, &encoded).expect("unit enum encodes as a u32");
-        assert_eq!(code, (*state) as u32);
+        assert_eq!(code, state.clone() as u32);
     }
 }
 
@@ -127,7 +127,7 @@ fn generated_client_compiles_against_the_env() {
 fn has_executed_covers_completion_states() {
     for state in ALL_STATES.iter() {
         let expected = matches!(state, ProposalState::Executed | ProposalState::Closed);
-        assert_eq!((*state).has_executed(), expected);
+        assert_eq!(state.clone().has_executed(), expected);
     }
     // The two states downstream chaining cares about.
     assert!(ProposalState::Executed.has_executed());
@@ -147,7 +147,7 @@ fn deposit_settled_covers_refund_and_completion_states() {
                 | ProposalState::Executed
                 | ProposalState::Closed
         );
-        assert_eq!((*state).deposit_settled(), expected);
+        assert_eq!(state.clone().deposit_settled(), expected);
     }
     // Still holding the proposer's deposit: these may not be purged.
     assert!(!ProposalState::Pending.deposit_settled());
@@ -160,12 +160,12 @@ fn live_and_terminal_partition_the_lifecycle() {
     for state in ALL_STATES.iter() {
         // `Created` is neither live nor terminal; every other state is one or
         // the other, never both.
-        if (*state) == ProposalState::Created {
-            assert!(!(*state).is_live());
-            assert!(!(*state).is_terminal());
+        if state.clone() == ProposalState::Created {
+            assert!(!state.clone().is_live());
+            assert!(!state.clone().is_terminal());
             continue;
         }
-        assert_ne!((*state).is_live(), (*state).is_terminal());
+        assert_ne!(state.clone().is_live(), state.clone().is_terminal());
     }
     assert!(ProposalState::Pending.is_live());
     assert!(ProposalState::Approved.is_live());

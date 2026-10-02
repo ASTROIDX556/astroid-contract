@@ -113,45 +113,6 @@ impl ProposalState {
     pub fn is_terminal(self) -> bool {
         !self.is_live() && self != ProposalState::Created
     }
-
-    /// The canonical state machine: whether the transition `self → next` is
-    /// legal. This is the single table every state-changing proposal
-    /// entrypoint validates against — ad-hoc per-entrypoint checks drift, a
-    /// table cannot.
-    ///
-    /// Exactly one edge leaves each non-terminal state, mirroring the module
-    /// lifecycle diagram:
-    ///
-    /// ```text
-    /// Created    → Pending
-    /// Pending    → Approved | Rejected | Cancelled | Expired
-    /// Approved   → Executed  | Failed   | Cancelled | Expired
-    /// Executed   → Closed
-    /// ```
-    ///
-    /// Everything else is refused: a terminal state (`Rejected`,
-    /// `Cancelled`, `Expired`, `Failed`, `Closed`) has no outgoing edges, so
-    /// a rejected proposal can never be cancelled (which would double-refund
-    /// its deposit), a failed one can never execute, and a closed one can
-    /// never be re-opened. `Created → Pending` is reserved for the documented
-    /// lifecycle — `create` currently records `Pending` directly, so no
-    /// entrypoint exercises the edge yet.
-    pub fn may_transition(self, next: ProposalState) -> bool {
-        use ProposalState::*;
-        matches!(
-            (self, next),
-            (Created, Pending)
-                | (Pending, Approved)
-                | (Pending, Rejected)
-                | (Pending, Cancelled)
-                | (Pending, Expired)
-                | (Approved, Executed)
-                | (Approved, Failed)
-                | (Approved, Cancelled)
-                | (Approved, Expired)
-                | (Executed, Closed)
-        )
-    }
 }
 
 /// Proposal status-query surface. Other contracts (and the Astroid backend)

@@ -21,30 +21,7 @@
 //! existing nor new consumers break.
 
 use crate::types::{AssetAmount, ModuleKind};
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
-
-/// Typed payload of the upgrade audit trail: who did what to which version of
-/// a module kind, and when. Emitted as part of every upgrade-lifecycle event
-/// (`UpgradeProposed`, `UpgradeCommitted`, `UpgradeRejected`) and stored
-/// on-chain as an immutable historical log by the registry, so off-chain
-/// indexers and on-chain readers see one identical audit schema.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpgradeAudit {
-    /// The module kind whose upgrade path this record concerns.
-    pub kind: ModuleKind,
-    /// The version number involved in the action.
-    pub version: u32,
-    /// The Wasm hash involved in the action.
-    pub wasm_hash: BytesN<32>,
-    /// The organization the action was taken under.
-    pub org: String,
-    /// The account that performed the action (proposer, committing admin,
-    /// or rejecting actor).
-    pub actor: Address,
-    /// Unix timestamp of the action.
-    pub recorded_at: u64,
-}
+use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
 
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
@@ -65,145 +42,13 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
-    /// A contract implementation upgrade was proposed for a module kind.
-    /// Carries the audit payload ([`UpgradeAudit`]) written to the registry's
-    /// historical upgrade log at the same moment.
-    UpgradeProposed { audit: UpgradeAudit },
-    /// A proposed upgrade was rejected or withdrawn.
-    UpgradeRejected { audit: UpgradeAudit },
-    /// A proposed upgrade was committed: the implementation address was
-    /// recorded in the version table and its Wasm hash approved for the kind.
-    UpgradeCommitted {
-        audit: UpgradeAudit,
-        address: Address,
-    },
-    // NOTE: there is deliberately no "upgrade attempt rejected" event. A
-    // Soroban invocation is atomic: every event and storage write of a call
-    // that returns an error is rolled back, so an event published on a failure
-    // path could never be observed on-chain. Refused upgrade attempts (an
-    // unauthorized actor, a re-proposal of already-approved bytecode, …) stay
-    // visible off-chain as reverted transactions carrying their error code;
-    // the UpgradeProposed/UpgradeCommitted/UpgradeRejected events and the
-    // registry's on-chain audit log cover the actions that took effect.
-    /// A contract implementation version was registered in the global upgrade
-    /// map, bound to the approved WASM hash it runs.
-    RegistryVersionRegistered {
-        kind: ModuleKind,
-        version: u32,
-        address: Address,
-        wasm_hash: BytesN<32>,
-    },
-    /// An organization's module was moved onto a newer registered implementation
-    /// through the validated upgrade path (Issue #249).
-    ///
-    /// `from_version` is `0` when the module was registered by address and had
-    /// not been upgraded before, so a consumer reading the log can tell a first
-    /// validated step apart from a later one. `wasm_hash` is the approved hash
-    /// `address` is bound to in the version map — never a caller-supplied one.
-    RegistryModuleUpgraded {
-        org: String,
-        kind: ModuleKind,
-        from_version: u32,
-        to_version: u32,
-        address: Address,
-        wasm_hash: BytesN<32>,
-    },
-    /// The registry replaced its own code with a newer published implementation
-    /// (Issue #206).
-    ///
-    /// `from_version` is `0` for a registry that was deployed before the upgrade
-    /// map was tracking its own version, so a consumer can tell the first
-    /// validated self-upgrade apart from a later one. `to_version` is the
-    /// published `Organization` version the target hash is bound to — the
-    /// registry resolved it from its upgrade map, it was never caller-supplied,
-    /// and it is strictly greater than `from_version`, so this event is the
-    /// audit trail that the registry's own version never went backwards.
-    RegistryUpgraded {
-        from_version: u32,
-        to_version: u32,
-        wasm_hash: BytesN<32>,
-    },
+    /// The registry's global emergency circuit breaker was engaged
+    /// (`paused = true`) or released (`paused = false`).
+    RegistryPaused { paused: bool },
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
     WalletStateChanged { wallet_id: u64, state: Symbol },
-    /// Value was deposited into a wallet's internal balance.
-    ///
-    /// Distinct from [`ContractEvent::TransferExecuted`]: that reports the token
-    /// leg (custody in, recipient out), this attributes it to the wallet it
-    /// credited.
-    WalletFunded {
-        wallet_id: u64,
-        from: Address,
-        asset: Address,
-        amount: i128,
-    },
-    /// Value left a wallet for its owner.
-    WalletWithdrawn {
-        wallet_id: u64,
-        to: Address,
-        asset: Address,
-        amount: i128,
-    },
-    /// A spend cleared the wallet's policy gate. Emitted only on the passing
-    /// path: a denial reverts the invocation, so the policy contract's own
-    /// [`ContractEvent::PolicyViolation`] is what reports a refusal, and this
-    /// event is the record that the gate was consulted and allowed the spend.
-    WalletPolicyChecked {
-        wallet_id: u64,
-        asset: Address,
-        amount: i128,
-    },
-    /// The wallet's policy gate was wired to a policy contract.
-    WalletPolicyConfigured { policy: Address },
-    /// The wallet's policy gate was removed; subsequent spends run ungated.
-    WalletPolicyCleared,
-    /// A wallet was granted or revoked an exemption from the policy gate.
-    WalletPolicyBypassChanged { wallet_id: u64, bypass: bool },
-    /// A per-asset velocity ceiling was set on a wallet.
-    WalletVelocityLimitSet {
-        wallet_id: u64,
-        asset: Address,
-        max_amount: i128,
-        window_seconds: u64,
-    },
-    /// A per-asset velocity ceiling was removed from a wallet.
-    WalletVelocityLimitCleared { wallet_id: u64, asset: Address },
-    /// A per-wallet rate limit was set. A `window_seconds` of `0` reports that
-    /// the limit was disabled and its usage cleared; a `0` cap means that
-    /// dimension is unlimited.
-    WalletRateLimitSet {
-        wallet_id: u64,
-        max_volume: i128,
-        max_count: u32,
-        window_seconds: u64,
-    },
-    /// A wallet's rate limit was removed.
-    WalletRateLimitCleared { wallet_id: u64 },
-    /// The wallet's emergency guardian was (re)designated.
-    WalletGuardianChanged { guardian: Address },
-    /// A supporting module was wired into the wallet (`module` is e.g.
-    /// `budget`/`registry`), replacing any previous address.
-    WalletModuleWired { module: Symbol, address: Address },
-    /// A per-asset budget envelope was bound to the wallet.
-    WalletAssetBudgetSet { asset: Address, budget_id: String },
-    /// A role on a wallet changed. `role` is the role granted, and is `None` on
-    /// a revocation, where the account simply holds nothing.
-    WalletRoleChanged {
-        wallet_id: u64,
-        account: Address,
-        role: Option<Symbol>,
-        action: Symbol,
-    },
-    /// A batch passed policy, velocity and budget validation and was executed
-    /// atomically. One event for the whole batch, so the log stays concise;
-    /// the individual token transfers remain visible as SAC events.
-    WalletBatchValidated {
-        wallet_id: u64,
-        executed: u32,
-        total_amount: i128,
-        budget_remaining: i128,
-    },
     /// Value moved out of a contract to a recipient.
     TransferExecuted {
         from: Address,
@@ -226,24 +71,6 @@ pub enum ContractEvent {
     TreasuryFrozen { org: String },
     /// A treasury was unfrozen by the multisig.
     TreasuryUnfrozen { org: String },
-    /// Value was deposited into a treasury. `balance` is the treasury's
-    /// recorded balance of `asset` after the deposit.
-    TreasuryDeposited {
-        org: String,
-        from: Address,
-        asset: Address,
-        amount: i128,
-        balance: i128,
-    },
-    /// Value was withdrawn from a treasury. `balance` is the treasury's
-    /// recorded balance of `asset` after the withdrawal.
-    TreasuryWithdrawn {
-        org: String,
-        to: Address,
-        asset: Address,
-        amount: i128,
-        balance: i128,
-    },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -252,28 +79,11 @@ pub enum ContractEvent {
     },
     /// A policy rejected a transfer.
     PolicyViolation { policy_id: String, reason: Symbol },
-    /// An escrow was created and funded: custody of the listed assets moved
-    /// from the sender to the contract (Issue #292).
-    EscrowCreated {
-        escrow_id: u64,
-        sender: Address,
-        recipient: Address,
-        assets: Vec<AssetAmount>,
-        deadline: u64,
-    },
     /// An escrow's held assets were released to its recipient, whether via the
     /// standard arbiter path or a signature-based manual override.
     EscrowReleased {
         escrow_id: u64,
         recipient: Address,
-        assets: Vec<AssetAmount>,
-    },
-    /// An escrow's remaining custody balance was returned to its sender,
-    /// whether via the timed-out refund paths or a pre-deadline cancellation
-    /// (Issue #292).
-    EscrowRefunded {
-        escrow_id: u64,
-        sender: Address,
         assets: Vec<AssetAmount>,
     },
     /// Gas usage telemetry for a single operation execution.
@@ -312,51 +122,9 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
         }
-        ContractEvent::UpgradeProposed { audit } => {
+        ContractEvent::RegistryPaused { paused } => {
             env.events()
-                .publish((Symbol::new(env, "UpgradeProposed"),), audit);
-        }
-        ContractEvent::UpgradeRejected { audit } => {
-            env.events()
-                .publish((Symbol::new(env, "UpgradeRejected"),), audit);
-        }
-        ContractEvent::UpgradeCommitted { audit, address } => {
-            env.events()
-                .publish((Symbol::new(env, "UpgradeCommitted"),), (audit, address));
-        }
-        ContractEvent::RegistryVersionRegistered {
-            kind,
-            version,
-            address,
-            wasm_hash,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "RegistryVersionRegistered"),),
-                (kind, version, address, wasm_hash),
-            );
-        }
-        ContractEvent::RegistryModuleUpgraded {
-            org,
-            kind,
-            from_version,
-            to_version,
-            address,
-            wasm_hash,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "RegistryModuleUpgraded"),),
-                (org, kind, from_version, to_version, address, wasm_hash),
-            );
-        }
-        ContractEvent::RegistryUpgraded {
-            from_version,
-            to_version,
-            wasm_hash,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "RegistryUpgraded"),),
-                (from_version, to_version, wasm_hash),
-            );
+                .publish((Symbol::new(env, "RegistryPaused"),), paused);
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
@@ -366,120 +134,6 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "WalletStateChanged"),),
                 (wallet_id, state),
-            );
-        }
-        ContractEvent::WalletFunded {
-            wallet_id,
-            from,
-            asset,
-            amount,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletFunded"),),
-                (wallet_id, from, asset, amount),
-            );
-        }
-        ContractEvent::WalletWithdrawn {
-            wallet_id,
-            to,
-            asset,
-            amount,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletWithdrawn"),),
-                (wallet_id, to, asset, amount),
-            );
-        }
-        ContractEvent::WalletPolicyChecked {
-            wallet_id,
-            asset,
-            amount,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletPolicyChecked"),),
-                (wallet_id, asset, amount),
-            );
-        }
-        ContractEvent::WalletPolicyConfigured { policy } => {
-            env.events()
-                .publish((Symbol::new(env, "WalletPolicyConfigured"),), (policy,));
-        }
-        ContractEvent::WalletPolicyCleared => {
-            env.events()
-                .publish((Symbol::new(env, "WalletPolicyCleared"),), ());
-        }
-        ContractEvent::WalletPolicyBypassChanged { wallet_id, bypass } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletPolicyBypassChanged"),),
-                (wallet_id, bypass),
-            );
-        }
-        ContractEvent::WalletVelocityLimitSet {
-            wallet_id,
-            asset,
-            max_amount,
-            window_seconds,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletVelocityLimitSet"),),
-                (wallet_id, asset, max_amount, window_seconds),
-            );
-        }
-        ContractEvent::WalletVelocityLimitCleared { wallet_id, asset } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletVelocityLimitCleared"),),
-                (wallet_id, asset),
-            );
-        }
-        ContractEvent::WalletRateLimitSet {
-            wallet_id,
-            max_volume,
-            max_count,
-            window_seconds,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletRateLimitSet"),),
-                (wallet_id, max_volume, max_count, window_seconds),
-            );
-        }
-        ContractEvent::WalletRateLimitCleared { wallet_id } => {
-            env.events()
-                .publish((Symbol::new(env, "WalletRateLimitCleared"),), (wallet_id,));
-        }
-        ContractEvent::WalletGuardianChanged { guardian } => {
-            env.events()
-                .publish((Symbol::new(env, "WalletGuardianChanged"),), (guardian,));
-        }
-        ContractEvent::WalletModuleWired { module, address } => {
-            env.events()
-                .publish((Symbol::new(env, "WalletModuleWired"),), (module, address));
-        }
-        ContractEvent::WalletAssetBudgetSet { asset, budget_id } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletAssetBudgetSet"),),
-                (asset, budget_id),
-            );
-        }
-        ContractEvent::WalletRoleChanged {
-            wallet_id,
-            account,
-            role,
-            action,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletRoleChanged"),),
-                (wallet_id, account, role, action),
-            );
-        }
-        ContractEvent::WalletBatchValidated {
-            wallet_id,
-            executed,
-            total_amount,
-            budget_remaining,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "WalletBatchValidated"),),
-                (wallet_id, executed, total_amount, budget_remaining),
             );
         }
         ContractEvent::TransferExecuted {
@@ -530,42 +184,6 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events()
                 .publish((Symbol::new(env, "TreasuryUnfrozen"),), org);
         }
-        ContractEvent::TreasuryDeposited {
-            org,
-            from,
-            asset,
-            amount,
-            balance,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "TreasuryDeposited"),),
-                (org, from, asset, amount, balance),
-            );
-        }
-        ContractEvent::TreasuryWithdrawn {
-            org,
-            to,
-            asset,
-            amount,
-            balance,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "TreasuryWithdrawn"),),
-                (org, to, asset, amount, balance),
-            );
-        }
-        ContractEvent::EscrowCreated {
-            escrow_id,
-            sender,
-            recipient,
-            assets,
-            deadline,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "EscrowCreated"),),
-                (escrow_id, sender, recipient, assets, deadline),
-            );
-        }
         ContractEvent::EscrowReleased {
             escrow_id,
             recipient,
@@ -574,16 +192,6 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "EscrowReleased"),),
                 (escrow_id, recipient, assets),
-            );
-        }
-        ContractEvent::EscrowRefunded {
-            escrow_id,
-            sender,
-            assets,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "EscrowRefunded"),),
-                (escrow_id, sender, assets),
             );
         }
         ContractEvent::GasTelemetry {
@@ -608,6 +216,18 @@ pub fn publish(env: &Env, event: ContractEvent) {
             );
         }
     }
+}
+
+/// `WalletCreated` — topic `("wallet", "created")`.
+pub fn wallet_created(env: &Env, wallet_id: u64, owner: &Address) {
+    let topics = (symbol_short!("wallet"), symbol_short!("created"));
+    env.events().publish(topics, (wallet_id, owner.clone()));
+}
+
+/// `WalletFrozen` — topic `("wallet", "frozen")`.
+pub fn wallet_frozen(env: &Env, wallet_id: u64, by: &Address) {
+    let topics = (symbol_short!("wallet"), symbol_short!("frozen"));
+    env.events().publish(topics, (wallet_id, by.clone()));
 }
 
 /// `TransferExecuted` — topic `("transfer", "executed")`.
@@ -670,38 +290,24 @@ pub fn reason(env: &Env, name: &str) -> Symbol {
     Symbol::new(env, name)
 }
 
-/// `UpgradeProposed` — topic `("version", "proposed")`. Published when an
-/// org owner or admin proposes a version upgrade for a module kind.
-pub fn upgrade_proposed(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
-    let topics = (symbol_short!("version"), symbol_short!("proposed"));
-    env.events()
-        .publish(topics, (kind, version, wasm_hash.clone()));
-}
-
-/// `UpgradeRejected` — topic `("version", "rejected")`. Published when a
-/// pending upgrade proposal is rejected (or withdrawn by its proposer).
-pub fn upgrade_rejected(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
-    let topics = (symbol_short!("version"), symbol_short!("rejected"));
-    env.events()
-        .publish(topics, (kind, version, wasm_hash.clone()));
-}
-
-/// `UpgradeCommitted` — topic `("version", "committed")`. Published when a
-/// proposed upgrade is committed into the version table.
-pub fn upgrade_committed(
-    env: &Env,
-    kind: ModuleKind,
-    version: u32,
-    wasm_hash: &BytesN<32>,
-    address: &Address,
-) {
-    let topics = (symbol_short!("version"), symbol_short!("committed"));
-    env.events()
-        .publish(topics, (kind, version, wasm_hash.clone(), address.clone()));
-}
-
 /// `WalletBatchExecuted` — topic `("wallet", "batch")`.
 pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
     let topics = (symbol_short!("wallet"), symbol_short!("batch"));
     env.events().publish(topics, (wallet_id, call_count));
+}
+
+/// `WalletBatchValidated` — topic `("wallet", "batch_validated")`. Published by
+/// the wallet after a policy- and budget-validated batch run completes.
+pub fn wallet_batch_validated(
+    env: &Env,
+    wallet_id: u64,
+    executed: u32,
+    total_amount: i128,
+    budget_remaining: i128,
+) {
+    let topics = (symbol_short!("wallet"), Symbol::new(env, "batch_validated"));
+    env.events().publish(
+        topics,
+        (wallet_id, executed, total_amount, budget_remaining),
+    );
 }
