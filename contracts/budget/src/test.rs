@@ -2352,7 +2352,7 @@ fn batch_spend_rejects_the_whole_batch_when_one_leg_exceeds() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
-    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &xlm), 500);
 
@@ -2386,7 +2386,7 @@ fn batch_spend_rejects_unknown_and_duplicate_tokens() {
     let res =
         h.client
             .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &with_stranger);
-    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
+    assert_eq!(res, Err(Ok(BudgetError::AssetNotAuthorized)));
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
 
     // The same token twice would validate each leg against a stale counter,
@@ -2399,7 +2399,7 @@ fn batch_spend_rejects_unknown_and_duplicate_tokens() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &duplicated);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(BudgetError::InvalidInput)));
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
 }
 
@@ -2416,7 +2416,7 @@ fn batch_spend_rejects_empty_oversized_and_nonpositive_legs() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &empty);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(BudgetError::InvalidInput)));
 
     // Batches beyond MAX_BATCH_TOKENS are capped for cost predictability.
     let mut oversized: Vec<AssetSpend> = Vec::new(&h.env);
@@ -2426,7 +2426,7 @@ fn batch_spend_rejects_empty_oversized_and_nonpositive_legs() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &oversized);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(BudgetError::InvalidInput)));
 
     // Zero and negative amounts are refused before anything is validated.
     for bad in [0i128, -5] {
@@ -2434,7 +2434,7 @@ fn batch_spend_rejects_empty_oversized_and_nonpositive_legs() {
         let res = h
             .client
             .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
-        assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+        assert_eq!(res, Err(Ok(BudgetError::InvalidAmount)));
     }
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
 }
@@ -2478,7 +2478,7 @@ fn batch_spend_enforces_aggregate_window_consumption() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &over);
-    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
 
     // A fresh window replenishes every registered token at once.
     h.env.ledger().set_timestamp(1_000 + 3_600);
@@ -2506,7 +2506,7 @@ fn batch_spend_still_settles_windows_and_rejects_frozen_or_expired() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
-    assert_eq!(res, Err(Ok(Error::BudgetFrozen)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetFrozen)));
     h.client.unfreeze(&h.owner, &id(&h.env, "eng"));
 
     // An expired budget refuses the batch too.
@@ -2526,7 +2526,7 @@ fn batch_spend_still_settles_windows_and_rejects_frozen_or_expired() {
         &id(&h.env, "tmp"),
         &vec![&h.env, asset_spend(&h.env, &usdc, 1)],
     );
-    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExpired)));
 
     // Only the owner can drive the batch.
     let intruder = Address::generate(&h.env);
@@ -2535,7 +2535,7 @@ fn batch_spend_still_settles_windows_and_rejects_frozen_or_expired() {
         &id(&h.env, "eng"),
         &vec![&h.env, asset_spend(&h.env, &usdc, 1)],
     );
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(res, Err(Ok(BudgetError::Unauthorized)));
 }
 
 // Issue #236: deterministic validation for amount allocations and period
@@ -3146,4 +3146,215 @@ fn per_asset_budget_rollover_accounting() {
     assert_eq!(h.client.asset_remaining(&budget_id, &token), 1_000);
     let ab = h.client.get_asset_budget(&budget_id, &token);
     assert_eq!(ab.rollover_credit, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #215 — expenditure tracking, limit enforcement and deterministic
+// refusals across every spend entrypoint.
+// ---------------------------------------------------------------------------
+
+/// The cumulative expenditure of a period lives in persistent storage and is
+/// readable across invocations: each authorized spend adds to the stored
+/// `spent` counter, the remaining headroom shrinks by the same amount, and the
+/// period boundary resets the ledger for the next window.
+#[test]
+fn cumulative_expenditure_is_tracked_per_period_in_persistent_storage() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, false);
+
+    // Several spend requests accumulate into one per-period ledger.
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &100);
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &250);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 350);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 650);
+
+    // A later invocation reads the same persisted totals and can drive the
+    // ledger to its exact ceiling.
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &650);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 1_000);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
+
+    // The period boundary resets the stored ledger: the view settles the
+    // transition and persists it, so the record itself reads a fresh period.
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 0);
+}
+
+/// Storage updates are transactional: an over-limit request is refused with
+/// the deterministic `BudgetExceeded` code and never moves the stored ledger,
+/// on the aggregate envelope, the per-asset allowance or a batch alike.
+#[test]
+fn a_refused_spend_leaves_the_period_ledger_untouched() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::None, false);
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &500, &0);
+
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &800);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &400);
+
+    // Over-limit attempts on every entrypoint are refused with the same code.
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "eng"), &300),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &200),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    assert_eq!(
+        h.client.try_check_and_record_batch_spend(
+            &h.owner,
+            &id(&h.env, "eng"),
+            &vec![&h.env, asset_spend(&h.env, &token, 200)],
+        ),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+
+    // Nothing was persisted by any of the refusals: the ledgers still hold
+    // exactly the authorized totals and the original headroom.
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 800);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 200);
+    assert_eq!(
+        h.client.get_asset_budget(&id(&h.env, "eng"), &token).spent,
+        400
+    );
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 100);
+}
+
+/// An exhausted envelope refuses every spend path with one deterministic code
+/// and only admits spending again once its window has rolled and replenished.
+#[test]
+fn limit_exhaustion_blocks_every_spend_path_until_the_window_rolls() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, false);
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &100, &3_600);
+
+    // Exhaust both the aggregate envelope and the per-asset allowance.
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &100);
+
+    // One more unit is refused identically by every entrypoint.
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    assert_eq!(
+        h.client.try_check_and_record_batch_spend(
+            &h.owner,
+            &id(&h.env, "eng"),
+            &vec![&h.env, asset_spend(&h.env, &token, 1)],
+        ),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+
+    // The per-asset window rolls and replenishes; spending works again, and
+    // the fresh allowance is itself enforced to the unit.
+    h.env.ledger().set_timestamp(1_000 + 3_600);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &100);
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 0);
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    // The aggregate envelope is on its own weekly window: still exhausted.
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+}
+
+/// The same over-limit request on the same ledger yields the same refusal
+/// every time, and repeated refusals never erode the headroom actually left.
+#[test]
+fn over_limit_refusals_are_deterministic_across_attempts() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Daily, false);
+
+    for _ in 0..3 {
+        assert_eq!(
+            h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1_001),
+            Err(Ok(BudgetError::BudgetExceeded))
+        );
+    }
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 0);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+
+    // The exact ceiling is still spendable — one unit of headroom means one
+    // unit more than the limit is refused, exactly at the boundary.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000), 0);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+}
+
+/// The batch entrypoint honours a scheduled budget's start gate exactly like
+/// the single-spend paths: before the inclusive start every attempt reports
+/// the distinct `BudgetNotActive` code and records nothing, and at the start
+/// instant all paths open together.
+#[test]
+fn batch_spend_respects_a_scheduled_budgets_start_gate() {
+    let h = setup();
+    h.client.allocate_scheduled(
+        &h.owner,
+        &id(&h.env, "scheduled"),
+        &1_000,
+        &Period::None,
+        &false,
+        &2_000,
+        &0,
+    );
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "scheduled"), &token, &500, &0);
+
+    h.env.ledger().set_timestamp(1_999);
+    let batch = vec![&h.env, asset_spend(&h.env, &token, 100)];
+    assert_eq!(
+        h.client
+            .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "scheduled"), &batch),
+        Err(Ok(BudgetError::BudgetNotActive))
+    );
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "scheduled"), &token, &100),
+        Err(Ok(BudgetError::BudgetNotActive))
+    );
+    // Neither attempt recorded anything.
+    assert_eq!(
+        h.client
+            .get_asset_budget(&id(&h.env, "scheduled"), &token)
+            .spent,
+        0
+    );
+
+    // At the start instant both paths open together.
+    h.env.ledger().set_timestamp(2_000);
+    h.client
+        .check_and_record_batch_spend(&h.owner, &id(&h.env, "scheduled"), &batch);
+    assert_eq!(
+        h.client
+            .get_asset_budget(&id(&h.env, "scheduled"), &token)
+            .spent,
+        100
+    );
+    assert_eq!(
+        h.client.asset_remaining(&id(&h.env, "scheduled"), &token),
+        400
+    );
 }
