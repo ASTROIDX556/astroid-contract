@@ -3,7 +3,7 @@ extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
+    token, vec, Address, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 
 use astroid_shared::constants::{
@@ -25,6 +25,40 @@ fn assert_event(env: &Env, variant: &str) {
         .iter()
         .any(|(_contract_id, topics, _data)| topics.contains(want));
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
+}
+
+/// Decode the payload of the most recent `variant` event as the
+/// `(org, counterparty, asset, amount, balance)` tuple shared by the
+/// structured `TreasuryDeposited` / `TreasuryWithdrawn` events, or `None`
+/// when no such event was published.
+///
+/// Fields are decoded individually instead of comparing raw `Val`s: `Val`
+/// equality compares host handles for object types (addresses, strings,
+/// vecs), so a decoded event payload never compares equal to a locally
+/// constructed one even when the contents match.
+fn treasury_flow_payload(
+    env: &Env,
+    variant: &str,
+) -> Option<(String, Address, Address, i128, i128)> {
+    let topic: Val = Symbol::new(env, variant).into_val(env);
+    let mut found = None;
+    for (_emitter, topics, data) in env.events().all().iter() {
+        if !topics.contains(topic) {
+            continue;
+        }
+        let fields = match Vec::<Val>::try_from_val(env, &data) {
+            Ok(fields) if fields.len() == 5 => fields,
+            _ => continue,
+        };
+        found = Some((
+            String::try_from_val(env, &fields.get(0).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(1).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(2).unwrap()).unwrap(),
+            i128::try_from_val(env, &fields.get(3).unwrap()).unwrap(),
+            i128::try_from_val(env, &fields.get(4).unwrap()).unwrap(),
+        ));
+    }
+    found
 }
 
 struct Harness<'a> {
@@ -1360,6 +1394,151 @@ fn withdrawal_is_verified_against_live_custody() {
     assert_eq!(
         MockTokenClient::new(&h.env, &taxed).balance(&recipient),
         495
+    );
+}
+
+#[test]
+fn fee_on_transfer_deposits_book_and_announce_only_what_arrived() {
+    // Issue #218 — deposit accounting: the structured TreasuryDeposited
+    // payload must report the credited amount and the post-deposit recorded
+    // balance, neither of which may exceed real custody on a taxed token.
+    let h = setup("vault", 0);
+    let taxed = mock_token(&h, 7, 10, 1_000);
+    h.client.add_approved_asset(&h.admin, &taxed);
+
+    h.client.deposit(&h.admin, &taxed, &1_000); // 10 burned in transit
+    let org = String::from_str(&h.env, "vault");
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryDeposited"),
+        Some((org.clone(), h.admin.clone(), taxed.clone(), 990, 990))
+    );
+
+    // The corrected books compound: the next deposit accrues from 990.
+    MockTokenClient::new(&h.env, &taxed).mint(&h.admin, &100);
+    h.client.deposit(&h.admin, &taxed, &100); // 90 more arrives
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryDeposited"),
+        Some((org, h.admin.clone(), taxed.clone(), 90, 1_080))
+    );
+    assert_eq!(h.client.holding(&taxed).total_in, 1_080);
+}
+
+#[test]
+fn recorded_event_balance_follows_batch_and_milestone_outflows_per_token() {
+    // Issue #218 — every path that debits the ledger must keep the recorded
+    // event balance in step, or the next structured event would announce a
+    // balance the treasury no longer holds.
+    let h = setup("vault", 0);
+    let batched = mock_token(&h, 6, 0, 10_000);
+    let vested = mock_token(&h, 8, 0, 3_000);
+    h.client.add_approved_asset(&h.admin, &batched);
+    h.client.add_approved_asset(&h.admin, &vested);
+    h.client.deposit(&h.admin, &batched, &10_000);
+    h.client.deposit(&h.admin, &vested, &3_000);
+
+    // A batch payout takes 3_000 out of `batched` in two legs...
+    let payments: Vec<Payment> = vec![
+        &h.env,
+        payment(&Address::generate(&h.env), 1_000),
+        payment(&Address::generate(&h.env), 2_000),
+    ];
+    h.client.batch_transfer(&h.admin, &batched, &payments);
+
+    // ...and a milestone release takes 1_000 out of `vested`.
+    let payee = Address::generate(&h.env);
+    let mid = h
+        .client
+        .init_milestone_disbursement(&h.admin, &vested, &payee, &3_000, &3);
+    h.client.release_next_milestone(&h.admin, &mid);
+
+    // A later withdrawal on each token announces the true remainder.
+    let r1 = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &batched, &r1, &500);
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryWithdrawn"),
+        Some((
+            String::from_str(&h.env, "vault"),
+            r1,
+            batched.clone(),
+            500,
+            6_500
+        ))
+    );
+
+    let r2 = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &vested, &r2, &400);
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryWithdrawn"),
+        Some((
+            String::from_str(&h.env, "vault"),
+            r2,
+            vested.clone(),
+            400,
+            1_600
+        ))
+    );
+
+    // Custody and the books agree on every token.
+    assert_eq!(h.client.holding(&batched).total_in, 6_500);
+    assert_eq!(h.client.holding(&vested).total_in, 1_600);
+    assert_eq!(h.client.balance(&batched), 6_500);
+    assert_eq!(h.client.balance(&vested), 1_600);
+}
+
+#[test]
+fn unauthorized_withdrawals_are_refused_across_every_token_without_side_effects() {
+    // Issue #218 — strict address verification on the outbound paths, proven
+    // on a multi-token treasury: a non-admin caller moves no value, touches
+    // no ledger entry and emits no event for any asset, through either
+    // outflow route.
+    let h = setup("vault", 1_000);
+    let usdc = mock_token(&h, 6, 0, 5_000);
+    let wbtc = mock_token(&h, 8, 0, 3_000);
+    h.client.add_approved_asset(&h.admin, &usdc);
+    h.client.add_approved_asset(&h.admin, &wbtc);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &usdc, &5_000);
+    h.client.deposit(&h.admin, &wbtc, &3_000);
+
+    let intruder = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let events_before = h.env.events().all().len();
+
+    for asset in [h.asset.clone(), usdc.clone(), wbtc.clone()] {
+        assert_eq!(
+            h.client.try_withdraw(&intruder, &asset, &recipient, &100),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+    // The batch route sits behind the same single authorization point.
+    assert_eq!(
+        h.client
+            .try_batch_transfer(&intruder, &usdc, &vec![&h.env, payment(&recipient, 100)]),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Nothing moved: no events, no ledger changes, no custody changes.
+    assert_eq!(h.env.events().all().len(), events_before);
+    for (asset, deposited) in [
+        (h.asset.clone(), 1_000),
+        (usdc.clone(), 5_000),
+        (wbtc.clone(), 3_000),
+    ] {
+        assert_eq!(h.client.holding(&asset).total_in, deposited);
+        assert_eq!(h.client.balance(&asset), deposited);
+    }
+
+    // The admin's own withdrawal still settles with exact per-asset accounting.
+    h.client.withdraw(&h.admin, &usdc, &recipient, &1_500);
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryWithdrawn"),
+        Some((
+            String::from_str(&h.env, "vault"),
+            recipient,
+            usdc.clone(),
+            1_500,
+            3_500
+        ))
     );
 }
 
