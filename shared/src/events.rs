@@ -226,8 +226,10 @@ pub enum ContractEvent {
     TreasuryFrozen { org: String },
     /// A treasury was unfrozen by the multisig.
     TreasuryUnfrozen { org: String },
-    /// Value was deposited into a treasury. `balance` is the treasury's
-    /// recorded balance of `asset` after the deposit.
+    /// Value was deposited into a treasury. `amount` is what actually
+    /// arrived in custody (a fee-on-transfer token delivers less than was
+    /// requested), and `balance` is the treasury's recorded balance of
+    /// `asset` after the deposit.
     TreasuryDeposited {
         org: String,
         from: Address,
