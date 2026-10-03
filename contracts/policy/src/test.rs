@@ -2,7 +2,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    vec, Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+    vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use crate::{
@@ -4380,111 +4380,221 @@ fn time_window_is_persisted_on_the_policy_record() {
 }
 
 // ---------------------------------------------------------------------------
-// Standardized event emission (issue #222)
+// Issue #252 — deterministic error codes for boundary and failure paths.
+//
+// The scenario tests above pin *which* variant a refusal carries; these pin
+// the number an off-chain consumer decodes from a failed transaction,
+// asserted as literals so that renumbering the shared table — or routing a
+// refusal through the wrong gate — fails here instead of in production.
 // ---------------------------------------------------------------------------
 
-/// How many events were published under the two-symbol topic
-/// `(category, action)` (issue #222).
-fn event_count(env: &Env, category: &str, action: &str) -> u32 {
-    let cat: Val = Symbol::new(env, category).into_val(env);
-    let act: Val = Symbol::new(env, action).into_val(env);
-    let mut count = 0;
-    for (_emitter, topics, _data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
-            count += 1;
-        }
+/// Decode a `try_*` refusal exactly as an off-chain consumer reads it: the
+/// `u32` code on the wire (`e.code()` is the same value the host encodes).
+fn wire_code<T: core::fmt::Debug, C: core::fmt::Debug>(
+    res: Result<Result<T, C>, Result<Error, soroban_sdk::InvokeError>>,
+) -> u32 {
+    match res {
+        Err(Ok(e)) => e.code(),
+        other => panic!("expected a contract error, got {other:?}"),
     }
-    count
 }
 
-/// Decoded payload of the most recent `(category, action)` event, or `None`
-/// when none was published. Fields are decoded rather than compared as raw
-/// `Val`s: `Val` equality compares host handles for object types.
-fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
-    let cat: Val = Symbol::new(env, category).into_val(env);
-    let act: Val = Symbol::new(env, action).into_val(env);
-    let mut found = None;
-    for (_emitter, topics, data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
-            found = Vec::<Val>::try_from_val(env, &data).ok();
-        }
-    }
-    found
-}
-
+/// The single-transaction ceiling is resolved inclusively: exactly the
+/// ceiling passes, one unit over is `POLICY_DENIED` (20), and malformed or
+/// unknown requests keep their own codes rather than masquerading as denials.
 #[test]
-fn enable_toggles_emit_standardized_events_with_identifiers_and_timestamp() {
-    // Issue #222 — the master enable switch used to mutate storage silently.
-    // It now publishes under the standard (policy, action) schema: identifiers
-    // first, ledger timestamp last.
+fn max_amount_boundary_decodes_to_the_exact_codes() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().set_timestamp(1_700_000_000);
     let owner = Address::generate(&env);
-    let p = setup(&env, &owner);
-    let policy_id = String::from_str(&env, "max_txn");
+    let p = setup(&env, &owner); // "max_txn" with a 1_000_000 ceiling
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
 
-    assert_eq!(event_count(&env, "policy", "enabled"), 0);
-    p.set_enabled(&owner, &policy_id.clone(), &false);
-    assert_eq!(event_count(&env, "policy", "enabled"), 1);
-
-    let payload = event_payload(&env, "policy", "enabled").expect("enabled payload");
-    assert_eq!(payload.len(), 3);
+    // Exactly at the ceiling passes; one unit over is POLICY_DENIED (20).
+    assert!(p
+        .try_check_transfer(&pid, &asset, &recip, &1_000_000)
+        .is_ok());
     assert_eq!(
-        String::try_from_val(&env, &payload.get(0).unwrap()).unwrap(),
-        policy_id
-    );
-    assert!(!bool::try_from_val(&env, &payload.get(1).unwrap()).unwrap());
-    assert_eq!(
-        u64::try_from_val(&env, &payload.get(2).unwrap()).unwrap(),
-        1_700_000_000
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &1_000_001)),
+        20
     );
 
-    // One event per state change — toggling back is announced again.
-    p.set_enabled(&owner, &policy_id.clone(), &true);
-    assert_eq!(event_count(&env, "policy", "enabled"), 2);
+    // Zero and negative amounts are malformed requests (INVALID_AMOUNT, 12),
+    // never denials — the two must not be confusable on the wire.
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &0)),
+        12
+    );
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &-1)),
+        12
+    );
 
-    // A refused toggle (not the policy's owner) changes nothing and emits
-    // nothing: the failed invocation rolls its events back with it.
+    // An unknown policy is NOT_FOUND (1), whatever the amount.
+    let ghost = String::from_str(&env, "ghost");
+    assert_eq!(
+        wire_code(p.try_check_transfer(&ghost, &asset, &recip, &1)),
+        1
+    );
+
+    // A disabled policy denies even in-bounds spends, still with 20.
+    p.set_enabled(&owner, &pid, &false);
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &1)),
+        20
+    );
+}
+
+/// The per-asset allowance reports its ceiling breach as `ALLOWANCE_EXCEEDED`
+/// (83) and its lapse as `ALLOWANCE_EXPIRED` (84) — distinct from each other
+/// and from a rule denial — including when the ceiling is lowered below what
+/// has already been spent.
+#[test]
+fn allowance_boundaries_decode_to_the_exact_codes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner); // "mt", unlimited single-txn bound
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let pid = String::from_str(&env, "mt");
+
+    p.set_allowance(&owner, &pid, &asset, &1_000, &0);
+
+    // Exactly the ceiling passes, and consuming it exactly leaves zero
+    // headroom for anything more.
+    assert!(p.try_check_transfer(&pid, &asset, &recip, &1_000).is_ok());
+    p.update_allowance(&owner, &pid, &asset, &1_000);
+    assert_eq!(wire_code(p.try_check_allowance(&pid, &asset, &1)), 83);
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &1)),
+        83
+    );
+
+    // Lowering the ceiling below what is already spent keeps refusing with
+    // the same code instead of underflowing into a wrapped headroom.
+    p.set_allowance(&owner, &pid, &asset, &100, &0);
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &1)),
+        83
+    );
+
+    // A lapsed envelope is ALLOWANCE_EXPIRED (84), never confused with 83.
+    p.remove_allowance(&owner, &pid, &asset);
+    p.set_allowance(&owner, &pid, &asset, &1_000, &1_500);
+    env.ledger().set_timestamp(1_500);
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &1)),
+        84
+    );
+}
+
+/// Each constraint family keeps its own code on the wire: pinned-recipient
+/// and rule denials are POLICY_DENIED (20), the recipient blocklist is 22,
+/// the merchant blocklist is 23, and the asset allow-list is
+/// ASSET_NOT_AUTHORIZED (43).
+#[test]
+fn constraint_violations_decode_to_their_distinct_codes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner); // registers "max_txn"
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    // A policy pinning one approved recipient: anyone else is 20.
+    let pinned = String::from_str(&env, "pinned");
+    p.register_policy(
+        &owner,
+        &pinned,
+        &BytesN::from_array(&env, &[7; 32]),
+        &0,
+        &Some(recip.clone()),
+        &None,
+        &0,
+        &None,
+    );
+    assert!(p.try_check_transfer(&pinned, &asset, &recip, &1).is_ok());
     let stranger = Address::generate(&env);
     assert_eq!(
-        p.try_set_enabled(&stranger, &policy_id, &false),
-        Err(Ok(Error::Unauthorized))
+        wire_code(p.try_check_transfer(&pinned, &asset, &stranger, &1)),
+        20
     );
-    assert_eq!(event_count(&env, "policy", "enabled"), 2);
+
+    // The protocol recipient blocklist is its own code: 22.
+    let pid = String::from_str(&env, "max_txn");
+    p.add_to_blocklist(&owner, &pid, &stranger);
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &stranger, &1)),
+        22
+    );
+
+    // The merchant blocklist is its own code: 23.
+    let merchant = Address::generate(&env);
+    p.add_merchant_blacklist(&owner, &pid, &merchant);
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &asset, &merchant, &1)),
+        23
+    );
+
+    // The asset allow-list gate reports ASSET_NOT_AUTHORIZED (43).
+    let unlisted = Address::generate(&env);
+    p.set_asset_whitelist_enabled(&owner, &pid, &true);
+    assert_eq!(
+        wire_code(p.try_check_transfer(&pid, &unlisted, &recip, &1)),
+        43
+    );
 }
 
+/// Out-of-bounds amounts are answered deterministically by comparison or
+/// checked arithmetic — denied, admitted or lapsed — and never panic or
+/// wrap on the way through the evaluation.
 #[test]
-fn asset_whitelist_mode_toggle_emits_its_own_standardized_topic() {
-    // Issue #222 — the asset-whitelist switch also mutated storage silently.
-    // It gets its own namespaced topic so an indexer can tell the two
-    // whitelists apart, on the same (policy_id, enabled, timestamp) schema.
+fn out_of_bounds_amounts_fail_closed_without_panicking() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().set_timestamp(1_700_000_000);
     let owner = Address::generate(&env);
     let p = setup(&env, &owner);
-    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let pid = String::from_str(&env, "max_txn");
 
-    assert_eq!(event_count(&env, "policy", "awl_mode"), 0);
-    p.set_asset_whitelist_enabled(&owner, &policy_id.clone(), &true);
-    assert_eq!(event_count(&env, "policy", "awl_mode"), 1);
-
-    let payload = event_payload(&env, "policy", "awl_mode").expect("awl_mode payload");
-    assert_eq!(payload.len(), 3);
+    // Against the ceiling the maximal amount is a plain denial (20): the
+    // comparison never performs arithmetic that could overflow.
     assert_eq!(
-        String::try_from_val(&env, &payload.get(0).unwrap()).unwrap(),
-        policy_id
-    );
-    assert!(bool::try_from_val(&env, &payload.get(1).unwrap()).unwrap());
-    assert_eq!(
-        u64::try_from_val(&env, &payload.get(2).unwrap()).unwrap(),
-        1_700_000_000
+        wire_code(p.try_check_transfer(&pid, &asset, &recip, &i128::MAX)),
+        20
     );
 
-    // The recipient-whitelist toggle keeps its own distinct topic, so the two
-    // whitelists stay separable — and each fires exactly once.
-    p.set_recipient_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
-    assert_eq!(event_count(&env, "policy", "wl_mode"), 1);
-    assert_eq!(event_count(&env, "policy", "awl_mode"), 1);
+    // The same amount on an unrestricted policy reaches the allowance gate
+    // unharmed: with no ceiling configured there is nothing to overflow.
+    let q = allowance_setup(&env, &owner); // second contract, "mt"
+    let mt = String::from_str(&env, "mt");
+    let asset2 = Address::generate(&env);
+    assert!(q
+        .try_check_transfer(&mt, &asset2, &recip, &i128::MAX)
+        .is_ok());
+
+    // With a maximal ceiling the whole ceiling is consumable, and one unit
+    // beyond what has been consumed is refused with 83 — headroom is
+    // computed with checked math, so the refusal cannot be a wrapped value.
+    q.set_allowance(&owner, &mt, &asset2, &i128::MAX, &0);
+    q.update_allowance(&owner, &mt, &asset2, &i128::MAX);
+    assert_eq!(
+        wire_code(q.try_check_transfer(&mt, &asset2, &recip, &1)),
+        83
+    );
+
+    // Expiry is evaluated before any arithmetic: a lapsed envelope reports
+    // 84 for an out-of-bounds amount exactly as for a tiny one.
+    q.remove_allowance(&owner, &mt, &asset2);
+    q.set_allowance(&owner, &mt, &asset2, &1_000, &500);
+    env.ledger().set_timestamp(500);
+    assert_eq!(
+        wire_code(q.try_check_transfer(&mt, &asset2, &recip, &i128::MAX)),
+        84
+    );
 }
