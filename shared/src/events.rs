@@ -61,6 +61,12 @@ pub enum ContractEvent {
         kind: ModuleKind,
         address: Address,
     },
+    /// Registry WASM was updated after an approved, authorized request.
+    RegistryUpgraded {
+        sequence: u32,
+        caller: Address,
+        wasm_hash: BytesN<32>,
+    },
     /// An organization's owner changed.
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
@@ -304,6 +310,16 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "RegistryModuleUpdated"),),
                 (org, kind, address),
+            );
+        }
+        ContractEvent::RegistryUpgraded {
+            sequence,
+            caller,
+            wasm_hash,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryUpgraded"),),
+                (sequence, caller, wasm_hash),
             );
         }
         ContractEvent::OrgOwnerChanged { org, new_owner } => {
