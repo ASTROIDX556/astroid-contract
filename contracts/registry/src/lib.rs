@@ -119,7 +119,9 @@
 //! nothing else — no auth, no code swap — so a deployer can confirm a target
 //! advances the registry before asking for the swap.
 
-use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
+use astroid_interfaces::{
+    RegistryInterface, UpgradeableClient, UpgradeableInterface, INTERFACE_VERSION,
+};
 use astroid_shared::constants::{
     MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD, UPGRADE_PROPOSAL_EXPIRY,
@@ -830,9 +832,10 @@ impl RegistryContract {
 
         let lkey = DataKey::LatestVersion(kind);
         let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
-        if version > latest {
-            env.storage().persistent().set(&lkey, &version);
-            Self::bump(&env, &lkey);
+        ensure!(version > latest, Error::InvalidInput);
+        match UpgradeableClient::new(&env, &address).try_get_interface_version() {
+            Ok(interface_version) if interface_version == INTERFACE_VERSION => {}
+            _ => return Err(Error::InvalidInput),
         }
         astroid_shared::events::publish(
             &env,
@@ -2250,6 +2253,10 @@ impl RegistryInterface for RegistryContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for RegistryContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. The first call must come from the registry's
     /// protocol admin, so nobody can claim upgrade rights over the source of

@@ -523,6 +523,50 @@ fn rejected_registration_emits_no_version_event() {
 }
 
 #[test]
+fn register_version_rejects_duplicate_version() {
+    let (env, client, admin) = setup();
+    let original = env.register_contract(None, RegistryContract);
+    let replacement = env.register_contract(None, RegistryContract);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &original);
+
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &replacement);
+
+    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
+    assert_eq!(client.get_version(&ModuleKind::Wallet, &1), original);
+}
+
+#[test]
+fn register_version_rejects_downgrades() {
+    let (env, client, admin) = setup();
+    let latest = env.register_contract(None, RegistryContract);
+    let older = env.register_contract(None, RegistryContract);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &latest);
+
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &older);
+
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(client.get_latest(&ModuleKind::Wallet), latest);
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn register_version_rejects_incompatible_contract() {
+    let (env, client, admin) = setup();
+    let address = Address::generate(&env);
+
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &address);
+
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Wallet, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
 fn remove_module_works_and_missing_fails() {
     let (env, client, admin) = setup();
     let org = String::from_str(&env, "acme");
