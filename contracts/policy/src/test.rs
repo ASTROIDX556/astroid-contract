@@ -2,7 +2,7 @@ use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    vec, Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 
 use crate::{
@@ -4377,4 +4377,114 @@ fn time_window_is_persisted_on_the_policy_record() {
     assert_eq!(policy.window_end_time, 6 * 3600);
     assert_eq!(policy.window_days, SECONDS_PER_DAY);
     assert!(policy.enabled);
+}
+
+// ---------------------------------------------------------------------------
+// Standardized event emission (issue #222)
+// ---------------------------------------------------------------------------
+
+/// How many events were published under the two-symbol topic
+/// `(category, action)` (issue #222).
+fn event_count(env: &Env, category: &str, action: &str) -> u32 {
+    let cat: Val = Symbol::new(env, category).into_val(env);
+    let act: Val = Symbol::new(env, action).into_val(env);
+    let mut count = 0;
+    for (_emitter, topics, _data) in env.events().all().iter() {
+        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Decoded payload of the most recent `(category, action)` event, or `None`
+/// when none was published. Fields are decoded rather than compared as raw
+/// `Val`s: `Val` equality compares host handles for object types.
+fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
+    let cat: Val = Symbol::new(env, category).into_val(env);
+    let act: Val = Symbol::new(env, action).into_val(env);
+    let mut found = None;
+    for (_emitter, topics, data) in env.events().all().iter() {
+        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+            found = Vec::<Val>::try_from_val(env, &data).ok();
+        }
+    }
+    found
+}
+
+#[test]
+fn enable_toggles_emit_standardized_events_with_identifiers_and_timestamp() {
+    // Issue #222 — the master enable switch used to mutate storage silently.
+    // It now publishes under the standard (policy, action) schema: identifiers
+    // first, ledger timestamp last.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_700_000_000);
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+
+    assert_eq!(event_count(&env, "policy", "enabled"), 0);
+    p.set_enabled(&owner, &policy_id.clone(), &false);
+    assert_eq!(event_count(&env, "policy", "enabled"), 1);
+
+    let payload = event_payload(&env, "policy", "enabled").expect("enabled payload");
+    assert_eq!(payload.len(), 3);
+    assert_eq!(
+        String::try_from_val(&env, &payload.get(0).unwrap()).unwrap(),
+        policy_id
+    );
+    assert!(!bool::try_from_val(&env, &payload.get(1).unwrap()).unwrap());
+    assert_eq!(
+        u64::try_from_val(&env, &payload.get(2).unwrap()).unwrap(),
+        1_700_000_000
+    );
+
+    // One event per state change — toggling back is announced again.
+    p.set_enabled(&owner, &policy_id.clone(), &true);
+    assert_eq!(event_count(&env, "policy", "enabled"), 2);
+
+    // A refused toggle (not the policy's owner) changes nothing and emits
+    // nothing: the failed invocation rolls its events back with it.
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        p.try_set_enabled(&stranger, &policy_id, &false),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(event_count(&env, "policy", "enabled"), 2);
+}
+
+#[test]
+fn asset_whitelist_mode_toggle_emits_its_own_standardized_topic() {
+    // Issue #222 — the asset-whitelist switch also mutated storage silently.
+    // It gets its own namespaced topic so an indexer can tell the two
+    // whitelists apart, on the same (policy_id, enabled, timestamp) schema.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_700_000_000);
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+
+    assert_eq!(event_count(&env, "policy", "awl_mode"), 0);
+    p.set_asset_whitelist_enabled(&owner, &policy_id.clone(), &true);
+    assert_eq!(event_count(&env, "policy", "awl_mode"), 1);
+
+    let payload = event_payload(&env, "policy", "awl_mode").expect("awl_mode payload");
+    assert_eq!(payload.len(), 3);
+    assert_eq!(
+        String::try_from_val(&env, &payload.get(0).unwrap()).unwrap(),
+        policy_id
+    );
+    assert!(bool::try_from_val(&env, &payload.get(1).unwrap()).unwrap());
+    assert_eq!(
+        u64::try_from_val(&env, &payload.get(2).unwrap()).unwrap(),
+        1_700_000_000
+    );
+
+    // The recipient-whitelist toggle keeps its own distinct topic, so the two
+    // whitelists stay separable — and each fires exactly once.
+    p.set_recipient_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
+    assert_eq!(event_count(&env, "policy", "wl_mode"), 1);
+    assert_eq!(event_count(&env, "policy", "awl_mode"), 1);
 }
