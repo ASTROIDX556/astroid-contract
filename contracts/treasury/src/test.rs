@@ -3,7 +3,7 @@ extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
+    token, vec, Address, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 
 use astroid_shared::constants::{
@@ -2359,4 +2359,177 @@ fn a_queued_request_is_observable_and_survives_being_left_alone() {
     h.client.execute_withdrawal(&h.admin, &id);
     assert_eq!(token_balance(&h, &to), 6_000);
     assert_eq!(h.client.holding(&h.asset).total_out, 6_000);
+}
+
+// ---------------------------------------------------------------------------
+// Standardized event emission (issue #222)
+// ---------------------------------------------------------------------------
+
+/// How many events were published under the two-symbol topic
+/// `(category, action)` (issue #222).
+fn event_count(env: &Env, category: &str, action: &str) -> u32 {
+    let cat: Val = Symbol::new(env, category).into_val(env);
+    let act: Val = Symbol::new(env, action).into_val(env);
+    let mut count = 0;
+    for (_emitter, topics, _data) in env.events().all().iter() {
+        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Decoded payload of the most recent `(category, action)` event, or `None`
+/// when none was published. Fields are decoded rather than compared as raw
+/// `Val`s: `Val` equality compares host handles for object types.
+fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
+    let cat: Val = Symbol::new(env, category).into_val(env);
+    let act: Val = Symbol::new(env, action).into_val(env);
+    let mut found = None;
+    for (_emitter, topics, data) in env.events().all().iter() {
+        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+            found = Vec::<Val>::try_from_val(env, &data).ok();
+        }
+    }
+    found
+}
+
+#[test]
+fn budget_allocation_events_carry_identifiers_and_timestamp() {
+    // Issue #222 — binding a budget envelope mutates the treasury record, so
+    // it announces itself on both layers: the tuple-topic event carries the
+    // identifiers and the ledger timestamp, the typed event the org context.
+    let h = setup("vault", 0);
+    h.env.ledger().set_timestamp(1_700_000_000);
+    let budget_id = String::from_str(&h.env, "maint");
+
+    assert_eq!(event_count(&h.env, "treasury", "bgt_alloc"), 0);
+    h.client.allocate_budget(&h.admin, &h.asset, &budget_id);
+    assert_eq!(event_count(&h.env, "treasury", "bgt_alloc"), 1);
+
+    let payload = event_payload(&h.env, "treasury", "bgt_alloc").expect("bgt_alloc payload");
+    assert_eq!(payload.len(), 3);
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(0).unwrap()).unwrap(),
+        h.asset
+    );
+    assert_eq!(
+        String::try_from_val(&h.env, &payload.get(1).unwrap()).unwrap(),
+        budget_id
+    );
+    assert_eq!(
+        u64::try_from_val(&h.env, &payload.get(2).unwrap()).unwrap(),
+        1_700_000_000
+    );
+    // The canonical typed layer fires exactly once for the same action.
+    assert_event(&h.env, "TreasuryConfigUpdated");
+
+    // A second allocation replaces the first and is announced again.
+    let next = String::from_str(&h.env, "ops");
+    h.client.allocate_budget(&h.admin, &h.asset, &next);
+    assert_eq!(event_count(&h.env, "treasury", "bgt_alloc"), 2);
+}
+
+#[test]
+fn allowance_lifecycle_events_follow_the_shared_topic_schema() {
+    // Issue #222 — the treasury allowance lifecycle publishes on the same
+    // allow_set / allow_use / allow_rem schema as the policy contract, each
+    // payload carrying identifiers, the amount where relevant, and the ledger
+    // timestamp as its final field.
+    let h = setup("vault", 1_000);
+    h.env.ledger().set_timestamp(1_700_000_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let agent = h.admin.clone();
+    let recipient = Address::generate(&h.env);
+
+    // Creation → ("treasury", "allow_set").
+    assert_eq!(event_count(&h.env, "treasury", "allow_set"), 0);
+    h.client
+        .set_allowance(&h.admin, &agent, &recipient, &h.asset, &500, &0);
+    assert_eq!(event_count(&h.env, "treasury", "allow_set"), 1);
+
+    let payload = event_payload(&h.env, "treasury", "allow_set").expect("allow_set payload");
+    assert_eq!(payload.len(), 6);
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(0).unwrap()).unwrap(),
+        agent
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(1).unwrap()).unwrap(),
+        recipient
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(2).unwrap()).unwrap(),
+        h.asset
+    );
+    assert_eq!(
+        i128::try_from_val(&h.env, &payload.get(3).unwrap()).unwrap(),
+        500
+    );
+    assert_eq!(
+        u64::try_from_val(&h.env, &payload.get(4).unwrap()).unwrap(),
+        0
+    );
+    assert_eq!(
+        u64::try_from_val(&h.env, &payload.get(5).unwrap()).unwrap(),
+        1_700_000_000
+    );
+
+    // A spend that draws on the allowance → ("treasury", "allow_use").
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &200);
+    assert_eq!(event_count(&h.env, "treasury", "allow_use"), 1);
+
+    let payload = event_payload(&h.env, "treasury", "allow_use").expect("allow_use payload");
+    assert_eq!(payload.len(), 5);
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(0).unwrap()).unwrap(),
+        agent
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(1).unwrap()).unwrap(),
+        recipient
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(2).unwrap()).unwrap(),
+        h.asset
+    );
+    assert_eq!(
+        i128::try_from_val(&h.env, &payload.get(3).unwrap()).unwrap(),
+        200
+    );
+    assert_eq!(
+        u64::try_from_val(&h.env, &payload.get(4).unwrap()).unwrap(),
+        1_700_000_000
+    );
+
+    // A refused draw emits nothing: the invocation's events roll back with it.
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &400),
+        Err(Ok(Error::AllowanceExceeded))
+    );
+    assert_eq!(event_count(&h.env, "treasury", "allow_use"), 1);
+
+    // Revocation → ("treasury", "allow_rem").
+    h.client
+        .remove_allowance(&h.admin, &agent, &recipient, &h.asset);
+    assert_eq!(event_count(&h.env, "treasury", "allow_rem"), 1);
+
+    let payload = event_payload(&h.env, "treasury", "allow_rem").expect("allow_rem payload");
+    assert_eq!(payload.len(), 4);
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(0).unwrap()).unwrap(),
+        agent
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(1).unwrap()).unwrap(),
+        recipient
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &payload.get(2).unwrap()).unwrap(),
+        h.asset
+    );
+    assert_eq!(
+        u64::try_from_val(&h.env, &payload.get(3).unwrap()).unwrap(),
+        1_700_000_000
+    );
 }
