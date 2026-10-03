@@ -651,17 +651,75 @@ pub fn treasury_created(env: &Env, org: &String, admin: &Address) {
 }
 
 /// `AllowanceSet` — topic `("treasury", "allow_set")`.
-pub fn allowance_set(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+///
+/// Published when a withdrawal allowance is created or replaced. The payload
+/// ends with the ledger timestamp — the convention standardized for treasury
+/// and policy events in Issue #222 — so an indexer can order allowance
+/// changes without correlating ledger metadata (the same convention is used
+/// by [`allowance_consumed`] and [`allowance_removed`]).
+pub fn allowance_set(
+    env: &Env,
+    agent: &Address,
+    recipient: &Address,
+    asset: &Address,
+    limit: i128,
+    expires_at: u64,
+) {
     let topics = (symbol_short!("treasury"), symbol_short!("allow_set"));
-    env.events()
-        .publish(topics, (agent.clone(), asset.clone(), amount));
+    env.events().publish(
+        topics,
+        (
+            agent.clone(),
+            recipient.clone(),
+            asset.clone(),
+            limit,
+            expires_at,
+            env.ledger().timestamp(),
+        ),
+    );
 }
 
 /// `AllowanceConsumed` — topic `("treasury", "allow_use")`.
-pub fn allowance_consumed(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+///
+/// Published when a spend consumes part of a withdrawal allowance: `amount` is
+/// what this movement consumed, and the payload ends with the ledger
+/// timestamp (Issue #222).
+pub fn allowance_consumed(
+    env: &Env,
+    agent: &Address,
+    recipient: &Address,
+    asset: &Address,
+    amount: i128,
+) {
     let topics = (symbol_short!("treasury"), symbol_short!("allow_use"));
-    env.events()
-        .publish(topics, (agent.clone(), asset.clone(), amount));
+    env.events().publish(
+        topics,
+        (
+            agent.clone(),
+            recipient.clone(),
+            asset.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// `AllowanceRemoved` — topic `("treasury", "allow_rem")`.
+///
+/// Published when a withdrawal allowance is revoked, mirroring the policy
+/// contract's `allow_rem` topic and ending with the ledger timestamp
+/// (Issue #222).
+pub fn allowance_removed(env: &Env, agent: &Address, recipient: &Address, asset: &Address) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_rem"));
+    env.events().publish(
+        topics,
+        (
+            agent.clone(),
+            recipient.clone(),
+            asset.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
 }
 
 /// Construct a `Symbol` reason code from a static name (used as event payloads
