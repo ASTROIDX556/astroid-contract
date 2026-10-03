@@ -3147,3 +3147,229 @@ fn per_asset_budget_rollover_accounting() {
     let ab = h.client.get_asset_budget(&budget_id, &token);
     assert_eq!(ab.rollover_credit, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #252 — deterministic error codes at boundary and failure paths.
+//
+// The scenario tests above pin *which* variant a refusal carries; these pin
+// the number an off-chain consumer decodes from a failed transaction,
+// asserted as literals so that renumbering the shared table — or routing a
+// refusal through the wrong gate — fails here instead of in production.
+// ---------------------------------------------------------------------------
+
+/// Decode a budget refusal (`BudgetError`) the way the host encodes it: the
+/// `u32` an off-chain consumer reads off the wire.
+fn budget_wire_code<T: std::fmt::Debug, C: std::fmt::Debug>(
+    res: Result<Result<T, C>, Result<BudgetError, soroban_sdk::InvokeError>>,
+) -> u32 {
+    match res {
+        Err(Ok(e)) => soroban_sdk::Error::from(e).get_code(),
+        other => panic!("expected a budget error, got {other:?}"),
+    }
+}
+
+/// Same, for entrypoints that report through the shared `Error` table.
+fn shared_wire_code<T: std::fmt::Debug, C: std::fmt::Debug>(
+    res: Result<Result<T, C>, Result<Error, soroban_sdk::InvokeError>>,
+) -> u32 {
+    match res {
+        Err(Ok(e)) => e.code(),
+        other => panic!("expected a contract error, got {other:?}"),
+    }
+}
+
+/// The spending ceiling is resolved inclusively on every entrypoint: exactly
+/// the limit passes, one unit over is `BUDGET_EXCEEDED` (40) everywhere, and
+/// malformed, unknown or unauthorized requests keep their own codes.
+#[test]
+fn spend_boundaries_decode_to_the_exact_codes() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::None, false);
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &500, &0);
+
+    // Exactly at the ceiling every path admits the spend.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000), 0);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &500);
+
+    // One unit past it is BUDGET_EXCEEDED (40) everywhere.
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1)),
+        40
+    );
+    assert_eq!(
+        budget_wire_code(h.client.try_check_and_record_spend(
+            &h.owner,
+            &id(&h.env, "eng"),
+            &token,
+            &1
+        ),),
+        40
+    );
+    assert_eq!(
+        shared_wire_code(h.client.try_check_and_record_batch_spend(
+            &h.owner,
+            &id(&h.env, "eng"),
+            &vec![&h.env, asset_spend(&h.env, &token, 1)],
+        )),
+        40
+    );
+
+    // A malformed amount is INVALID_AMOUNT (12), never a ceiling breach.
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &id(&h.env, "eng"), &0)),
+        12
+    );
+
+    // An unknown budget is NOT_FOUND (1) and a stranger's attempt is
+    // UNAUTHORIZED (3) — the role gate fires before any ceiling.
+    let ghost = String::from_str(&h.env, "ghost");
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &ghost, &1)),
+        1
+    );
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&stranger, &id(&h.env, "eng"), &1)),
+        3
+    );
+}
+
+/// Every lifecycle gate reports its own deterministic code: frozen 41,
+/// archived 42, unregistered asset 43, expired 44, not-yet-started 45 —
+/// never a generic failure.
+#[test]
+fn lifecycle_gates_decode_to_the_exact_codes() {
+    let h = setup(); // ledger pinned at t = 1_000
+    allocate(&h, "frozen", 100, Period::None, false);
+    allocate(&h, "archived", 100, Period::None, false);
+    allocate(&h, "live", 100, Period::None, false);
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "expiring"),
+        &100,
+        &Period::None,
+        &false,
+        &(1_000 + DAY),
+    );
+    h.client.allocate_scheduled(
+        &h.owner,
+        &id(&h.env, "scheduled"),
+        &100,
+        &Period::None,
+        &false,
+        &(1_000 + 60),
+        &0,
+    );
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "frozen"), &token, &100, &0);
+
+    // BUDGET_FROZEN (41) on both the aggregate and the per-asset path.
+    h.client.freeze(&h.owner, &id(&h.env, "frozen"));
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &id(&h.env, "frozen"), &1)),
+        41
+    );
+    assert_eq!(
+        budget_wire_code(h.client.try_check_and_record_spend(
+            &h.owner,
+            &id(&h.env, "frozen"),
+            &token,
+            &1
+        ),),
+        41
+    );
+
+    // BUDGET_ARCHIVED (42).
+    h.client.archive(&h.owner, &id(&h.env, "archived"));
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &id(&h.env, "archived"), &1)),
+        42
+    );
+
+    // ASSET_NOT_AUTHORIZED (43) — a token with no registered per-asset
+    // allowance on an otherwise healthy budget.
+    assert_eq!(
+        budget_wire_code(h.client.try_check_and_record_spend(
+            &h.owner,
+            &id(&h.env, "live"),
+            &token,
+            &1
+        ),),
+        43
+    );
+
+    // BUDGET_NOT_ACTIVE (45) one second before the scheduled start.
+    h.env.ledger().set_timestamp(1_000 + 59);
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &id(&h.env, "scheduled"), &1)),
+        45
+    );
+
+    // BUDGET_EXPIRED (44) at and past the expiry instant.
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &id(&h.env, "expiring"), &1)),
+        44
+    );
+}
+
+/// Spending at the representable boundary fails closed with OVERFLOW (11)
+/// on both ledgers — checked arithmetic reports instead of wrapping or
+/// panicking — and a limit that cannot exist is INVALID_AMOUNT (12)
+/// before any state is written.
+#[test]
+fn out_of_bounds_spend_decodes_to_overflow_without_panicking() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "max"),
+        &i128::MAX,
+        &Period::None,
+        &false,
+        &0,
+    );
+
+    // Aggregate ledger: MAX fits exactly, one more cannot be represented.
+    assert_eq!(
+        h.client.consume(&h.owner, &id(&h.env, "max"), &i128::MAX),
+        0
+    );
+    assert_eq!(
+        budget_wire_code(h.client.try_consume(&h.owner, &id(&h.env, "max"), &1)),
+        11
+    );
+
+    // Per-asset ledger: the same boundary on the other counter.
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "max"), &token, &i128::MAX, &0);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "max"), &token, &i128::MAX);
+    assert_eq!(
+        budget_wire_code(h.client.try_check_and_record_spend(
+            &h.owner,
+            &id(&h.env, "max"),
+            &token,
+            &1
+        ),),
+        11
+    );
+
+    // A negative limit can never be created: INVALID_AMOUNT (12), shared
+    // table, asserted as its literal wire value.
+    assert_eq!(
+        shared_wire_code(h.client.try_allocate(
+            &h.owner,
+            &id(&h.env, "neg"),
+            &-1,
+            &Period::None,
+            &false,
+            &0
+        ),),
+        12
+    );
+}
