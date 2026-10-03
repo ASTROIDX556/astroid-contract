@@ -184,7 +184,7 @@ fn setup() -> Harness<'static> {
         &2,
     );
     // The mandatory delay between approval and execution, in seconds.
-    proposal.initialize(&TIMELOCK);
+    proposal.initialize(&TIMELOCK, &multisig_addr);
 
     // --- Policy -------------------------------------------------------------
     // The multisig contract itself owns the policy, so the rule engine that can
