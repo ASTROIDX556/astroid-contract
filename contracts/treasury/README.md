@@ -63,11 +63,19 @@ so unit/integration tests that exercise gated flows must register their test
 admin/funder under the expected module kinds (see
 `contracts/treasury/src/test.rs` and `tests/src/gated_fund_flows.rs`).
 
+## Events
+
 - `("treasury", "deposited")` on every deposit.
 - `("transfer", "executed")` on successful withdrawals (shared standard).
 - `("treasury", "policy")` / `("treasury", "budget")` when enforcement contracts are wired.
 - `("treasury", "paused")` / `("treasury", "unpaused")` when the circuit breaker
   is engaged or released.
+- `("treasury", "allow_set")` / `("treasury", "allow_use")` /
+  `("treasury", "allow_rem")` across the withdrawal-allowance lifecycle — the
+  same schema the policy contract publishes under, each payload ending with
+  the ledger timestamp (Issue #222).
+- `("treasury", "bgt_alloc")` when a budget envelope is bound to an asset,
+  carrying the asset, the budget id and the ledger timestamp (Issue #222).
 
 ## Cross-contract flow
 
