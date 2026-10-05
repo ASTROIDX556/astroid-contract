@@ -3,9 +3,9 @@
 //! Deploys all eight workspace contracts into one mock Soroban [`Env`] and
 //! exercises the full lifecycle of an agent spend:
 //!
-//! 1. `initialize` the registry and register the organization.
-//! 2. Deploy treasury, budget, policy, wallet and escrow; register their
-//!    addresses in the registry under the organization.
+//! 1. Deploy and initialize all eight contracts in architectural order:
+//!    registry, wallet, treasury, multisig, proposal, budget, policy, escrow.
+//! 2. Register their addresses under the organization.
 //! 3. Mint a real SAC token and fund the treasury.
 //! 4. Create a wallet for the org's owner and give the agent the Agent role.
 //! 5. Allocate a budget and register a policy that caps agent spending.
@@ -22,7 +22,7 @@ use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState, ReleaseConditionConfig};
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::{PolicyContract, PolicyContractClient};
-use astroid_proposal::{ProposalContractClient, ProposalState};
+use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
@@ -61,6 +61,10 @@ struct Harness<'a> {
 /// Deploy every workspace contract in dependency order, register the org's
 /// module addresses with the registry, and fund the treasury.
 fn setup() -> Harness<'static> {
+    setup_with_timelock(0)
+}
+
+fn setup_with_timelock(timelock: u64) -> Harness<'static> {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = START);
@@ -69,46 +73,26 @@ fn setup() -> Harness<'static> {
     let org_owner = Address::generate(&env);
     let agent = Address::generate(&env);
     let recipient = Address::generate(&env);
-
     // 1. Registry — source of truth for module addresses.
     let registry_id = env.register_contract(None, RegistryContract);
     let registry = RegistryContractClient::new(&env, &registry_id);
     registry.initialize(&admin);
     registry.register_org(&admin, &String::from_str(&env, ORG), &org_owner);
 
-    // 2. Treasury — custodies org funds. The multisig is recorded so the
-    //    emergency freeze path has a counterparty.
-    let treasury_id = env.register_contract(None, TreasuryContract);
-    let treasury = TreasuryContractClient::new(&env, &treasury_id);
-    treasury.initialize(&String::from_str(&env, ORG), &admin);
-
-    // 3. Budget — spending limits consumed by the treasury.
-    let budget_id = env.register_contract(None, BudgetContract);
-    let budget = BudgetContractClient::new(&env, &budget_id);
-    budget.initialize(&admin);
-
-    // 4. Policy — rule engine consulted before every spend.
-    let policy_id = env.register_contract(None, PolicyContract);
-    let policy = PolicyContractClient::new(&env, &policy_id);
-    policy.initialize();
-
-    // 5. Wallet — per-org custody with role-based access.
+    // 2. Wallet — per-org custody with role-based access.
     let wallet_id = env.register_contract(None, WalletContract);
     let wallet = WalletContractClient::new(&env, &wallet_id);
     wallet.initialize(&admin);
 
-    // 6. Escrow — time-locked conditional custody. The token whitelist starts
-    // empty, so the admin must approve the asset before anything can be
-    // escrowed.
-    let escrow_id = env.register_contract(None, EscrowContract);
-    let escrow = EscrowContractClient::new(&env, &escrow_id);
-    escrow.initialize(&admin);
+    // 3. Treasury — custodies org funds.
+    let treasury_id = env.register_contract(None, TreasuryContract);
+    let treasury = TreasuryContractClient::new(&env, &treasury_id);
+    treasury.initialize(&String::from_str(&env, ORG), &admin);
 
-    // 7. Multisig + proposal — deployed and recorded in the registry like the
-    //    other modules; governance flows in these tests act through the
-    //    admin/owner roles directly.
-    let multisig_contract = env.register_contract(None, MultiSigContract);
-    MultiSigContractClient::new(&env, &multisig_contract).initialize(
+    // 4. Multisig — threshold governance for treasury actions.
+    let multisig_id = env.register_contract(None, MultiSigContract);
+    let multisig = MultiSigContractClient::new(&env, &multisig_id);
+    multisig.initialize(
         &vec![
             &env,
             SignerWeight {
@@ -124,24 +108,39 @@ fn setup() -> Harness<'static> {
                 weight: 1,
             },
         ],
-        &1,
+        &2,
     );
-    treasury.set_multisig(&admin, &multisig_contract);
-    let proposal_contract = env.register_contract(None, astroid_proposal::ProposalContract);
-    registry.register_module(
-        &admin,
-        &String::from_str(&env, ORG),
-        &ModuleKind::Multisig,
-        &multisig_contract,
-    );
-    registry.register_module(
-        &admin,
-        &String::from_str(&env, ORG),
-        &ModuleKind::Proposal,
-        &proposal_contract,
-    );
+    treasury.set_multisig(&admin, &multisig_id);
 
-    // 8. Register the org's core modules so `lookup` resolves them.
+    // 5. Proposal — organization action approval flow.
+    let proposal_id = env.register_contract(None, ProposalContract);
+    let proposal = ProposalContractClient::new(&env, &proposal_id);
+    proposal.initialize(&timelock, &multisig_id);
+
+    // 6. Budget — spending limits consumed by the treasury.
+    let budget_id = env.register_contract(None, BudgetContract);
+    let budget = BudgetContractClient::new(&env, &budget_id);
+    budget.initialize(&admin);
+
+    // 7. Policy — rule engine consulted before every spend.
+    let policy_id = env.register_contract(None, PolicyContract);
+    let policy = PolicyContractClient::new(&env, &policy_id);
+    policy.initialize();
+
+    // 8. Escrow — time-locked conditional custody. The token whitelist starts
+    // empty, so the admin must approve the asset before anything can be
+    // escrowed.
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let escrow = EscrowContractClient::new(&env, &escrow_id);
+    escrow.initialize(&admin);
+
+    // Register modules in the same order as the architecture.
+    registry.register_module(
+        &admin,
+        &String::from_str(&env, ORG),
+        &ModuleKind::Wallet,
+        &wallet_id,
+    );
     registry.register_module(
         &admin,
         &String::from_str(&env, ORG),
@@ -151,8 +150,14 @@ fn setup() -> Harness<'static> {
     registry.register_module(
         &admin,
         &String::from_str(&env, ORG),
-        &ModuleKind::Wallet,
-        &wallet_id,
+        &ModuleKind::Multisig,
+        &multisig_id,
+    );
+    registry.register_module(
+        &admin,
+        &String::from_str(&env, ORG),
+        &ModuleKind::Proposal,
+        &proposal_id,
     );
     registry.register_module(
         &admin,
@@ -201,7 +206,7 @@ fn setup() -> Harness<'static> {
         policy,
         wallet,
         escrow,
-        multisig: multisig_contract,
+        multisig: multisig_id,
         admin,
         org_owner,
         agent,
@@ -955,15 +960,15 @@ fn registry_links_the_deployed_modules() {
 /// through the contract's own views and the registry.
 #[test]
 fn proposal_timelock_gates_execution_end_to_end() {
-    let h = setup();
+    let h = setup_with_timelock(100);
 
     // The harness deployed the proposal contract and registered it in the
     // registry; resolve it through the registry like a real integrator.
     let proposal_id = h.registry.lookup(&string(&h, ORG), &ModuleKind::Proposal);
     let proposal = ProposalContractClient::new(&h.env, &proposal_id);
 
-    // Configure a 100-second timelock (the contract is fresh in this env).
-    proposal.initialize(&100, &h.multisig);
+    // The harness configured a 100-second timelock and the governance signer
+    // at deployment.
     assert_eq!(h.env.ledger().timestamp(), START);
 
     let proposer = h.org_owner.clone();
