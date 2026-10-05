@@ -24,17 +24,6 @@ fn assert_event(env: &Env, variant: &str) {
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
-/// Count canonical `ContractEvent` emissions of the given variant symbol so
-/// tests can also assert that an event did *not* fire.
-fn count_events(env: &Env, variant: &str) -> usize {
-    let want: Val = Symbol::new(env, variant).into_val(env);
-    env.events()
-        .all()
-        .iter()
-        .filter(|(_contract_id, topics, _data)| topics.contains(want))
-        .count()
-}
-
 fn setup() -> (Env, RegistryContractClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();

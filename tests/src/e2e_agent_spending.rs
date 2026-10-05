@@ -20,8 +20,9 @@
 
 use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState, ReleaseConditionConfig};
+use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::{PolicyContract, PolicyContractClient};
-use astroid_proposal::{ProposalContractClient, ProposalState};
+use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
@@ -60,6 +61,10 @@ struct Harness<'a> {
 /// Deploy every workspace contract in dependency order, register the org's
 /// module addresses with the registry, and fund the treasury.
 fn setup() -> Harness<'static> {
+    setup_with_timelock(0)
+}
+
+fn setup_with_timelock(timelock: u64) -> Harness<'static> {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = START);
@@ -110,7 +115,7 @@ fn setup() -> Harness<'static> {
     // 5. Proposal — organization action approval flow.
     let proposal_id = env.register_contract(None, ProposalContract);
     let proposal = ProposalContractClient::new(&env, &proposal_id);
-    proposal.initialize(&0);
+    proposal.initialize(&timelock);
 
     // 6. Budget — spending limits consumed by the treasury.
     let budget_id = env.register_contract(None, BudgetContract);
@@ -122,12 +127,7 @@ fn setup() -> Harness<'static> {
     let policy = PolicyContractClient::new(&env, &policy_id);
     policy.initialize();
 
-    // 5. Wallet — per-org custody with role-based access.
-    let wallet_id = env.register_contract(None, WalletContract);
-    let wallet = WalletContractClient::new(&env, &wallet_id);
-    wallet.initialize(&admin);
-
-    // 6. Escrow — time-locked conditional custody. The token whitelist starts
+    // 8. Escrow — time-locked conditional custody. The token whitelist starts
     // empty, so the admin must approve the asset before anything can be
     // escrowed.
     let escrow_id = env.register_contract(None, EscrowContract);
@@ -206,7 +206,7 @@ fn setup() -> Harness<'static> {
         policy,
         wallet,
         escrow,
-        multisig,
+        multisig: multisig_id,
         admin,
         org_owner,
         agent,
@@ -960,15 +960,14 @@ fn registry_links_the_deployed_modules() {
 /// through the contract's own views and the registry.
 #[test]
 fn proposal_timelock_gates_execution_end_to_end() {
-    let h = setup();
+    let h = setup_with_timelock(100);
 
     // The harness deployed the proposal contract and registered it in the
     // registry; resolve it through the registry like a real integrator.
     let proposal_id = h.registry.lookup(&string(&h, ORG), &ModuleKind::Proposal);
     let proposal = ProposalContractClient::new(&h.env, &proposal_id);
 
-    // Configure a 100-second timelock (the contract is fresh in this env).
-    proposal.initialize(&100);
+    // The harness configured a 100-second timelock at deployment.
     assert_eq!(h.env.ledger().timestamp(), START);
 
     let proposer = h.org_owner.clone();
