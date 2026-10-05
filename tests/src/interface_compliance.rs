@@ -210,7 +210,18 @@ fn proposal_serves_the_proposal_interface() {
 
     let id = env.register_contract(None, ProposalContract);
     let contract = astroid_proposal::ProposalContractClient::new(&env, &id);
-    contract.initialize(&0);
+    let multisig_id = env.register_contract(None, MultiSigContract);
+    MultiSigContractClient::new(&env, &multisig_id).initialize(
+        &vec![
+            &env,
+            SignerWeight {
+                address: approver.clone(),
+                weight: 1,
+            },
+        ],
+        &1,
+    );
+    contract.initialize(&0, &multisig_id);
 
     let proposal = ProposalClient::new(&env, &id);
     // An unknown id decodes to the canonical error code through the shared

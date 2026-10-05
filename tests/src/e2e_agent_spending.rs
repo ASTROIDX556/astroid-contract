@@ -20,6 +20,7 @@
 
 use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState, ReleaseConditionConfig};
+use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::{PolicyContract, PolicyContractClient};
 use astroid_proposal::{ProposalContractClient, ProposalState};
 use astroid_registry::{RegistryContract, RegistryContractClient};
@@ -68,7 +69,6 @@ fn setup() -> Harness<'static> {
     let org_owner = Address::generate(&env);
     let agent = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let multisig = Address::generate(&env);
 
     // 1. Registry — source of truth for module addresses.
     let registry_id = env.register_contract(None, RegistryContract);
@@ -81,7 +81,6 @@ fn setup() -> Harness<'static> {
     let treasury_id = env.register_contract(None, TreasuryContract);
     let treasury = TreasuryContractClient::new(&env, &treasury_id);
     treasury.initialize(&String::from_str(&env, ORG), &admin);
-    treasury.set_multisig(&admin, &multisig);
 
     // 3. Budget — spending limits consumed by the treasury.
     let budget_id = env.register_contract(None, BudgetContract);
@@ -108,7 +107,26 @@ fn setup() -> Harness<'static> {
     // 7. Multisig + proposal — deployed and recorded in the registry like the
     //    other modules; governance flows in these tests act through the
     //    admin/owner roles directly.
-    let multisig_contract = env.register_contract(None, astroid_multisig::MultiSigContract);
+    let multisig_contract = env.register_contract(None, MultiSigContract);
+    MultiSigContractClient::new(&env, &multisig_contract).initialize(
+        &vec![
+            &env,
+            SignerWeight {
+                address: admin.clone(),
+                weight: 1,
+            },
+            SignerWeight {
+                address: org_owner.clone(),
+                weight: 1,
+            },
+            SignerWeight {
+                address: agent.clone(),
+                weight: 1,
+            },
+        ],
+        &1,
+    );
+    treasury.set_multisig(&admin, &multisig_contract);
     let proposal_contract = env.register_contract(None, astroid_proposal::ProposalContract);
     registry.register_module(
         &admin,
@@ -183,7 +201,7 @@ fn setup() -> Harness<'static> {
         policy,
         wallet,
         escrow,
-        multisig,
+        multisig: multisig_contract,
         admin,
         org_owner,
         agent,
@@ -945,7 +963,7 @@ fn proposal_timelock_gates_execution_end_to_end() {
     let proposal = ProposalContractClient::new(&h.env, &proposal_id);
 
     // Configure a 100-second timelock (the contract is fresh in this env).
-    proposal.initialize(&100);
+    proposal.initialize(&100, &h.multisig);
     assert_eq!(h.env.ledger().timestamp(), START);
 
     let proposer = h.org_owner.clone();
