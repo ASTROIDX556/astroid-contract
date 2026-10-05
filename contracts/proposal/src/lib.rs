@@ -163,6 +163,8 @@
 //! `dependencies`, `dependencies_met`, `vote_bars` and `can_execute` views.
 //! `initialize` also stores the mandatory per-proposal timelock.
 
+mod timelock;
+
 use astroid_interfaces::{MultisigClient, ProposalInterface, UpgradeableInterface};
 // The lifecycle vocabulary lives in the interfaces crate so the multisig, the
 // wallet and off-chain consumers all decode the same `u32` discriminants. The
@@ -356,7 +358,7 @@ impl ProposalContract {
         if env.storage().instance().has(&DataKey::ProposalCount) {
             return Err(Error::AlreadyInitialized);
         }
-        MultisigClient::new(&env, &multisig).get_threshold()?;
+        MultisigClient::new(&env, &multisig).get_threshold();
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
         env.storage().instance().set(&DataKey::Timelock, &timelock);
         env.storage().instance().set(&DataKey::Multisig, &multisig);
@@ -420,7 +422,7 @@ impl ProposalContract {
             )?;
             unique_approvers.push_back(approver);
         }
-        if eligible_weight < multisig_client.get_threshold()? as i128 {
+        if eligible_weight < multisig_client.get_threshold() as i128 {
             return Err(Error::InvalidThreshold);
         }
         if threshold == 0 || threshold > n {
@@ -519,7 +521,10 @@ impl ProposalContract {
         if Self::expire_if_due(&env, id, &mut proposal)? {
             return Ok(proposal.approvals);
         }
-        if !matches!(proposal.state, ProposalState::Pending | ProposalState::Approved) {
+        if !matches!(
+            proposal.state,
+            ProposalState::Pending | ProposalState::Approved
+        ) {
             return Err(Error::InvalidProposalState);
         }
         if !proposal.approvers.contains(&caller) {
@@ -534,22 +539,22 @@ impl ProposalContract {
         if env.storage().persistent().get(&akey).unwrap_or(false) {
             return Err(Error::AlreadySigned);
         }
-        let multisig_threshold = multisig_client.get_threshold()?;
+        let multisig_threshold = multisig_client.get_threshold();
         let previous_weight = if proposal.state == ProposalState::Approved {
             Self::live_approval_tally(&env, id, &proposal)?.1
         } else {
             0
         };
-        if proposal.state == ProposalState::Approved {
-            if previous_weight >= multisig_threshold {
-                return Err(Error::InvalidProposalState);
-            }
+        if proposal.state == ProposalState::Approved && previous_weight >= multisig_threshold {
+            return Err(Error::InvalidProposalState);
         }
         env.storage().persistent().set(&akey, &true);
         let (approvals, approval_weight) = Self::live_approval_tally(&env, id, &proposal)?;
         proposal.approvals = approvals;
         proposal.approval_weight = approval_weight;
-        if proposal.approvals >= proposal.threshold {
+        let crossed_multisig_threshold =
+            previous_weight < multisig_threshold && approval_weight >= multisig_threshold;
+        if proposal.state == ProposalState::Pending && proposal.approvals >= proposal.threshold {
             // Issue #329 — every transition passes the canonical state
             // machine; an entrypoint that fell out of sync with it aborts
             // instead of corrupting the record.
@@ -562,8 +567,16 @@ impl ProposalContract {
             // once, when the threshold is reached, and is re-applied verbatim
             // (approval signatures cannot be retracted).
             proposal.approved_at = env.ledger().timestamp();
+        } else if proposal.state == ProposalState::Approved && crossed_multisig_threshold {
+            proposal.approved_at = env.ledger().timestamp();
         }
         Self::store(&env, id, &proposal);
+        if crossed_multisig_threshold {
+            env.events().publish(
+                (symbol_short!("proposal"), symbol_short!("weightok")),
+                (id, caller.clone(), approval_weight),
+            );
+        }
         env.events().publish(
             (symbol_short!("proposal"), symbol_short!("approved")),
             (id, caller, proposal.approvals),
@@ -819,7 +832,7 @@ impl ProposalContract {
         proposal.approval_weight = approval_weight;
         Self::ensure_vote_valid(&proposal)?;
         let multisig = Self::multisig(&env)?;
-        let multisig_threshold = MultisigClient::new(&env, &multisig).get_threshold()?;
+        let multisig_threshold = MultisigClient::new(&env, &multisig).get_threshold();
         if approval_weight < multisig_threshold {
             return Err(Error::ThresholdNotMet);
         }
@@ -1055,11 +1068,7 @@ impl ProposalContract {
         VoteBars::for_proposal(proposal).ensure_met(proposal.approvals)
     }
 
-    fn live_approval_tally(
-        env: &Env,
-        id: u64,
-        proposal: &Proposal,
-    ) -> Result<(u32, u32), Error> {
+    fn live_approval_tally(env: &Env, id: u64, proposal: &Proposal) -> Result<(u32, u32), Error> {
         let multisig = Self::multisig(env)?;
         let multisig_client = MultisigClient::new(env, &multisig);
         let mut approvals = 0u32;
@@ -1072,10 +1081,7 @@ impl ProposalContract {
                 .unwrap_or(false);
             if approved && multisig_client.is_signer(&approver) {
                 approvals = checked_add(approvals as i128, 1)? as u32;
-                weight = checked_add(
-                    weight,
-                    multisig_client.get_signer_weight(&approver) as i128,
-                )?;
+                weight = checked_add(weight, multisig_client.get_signer_weight(&approver) as i128)?;
             }
         }
         let approval_weight = u32::try_from(weight).map_err(|_| Error::Overflow)?;
@@ -1238,7 +1244,7 @@ impl ProposalInterface for ProposalContract {
             return Ok(false);
         }
         let multisig = Self::multisig(&env)?;
-        if approval_weight < MultisigClient::new(&env, &multisig).get_threshold()? {
+        if approval_weight < MultisigClient::new(&env, &multisig).get_threshold() {
             return Ok(false);
         }
         Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())

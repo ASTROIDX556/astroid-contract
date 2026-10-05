@@ -1,9 +1,9 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{ProposalContract, ProposalContractClient, ProposalState, VoteBars};
+use crate::{timelock, ProposalContract, ProposalContractClient, ProposalState, VoteBars};
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH};
+use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH, MAX_SIGNERS};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
 use soroban_sdk::{vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
@@ -1442,7 +1442,6 @@ fn unrepresentable_grace_window_does_not_trap_cancellation() {
 // refund to prove a proposal settles exactly once, however often `execute` is
 // called.
 
-use astroid_shared::constants::MAX_APPROVERS;
 use astroid_shared::types::AssetAmount;
 use soroban_sdk::testutils::AuthorizedFunction;
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
@@ -1688,11 +1687,10 @@ fn vote_bars_hold_at_the_approver_cap_and_do_not_overflow() {
     assert_eq!(VoteBars::quorum_required(u32::MAX, 50), u32::MAX / 2 + 1);
     assert_eq!(VoteBars::majority_required(u32::MAX), u32::MAX / 2 + 1);
 
-    // At the largest allow-list `create` accepts, the bars still land on the
-    // exact boundary: half of the allow-list is a tie, one more is a strict
-    // majority.
-    let h = setup(MAX_APPROVERS);
-    let half = MAX_APPROVERS / 2;
+    // At the largest signer set `create` can accept, the bars still land on
+    // the exact boundary: half is a tie, one more is a strict majority.
+    let h = setup(MAX_SIGNERS);
+    let half = MAX_SIGNERS / 2;
     let tie = create(&h, half, 0);
     let win = create(&h, half + 1, 0);
     for approver in h.approvers.iter().take(half as usize) {

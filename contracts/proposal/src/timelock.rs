@@ -148,12 +148,14 @@ pub fn time_lock_status(env: &Env, approved_at: u64, delay: u64) -> Result<TimeL
 
 /// Whether the cooling-off period for `approved_at` / `delay` has elapsed on
 /// the current ledger. An unarmed time-lock is always released.
+#[cfg(test)]
 pub fn is_released(env: &Env, approved_at: u64, delay: u64) -> Result<bool, Error> {
     Ok(time_lock_status(env, approved_at, delay)?.released)
 }
 
 /// Whether the time-lock is still holding the proposal back on the current
 /// ledger — the predicate behind every premature-execution refusal.
+#[cfg(test)]
 pub fn is_active(env: &Env, approved_at: u64, delay: u64) -> Result<bool, Error> {
     Ok(time_lock_status(env, approved_at, delay)?.blocking())
 }
