@@ -13,6 +13,7 @@
 //! `timelock_status` views so a client can check before spending a
 //! transaction.
 
+use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
@@ -41,20 +42,31 @@ fn setup(timelock: u64) -> Harness {
         l.timestamp = START;
     });
 
+    let mut approvers = std::vec::Vec::new();
+    for _ in 0..3 {
+        approvers.push(Address::generate(&env));
+    }
+
+    let multisig_id = env.register_contract(None, MultiSigContract);
+    let multisig = MultiSigContractClient::new(&env, &multisig_id);
+    let mut signers = Vec::new(&env);
+    for approver in &approvers {
+        signers.push_back(SignerWeight {
+            address: approver.clone(),
+            weight: 1,
+        });
+    }
+    multisig.initialize(&signers, &2);
+
     let contract_id = env.register_contract(None, ProposalContract);
     let proposals = ProposalContractClient::new(&env, &contract_id);
-    proposals.initialize(&timelock);
+    proposals.initialize(&timelock, &multisig_id);
 
     let asset = env
         .register_stellar_asset_contract_v2(Address::generate(&env))
         .address();
     let proposer = Address::generate(&env);
     token::StellarAssetClient::new(&env, &asset).mint(&proposer, &100_000);
-
-    let mut approvers = std::vec::Vec::new();
-    for _ in 0..3 {
-        approvers.push(Address::generate(&env));
-    }
 
     Harness {
         env,

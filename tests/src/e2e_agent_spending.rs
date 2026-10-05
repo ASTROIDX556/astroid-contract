@@ -115,7 +115,7 @@ fn setup_with_timelock(timelock: u64) -> Harness<'static> {
     // 5. Proposal — organization action approval flow.
     let proposal_id = env.register_contract(None, ProposalContract);
     let proposal = ProposalContractClient::new(&env, &proposal_id);
-    proposal.initialize(&timelock);
+    proposal.initialize(&timelock, &multisig_id);
 
     // 6. Budget — spending limits consumed by the treasury.
     let budget_id = env.register_contract(None, BudgetContract);
@@ -967,7 +967,8 @@ fn proposal_timelock_gates_execution_end_to_end() {
     let proposal_id = h.registry.lookup(&string(&h, ORG), &ModuleKind::Proposal);
     let proposal = ProposalContractClient::new(&h.env, &proposal_id);
 
-    // The harness configured a 100-second timelock at deployment.
+    // The harness configured a 100-second timelock and the governance signer
+    // at deployment.
     assert_eq!(h.env.ledger().timestamp(), START);
 
     let proposer = h.org_owner.clone();
