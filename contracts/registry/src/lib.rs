@@ -818,6 +818,13 @@ impl RegistryContract {
             Self::is_wasm_approved(env.clone(), kind, wasm_hash.clone()),
             Error::Unauthorized
         );
+        let lkey = DataKey::LatestVersion(kind);
+        let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
+        ensure!(version > latest, Error::InvalidInput);
+        match UpgradeableClient::new(&env, &address).try_get_interface_version() {
+            Ok(Ok(interface_version)) if interface_version == INTERFACE_VERSION => {}
+            _ => return Err(Error::InvalidInput),
+        }
         // One write for the whole record, where the address and the hash used to
         // be two separate entries and two writes.
         let vkey = DataKey::VersionRecord(kind, version);
@@ -829,14 +836,8 @@ impl RegistryContract {
             },
         );
         Self::bump(&env, &vkey);
-
-        let lkey = DataKey::LatestVersion(kind);
-        let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
-        ensure!(version > latest, Error::InvalidInput);
-        match UpgradeableClient::new(&env, &address).try_get_interface_version() {
-            Ok(interface_version) if interface_version == INTERFACE_VERSION => {}
-            _ => return Err(Error::InvalidInput),
-        }
+        env.storage().persistent().set(&lkey, &version);
+        Self::bump(&env, &lkey);
         astroid_shared::events::publish(
             &env,
             ContractEvent::RegistryVersionRegistered {
