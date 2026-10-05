@@ -188,7 +188,7 @@ impl MultiSigContract {
         let idx = Self::index_of(&signers, &signer)?;
         let remaining_total = checked_sub(
             Self::total_weight(&signers)? as i128,
-            signers.get(idx).unwrap().weight as i128,
+            signers.get(idx).ok_or(Error::NotFound)?.weight as i128,
         )?;
         if remaining_total < threshold as i128 {
             return Err(Error::InvalidThreshold);
@@ -748,7 +748,7 @@ impl MultiSigContract {
         let len = signers.len();
         let mut i = 0;
         while i < len {
-            let w = signers.get(i).unwrap().weight;
+            let w = signers.get(i).ok_or(Error::InvalidInput)?.weight;
             total = quorum::add_weight(total, w)?;
             i += 1;
         }
@@ -1074,7 +1074,7 @@ impl MultiSigContract {
             GovernanceChange::SignerWeight(signer, weight) => {
                 let mut signers = Self::signers(env)?;
                 let idx = Self::index_of(&signers, signer)?;
-                let mut updated = signers.get(idx).unwrap();
+                let mut updated = signers.get(idx).ok_or(Error::NotFound)?;
                 updated.weight = *weight;
                 signers.set(idx, updated);
                 env.storage().instance().set(&DataKey::Signers, &signers);
@@ -1190,10 +1190,10 @@ impl MultiSigContract {
         let len = signers.len();
         let mut i = 0;
         while i < len {
-            let a = signers.get(i).unwrap().address.clone();
+            let a = signers.get(i).ok_or(Error::InvalidInput)?.address;
             let mut j = i + 1;
             while j < len {
-                if a == signers.get(j).unwrap().address {
+                if a == signers.get(j).ok_or(Error::InvalidInput)?.address {
                     return Err(Error::InvalidInput);
                 }
                 j += 1;

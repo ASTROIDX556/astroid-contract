@@ -4390,7 +4390,7 @@ fn event_count(env: &Env, category: &str, action: &str) -> u32 {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut count = 0;
     for (_emitter, topics, _data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
             count += 1;
         }
     }
@@ -4405,7 +4405,7 @@ fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut found = None;
     for (_emitter, topics, data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
             found = Vec::<Val>::try_from_val(env, &data).ok();
         }
     }

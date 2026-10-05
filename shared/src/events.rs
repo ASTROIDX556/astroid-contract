@@ -61,12 +61,6 @@ pub enum ContractEvent {
         kind: ModuleKind,
         address: Address,
     },
-    /// Registry WASM was updated after an approved, authorized request.
-    RegistryUpgraded {
-        sequence: u32,
-        caller: Address,
-        wasm_hash: BytesN<32>,
-    },
     /// An organization's owner changed.
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
@@ -124,7 +118,11 @@ pub enum ContractEvent {
     /// registry resolved it from its upgrade map, it was never caller-supplied,
     /// and it is strictly greater than `from_version`, so this event is the
     /// audit trail that the registry's own version never went backwards.
+    /// `sequence` is the zero-based position in its persistent upgrade history,
+    /// and `caller` is the authorized upgrade administrator.
     RegistryUpgraded {
+        sequence: u32,
+        caller: Address,
         from_version: u32,
         to_version: u32,
         wasm_hash: BytesN<32>,
@@ -312,16 +310,6 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (org, kind, address),
             );
         }
-        ContractEvent::RegistryUpgraded {
-            sequence,
-            caller,
-            wasm_hash,
-        } => {
-            env.events().publish(
-                (Symbol::new(env, "RegistryUpgraded"),),
-                (sequence, caller, wasm_hash),
-            );
-        }
         ContractEvent::OrgOwnerChanged { org, new_owner } => {
             env.events()
                 .publish((Symbol::new(env, "OrgOwnerChanged"),), (org, new_owner));
@@ -367,13 +355,15 @@ pub fn publish(env: &Env, event: ContractEvent) {
             );
         }
         ContractEvent::RegistryUpgraded {
+            sequence,
+            caller,
             from_version,
             to_version,
             wasm_hash,
         } => {
             env.events().publish(
                 (Symbol::new(env, "RegistryUpgraded"),),
-                (from_version, to_version, wasm_hash),
+                (sequence, caller, from_version, to_version, wasm_hash),
             );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {

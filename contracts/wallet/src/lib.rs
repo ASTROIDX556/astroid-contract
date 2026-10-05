@@ -349,7 +349,9 @@ impl VelocityGate {
     /// first touch and reusing them for every later action in this invocation.
     fn enforce(&mut self, env: &Env, asset: &Address, amount: i128) -> Result<(), Error> {
         let index = self.position(env, asset);
-        let (_, limit, usage) = self.entries.get(index).unwrap();
+        let Some((_, limit, usage)) = self.entries.get(index) else {
+            return Err(Error::InvalidState);
+        };
         // No ceiling for this asset: there is nothing to charge and nothing to
         // record, exactly as an ungated asset behaves.
         let (Some(limit), Some(mut usage)) = (limit, usage) else {
@@ -394,8 +396,10 @@ impl VelocityGate {
     /// comparison over in-memory handles and costs no ledger access.
     fn position(&mut self, env: &Env, asset: &Address) -> u32 {
         for index in 0..self.entries.len() {
-            if self.entries.get(index).unwrap().0 == *asset {
-                return index;
+            if let Some((entry_asset, _, _)) = self.entries.get(index) {
+                if entry_asset == *asset {
+                    return index;
+                }
             }
         }
         let wallet_id = self.wallet_id;
@@ -1549,14 +1553,14 @@ impl WalletContract {
             });
             match RegistryClient::new(env, &reg).try_get_modules_batch(&ids) {
                 Ok(Ok(modules)) => {
-                    let policy = modules.get(0).unwrap().and_then(|info| {
+                    let policy = modules.get(0).ok_or(Error::InvalidState)?.and_then(|info| {
                         if info.deprecated {
                             None
                         } else {
                             Some(info.address)
                         }
                     });
-                    let budget = modules.get(1).unwrap().and_then(|info| {
+                    let budget = modules.get(1).ok_or(Error::InvalidState)?.and_then(|info| {
                         if info.deprecated {
                             None
                         } else {

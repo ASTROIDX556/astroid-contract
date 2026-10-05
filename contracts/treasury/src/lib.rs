@@ -1364,7 +1364,11 @@ impl TreasuryContract {
         // `payments` are the record. The first leg's recipient is carried so the
         // stored record is never self-contradictory for a reader that only
         // looks at the scalar fields.
-        let to = payments.first().unwrap().recipient.clone();
+        let to = payments
+            .first()
+            .ok_or(Error::InvalidInput)?
+            .recipient
+            .clone();
         Self::open_pending(&env, &caller, asset, to, total, payments)
     }
 
