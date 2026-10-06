@@ -928,19 +928,27 @@ impl BudgetContract {
     /// each leg's new spent total must stay within the token's current-window
     /// limit ([`Error::BudgetExceeded`] otherwise). Only when every leg passes
     /// are all new spent totals persisted — a single breach rejects the whole
-    /// batch and leaves every ledger untouched. Time-based window resets are
-    /// settled along the way exactly as [`Self::check_and_record_spend`] does.
+    /// batch and leaves every ledger untouched. Time-based window resets,
+    /// lifecycle state and the scheduled-start gate are checked exactly as
+    /// [`Self::check_and_record_spend`] does, and — like that entrypoint — the
+    /// refusal is reported through [`BudgetError`] so a not-yet-started budget
+    /// keeps its distinct `BudgetNotActive` code instead of folding onto the
+    /// shared table.
     pub fn check_and_record_batch_spend(
         env: Env,
         caller: Address,
         budget_id: String,
         spends: Vec<AssetSpend>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), BudgetError> {
         if spends.is_empty() || spends.len() > MAX_BATCH_TOKENS {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidInput.into());
         }
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
+        // A scheduled budget blocks every spend path until its inclusive
+        // start, batch included — without this gate the batch entrypoint was
+        // the one way to spend an envelope before it activated.
+        Self::require_started(&env, &budget)?;
         Self::require_not_expired(&env, &budget)?;
 
         // First pass: settle each token's window and simulate its leg without
@@ -954,7 +962,7 @@ impl BudgetContract {
             // spent counter, letting the legs jointly exceed the cap.
             for j in 0..i {
                 if spends.get(j).unwrap().token == spend.token {
-                    return Err(Error::InvalidInput);
+                    return Err(Error::InvalidInput.into());
                 }
             }
             let key = DataKey::AssetBudget(budget_id.clone(), spend.token.clone());
@@ -967,7 +975,7 @@ impl BudgetContract {
 
             let new_spent = checked_add(asset_budget.spent, spend.amount)?;
             if new_spent > asset_budget.limit {
-                return Err(Error::BudgetExceeded);
+                return Err(BudgetError::BudgetExceeded);
             }
             asset_budget.spent = new_spent;
             settled.push_back(asset_budget);
@@ -1638,6 +1646,10 @@ impl BudgetInterface for BudgetContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for BudgetContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        astroid_interfaces::INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. Bootstrapped by the deployer alongside
     /// `initialize`; afterwards only the current upgrade admin may rotate it.

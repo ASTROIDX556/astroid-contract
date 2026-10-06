@@ -268,6 +268,9 @@ pub trait EscrowInterface {
 /// operators can drive an upgrade of any contract through one client.
 #[contractclient(name = "UpgradeableClient")]
 pub trait UpgradeableInterface {
+    /// Runtime version of the shared contract interface.
+    fn get_interface_version(env: Env) -> u32;
+
     /// Record (or rotate) who may upgrade the contract and which registry
     /// authorizes the new code. See [`upgrade::set_authority`].
     fn set_upgrade_authority(

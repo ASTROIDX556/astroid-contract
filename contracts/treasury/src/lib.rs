@@ -791,7 +791,12 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
-        let balance = checked_add(Self::asset_balance_internal(&env, &asset), amount)?;
+        // The recorded balance mirrors the ledger itself rather than being
+        // credited with the *requested* amount: on a fee-on-transfer token the
+        // two differ, and only what actually arrived may be booked (Issue
+        // #218). Syncing from the holding keeps the two inseparable on every
+        // path that mutates either.
+        let balance = h.total_in;
         Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
@@ -803,7 +808,9 @@ impl TreasuryContract {
                 org: t.org.clone(),
                 from: from.clone(),
                 asset: asset.clone(),
-                amount,
+                // The value actually credited to the treasury, matching the
+                // tuple-topic event above — never the requested figure.
+                amount: received,
                 balance,
             },
         );
@@ -818,12 +825,27 @@ impl TreasuryContract {
         asset: Address,
         budget_id: String,
     ) -> Result<(), Error> {
-        let _t = Self::require_admin(&env, &admin)?;
+        let t = Self::require_admin(&env, &admin)?;
         require_non_empty(&budget_id)?;
         Self::require_approved_asset(&env, &asset)?;
         let mut h = Self::load_holding(&env, &asset);
-        h.budget_id = Some(budget_id);
+        h.budget_id = Some(budget_id.clone());
         Self::store_holding(&env, &asset, &h);
+        // Issue #222 — binding an envelope mutates the treasury record, so it
+        // announces itself on both layers like every other config change: the
+        // canonical typed event plus a tuple-topic event carrying the
+        // identifiers and the ledger timestamp.
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("bgt_alloc")),
+            (asset.clone(), budget_id.clone(), env.ledger().timestamp()),
+        );
+        events::publish(
+            &env,
+            events::ContractEvent::TreasuryConfigUpdated {
+                org: t.org.clone(),
+                action: symbol_short!("bgt_alloc"),
+            },
+        );
         Ok(())
     }
 
@@ -859,9 +881,11 @@ impl TreasuryContract {
         };
         env.storage()
             .persistent()
-            .set(&DataKey::Allowance(id), &allowance);
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("allow")), ());
+            .set(&DataKey::Allowance(id.clone()), &allowance);
+        // Issue #222 — shared topic helpers keep the treasury on the same
+        // `allow_set` / `allow_use` / `allow_rem` schema the policy contract
+        // already publishes under.
+        events::allowance_set(&env, &id.agent, &id.recipient, &id.asset, limit, expires_at);
         Ok(())
     }
 
@@ -886,9 +910,10 @@ impl TreasuryContract {
         {
             return Err(Error::NotFound);
         }
-        env.storage().persistent().remove(&DataKey::Allowance(id));
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("allowrm")), ());
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Allowance(id.clone()));
+        events::allowance_removed(&env, &id.agent, &id.recipient, &id.asset);
         Ok(())
     }
 
@@ -1017,6 +1042,9 @@ impl TreasuryContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Allowance(allowance_id), &al);
+            // Issue #222 — consuming an allowance is a state change worth
+            // indexing: who spent, to whom, in what asset, how much, and when.
+            events::allowance_consumed(env, caller, to, asset, amount);
         }
 
         // Debit the internal ledger, then move real tokens out of custody.
@@ -1027,7 +1055,10 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(env, asset, &holding);
-        let balance = checked_sub(Self::asset_balance_internal(env, asset), amount)?;
+        // Mirror the debited ledger exactly (see `Self::deposit`): the recorded
+        // balance is the holding itself, so it cannot drift from the books
+        // regardless of which outflow path settles (Issue #218).
+        let balance = holding.total_in;
         Self::store_asset_balance(env, asset, balance);
         events::transfer_executed(env, &t.admin, to, asset, amount);
         Self::transfer_out(env, asset, to, amount)?;
@@ -1167,6 +1198,10 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, total)?;
         holding.total_out = checked_add(holding.total_out, total)?;
         Self::store_holding(env, asset, &holding);
+        // Keep the recorded event balance in lockstep with the ledger this
+        // batch just debited (Issue #218): a later deposit/withdrawal event
+        // must not announce a balance this payout already paid out.
+        Self::store_asset_balance(env, asset, holding.total_in);
 
         let token_client = token::TokenClient::new(env, asset);
         let custody = env.current_contract_address();
@@ -1583,6 +1618,8 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &d.asset, &holding);
+        // Same recorded-balance sync as every other outflow (Issue #218).
+        Self::store_asset_balance(&env, &d.asset, holding.total_in);
 
         Self::transfer_out(&env, &d.asset, &d.to, amount)?;
         env.events().publish(
@@ -1759,17 +1796,13 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
-    /// Current recorded balance for `asset` (0 when the asset never moved).
-    fn asset_balance_internal(env: &Env, asset: &Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AssetBalance(asset.clone()))
-            .unwrap_or(0)
-    }
-
     /// Persist the per-asset balance used by the structured deposit and
     /// withdrawal events so the resulting balance never has to be recomputed
     /// from the flow totals at emission time.
+    ///
+    /// Callers always pass the updated [`Holding::total_in`], keeping this
+    /// record an exact mirror of the internal ledger on every value path
+    /// (Issue #218).
     fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
         let key = DataKey::AssetBalance(asset.clone());
         env.storage().persistent().set(&key, &balance);
@@ -2141,6 +2174,10 @@ impl TreasuryInterface for TreasuryContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for TreasuryContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        astroid_interfaces::INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. Bootstrapped by the deployer alongside
     /// `initialize`; afterwards only the current upgrade admin may rotate it.
