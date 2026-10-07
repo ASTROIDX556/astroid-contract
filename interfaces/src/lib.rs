@@ -45,6 +45,14 @@ pub trait RegistryInterface {
     /// with `InvalidInput` before any record is read. An empty list returns an
     /// empty list.
     fn get_modules_batch(env: Env, ids: Vec<ModuleId>) -> Result<Vec<Option<ModuleInfo>>, Error>;
+
+    /// Whether the registry's emergency circuit breaker is engaged.
+    ///
+    /// While `true`, every state-mutating registry entrypoint fails with
+    /// `Error::RegistryPaused`; read-only lookups stay available for incident
+    /// inspection. Cross-contract upgrades observe the pause too, because
+    /// `is_wasm_approved` reports no hash as approved while paused.
+    fn is_paused(env: Env) -> bool;
 }
 
 /// Policy verification surface. Contracts call `check_transfer` to have a spend
@@ -108,4 +116,101 @@ pub trait TelemetryInterface {
     /// Returns `true` if recent operations have consumed more than 90% of the
     /// available gas budget, signaling that subsequent operations may fail.
     fn is_near_limit(env: Env) -> Result<bool, Error>;
+}
+/// Treasury read surface. Lets wallets, proposals and off-chain services query
+/// treasury holdings and routing state without depending on the treasury crate
+/// (PRD Doc 7 §Treasury).
+#[contractclient(name = "TreasuryClient")]
+pub trait TreasuryInterface {
+    /// Live on-chain balance the treasury holds of `asset`. Fails with
+    /// [`Error::AssetNotAuthorized`] when `asset` is not on the approved list.
+    fn balance(env: Env, asset: Address) -> Result<i128, Error>;
+
+    /// Whether `asset` is currently approved for routing through the treasury.
+    fn is_approved_asset(env: Env, asset: Address) -> bool;
+
+    /// Whether the treasury's emergency circuit breaker is engaged.
+    fn is_paused(env: Env) -> bool;
+}
+
+/// Multisig verification surface. Other contracts (e.g. the proposal flow) use
+/// it to check that a signer set meets the organization's quorum before acting
+/// (PRD Doc 7 §Multisig).
+#[contractclient(name = "MultisigClient")]
+pub trait MultisigInterface {
+    /// Verify that `signatories` (each authorizing `payload`) together with
+    /// `caller` meet the weighted threshold. Returns the accumulated weight.
+    fn verify_threshold(
+        env: Env,
+        caller: Address,
+        signatories: Vec<Address>,
+        payload: Bytes,
+    ) -> Result<u32, Error>;
+
+    /// Whether `who` is a registered signer.
+    fn is_signer(env: Env, who: Address) -> bool;
+
+    /// Voting weight of `who`, or `0` when it is not a registered signer.
+    fn get_signer_weight(env: Env, who: Address) -> u32;
+
+    /// The weighted approval threshold currently in force.
+    fn get_threshold(env: Env) -> Result<u32, Error>;
+}
+
+/// Escrow lifecycle read surface. An escrow holds one party's funds until a
+/// release condition, schedule or refund rule is met, so wallets, budgets and
+/// off-chain monitors need to ask the escrow contract what it may still pay out
+/// without depending on the escrow crate (PRD Doc 7 §Escrow).
+///
+/// Only primitive answers cross this boundary. An escrow's full record carries
+/// the escrow crate's own `#[contracttype]`s, whereas a caller deciding whether
+/// to fund, claim, reclaim or merely display an escrow needs the amounts and the
+/// state predicates below — so those, and not the record, are what the shared
+/// client is for.
+#[contractclient(name = "EscrowClient")]
+pub trait EscrowInterface {
+    /// Number of escrows created so far, i.e. the id the next `create` takes.
+    fn escrow_count(env: Env) -> u64;
+
+    /// Timestamp at which the escrow's refund window closes, or `0` when the
+    /// window has no upper bound.
+    fn refund_window_closes_at(env: Env, id: u64) -> Result<u64, Error>;
+
+    /// Whether the escrow's funds may be reclaimed at the current ledger time:
+    /// still held, grace elapsed and refund window still open.
+    fn is_refundable(env: Env, id: u64) -> Result<bool, Error>;
+
+    /// Amount claimable right now under the escrow's release schedule.
+    fn get_claimable_amount(env: Env, id: u64) -> Result<i128, Error>;
+
+    /// Amount vested so far under the escrow's release schedule.
+    fn get_vested_amount(env: Env, id: u64) -> Result<i128, Error>;
+
+    /// Whether the release schedule has matured at the current ledger time.
+    fn is_unlocked(env: Env, id: u64) -> Result<bool, Error>;
+}
+
+/// Registry-gated upgrade surface shared by every member contract. The
+/// behaviour lives in [`upgrade`]; this trait pins the entrypoint signatures so
+/// operators can drive an upgrade of any contract through one client.
+#[contractclient(name = "UpgradeableClient")]
+pub trait UpgradeableInterface {
+    /// Runtime version of the shared contract interface.
+    fn get_interface_version(env: Env) -> u32;
+
+    /// Record (or rotate) who may upgrade the contract and which registry
+    /// authorizes the new code. See [`upgrade::set_authority`].
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error>;
+
+    /// Read the recorded upgrade authority, or [`Error::NotInitialized`].
+    fn get_upgrade_authority(env: Env) -> Result<upgrade::UpgradeAuthority, Error>;
+
+    /// Replace the contract's code with `wasm_hash` once the caller and the
+    /// registry approval both check out. See [`upgrade::perform`].
+    fn upgrade(env: Env, caller: Address, wasm_hash: BytesN<32>) -> Result<(), Error>;
 }
