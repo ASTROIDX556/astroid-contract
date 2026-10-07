@@ -1621,6 +1621,10 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
+    pub fn balance(env: Env, asset: Address) -> Result<i128, Error> {
+        Self::read_token_balance(&env, &asset)
+    }
+
     pub fn balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error> {
         if assets.len() > MAX_BALANCE_ASSETS {
             return Err(Error::InvalidInput);
@@ -1640,6 +1644,11 @@ impl TreasuryContract {
             report.push_back(AssetBalance { asset, balance });
         }
         Ok(report)
+    }
+
+    /// Whether `asset` is currently approved for routing.
+    pub fn is_approved_asset(env: Env, asset: Address) -> bool {
+        Self::is_asset_approved(&env, &asset)
     }
 
     /// Live balances for every approved token, bounded by `MAX_TREASURY_ASSETS`.
