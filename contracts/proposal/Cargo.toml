@@ -19,4 +19,5 @@ astroid-shared = { workspace = true }
 astroid-interfaces = { workspace = true }
 
 [dev-dependencies]
+astroid-multisig = { path = "../multisig" }
 soroban-sdk = { workspace = true, features = ["testutils"] }

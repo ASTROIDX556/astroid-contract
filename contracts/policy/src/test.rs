@@ -4399,6 +4399,35 @@ fn wire_code<T: core::fmt::Debug, C: core::fmt::Debug>(
     }
 }
 
+/// How many events were published under the two-symbol topic
+/// `(category, action)` (issue #222).
+fn event_count(env: &Env, category: &str, action: &str) -> u32 {
+    let cat: Val = Symbol::new(env, category).into_val(env);
+    let act: Val = Symbol::new(env, action).into_val(env);
+    let mut count = 0;
+    for (_emitter, topics, _data) in env.events().all().iter() {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Decoded payload of the most recent `(category, action)` event, or `None`
+/// when none was published. Fields are decoded rather than compared as raw
+/// `Val`s: `Val` equality compares host handles for object types.
+fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
+    let cat: Val = Symbol::new(env, category).into_val(env);
+    let act: Val = Symbol::new(env, action).into_val(env);
+    let mut found = None;
+    for (_emitter, topics, data) in env.events().all().iter() {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
+            found = Vec::<Val>::try_from_val(env, &data).ok();
+        }
+    }
+    found
+}
+
 /// The single-transaction ceiling is resolved inclusively: exactly the
 /// ceiling passes, one unit over is `POLICY_DENIED` (20), and malformed or
 /// unknown requests keep their own codes rather than masquerading as denials.

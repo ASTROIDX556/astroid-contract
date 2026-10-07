@@ -119,8 +119,13 @@
 //! nothing else — no auth, no code swap — so a deployer can confirm a target
 //! advances the registry before asking for the swap.
 
-use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
+use astroid_interfaces::{
+    RegistryInterface, UpgradeableClient, UpgradeableInterface, INTERFACE_VERSION,
+};
 use astroid_shared::constants::{
+    MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD, UPGRADE_PROPOSAL_EXPIRY,
+    MAX_APPROVERS, MAX_REGISTRY_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
     MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD, UPGRADE_PROPOSAL_EXPIRY,
 };
@@ -193,12 +198,19 @@ enum DataKey {
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
     Frozen,
+    /// Global emergency circuit breaker (instance). Deliberately distinct from
+    /// [`DataKey::Frozen`]: it is admin-only, pauses every state-mutating
+    /// entrypoint at once, and reports [`Error::RegistryPaused`].
+    Paused,
     /// Approved WASM hashes: (kind, hash) -> bool.
     ApprovedWasm(ModuleKind, BytesN<32>),
     /// Pending version-upgrade proposal: kind -> UpgradeProposal.
     UpgradeProposal(ModuleKind),
     /// Immutable historical log of upgrade-lifecycle actions (instance).
     UpgradeAuditLog,
+    /// Persistent count and records for successful upgrades of this registry.
+    UpgradeHistoryCount,
+    UpgradeHistory(u32),
     /// The published `Organization` version whose code this contract is
     /// currently running (instance).
     ///
@@ -238,6 +250,18 @@ pub struct UpgradeProposal {
     pub proposer: Address,
     /// Unix timestamp after which the proposal can no longer be committed.
     pub expires_at: u64,
+}
+
+/// Persistent audit record for an applied registry upgrade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeRecord {
+    /// The authorized administrator who requested the upgrade.
+    pub caller: Address,
+    /// The approved WASM hash installed by the upgrade.
+    pub wasm_hash: BytesN<32>,
+    /// Ledger timestamp when the upgrade was applied.
+    pub timestamp: u64,
 }
 
 /// What kind of upgrade-lifecycle action an [`UpgradeAuditRecord`] captures.
@@ -363,9 +387,10 @@ impl VersionLookupCache {
     /// key in this invocation (matching `get_version` policy).
     fn get(&mut self, kind: ModuleKind, version: u32) -> Option<VersionRecord> {
         for i in 0..self.entries.len() {
-            let (k, v, rec) = self.entries.get(i).unwrap();
-            if k == kind && v == version {
-                return rec.clone();
+            if let Some((cached_kind, cached_version, record)) = self.entries.get(i) {
+                if cached_kind == kind && cached_version == version {
+                    return record;
+                }
             }
         }
         let rec = RegistryContract::read_version(&self.env, kind, version);
@@ -468,6 +493,9 @@ impl RegistryContract {
         let mut admins = Vec::new(&env);
         admins.push_back(admin.clone());
         env.storage().instance().set(&DataKey::Admins, &admins);
+        // The circuit breaker starts released; storing it explicitly keeps the
+        // initial state readable and bumps the instance TTL alongside `Admin`.
+        env.storage().instance().set(&DataKey::Paused, &false);
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
@@ -484,6 +512,7 @@ impl RegistryContract {
         owner: Address,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         require_non_empty(&org)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::Org(org.clone());
@@ -508,6 +537,7 @@ impl RegistryContract {
         new_owner: Address,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let key = DataKey::Org(org.clone());
         let current: Address = env
@@ -559,6 +589,7 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
         let key = DataKey::Module(org.clone(), kind);
@@ -604,6 +635,7 @@ impl RegistryContract {
         kind: ModuleKind,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let mkey = DataKey::Module(org.clone(), kind);
         if !env.storage().persistent().has(&mkey) {
@@ -627,6 +659,7 @@ impl RegistryContract {
         kind: ModuleKind,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let mkey = DataKey::Module(org.clone(), kind);
         if !env.storage().persistent().has(&mkey) {
@@ -669,6 +702,7 @@ impl RegistryContract {
         kind: ModuleKind,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
         let key = DataKey::Module(org.clone(), kind);
@@ -712,6 +746,7 @@ impl RegistryContract {
         role: RegistryRole,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let owner = Self::require_root_owner(&env, &caller, &org)?;
         if account == owner {
@@ -797,6 +832,7 @@ impl RegistryContract {
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
         // A pair is taken if either layout already holds it. The common case is
@@ -816,6 +852,13 @@ impl RegistryContract {
             Self::is_wasm_approved(env.clone(), kind, wasm_hash.clone()),
             Error::Unauthorized
         );
+        let lkey = DataKey::LatestVersion(kind);
+        let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
+        ensure!(version > latest, Error::InvalidInput);
+        match UpgradeableClient::new(&env, &address).try_get_interface_version() {
+            Ok(Ok(interface_version)) if interface_version == INTERFACE_VERSION => {}
+            _ => return Err(Error::InvalidInput),
+        }
         // One write for the whole record, where the address and the hash used to
         // be two separate entries and two writes.
         let vkey = DataKey::VersionRecord(kind, version);
@@ -827,13 +870,8 @@ impl RegistryContract {
             },
         );
         Self::bump(&env, &vkey);
-
-        let lkey = DataKey::LatestVersion(kind);
-        let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
-        if version > latest {
-            env.storage().persistent().set(&lkey, &version);
-            Self::bump(&env, &lkey);
-        }
+        env.storage().persistent().set(&lkey, &version);
+        Self::bump(&env, &lkey);
         astroid_shared::events::publish(
             &env,
             ContractEvent::RegistryVersionRegistered {
@@ -895,6 +933,7 @@ impl RegistryContract {
         address: Address,
     ) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         require_non_empty(&org)?;
         caller.require_auth();
         // Authorization: org owners and delegated module upgraders may propose;
@@ -987,6 +1026,7 @@ impl RegistryContract {
         kind: ModuleKind,
     ) -> Result<(u32, Address), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
 
         let pkey = DataKey::UpgradeProposal(kind);
@@ -1074,6 +1114,7 @@ impl RegistryContract {
     /// atomically, so refused rejections never touch the trail.
     pub fn reject_upgrade(env: Env, caller: Address, kind: ModuleKind) -> Result<(), Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         caller.require_auth();
 
         let pkey = DataKey::UpgradeProposal(kind);
@@ -1221,6 +1262,7 @@ impl RegistryContract {
         target_version: u32,
     ) -> Result<u32, Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         require_non_empty(&org)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
@@ -1296,6 +1338,7 @@ impl RegistryContract {
         version: u32,
     ) -> Result<u32, Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         require_non_empty(&org)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
@@ -1382,6 +1425,7 @@ impl RegistryContract {
         target_version: u32,
     ) -> Result<Address, Error> {
         Self::check_frozen(&env)?;
+        Self::require_not_paused(&env)?;
         require_non_empty(&org)?;
         Ok(Self::plan_upgrade(&env, &org, kind, target_version)?.address)
     }
@@ -1418,6 +1462,26 @@ impl RegistryContract {
             .instance()
             .get(&DataKey::RegistryVersion)
             .unwrap_or(0)
+    }
+
+    /// Number of upgrades applied to this registry.
+    pub fn upgrade_history_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeHistoryCount)
+            .unwrap_or(0)
+    }
+
+    /// Read one upgrade audit record by its zero-based sequence number.
+    pub fn get_upgrade_record(env: Env, sequence: u32) -> Result<UpgradeRecord, Error> {
+        let key = DataKey::UpgradeHistory(sequence);
+        let record = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(record)
     }
 
     /// Run every check [`Self::upgrade`] would run against the version upgrade
@@ -1514,6 +1578,7 @@ impl RegistryContract {
     /// Rotate the admin. Only an authorized admin or multisig may do this.
     /// Replaces the old primary admin with `new_admin` in the multi-admin set.
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let old_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -1549,6 +1614,7 @@ impl RegistryContract {
 
     /// Add an authorized administrator. Admin or multisig gated.
     pub fn add_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let mut admins: Vec<Address> = env
             .storage()
@@ -1576,6 +1642,7 @@ impl RegistryContract {
     /// Remove an authorized administrator. Admin or multisig gated.
     /// At least one admin must remain in the authorized admin set.
     pub fn remove_admin(env: Env, caller: Address, admin: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let admins: Vec<Address> = env
             .storage()
@@ -1602,7 +1669,7 @@ impl RegistryContract {
         // If the primary admin was removed, rotate DataKey::Admin to the first remaining admin.
         if let Some(primary) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
             if primary == admin {
-                let next_primary = new_admins.get(0).unwrap();
+                let next_primary = new_admins.get(0).ok_or(Error::InvalidInput)?;
                 env.storage().instance().set(&DataKey::Admin, &next_primary);
             }
         }
@@ -1636,6 +1703,7 @@ impl RegistryContract {
 
     /// Configure or rotate the designated multisig governance contract.
     pub fn set_multisig(env: Env, caller: Address, multisig: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Multisig, &multisig);
         env.storage()
@@ -1655,6 +1723,7 @@ impl RegistryContract {
 
     /// Remove the designated multisig governance contract.
     pub fn remove_multisig(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         if !env.storage().instance().has(&DataKey::Multisig) {
             return Err(Error::NotFound);
@@ -1720,6 +1789,57 @@ impl RegistryContract {
         Ok(())
     }
 
+    /// Engage the registry's global emergency circuit breaker. Admin-gated.
+    ///
+    /// While engaged, every state-mutating registry entrypoint short-circuits
+    /// with [`Error::RegistryPaused`]: organization and module registration,
+    /// module deprecation, role grants, version records, WASM approvals and
+    /// registry-gated upgrades. Read-only lookups stay available so operators
+    /// can inspect protocol state during an incident, and reverting a delegated
+    /// role stays available so an owner can always withdraw access. This is
+    /// deliberately distinct from [`Self::freeze`]: `freeze` is org-scoped and
+    /// may be driven by an organization owner, whereas the circuit breaker is a
+    /// protocol-wide, admin-only control.
+    ///
+    /// Pausing an already-paused registry fails with [`Error::InvalidState`]
+    /// rather than silently doing nothing, so an operator always knows the
+    /// breaker's state.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        astroid_shared::events::publish(&env, ContractEvent::RegistryPaused { paused: true });
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("paused")), ());
+        Ok(())
+    }
+
+    /// Release the registry's emergency circuit breaker and restore normal
+    /// operation. Admin-gated, and symmetric with [`Self::pause`]: unpausing a
+    /// registry that is not paused fails with [`Error::InvalidState`].
+    ///
+    /// This entrypoint bypasses the pause check by design — it is the recovery
+    /// path an operator must always be able to reach.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &caller)?;
+        if !Self::paused(&env) {
+            return Err(Error::InvalidState);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        astroid_shared::events::publish(&env, ContractEvent::RegistryPaused { paused: false });
+        env.events()
+            .publish((symbol_short!("registry"), symbol_short!("unpaused")), ());
+        Ok(())
+    }
+
     /// Record an approved WASM hash for a specific module kind.
     ///
     /// The hash must be well-formed ([`require_valid_wasm_hash`]) and must not
@@ -1734,6 +1854,7 @@ impl RegistryContract {
         kind: ModuleKind,
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         require_valid_wasm_hash(&env, &wasm_hash)?;
         if let Some(pending) = Self::pending_proposal(&env, &kind) {
@@ -1756,6 +1877,7 @@ impl RegistryContract {
         kind: ModuleKind,
         wasm_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         if !env.storage().persistent().has(&key) {
@@ -1770,7 +1892,16 @@ impl RegistryContract {
     }
 
     /// Read-only check to see if a WASM hash is approved for a given kind.
+    ///
+    /// Reporting `false` while the circuit breaker is engaged is what freezes
+    /// module upgrades protocol-wide: every member contract routes its upgrade
+    /// authorization through this method, and its cross-contract check fails
+    /// closed on a `false` answer. The stored approval itself is untouched, so
+    /// releasing the pause restores exactly the approvals that were in force.
     pub fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool {
+        if Self::paused(&env) {
+            return false;
+        }
         let key = DataKey::ApprovedWasm(kind, wasm_hash);
         env.storage().persistent().get(&key).unwrap_or(false)
     }
@@ -2052,6 +2183,22 @@ impl RegistryContract {
         })
     }
 
+    /// Read the global emergency circuit breaker flag (instance storage).
+    fn paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Short-circuit a state-mutating operation while the emergency circuit
+    /// breaker is engaged, with the dedicated [`Error::RegistryPaused`] code.
+    /// The flag is read from storage on every call rather than cached.
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        ensure!(!Self::paused(env), Error::RegistryPaused);
+        Ok(())
+    }
+
     fn check_frozen(env: &Env) -> Result<(), Error> {
         ensure!(
             !env.storage()
@@ -2234,6 +2381,15 @@ impl RegistryInterface for RegistryContract {
     /// are requested (checked before any storage is read), and
     /// [`Error::RegistryFrozen`] while the registry is frozen, like every
     /// other lookup on this interface. Read-only: no auth is required.
+    /// Whether the registry's global emergency circuit breaker is engaged.
+    ///
+    /// Exposed through [`RegistryInterface`] so a cross-contract consumer can
+    /// observe the pause through the generated `RegistryClient`. While `true`, a
+    /// mutation through this contract fails with [`Error::RegistryPaused`].
+    fn is_paused(env: Env) -> bool {
+        Self::paused(&env)
+    }
+
     fn get_modules_batch(env: Env, ids: Vec<ModuleId>) -> Result<Vec<Option<ModuleInfo>>, Error> {
         ensure!(ids.len() <= MAX_REGISTRY_BATCH, Error::InvalidInput);
         Self::check_frozen(&env)?;
@@ -2250,6 +2406,10 @@ impl RegistryInterface for RegistryContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for RegistryContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. The first call must come from the registry's
     /// protocol admin, so nobody can claim upgrade rights over the source of
@@ -2261,6 +2421,7 @@ impl UpgradeableInterface for RegistryContract {
         admin: Address,
         registry: Address,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         if astroid_interfaces::upgrade::get_authority(&env).is_err() {
             // `set_authority` performs the `require_auth`; checking identity
             // here without a second auth keeps a single signature per call.
@@ -2320,6 +2481,8 @@ impl UpgradeableInterface for RegistryContract {
     /// registry that could not replace its own code during an incident would be
     /// the one contract nobody could repair.
     fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        // The circuit breaker freezes the registry's own upgrade too.
+        Self::require_not_paused(&env)?;
         // Gate 1: the recorded upgrade admin's signature or multi-admin/multisig
         // signature, then the approval for this kind — the shared rule, resolved
         // against this contract's own approval list for the reason given above.
@@ -2335,6 +2498,21 @@ impl UpgradeableInterface for RegistryContract {
         // Gate 2: the version upgrade map. Run before anything is applied, so a
         // refusal leaves the running code and the recorded version untouched.
         let plan = Self::plan_registry_upgrade(&env, &wasm_hash)?;
+        let sequence = Self::upgrade_history_count(env.clone());
+        let next_sequence = sequence.checked_add(1).ok_or(Error::InvalidInput)?;
+        let history_key = DataKey::UpgradeHistory(sequence);
+        env.storage().persistent().set(
+            &history_key,
+            &UpgradeRecord {
+                caller: caller.clone(),
+                wasm_hash: wasm_hash.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Self::bump(&env, &history_key);
+        let count_key = DataKey::UpgradeHistoryCount;
+        env.storage().persistent().set(&count_key, &next_sequence);
+        Self::bump(&env, &count_key);
         // Gate 3. The pin moves with the code in the same invocation, so the
         // version this contract runs can never disagree with the code it runs.
         astroid_interfaces::upgrade::apply(&env, ModuleKind::Organization, wasm_hash)?;
@@ -2347,6 +2525,8 @@ impl UpgradeableInterface for RegistryContract {
         astroid_shared::events::publish(
             &env,
             ContractEvent::RegistryUpgraded {
+                sequence,
+                caller,
                 from_version: plan.from_version,
                 to_version: plan.to_version,
                 // The binding the map resolved, not the caller's spelling of it.

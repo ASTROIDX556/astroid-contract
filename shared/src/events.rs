@@ -65,6 +65,10 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// The registry's global emergency circuit breaker was engaged
+    /// (`paused = true`) or released (`paused = false`). Distinct from the
+    /// org-scoped `RegistryFrozen`: admin-only and protocol-wide.
+    RegistryPaused { paused: bool },
     /// A contract implementation upgrade was proposed for a module kind.
     /// Carries the audit payload ([`UpgradeAudit`]) written to the registry's
     /// historical upgrade log at the same moment.
@@ -118,7 +122,11 @@ pub enum ContractEvent {
     /// registry resolved it from its upgrade map, it was never caller-supplied,
     /// and it is strictly greater than `from_version`, so this event is the
     /// audit trail that the registry's own version never went backwards.
+    /// `sequence` is the zero-based position in its persistent upgrade history,
+    /// and `caller` is the authorized upgrade administrator.
     RegistryUpgraded {
+        sequence: u32,
+        caller: Address,
         from_version: u32,
         to_version: u32,
         wasm_hash: BytesN<32>,
@@ -314,6 +322,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
         }
+        ContractEvent::RegistryPaused { paused } => {
+            env.events()
+                .publish((Symbol::new(env, "RegistryPaused"),), paused);
+        }
         ContractEvent::UpgradeProposed { audit } => {
             env.events()
                 .publish((Symbol::new(env, "UpgradeProposed"),), audit);
@@ -351,13 +363,15 @@ pub fn publish(env: &Env, event: ContractEvent) {
             );
         }
         ContractEvent::RegistryUpgraded {
+            sequence,
+            caller,
             from_version,
             to_version,
             wasm_hash,
         } => {
             env.events().publish(
                 (Symbol::new(env, "RegistryUpgraded"),),
-                (from_version, to_version, wasm_hash),
+                (sequence, caller, from_version, to_version, wasm_hash),
             );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
