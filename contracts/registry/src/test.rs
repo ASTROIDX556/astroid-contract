@@ -35,6 +35,17 @@ fn assert_event(env: &Env, variant: &str) {
     assert!(found, "expected ContractEvent::{} to be emitted", variant);
 }
 
+/// Count canonical `ContractEvent` emissions of the given variant symbol so
+/// tests can also assert that an event did *not* fire.
+fn count_events(env: &Env, variant: &str) -> usize {
+    let want: Val = Symbol::new(env, variant).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_contract_id, topics, _data)| topics.contains(want))
+        .count()
+}
+
 fn setup() -> (Env, RegistryContractClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -334,10 +345,11 @@ fn registered_version_cannot_be_repointed() {
     client.register_version(&admin, &ModuleKind::Wallet, &1, &original, &h1);
 
     // Even the admin with an approved hash cannot overwrite a published
-    // version, so a consumer pinned to v1 keeps getting v1.
+    // version: the monotonic guard rejects the repeat before the record-exists
+    // check, so a consumer pinned to v1 keeps getting v1.
     assert_eq!(
         client.try_register_version(&admin, &ModuleKind::Wallet, &1, &hijack, &h2),
-        Err(Ok(Error::AlreadyExists))
+        Err(Ok(Error::InvalidState))
     );
     assert_eq!(client.get_version(&ModuleKind::Wallet, &1), original);
     assert_eq!(client.get_version_wasm(&ModuleKind::Wallet, &1), h1);
@@ -366,9 +378,12 @@ fn register_version_rejects_backfilled_older_version() {
     let h5 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 5);
 
     client.register_version(&admin, &ModuleKind::Wallet, &5, &v5, &h5);
+    // The version table is monotonic per kind: backfilling a number below the
+    // current latest is refused outright (Issue #304 downgrade protection),
+    // so latest never moves backwards.
     assert_eq!(
         client.try_register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h1),
-        Err(Ok(Error::InvalidInput))
+        Err(Ok(Error::InvalidState))
     );
     assert_eq!(client.get_latest(&ModuleKind::Wallet), v5);
     assert_eq!(
@@ -533,6 +548,33 @@ fn rejected_registration_emits_no_version_event() {
 }
 
 #[test]
+fn register_version_rejects_downgrades_and_repeats() {
+    let (env, client, admin) = setup();
+    let v1 = Address::generate(&env);
+    let v2 = Address::generate(&env);
+    let h = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 7);
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &v1, &h);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &v2, &h);
+
+    // The version table is monotonic per kind: the admin escape hatch may
+    // never lower or repeat the latest version, mirroring the propose/commit
+    // flow's downgrade protection (Issue #304).
+    let addr = Address::generate(&env);
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &2, &addr, &h),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &h),
+        Err(Ok(Error::InvalidState))
+    );
+    // Strictly newer versions still land.
+    let v3 = Address::generate(&env);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &v3, &h);
+    assert_eq!(client.get_latest(&ModuleKind::Wallet), v3);
+}
+
+#[test]
 fn register_version_rejects_duplicate_version() {
     let (env, client, admin) = setup();
     let hash = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
@@ -542,7 +584,7 @@ fn register_version_rejects_duplicate_version() {
 
     let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &replacement, &hash);
 
-    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(client.get_version(&ModuleKind::Wallet, &1), original);
 }
 
@@ -556,7 +598,7 @@ fn register_version_rejects_downgrades() {
 
     let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &older, &hash);
 
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
     assert_eq!(client.get_latest(&ModuleKind::Wallet), latest);
     assert_eq!(
         client.try_get_version(&ModuleKind::Wallet, &1),
