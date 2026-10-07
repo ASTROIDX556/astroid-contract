@@ -10,7 +10,7 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
@@ -19,4 +19,5 @@ astroid-shared = { workspace = true }
 astroid-interfaces = { workspace = true }
 
 [dev-dependencies]
+astroid-multisig = { path = "../multisig" }
 soroban-sdk = { workspace = true, features = ["testutils"] }

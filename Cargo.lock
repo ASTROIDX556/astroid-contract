@@ -55,6 +55,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "astroid-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "astroid-budget",
+ "astroid-escrow",
+ "astroid-interfaces",
+ "astroid-multisig",
+ "astroid-policy",
+ "astroid-proposal",
+ "astroid-registry",
+ "astroid-shared",
+ "astroid-treasury",
+ "astroid-wallet",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "astroid-interfaces"
 version = "0.1.0"
 dependencies = [
@@ -85,6 +102,7 @@ name = "astroid-proposal"
 version = "0.1.0"
 dependencies = [
  "astroid-interfaces",
+ "astroid-multisig",
  "astroid-shared",
  "soroban-sdk",
 ]
@@ -110,7 +128,9 @@ name = "astroid-treasury"
 version = "0.1.0"
 dependencies = [
  "astroid-interfaces",
+ "astroid-registry",
  "astroid-shared",
+ "astroid-wallet",
  "soroban-sdk",
 ]
 
