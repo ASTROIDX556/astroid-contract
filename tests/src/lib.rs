@@ -33,6 +33,8 @@ pub mod proposal_to_wallet_execution;
 #[cfg(test)]
 pub mod registry_batch;
 #[cfg(test)]
+pub mod registry_pause;
+#[cfg(test)]
 pub mod registry_upgrade;
 #[cfg(test)]
 pub mod treasury_transfer_auth;

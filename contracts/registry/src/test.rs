@@ -3771,3 +3771,206 @@ fn multi_admin_and_multisig_module_upgrade_authorization() {
     );
     assert_eq!(client.lookup(&org, &ModuleKind::Wallet), mod_v3);
 }
+
+// Emergency circuit breaker (Issue #335)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pause_requires_the_protocol_admin() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // Neither a stranger nor the organization owner may throw the breaker — it
+    // is a protocol-wide, admin-only control, unlike the org-scoped freeze.
+    let stranger = Address::generate(&env);
+    assert_eq!(client.try_pause(&stranger), Err(Ok(Error::Unauthorized)));
+    assert_eq!(client.try_pause(&owner), Err(Ok(Error::Unauthorized)));
+    assert!(!client.is_paused());
+
+    client.pause(&admin);
+    assert!(client.is_paused());
+}
+
+#[test]
+fn pause_toggle_is_idempotency_checked() {
+    let (_env, client, admin) = setup();
+    client.pause(&admin);
+    // Pausing twice is an explicit failure, not a silent no-op.
+    assert_eq!(client.try_pause(&admin), Err(Ok(Error::InvalidState)));
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+    // ...and so is unpausing a registry that is not paused.
+    assert_eq!(client.try_unpause(&admin), Err(Ok(Error::InvalidState)));
+}
+
+#[test]
+fn paused_registry_rejects_every_modification() {
+    let (env, client, admin, org, owner) = setup_org();
+    let delegate = Address::generate(&env);
+    let other = Address::generate(&env);
+    let addr = Address::generate(&env);
+    client.grant_role(&owner, &org, &delegate, &RegistryRole::Owner);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &addr);
+    // Approve the version hash before pausing: approvals are blocked while
+    // paused, so the version refusal below must come from the pause guard.
+    let version_hash = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 9);
+
+    client.pause(&admin);
+    assert!(client.is_paused());
+
+    // Every state-mutating entrypoint short-circuits with the designated code,
+    // whichever account would otherwise be allowed to call it.
+    let ghost = String::from_str(&env, "globex");
+    assert_eq!(
+        client.try_register_org(&admin, &ghost, &owner),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_set_org_owner(&owner, &org, &other),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_register_module(&delegate, &org, &ModuleKind::Treasury, &addr),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_deprecate_module(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_reactivate_module(&admin, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_remove_module(&owner, &org, &ModuleKind::Wallet),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_grant_role(&owner, &org, &other, &RegistryRole::Owner),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &addr, &version_hash,),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_set_admin(&admin, &other),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_add_approved_wasm(&admin, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::RegistryPaused))
+    );
+    assert_eq!(
+        client.try_remove_approved_wasm(&admin, &ModuleKind::Wallet, &hash(&env, 1)),
+        Err(Ok(Error::RegistryPaused))
+    );
+
+    // Nothing above changed state.
+    assert_eq!(client.get_org_owner(&org), owner);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), addr);
+}
+
+#[test]
+fn inspection_stays_available_while_paused() {
+    let (env, client, admin, org, owner) = setup_org();
+    let wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+    client.pause(&admin);
+
+    // Read paths remain open so operators can inspect the incident.
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), wallet);
+    assert_eq!(client.get_org_owner(&org), owner);
+    assert!(client.verify_owner(&org, &owner));
+    assert_eq!(client.get_role(&org, &owner), Some(RegistryRole::Owner));
+    let ids = vec![&env, module_id(&env, "acme", ModuleKind::Wallet)];
+    assert_eq!(client.get_modules_batch(&ids), vec![&env, live(&wallet)]);
+}
+
+#[test]
+fn paused_registry_still_allows_role_revocation() {
+    let (env, client, admin, org, owner) = setup_org();
+    let delegate = Address::generate(&env);
+    client.grant_role(&owner, &org, &delegate, &RegistryRole::PolicyManager);
+    client.pause(&admin);
+
+    // Withdrawing access is a downgrade, so it must remain reachable during an
+    // incident — an owner can always pull a compromised key's delegation.
+    client.revoke_role(&owner, &org, &delegate);
+    assert_eq!(client.get_role(&org, &delegate), None);
+}
+
+#[test]
+fn unpause_restores_normal_operation() {
+    let (env, client, admin, org, owner) = setup_org();
+    let addr = Address::generate(&env);
+    client.pause(&admin);
+    assert_eq!(
+        client.try_register_module(&owner, &org, &ModuleKind::Wallet, &addr),
+        Err(Ok(Error::RegistryPaused))
+    );
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &addr);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), addr);
+}
+
+#[test]
+fn pause_and_unpause_emit_standard_events() {
+    let (env, client, admin) = setup();
+    client.pause(&admin);
+    assert_event(&env, "RegistryPaused");
+    client.unpause(&admin);
+    assert_event(&env, "RegistryPaused");
+}
+
+#[test]
+fn paused_registry_freezes_module_upgrades() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    h.registry
+        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
+    assert!(h
+        .registry
+        .is_wasm_approved(&ModuleKind::Organization, &hash(&h.env, 1)));
+
+    h.registry.pause(&h.admin);
+    // Approvals report nothing while paused, so a member's cross-contract gate
+    // fails closed and no code is swapped.
+    assert!(!h
+        .registry
+        .is_wasm_approved(&ModuleKind::Organization, &hash(&h.env, 1)));
+    assert_eq!(
+        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The registry's own upgrade path short-circuits with the paused code.
+    assert_eq!(
+        h.registry.try_upgrade(&h.admin, &hash(&h.env, 1)),
+        Err(Ok(Error::RegistryPaused))
+    );
+    // Rotating the upgrade authority is likewise refused while paused.
+    assert_eq!(
+        h.registry
+            .try_set_upgrade_authority(&h.admin, &h.admin, &h.registry_id),
+        Err(Ok(Error::RegistryPaused))
+    );
+
+    h.registry.unpause(&h.admin);
+    assert!(h
+        .registry
+        .is_wasm_approved(&ModuleKind::Organization, &hash(&h.env, 1)));
+}
+
+#[test]
+fn paused_code_is_the_registry_circuit_breaker_slot() {
+    // The protocol error table sits at Stellar's hard limit of 50 union cases,
+    // so the pause shares the registry's existing halt slot rather than adding
+    // a 51st variant. Pin that so a future renumbering is a deliberate act.
+    assert_eq!(Error::RegistryPaused as u32, 30);
+    assert_eq!(Error::RegistryPaused as u32, Error::RegistryFrozen as u32);
+}

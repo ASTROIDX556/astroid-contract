@@ -65,6 +65,10 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// The registry's global emergency circuit breaker was engaged
+    /// (`paused = true`) or released (`paused = false`). Distinct from the
+    /// org-scoped `RegistryFrozen`: admin-only and protocol-wide.
+    RegistryPaused { paused: bool },
     /// A contract implementation upgrade was proposed for a module kind.
     /// Carries the audit payload ([`UpgradeAudit`]) written to the registry's
     /// historical upgrade log at the same moment.
@@ -313,6 +317,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::RegistryFrozen { org, frozen } => {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
+        }
+        ContractEvent::RegistryPaused { paused } => {
+            env.events()
+                .publish((Symbol::new(env, "RegistryPaused"),), paused);
         }
         ContractEvent::UpgradeProposed { audit } => {
             env.events()
