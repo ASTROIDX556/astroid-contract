@@ -1537,5 +1537,121 @@ impl EscrowContract {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Escrow lifecycle reads, exposed through the shared `EscrowInterface`
+// (Issue #293).
+//
+// These views are the escrow crate's part of the workspace-wide read surface:
+// they answer with primitives only, so a wallet, a budget or an off-chain
+// monitor can drive them through the one generated `EscrowClient` without
+// depending on this crate's record types.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl EscrowInterface for EscrowContract {
+    /// Number of escrows created so far, i.e. the id the next `create` takes.
+    fn escrow_count(env: Env) -> u64 {
+        get_count(&env)
+    }
+
+    /// Timestamp at which the escrow's refund window closes, or `0` when the
+    /// window has no upper bound. Lets clients show a countdown without
+    /// recomputing the window rule off-chain.
+    fn refund_window_closes_at(env: Env, id: u64) -> Result<u64, Error> {
+        Ok(Self::closes_at(&load_escrow(&env, id)?))
+    }
+
+    /// Whether the funds may be reclaimed for `id` at the current ledger time —
+    /// the escrow still holds them, the grace period has elapsed, and the refund
+    /// window has not closed.
+    fn is_refundable(env: Env, id: u64) -> Result<bool, Error> {
+        let escrow = load_escrow(&env, id)?;
+        if !matches!(
+            escrow.state,
+            EscrowState::Created | EscrowState::Funded | EscrowState::Expired
+        ) {
+            return Ok(false);
+        }
+        let now = env.ledger().timestamp();
+        if now < Self::grace_end(&escrow)? {
+            return Ok(false);
+        }
+        Ok(Self::require_refund_window_open(&env, &escrow).is_ok())
+    }
+
+    /// Amount claimable right now under the escrow's release schedule.
+    fn get_claimable_amount(env: Env, id: u64) -> Result<i128, Error> {
+        let escrow = load_escrow(&env, id)?;
+        calculate_claimable_amount(&escrow, env.ledger().timestamp())
+    }
+
+    /// Amount vested so far under the escrow's release schedule.
+    fn get_vested_amount(env: Env, id: u64) -> Result<i128, Error> {
+        let escrow = load_escrow(&env, id)?;
+        calculate_vested_amount(
+            escrow.funded_amount,
+            &escrow.schedule,
+            env.ledger().timestamp(),
+        )
+    }
+
+    /// Whether the escrow's release schedule has matured at the current ledger
+    /// timestamp: `true` for schedule-less escrows once they exist, `true` for
+    /// a `Cliff` schedule at/after `cliff_time`, and `true` for a `Linear`
+    /// schedule once anything has vested. Clients use this to show an unlock
+    /// countdown without recomputing the schedule off-chain.
+    fn is_unlocked(env: Env, id: u64) -> Result<bool, Error> {
+        let escrow = load_escrow(&env, id)?;
+        Ok(matches!(escrow.schedule.release_type, ReleaseType::None)
+            || calculate_vested_amount(
+                escrow.funded_amount,
+                &escrow.schedule,
+                env.ledger().timestamp(),
+            )? > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry-gated upgrades, exposed through the shared `UpgradeableInterface`.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeableInterface for EscrowContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        astroid_interfaces::INTERFACE_VERSION
+    }
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    fn set_upgrade_authority(
+        env: Env,
+        caller: Address,
+        admin: Address,
+        registry: Address,
+    ) -> Result<(), Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    fn get_upgrade_authority(
+        env: Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for `ModuleKind::Escrow` in the registry.
+    /// Any other outcome leaves the contract running its current code.
+    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Escrow,
+            wasm_hash,
+        )
+    }
+}
+
 #[cfg(test)]
 mod test;

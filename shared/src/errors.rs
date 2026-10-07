@@ -469,6 +469,17 @@ impl Error {
     /// sharing a discriminant.
     #[allow(non_upper_case_globals)]
     pub const EscrowLocked: Error = Error::TimelockNotExpired;
+
+    /// The registry's designated emergency-circuit-breaker code.
+    ///
+    /// This is an alias for [`Error::RegistryFrozen`], not a distinct variant:
+    /// the protocol's error table already sits at Stellar's hard limit of 50
+    /// `ScSpecUdtUnionCaseV0` entries, so the registry's single halt code (30)
+    /// serves both the organization freeze and the admin pause. Exposing it
+    /// under the pause name lets contracts and clients speak in the circuit
+    /// breaker's terms while off-chain decoders keep seeing the stable code 30.
+    #[allow(non_upper_case_globals)]
+    pub const RegistryPaused: Error = Error::RegistryFrozen;
 }
 
 /// Budget spend errors, kept separate from the protocol-wide error enum so

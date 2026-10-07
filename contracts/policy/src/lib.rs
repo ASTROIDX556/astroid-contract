@@ -795,6 +795,13 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
+        // Issue #222 — an enable/disable toggle is a state change an indexer
+        // must see: identifiers first, then the ledger timestamp as the final
+        // payload field (the standardized event convention).
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("enabled")),
+            (policy_id, enabled, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
@@ -1000,8 +1007,15 @@ impl PolicyContract {
         if policy.owner != caller {
             return Err(Error::Unauthorized);
         }
-        let key = DataKey::AssetWhitelistEnabled(policy_id);
+        let key = DataKey::AssetWhitelistEnabled(policy_id.clone());
         env.storage().persistent().set(&key, &enabled);
+        // Issue #222 — same schema as `set_recipient_whitelist_enabled`'s
+        // `wl_mode`, namespaced by the whitelist it toggles, ending with the
+        // ledger timestamp.
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("awl_mode")),
+            (policy_id, enabled, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
@@ -2352,6 +2366,10 @@ fn events_policy_violation(env: &Env, policy_id: &String, reason: &str) {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for PolicyContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        astroid_interfaces::INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. Bootstrapped by the deployer alongside
     /// `initialize`; afterwards only the current upgrade admin may rotate it.

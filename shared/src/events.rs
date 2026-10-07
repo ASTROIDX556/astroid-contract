@@ -65,6 +65,10 @@ pub enum ContractEvent {
     OrgOwnerChanged { org: String, new_owner: Address },
     /// The registry was frozen (`frozen = true`) or unfrozen (`frozen = false`).
     RegistryFrozen { org: String, frozen: bool },
+    /// The registry's global emergency circuit breaker was engaged
+    /// (`paused = true`) or released (`paused = false`). Distinct from the
+    /// org-scoped `RegistryFrozen`: admin-only and protocol-wide.
+    RegistryPaused { paused: bool },
     /// A contract implementation upgrade was proposed for a module kind.
     /// Carries the audit payload ([`UpgradeAudit`]) written to the registry's
     /// historical upgrade log at the same moment.
@@ -118,7 +122,11 @@ pub enum ContractEvent {
     /// registry resolved it from its upgrade map, it was never caller-supplied,
     /// and it is strictly greater than `from_version`, so this event is the
     /// audit trail that the registry's own version never went backwards.
+    /// `sequence` is the zero-based position in its persistent upgrade history,
+    /// and `caller` is the authorized upgrade administrator.
     RegistryUpgraded {
+        sequence: u32,
+        caller: Address,
         from_version: u32,
         to_version: u32,
         wasm_hash: BytesN<32>,
@@ -226,8 +234,10 @@ pub enum ContractEvent {
     TreasuryFrozen { org: String },
     /// A treasury was unfrozen by the multisig.
     TreasuryUnfrozen { org: String },
-    /// Value was deposited into a treasury. `balance` is the treasury's
-    /// recorded balance of `asset` after the deposit.
+    /// Value was deposited into a treasury. `amount` is what actually
+    /// arrived in custody (a fee-on-transfer token delivers less than was
+    /// requested), and `balance` is the treasury's recorded balance of
+    /// `asset` after the deposit.
     TreasuryDeposited {
         org: String,
         from: Address,
@@ -312,6 +322,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events()
                 .publish((Symbol::new(env, "RegistryFrozen"),), (org, frozen));
         }
+        ContractEvent::RegistryPaused { paused } => {
+            env.events()
+                .publish((Symbol::new(env, "RegistryPaused"),), paused);
+        }
         ContractEvent::UpgradeProposed { audit } => {
             env.events()
                 .publish((Symbol::new(env, "UpgradeProposed"),), audit);
@@ -349,13 +363,15 @@ pub fn publish(env: &Env, event: ContractEvent) {
             );
         }
         ContractEvent::RegistryUpgraded {
+            sequence,
+            caller,
             from_version,
             to_version,
             wasm_hash,
         } => {
             env.events().publish(
                 (Symbol::new(env, "RegistryUpgraded"),),
-                (from_version, to_version, wasm_hash),
+                (sequence, caller, from_version, to_version, wasm_hash),
             );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
@@ -651,17 +667,75 @@ pub fn treasury_created(env: &Env, org: &String, admin: &Address) {
 }
 
 /// `AllowanceSet` — topic `("treasury", "allow_set")`.
-pub fn allowance_set(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+///
+/// Published when a withdrawal allowance is created or replaced. The payload
+/// ends with the ledger timestamp — the convention standardized for treasury
+/// and policy events in Issue #222 — so an indexer can order allowance
+/// changes without correlating ledger metadata (the same convention is used
+/// by [`allowance_consumed`] and [`allowance_removed`]).
+pub fn allowance_set(
+    env: &Env,
+    agent: &Address,
+    recipient: &Address,
+    asset: &Address,
+    limit: i128,
+    expires_at: u64,
+) {
     let topics = (symbol_short!("treasury"), symbol_short!("allow_set"));
-    env.events()
-        .publish(topics, (agent.clone(), asset.clone(), amount));
+    env.events().publish(
+        topics,
+        (
+            agent.clone(),
+            recipient.clone(),
+            asset.clone(),
+            limit,
+            expires_at,
+            env.ledger().timestamp(),
+        ),
+    );
 }
 
 /// `AllowanceConsumed` — topic `("treasury", "allow_use")`.
-pub fn allowance_consumed(env: &Env, agent: &Address, asset: &Address, amount: i128) {
+///
+/// Published when a spend consumes part of a withdrawal allowance: `amount` is
+/// what this movement consumed, and the payload ends with the ledger
+/// timestamp (Issue #222).
+pub fn allowance_consumed(
+    env: &Env,
+    agent: &Address,
+    recipient: &Address,
+    asset: &Address,
+    amount: i128,
+) {
     let topics = (symbol_short!("treasury"), symbol_short!("allow_use"));
-    env.events()
-        .publish(topics, (agent.clone(), asset.clone(), amount));
+    env.events().publish(
+        topics,
+        (
+            agent.clone(),
+            recipient.clone(),
+            asset.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// `AllowanceRemoved` — topic `("treasury", "allow_rem")`.
+///
+/// Published when a withdrawal allowance is revoked, mirroring the policy
+/// contract's `allow_rem` topic and ending with the ledger timestamp
+/// (Issue #222).
+pub fn allowance_removed(env: &Env, agent: &Address, recipient: &Address, asset: &Address) {
+    let topics = (symbol_short!("treasury"), symbol_short!("allow_rem"));
+    env.events().publish(
+        topics,
+        (
+            agent.clone(),
+            recipient.clone(),
+            asset.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
 }
 
 /// Construct a `Symbol` reason code from a static name (used as event payloads
