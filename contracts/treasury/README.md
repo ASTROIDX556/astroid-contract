@@ -11,7 +11,10 @@ on every outflow.
 - `set_policy(policy)` / `set_budget(budget)` — wire enforcement contracts.
 - `freeze` / `unfreeze` — emergency stop on outflows (multisig only).
 - `pause` / `unpause` — circuit breaker: guardian or multisig stops all
-  outflows (`Error::TreasuryPaused`) while deposits keep flowing in.
+  outflows (`Error::TreasuryPaused`) while deposits keep flowing in. A pause
+  lapses automatically after `MAX_PAUSE_DURATION` (one month) so a lost
+  guardian key cannot strand the treasury forever; indefinite stops must go
+  through `freeze`.
 - `set_guardian(guardian)` — rotate the account that may pause / unpause.
 - `set_registry(registry)` — wire the registry used to verify contract
   callers (Issue #308); `None` clears the gate.
@@ -29,6 +32,10 @@ A withdrawal can only succeed when:
 
 Deposits are exempt from 2 and 3: inbound funding stays available during an
 emergency so the treasury can be replenished while paused or frozen.
+
+A pause older than `MAX_PAUSE_DURATION` no longer blocks outflows (2 stops
+applying on its own); the stale flag remains until the next `pause` re-engages
+a fresh window or `unpause` clears it and resets the recorded timestamp.
 
 ## Registry-verified callers and reentrancy (Issue #308)
 
@@ -56,11 +63,19 @@ so unit/integration tests that exercise gated flows must register their test
 admin/funder under the expected module kinds (see
 `contracts/treasury/src/test.rs` and `tests/src/gated_fund_flows.rs`).
 
+## Events
+
 - `("treasury", "deposited")` on every deposit.
 - `("transfer", "executed")` on successful withdrawals (shared standard).
 - `("treasury", "policy")` / `("treasury", "budget")` when enforcement contracts are wired.
 - `("treasury", "paused")` / `("treasury", "unpaused")` when the circuit breaker
   is engaged or released.
+- `("treasury", "allow_set")` / `("treasury", "allow_use")` /
+  `("treasury", "allow_rem")` across the withdrawal-allowance lifecycle — the
+  same schema the policy contract publishes under, each payload ending with
+  the ledger timestamp (Issue #222).
+- `("treasury", "bgt_alloc")` when a budget envelope is bound to an asset,
+  carrying the asset, the budget id and the ledger timestamp (Issue #222).
 
 ## Cross-contract flow
 

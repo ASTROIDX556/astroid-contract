@@ -13,11 +13,13 @@
 //! internal proposals through an approve → execute flow with an optional
 //! per-proposal time lock and a global emergency lock.
 //!
-//! Every approval weight is accumulated with checked arithmetic and every
-//! quorum decision is taken through a single threshold verification helper, so
-//! neither an overflowing weight sum nor a duplicate approval can manufacture
-//! a quorum; signer lookups reuse the already-loaded signer set instead of
-//! re-reading storage.
+//! Threshold verification and approval tracking live in [`quorum`]: every
+//! weight is accumulated with checked arithmetic, every tally is compared
+//! against the configured threshold through one predicate, and the tally is
+//! rebuilt from the approval flags of the *current* signer set — so neither a
+//! duplicate approval nor an overflowing weight sum can manufacture a quorum.
+//! Signer lookups reuse the already-loaded signer set instead of re-reading
+//! storage.
 //!
 //! [`MultiSigContract::execute_batch`] additionally supports bundling multiple
 //! discrete contract calls into one transaction: each contributing signer's
@@ -58,7 +60,13 @@
 //! Events: `signer/added`, `signer/removed`, `signer/weight`,
 //! `threshold/changed`, `timelock/changed`, `govchange/proposed`,
 //! `govchange/executed`, `govchange/cancelled`, `proposal/approved`,
-//! `proposal/executed`, `batch/executed`, `emergency/lock`.
+//! `proposal/quorum`, `proposal/executed`, `batch/quorum`, `batch/executed`,
+//! `emergency/lock`.
+//!
+//! `proposal/approved` (and the batch equivalents) record that *an* approval
+//! was added; `proposal/quorum` (and `batch/quorum`) fire once, on the
+//! transition from short of the threshold to met, and carry the full verified
+//! tally so a consumer can see the numbers behind the quorum.
 //!
 //! Execution below the weight threshold is rejected with
 //! [`Error::InsufficientWeight`]; premature governance execution with
@@ -78,11 +86,14 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol, Val, Vec,
 };
 
+mod quorum;
 mod storage;
 use storage::DataKey;
 pub use storage::{
     BatchCall, GovernanceChange, MsProposal, PendingChange, PendingThresholdChange, SignerWeight,
 };
+
+pub use quorum::QuorumStatus;
 
 #[contract]
 pub struct MultiSigContract;
@@ -177,7 +188,7 @@ impl MultiSigContract {
         let idx = Self::index_of(&signers, &signer)?;
         let remaining_total = checked_sub(
             Self::total_weight(&signers)? as i128,
-            signers.get(idx).unwrap().weight as i128,
+            signers.get(idx).ok_or(Error::NotFound)?.weight as i128,
         )?;
         if remaining_total < threshold as i128 {
             return Err(Error::InvalidThreshold);
@@ -472,19 +483,27 @@ impl MultiSigContract {
             (symbol_short!("proposal"), symbol_short!("created")),
             (id, proposer),
         );
+        // The proposer's own weight counts toward the threshold, so a heavy
+        // signer can satisfy it alone at creation time — announce that once,
+        // with the same verified tally every later approval is measured against.
+        let status = Self::quorum_status(&env, id)?;
+        if status.met {
+            quorum::publish_threshold_met(&env, symbol_short!("proposal"), id, &status);
+        }
         Ok(id)
     }
 
     /// Approve a proposal. Only signers may approve, once each. Their weight is
     /// added to the accumulated total. Emits `ProposalApproved` with the running
-    /// weight.
+    /// weight, and — on the transition from short of the threshold to met — the
+    /// distinct `("proposal", "quorum")` event carrying the verified tally.
     pub fn approve(env: Env, caller: Address, proposal_id: u64) -> Result<u32, Error> {
         Self::require_not_locked(&env)?;
         // Authorization and signer membership are resolved from a single read of
         // the signer set (gas: one lookup instead of two). The caller's own
-        // weight is not consumed here: `live_approval_weight` recomputes the
-        // running total from the current signer set and the approval flags, so a
-        // re-weighted signer is credited at their current weight.
+        // weight is not consumed here: `live_tally` recomputes the running total
+        // from the current signer set and the approval flags, so a re-weighted
+        // signer is credited at their current weight.
         Self::require_signer_weight(&env, &caller)?;
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
         if proposal.executed {
@@ -500,7 +519,11 @@ impl MultiSigContract {
         }
         env.storage().persistent().set(&akey, &true);
         Self::bump_approval(&env, proposal_id, &caller);
-        proposal.approval_weight = Self::live_approval_weight(&env, proposal_id)?;
+        // The tally *before* this approval: whether the quorum was already
+        // reached decides if the new one is the transition or just an addition.
+        let was_met = quorum::is_met(proposal.approval_weight, Self::threshold(&env)?);
+        let status = Self::quorum_status(&env, proposal_id)?;
+        proposal.approval_weight = status.approval_weight;
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -509,6 +532,12 @@ impl MultiSigContract {
             (symbol_short!("proposal"), symbol_short!("approved")),
             (proposal_id, caller, proposal.approval_weight),
         );
+        // Threshold reached by this very approval: announce the quorum once,
+        // carrying the tally that satisfied it. Later approvals past the
+        // threshold stay quiet.
+        if status.met && !was_met {
+            quorum::publish_threshold_met(&env, symbol_short!("proposal"), proposal_id, &status);
+        }
         Ok(proposal.approval_weight)
     }
 
@@ -528,12 +557,12 @@ impl MultiSigContract {
         if proposal.executed {
             return Err(Error::InvalidProposalState);
         }
-        let threshold = Self::threshold(&env)?;
-        let weight = Self::live_approval_weight(&env, proposal_id)?;
-        proposal.approval_weight = weight;
-        // Same quorum verification helper as the batch flow; the proposal flow
-        // reports its own shortfall code.
-        Self::require_quorum(weight, threshold, Error::InsufficientWeight)?;
+        // Same quorum verification helper as the batch flow, over the tally
+        // rebuilt from the live signer set; the proposal flow reports its own
+        // shortfall code.
+        let status = Self::quorum_status(&env, proposal_id)?;
+        proposal.approval_weight = status.approval_weight;
+        status.ensure_met(Error::InsufficientWeight)?;
         if proposal.unlock_at != 0 {
             require_time_reached(&env, proposal.unlock_at)?;
         }
@@ -610,12 +639,26 @@ impl MultiSigContract {
         // Aggregate signature verification over the entire batch payload: the
         // caller plus every distinct approver must be a signer and must have
         // authorized `(nonce, calls)`. Each distinct signer contributes its own
-        // voting weight.
+        // voting weight, accumulated with checked arithmetic and narrowed
+        // without truncation.
         let payload = Self::batch_payload(&env, nonce, &calls);
         let weight = Self::accumulate_weight(&env, &signers, &caller, &approvers, &payload)?;
         // Same quorum verification helper as the proposal flow; batches report
         // their dedicated shortfall code.
         Self::require_quorum(weight, threshold, Error::ThresholdNotMet)?;
+        // The signatures just verified met the threshold: announce the quorum
+        // with the tally behind it, distinct from `batch/executed`.
+        quorum::publish_threshold_met(
+            &env,
+            symbol_short!("batch"),
+            nonce,
+            &QuorumStatus::evaluate(
+                weight,
+                approvers.len() + 1,
+                threshold,
+                Self::total_weight(&signers)?,
+            ),
+        );
 
         env.storage()
             .instance()
@@ -705,19 +748,16 @@ impl MultiSigContract {
         let len = signers.len();
         let mut i = 0;
         while i < len {
-            let w = signers.get(i).unwrap().weight;
-            total = Self::add_weight(total, w)?;
+            let w = signers.get(i).ok_or(Error::InvalidInput)?.weight;
+            total = quorum::add_weight(total, w)?;
             i += 1;
         }
-        Self::to_weight(total)
+        quorum::narrow(total)
     }
 
     /// Narrow an accumulated `i128` weight back to `u32`, refusing to truncate.
     fn to_weight(total: i128) -> Result<u32, Error> {
-        if total > u32::MAX as i128 {
-            return Err(Error::Overflow);
-        }
-        Ok(total as u32)
+        quorum::narrow(total)
     }
 
     /// Resolve `who` against an already-loaded signer set and return its
@@ -748,38 +788,44 @@ impl MultiSigContract {
     }
 
     /// Checked accumulation of a signer weight into a running approval total.
-    /// The sum is computed in `i128` and narrowed by [`Self::to_weight`], so an
-    /// overflowing weight sum surfaces as [`Error::Overflow`] instead of
-    /// truncating into a smaller value that could wrongly satisfy the
-    /// threshold.
+    /// Thin alias for [`quorum::add_weight`], which owns the arithmetic and the
+    /// fail-closed overflow behaviour.
     fn add_weight(total: i128, weight: u32) -> Result<i128, Error> {
-        checked_add(total, weight as i128)
+        quorum::add_weight(total, weight)
     }
 
     /// Quorum verification helper: validate a signer weight sum against the
     /// configured threshold.
     ///
-    /// `sum` is built exclusively through [`Self::add_weight`], i.e. it is
-    /// wrap-free by construction; a sum below `threshold` is rejected with
-    /// `shortfall`, the caller's own shortfall code ([`Error::InsufficientWeight`]
-    /// for proposal approvals, [`Error::ThresholdNotMet`] for batches), so
-    /// every quorum decision in the contract is taken in exactly one place.
+    /// A thin alias for [`quorum::require`]: `sum` is built exclusively through
+    /// [`Self::add_weight`] (i.e. it is wrap-free by construction), a sum below
+    /// `threshold` is rejected with `shortfall`, the caller's own shortfall code
+    /// ([`Error::InsufficientWeight`] for proposal approvals,
+    /// [`Error::ThresholdNotMet`] for batches), so every quorum decision in the
+    /// contract is taken in exactly one place.
     ///
     /// Named distinctly from the public
     /// [`MultisigInterface::verify_threshold`] signature-set entry point: that
     /// one takes `Env` and a payload, this one takes an already-accumulated sum.
     fn require_quorum(sum: u32, threshold: u32, shortfall: Error) -> Result<(), Error> {
-        if sum < threshold {
-            return Err(shortfall);
-        }
-        Ok(())
+        quorum::require(sum, threshold, shortfall)
     }
 
     /// Sum the current weight of every current signer that approved
-    /// `proposal_id`. One instance read for the signer set plus one approval
-    /// lookup per signer (bounded by `MAX_SIGNERS`).
-    fn live_approval_weight(env: &Env, proposal_id: u64) -> Result<u32, Error> {
+    /// `proposal_id`, and count how many distinct signers those were.
+    ///
+    /// The tally is rebuilt from the approval flags against the **live** signer
+    /// set rather than incremented on each approval, so a duplicate flag can
+    /// never stack weight: an approval from a signer who has since been removed
+    /// simply stops being visited, and a re-weighted signer is credited at
+    /// their current weight. One instance read for the signer set plus one
+    /// approval lookup per signer (bounded by `MAX_SIGNERS`); every addition
+    /// goes through [`quorum::add_weight`] and the result through
+    /// [`quorum::narrow`], so an unrepresentable sum is refused rather than
+    /// truncated.
+    fn live_tally(env: &Env, proposal_id: u64) -> Result<(u32, u32), Error> {
         let mut total: i128 = 0;
+        let mut approvers: u32 = 0;
         for s in Self::signers(env)?.iter() {
             let approved: bool = env
                 .storage()
@@ -788,9 +834,23 @@ impl MultiSigContract {
                 .unwrap_or(false);
             if approved {
                 total = Self::add_weight(total, s.weight)?;
+                approvers = approvers.checked_add(1).ok_or(Error::Overflow)?;
             }
         }
-        Self::to_weight(total)
+        Ok((Self::to_weight(total)?, approvers))
+    }
+
+    /// The verified quorum tally for `proposal_id` against the current signer
+    /// set and the configured threshold — the same value `execute` gates on.
+    fn quorum_status(env: &Env, proposal_id: u64) -> Result<QuorumStatus, Error> {
+        let signers = Self::signers(env)?;
+        let (approval_weight, approvers) = Self::live_tally(env, proposal_id)?;
+        Ok(QuorumStatus::evaluate(
+            approval_weight,
+            approvers,
+            Self::threshold(env)?,
+            Self::total_weight(&signers)?,
+        ))
     }
 
     fn threshold(env: &Env) -> Result<u32, Error> {
@@ -1014,7 +1074,7 @@ impl MultiSigContract {
             GovernanceChange::SignerWeight(signer, weight) => {
                 let mut signers = Self::signers(env)?;
                 let idx = Self::index_of(&signers, signer)?;
-                let mut updated = signers.get(idx).unwrap();
+                let mut updated = signers.get(idx).ok_or(Error::NotFound)?;
                 updated.weight = *weight;
                 signers.set(idx, updated);
                 env.storage().instance().set(&DataKey::Signers, &signers);
@@ -1130,10 +1190,10 @@ impl MultiSigContract {
         let len = signers.len();
         let mut i = 0;
         while i < len {
-            let a = signers.get(i).unwrap().address.clone();
+            let a = signers.get(i).ok_or(Error::InvalidInput)?.address;
             let mut j = i + 1;
             while j < len {
-                if a == signers.get(j).unwrap().address {
+                if a == signers.get(j).ok_or(Error::InvalidInput)?.address {
                     return Err(Error::InvalidInput);
                 }
                 j += 1;
@@ -1234,6 +1294,10 @@ impl MultisigInterface for MultiSigContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for MultiSigContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        astroid_interfaces::INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. Bootstrapped by the deployer alongside
     /// `initialize`; afterwards only the current upgrade admin may rotate it.

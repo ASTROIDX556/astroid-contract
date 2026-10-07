@@ -34,7 +34,21 @@
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
 //! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
 //! `set_policy_bypass`, `batch_execute_validated`, `set_budget`,
-//! `set_rate_limit`, `clear_rate_limit`.
+//! `set_rate_limit`, `clear_rate_limit`, `custody_balance`.
+//!
+//! ## Multi-token custody verification
+//!
+//! The contract custodies any number of Stellar Asset Contract (SAC) assets at
+//! once: per-wallet balances are tracked per `(wallet, asset)` pair, so one
+//! wallet can hold several tokens without the ledgers touching. Before any
+//! outbound movement is approved, two independent checks must pass: the
+//! wallet's tracked balance covers the amount ([`Error::InsufficientFunds`]
+//! otherwise) and the contract's real on-chain custody — read through the
+//! token's SAC `balance` entry point — covers it too. The custody read fails
+//! closed ([`Error::InvalidState`] / [`Error::Unauthorized`]) when the asset
+//! is not a queryable token, so a mis-typed asset address can never pass for
+//! a zero balance. Together the checks turn a token-side refusal that would
+//! trap the invocation into a deterministic error code.
 //!
 //! ## Pre-execution policy hook
 //!
@@ -97,13 +111,15 @@
 //! | `withdraw`, `pause`, `unpause`, `archive`     | `Admin`      |
 //! | `grant_role`, `revoke_role`                   | `Admin`      |
 //! | `transfer`                                    | `Agent`      |
+//! | `batch_execute`                               | `Agent`      |
 //! | `freeze`, `unfreeze`                          | `Agent`, or the contract admin |
 //!
 //! A caller whose role is below the requirement — including an `Auditor`, who
 //! holds no mutating power at all — is rejected with [`Error::Unauthorized`].
 //!
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
-//! `unfreeze`, `pause`, `unpause`, `archive`, `grant_role`, `revoke_role`.
+//! `unfreeze`, `pause`, `unpause`, `archive`, `grant_role`, `revoke_role`,
+//! `batch_execute` (raw atomic batch of arbitrary contract calls, Issue #301).
 //!
 //! Events: `WalletCreated`, `WalletFrozen`, `TransferExecuted` (shared schema)
 //! plus wallet-scoped state-change and role-administration events.
@@ -118,7 +134,8 @@ use astroid_shared::constants::{
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::{checked_add, SafeAdd, SafeSub};
+use astroid_shared::math::{checked_add, validate_sufficient_balance, SafeAdd, SafeSub};
+use astroid_shared::token::{safe_transfer, token_balance};
 pub use astroid_shared::types::WalletData;
 use astroid_shared::types::{ModuleId, ModuleKind, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
@@ -334,7 +351,9 @@ impl VelocityGate {
     /// first touch and reusing them for every later action in this invocation.
     fn enforce(&mut self, env: &Env, asset: &Address, amount: i128) -> Result<(), Error> {
         let index = self.position(env, asset);
-        let (_, limit, usage) = self.entries.get(index).unwrap();
+        let Some((_, limit, usage)) = self.entries.get(index) else {
+            return Err(Error::InvalidState);
+        };
         // No ceiling for this asset: there is nothing to charge and nothing to
         // record, exactly as an ungated asset behaves.
         let (Some(limit), Some(mut usage)) = (limit, usage) else {
@@ -379,8 +398,10 @@ impl VelocityGate {
     /// comparison over in-memory handles and costs no ledger access.
     fn position(&mut self, env: &Env, asset: &Address) -> u32 {
         for index in 0..self.entries.len() {
-            if self.entries.get(index).unwrap().0 == *asset {
-                return index;
+            if let Some((entry_asset, _, _)) = self.entries.get(index) {
+                if entry_asset == *asset {
+                    return index;
+                }
             }
         }
         let wallet_id = self.wallet_id;
@@ -851,15 +872,23 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
+        // Preliminary allowance verification before anything is approved: the
+        // tracked ledger and the real SAC custody must each cover the amount.
+        if let Err(e) = Self::require_custody_funds(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
             Self::unlock(&env);
             return Err(e);
         }
-        token::TokenClient::new(&env, &asset).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
+        // Funds were verified above, so the token call cannot refuse for
+        // balance reasons; any remaining refusal maps to a deterministic
+        // error instead of trapping the invocation.
+        if let Err(e) = safe_transfer(&env, &asset, &env.current_contract_address(), &to, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         events::transfer_executed(&env, &env.current_contract_address(), &to, &asset, amount);
         Self::unlock(&env);
         Ok(())
@@ -898,15 +927,27 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
+        // Same preliminary allowance verification as `transfer`: tracked
+        // balance and real SAC custody both cover the amount before the
+        // debit or any token call.
+        if let Err(e) = Self::require_custody_funds(&env, wallet_id, &asset, amount) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
             Self::unlock(&env);
             return Err(e);
         }
-        token::TokenClient::new(&env, &asset).transfer(
+        if let Err(e) = safe_transfer(
+            &env,
+            &asset,
             &env.current_contract_address(),
             &wallet.owner,
-            &amount,
-        );
+            amount,
+        ) {
+            Self::unlock(&env);
+            return Err(e);
+        }
         events::publish(
             &env,
             events::ContractEvent::WalletWithdrawn {
@@ -1177,6 +1218,56 @@ impl WalletContract {
             budget_remaining,
         })
     }
+    /// Execute a batch of up to [`MAX_BATCH_CALLS`] arbitrary contract calls
+    /// atomically in a single Soroban invocation (Issue #301). The agent
+    /// submits the calls it wants fired and the wallet is the sole authority
+    /// deciding whether they go — no per-call policy or budget metadata is
+    /// involved, which is what distinguishes this raw entrypoint from
+    /// [`Self::batch_execute_validated`].
+    ///
+    /// Gates, in order:
+    /// - the contract-wide circuit breaker must be untripped and the wallet
+    ///   `Active` (`Frozen` / `Paused` / `Archived` wallets spend nothing);
+    /// - `caller` must hold at least [`Role::Agent`] on the wallet, exactly as
+    ///   for a single [`Self::transfer`];
+    /// - `calls` must be non-empty (an empty batch is a mistake, not a no-op)
+    ///   and at most [`MAX_BATCH_CALLS`] long, so an oversized payload cannot
+    ///   exceed Soroban's per-invocation resource limits.
+    ///    /// Sub-calls run as the wallet contract — the custodian of record — so a
+    /// token move out of custody must name the wallet contract as its source;
+    /// Soroban resolves that authorization against this very invocation, and
+    /// its reentrancy protection prevents a callee from looping back into the
+    /// wallet. If any call fails the runtime reverts the whole batch, leaving
+    /// no partial state. On success `("wallet", "batch")` is published with
+    /// the executed count.
+    pub fn batch_execute(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        calls: soroban_sdk::Vec<ContractCall>,
+    ) -> Result<u32, Error> {
+        Self::when_not_paused(&env)?;
+        let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
+        Self::require_active(&wallet)?;
+
+        // Payload guards: an empty batch is refused rather than silently
+        // succeeding, and an oversized one is refused before any storage is
+        // read so it can never hit the invocation's resource limits.
+        ensure!(!calls.is_empty(), Error::InvalidInput);
+        ensure!(
+            calls.len() <= constants::MAX_BATCH_CALLS,
+            Error::InvalidInput
+        );
+
+        // Fire every sub-call sequentially; any failure propagates and reverts
+        // the entire transaction.
+        for call in calls.iter() {
+            Self::execute_call(&env, &call)?;
+        }
+
+        events::wallet_batch_executed(&env, wallet_id, calls.len());
+        Ok(calls.len())
+    }
 
     /// Wire the budget contract batch actions consume from (contract admin
     /// only). Mirrors [`WalletContract::set_policy`].
@@ -1412,6 +1503,14 @@ impl WalletContract {
             .unwrap_or(0)
     }
 
+    /// Read the contract's real on-chain custody of `asset` — the SAC balance
+    /// held at the contract's own address that backs every wallet's internal
+    /// bookkeeping. The read goes through the token's SAC interface and fails
+    /// closed with a deterministic error when the asset cannot be queried.
+    pub fn custody_balance(env: Env, asset: Address) -> Result<i128, Error> {
+        token_balance(&env, &asset, &env.current_contract_address())
+    }
+
     /// Whether the contract-wide circuit breaker is currently tripped.
     pub fn is_paused(env: Env) -> bool {
         Self::paused(&env)
@@ -1506,14 +1605,14 @@ impl WalletContract {
             });
             match RegistryClient::new(env, &reg).try_get_modules_batch(&ids) {
                 Ok(Ok(modules)) => {
-                    let policy = modules.get(0).unwrap().and_then(|info| {
+                    let policy = modules.get(0).ok_or(Error::InvalidState)?.and_then(|info| {
                         if info.deprecated {
                             None
                         } else {
                             Some(info.address)
                         }
                     });
-                    let budget = modules.get(1).unwrap().and_then(|info| {
+                    let budget = modules.get(1).ok_or(Error::InvalidState)?.and_then(|info| {
                         if info.deprecated {
                             None
                         } else {
@@ -1938,6 +2037,40 @@ impl WalletContract {
         Ok(())
     }
 
+    /// Preliminary allowance check for every outbound movement: both the
+    /// wallet's tracked balance for `asset` and the contract's real SAC
+    /// custody must cover `amount` before the spend is approved.
+    ///
+    /// The tracked read comes first so an uninitialized (never-funded)
+    /// `(wallet, asset)` pair answers [`Error::InsufficientFunds`] exactly
+    /// like a short balance, and the custody read second so a ledger that
+    /// drifted above the tokens actually on hand cannot overdraw custody —
+    /// a condition the later token call would otherwise surface as a raw
+    /// host trap instead of a code. A zero or negative amount is refused
+    /// with [`Error::InvalidAmount`]. Pure verification: no state changes.
+    fn require_custody_funds(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        let tracked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet_id, asset.clone()))
+            .unwrap_or(0);
+        validate_sufficient_balance(tracked, amount)?;
+        let custody = Self::sac_balance(env, asset)?;
+        validate_sufficient_balance(custody, amount)
+    }
+
+    /// Query the contract's own SAC balance of `asset` without trapping; a
+    /// token that cannot be queried fails closed with a deterministic code.
+    fn sac_balance(env: &Env, asset: &Address) -> Result<i128, Error> {
+        token_balance(env, asset, &env.current_contract_address())
+    }
+
     fn emit_state(env: &Env, id: u64, action: soroban_sdk::Symbol) {
         env.events()
             .publish((symbol_short!("wallet"), action.clone()), id);
@@ -1970,6 +2103,10 @@ impl WalletContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for WalletContract {
+    fn get_interface_version(_env: Env) -> u32 {
+        astroid_interfaces::INTERFACE_VERSION
+    }
+
     /// Record (or rotate) who may upgrade this contract and which registry
     /// authorizes the new code. Bootstrapped by the deployer alongside
     /// `initialize`; afterwards only the current upgrade admin may rotate it.

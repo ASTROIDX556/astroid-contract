@@ -1,8 +1,9 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{ProposalContract, ProposalContractClient, ProposalState, VoteBars};
-use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH};
+use crate::{timelock, ProposalContract, ProposalContractClient, ProposalState, VoteBars};
+use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
+use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH, MAX_SIGNERS};
 use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
 use soroban_sdk::{vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
@@ -10,26 +11,44 @@ use soroban_sdk::{vec, Address, Env, IntoVal, String, Symbol, Val, Vec};
 struct Harness {
     env: Env,
     client: ProposalContractClient<'static>,
+    multisig: Address,
     proposer: Address,
     approvers: std::vec::Vec<Address>,
 }
 
 fn setup(num_approvers: u32) -> Harness {
+    setup_with_weights(&std::vec![1; num_approvers as usize], 1, 0)
+}
+
+fn setup_with_weights(weights: &[u32], multisig_threshold: u32, timelock: u64) -> Harness {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1_000);
-    let contract_id = env.register_contract(None, ProposalContract);
-    let client = ProposalContractClient::new(&env, &contract_id);
-    client.initialize(&0);
 
-    let proposer = Address::generate(&env);
     let mut approvers = std::vec::Vec::new();
-    for _ in 0..num_approvers {
+    for _ in weights {
         approvers.push(Address::generate(&env));
     }
+    let multisig_id = env.register_contract(None, MultiSigContract);
+    let multisig = MultiSigContractClient::new(&env, &multisig_id);
+    let mut signers = Vec::new(&env);
+    for (index, address) in approvers.iter().enumerate() {
+        signers.push_back(SignerWeight {
+            address: address.clone(),
+            weight: weights[index],
+        });
+    }
+    multisig.initialize(&signers, &multisig_threshold);
+
+    let contract_id = env.register_contract(None, ProposalContract);
+    let client = ProposalContractClient::new(&env, &contract_id);
+    client.initialize(&timelock, &multisig_id);
+
+    let proposer = Address::generate(&env);
     Harness {
         env,
         client,
+        multisig: multisig_id,
         proposer,
         approvers,
     }
@@ -38,24 +57,7 @@ fn setup(num_approvers: u32) -> Harness {
 /// Like [`setup`], but with a mandatory non-zero timelock configured at
 /// initialization.
 fn setup_timelocked(num_approvers: u32, timelock: u64) -> Harness {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().set_timestamp(1_000);
-    let contract_id = env.register_contract(None, ProposalContract);
-    let client = ProposalContractClient::new(&env, &contract_id);
-    client.initialize(&timelock);
-
-    let proposer = Address::generate(&env);
-    let mut approvers = std::vec::Vec::new();
-    for _ in 0..num_approvers {
-        approvers.push(Address::generate(&env));
-    }
-    Harness {
-        env,
-        client,
-        proposer,
-        approvers,
-    }
+    setup_with_weights(&std::vec![1; num_approvers as usize], 1, timelock)
 }
 
 fn approver_vec(h: &Harness) -> Vec<Address> {
@@ -193,6 +195,121 @@ fn double_approval_rejected() {
     h.client.approve(&h.approvers[0], &id);
     let res = h.client.try_approve(&h.approvers[0], &id);
     assert_eq!(res, Err(Ok(Error::AlreadySigned)));
+}
+
+#[test]
+fn weighted_multisig_threshold_accepts_exact_and_excess_weight() {
+    let exact = setup_with_weights(&[3, 2, 1], 5, 0);
+    let exact_id = create(&exact, 2, 5_000);
+    exact.client.approve(&exact.approvers[0], &exact_id);
+    assert_eq!(exact.client.state(&exact_id), ProposalState::Pending);
+    exact.client.approve(&exact.approvers[1], &exact_id);
+    assert_eq!(exact.client.get(&exact_id).approval_weight, 5);
+    assert_eq!(exact.client.state(&exact_id), ProposalState::Approved);
+    assert!(emitted(&exact.env, "weightok"));
+
+    let excess = setup_with_weights(&[3, 2, 1], 4, 0);
+    let excess_id = create(&excess, 2, 5_000);
+    excess.client.approve(&excess.approvers[0], &excess_id);
+    excess.client.approve(&excess.approvers[1], &excess_id);
+    assert_eq!(excess.client.get(&excess_id).approval_weight, 5);
+    assert_eq!(excess.client.state(&excess_id), ProposalState::Approved);
+}
+
+#[test]
+fn proposal_waits_for_weight_threshold_and_checks_it_at_execution() {
+    let h = setup_with_weights(&[1, 2, 3], 6, 0);
+    let id = create(&h, 2, 5_000);
+
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approval_weight, 3);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.get(&id).approval_weight, 6);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn weighted_threshold_crossing_starts_the_timelock() {
+    let h = setup_with_weights(&[1, 2, 3], 6, 100);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    assert_eq!(h.client.get(&id).approved_at, 1_000);
+
+    h.env.ledger().set_timestamp(2_000);
+    h.client.approve(&h.approvers[2], &id);
+    assert_eq!(h.client.get(&id).approved_at, 2_000);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    h.env.ledger().set_timestamp(2_100);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn execution_recalculates_votes_after_signer_set_changes() {
+    let h = setup_with_weights(&[3, 2, 1], 4, 0);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.get(&id).approval_weight, 5);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    MultiSigContractClient::new(&h.env, &h.multisig)
+        .remove_signer(&h.approvers[0], &h.approvers[1]);
+
+    assert_eq!(h.client.get(&id).approvals, 1);
+    assert_eq!(h.client.get(&id).approval_weight, 3);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+}
+
+#[test]
+fn proposal_rejects_non_multisig_approvers_and_duplicate_allowlist_entries() {
+    let h = setup(3);
+    let stranger = Address::generate(&h.env);
+    let res = h.client.try_create(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &vec![&h.env, h.approvers[0].clone(), stranger],
+        &dep_vec(&h, &[]),
+        &1,
+        &vec![&h.env],
+        &0,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+
+    let res = h.client.try_create(
+        &h.proposer,
+        &String::from_str(&h.env, "acme"),
+        &String::from_str(&h.env, "wallet-1"),
+        &String::from_str(&h.env, "policy-1"),
+        &vec![&h.env, h.approvers[0].clone(), h.approvers[0].clone()],
+        &dep_vec(&h, &[]),
+        &1,
+        &vec![&h.env],
+        &0,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
 }
 
 #[test]
@@ -1325,7 +1442,6 @@ fn unrepresentable_grace_window_does_not_trap_cancellation() {
 // refund to prove a proposal settles exactly once, however often `execute` is
 // called.
 
-use astroid_shared::constants::MAX_APPROVERS;
 use astroid_shared::types::AssetAmount;
 use soroban_sdk::testutils::AuthorizedFunction;
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
@@ -1571,11 +1687,10 @@ fn vote_bars_hold_at_the_approver_cap_and_do_not_overflow() {
     assert_eq!(VoteBars::quorum_required(u32::MAX, 50), u32::MAX / 2 + 1);
     assert_eq!(VoteBars::majority_required(u32::MAX), u32::MAX / 2 + 1);
 
-    // At the largest allow-list `create` accepts, the bars still land on the
-    // exact boundary: half of the allow-list is a tie, one more is a strict
-    // majority.
-    let h = setup(MAX_APPROVERS);
-    let half = MAX_APPROVERS / 2;
+    // At the largest signer set `create` can accept, the bars still land on
+    // the exact boundary: half is a tie, one more is a strict majority.
+    let h = setup(MAX_SIGNERS);
+    let half = MAX_SIGNERS / 2;
     let tie = create(&h, half, 0);
     let win = create(&h, half + 1, 0);
     for approver in h.approvers.iter().take(half as usize) {
@@ -2132,4 +2247,244 @@ fn only_the_documented_edge_leaves_pending_and_approved() {
         Err(Ok(Error::InvalidProposalState))
     );
     assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+// ---------------------------------------------------------------------------
+// Time-lock enforcement (issue #209)
+//
+// The release criteria live in `crate::timelock`; the cases below pin them
+// from three sides — the pure arithmetic helpers, the on-chain views that
+// expose the stored threshold, and the `execute` entrypoint that enforces it
+// against the deterministic ledger clock. The boundary is the point: one
+// second early is refused with the dedicated code, the exact release instant
+// runs cleanly.
+// ---------------------------------------------------------------------------
+
+/// Drive the mock ledger to `timestamp` with a fresh env, for the pure
+/// time-lock helpers that need no contract deployed.
+fn ledger_at(timestamp: u64) -> Env {
+    let env = Env::default();
+    env.ledger().set_timestamp(timestamp);
+    env
+}
+
+#[test]
+fn time_lock_is_armed_only_once_approved_with_a_non_zero_delay() {
+    // Not approved yet, or a disabled delay: nothing to wait for.
+    assert!(!timelock::is_armed(0, 100));
+    assert!(!timelock::is_armed(1_000, 0));
+    assert!(!timelock::is_armed(0, 0));
+    // Approved under a live delay.
+    assert!(timelock::is_armed(1_000, 100));
+}
+
+#[test]
+fn release_instant_is_approval_stamp_plus_delay() {
+    assert_eq!(timelock::release_at(1_000, 100), Ok(1_100));
+    assert_eq!(timelock::release_at(1_000, 1), Ok(1_001));
+    // Unarmed inputs report the "nothing to wait for" sentinel.
+    assert_eq!(timelock::release_at(0, 100), Ok(0));
+    assert_eq!(timelock::release_at(1_000, 0), Ok(0));
+    // The largest representable instant still succeeds ...
+    assert_eq!(timelock::release_at(u64::MAX - 1, 1), Ok(u64::MAX));
+    // ... and one more fails closed rather than wrapping into the past.
+    assert_eq!(timelock::release_at(u64::MAX, 1), Err(Error::Overflow));
+    assert_eq!(
+        timelock::release_at(u64::MAX, u64::MAX),
+        Err(Error::Overflow)
+    );
+}
+
+#[test]
+fn remaining_counts_down_to_the_release_instant() {
+    // Approved at 1_000 with a 100s delay -> release at 1_100.
+    let early = timelock::time_lock_status(&ledger_at(1_000), 1_000, 100).unwrap();
+    assert_eq!(early.release_at, 1_100);
+    assert_eq!(early.remaining, 100);
+    assert!(early.armed && !early.released && early.blocking());
+
+    let later = timelock::time_lock_status(&ledger_at(1_099), 1_000, 100).unwrap();
+    assert_eq!(later.remaining, 1);
+    assert!(later.blocking());
+
+    // Exactly at the release instant: inclusive boundary, nothing left to wait.
+    let exact = timelock::time_lock_status(&ledger_at(1_100), 1_000, 100).unwrap();
+    assert_eq!(exact.remaining, 0);
+    assert!(exact.released);
+    assert!(!exact.blocking());
+
+    // Long past it: still released, and `remaining` saturates at zero rather
+    // than wrapping into a huge number.
+    let after = timelock::time_lock_status(&ledger_at(9_999), 1_000, 100).unwrap();
+    assert_eq!(after.remaining, 0);
+    assert!(after.released);
+}
+
+#[test]
+fn disabled_time_lock_never_blocks() {
+    // Delay of 0, and an unapproved record: both leave the time-lock unarmed
+    // and immediately released, whatever the clock says.
+    for now in [0u64, 1_000, u64::MAX] {
+        let env = ledger_at(now);
+        assert!(timelock::is_released(&env, 1_000, 0).unwrap());
+        assert!(!timelock::is_active(&env, 1_000, 0).unwrap());
+        assert!(timelock::require_released(&env, 1_000, 0).is_ok());
+
+        assert!(timelock::is_released(&env, 0, 100).unwrap());
+        assert!(!timelock::is_active(&env, 0, 100).unwrap());
+        assert!(timelock::require_released(&env, 0, 100).is_ok());
+    }
+}
+
+#[test]
+fn require_released_reports_the_deterministic_premature_code() {
+    // Every second before the release instant is the same, stable error —
+    // never a state code, never a panic — and the instant itself passes.
+    for now in [1_000u64, 1_001, 1_050, 1_099] {
+        assert_eq!(
+            timelock::require_released(&ledger_at(now), 1_000, 100),
+            Err(Error::TimelockNotExpired)
+        );
+    }
+    assert!(timelock::require_released(&ledger_at(1_100), 1_000, 100).is_ok());
+    // Fail closed on an unrepresentable release instant.
+    assert_eq!(
+        timelock::require_released(&ledger_at(1_000), u64::MAX, u64::MAX),
+        Err(Error::Overflow)
+    );
+}
+
+#[test]
+fn timelock_view_reports_the_configured_delay() {
+    let disabled = setup(3);
+    assert_eq!(disabled.client.timelock(), 0);
+
+    let h = setup_timelocked(3, 100);
+    assert_eq!(h.client.timelock(), 100);
+}
+
+#[test]
+fn release_at_view_tracks_the_approval_stamp() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+
+    // Pending: not approved, so there is no release instant to report.
+    assert_eq!(h.client.release_at(&id), 0);
+    assert_eq!(
+        h.client.timelock_status(&id),
+        timelock::TimeLockStatus {
+            approved_at: 0,
+            delay: 100,
+            release_at: 0,
+            remaining: 0,
+            armed: false,
+            released: true,
+        }
+    );
+
+    // Approved at the setup timestamp: the threshold is now fixed on-chain.
+    approve_to_threshold(&h, id);
+    assert_eq!(h.client.release_at(&id), 1_100);
+    let status = h.client.timelock_status(&id);
+    assert_eq!(status.approved_at, 1_000);
+    assert_eq!(status.delay, 100);
+    assert_eq!(status.release_at, 1_100);
+    assert!(status.armed && !status.released);
+}
+
+#[test]
+fn timelock_status_view_flips_exactly_at_the_release_instant() {
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+    approve_to_threshold(&h, id);
+
+    // One second early: the view advertises the wait and execution is refused
+    // with the dedicated premature-execution code.
+    advance(&h, 2, 1_099);
+    let blocked = h.client.timelock_status(&id);
+    assert_eq!(blocked.remaining, 1);
+    assert!(blocked.blocking());
+    assert!(!h.client.can_execute(&id));
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // Exactly at the release instant: nothing left to wait, the proposal
+    // executes cleanly and the stamp survives the transition.
+    advance(&h, 3, 1_100);
+    let mature = h.client.timelock_status(&id);
+    assert_eq!(mature.remaining, 0);
+    assert!(mature.released);
+    assert!(!mature.blocking());
+    assert!(h.client.can_execute(&id));
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+    assert_eq!(h.client.release_at(&id), 1_100);
+}
+
+#[test]
+fn a_zero_time_lock_settles_cleanly_for_every_proposal_stage() {
+    let h = setup(3); // timelock 0 — the disabled configuration.
+    let id = create(&h, 2, 10_000);
+
+    // Pending: unarmed, nothing to wait for.
+    let pending = h.client.timelock_status(&id);
+    assert!(!pending.armed);
+    assert_eq!(pending.release_at, 0);
+
+    // Approved: still unarmed, so execution is immediate as before.
+    approve_to_threshold(&h, id);
+    let approved = h.client.timelock_status(&id);
+    assert!(!approved.armed);
+    assert!(approved.released);
+    assert_eq!(approved.release_at, 0);
+    assert!(h.client.can_execute(&id));
+
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn an_unrepresentable_release_instant_is_visible_and_fails_closed() {
+    // A delay that cannot be added to the approval stamp must never wrap into
+    // the past. The view reports the deterministic `Overflow` code and the
+    // entrypoint refuses for the same reason.
+    let h = setup_timelocked(3, u64::MAX);
+    let id = create(&h, 2, 0);
+    approve_to_threshold(&h, id);
+
+    assert_eq!(h.client.try_release_at(&id), Err(Ok(Error::Overflow)));
+    assert_eq!(h.client.try_timelock_status(&id), Err(Ok(Error::Overflow)));
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn a_late_approval_does_not_buy_a_fresh_cooling_off_window() {
+    // The delay is measured from the instant the threshold was reached, so
+    // approving later in the window shortens the remaining wait rather than
+    // restarting it: a proposer cannot buy a longer veto period by slowing
+    // the vote down.
+    let h = setup_timelocked(3, 100);
+    let id = create(&h, 2, 10_000);
+
+    h.client.approve(&h.approvers[0], &id); // still Pending at t = 1_000
+    advance(&h, 5, 1_050);
+    h.client.approve(&h.approvers[1], &id); // reaches the threshold at 1_050
+
+    assert_eq!(h.client.release_at(&id), 1_150);
+    assert_eq!(h.client.timelock_status(&id).remaining, 100);
+    advance(&h, 6, 1_149);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    advance(&h, 7, 1_150);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
 }

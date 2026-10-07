@@ -116,6 +116,14 @@ pub trait RegistryInterface {
     /// with `InvalidInput` before any record is read. An empty list returns an
     /// empty list.
     fn get_modules_batch(env: Env, ids: Vec<ModuleId>) -> Result<Vec<Option<ModuleInfo>>, Error>;
+
+    /// Whether the registry's emergency circuit breaker is engaged.
+    ///
+    /// While `true`, every state-mutating registry entrypoint fails with
+    /// `Error::RegistryPaused`; read-only lookups stay available for incident
+    /// inspection. Cross-contract upgrades observe the pause too, because
+    /// `is_wasm_approved` reports no hash as approved while paused.
+    fn is_paused(env: Env) -> bool;
 }
 
 /// Policy verification surface. Contracts call `check_transfer` to have a spend
@@ -268,6 +276,9 @@ pub trait EscrowInterface {
 /// operators can drive an upgrade of any contract through one client.
 #[contractclient(name = "UpgradeableClient")]
 pub trait UpgradeableInterface {
+    /// Runtime version of the shared contract interface.
+    fn get_interface_version(env: Env) -> u32;
+
     /// Record (or rotate) who may upgrade the contract and which registry
     /// authorizes the new code. See [`upgrade::set_authority`].
     fn set_upgrade_authority(

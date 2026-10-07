@@ -3,6 +3,7 @@ extern crate std;
 
 use crate::access::Role;
 use crate::{BatchAction, BatchReceipt, ContractCall, WalletContract, WalletContractClient};
+use astroid_shared::constants;
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -2669,4 +2670,210 @@ fn rate_limit_configuration_reports_standard_events() {
         (id, 1_000i128, 5u32, WINDOW),
     );
     assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-token balance tracking and allowance checks (Issue #279)
+// ---------------------------------------------------------------------------
+
+/// Register a second independent SAC asset on the harness.
+fn second_asset(h: &Harness) -> Address {
+    let token_admin = Address::generate(&h.env);
+    h.env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address()
+}
+
+/// `custody_balance` reads the contract's real SAC balance, not bookkeeping.
+#[test]
+fn custody_balance_tracks_real_tokens_across_assets() {
+    let h = setup();
+    let token_b = second_asset(&h);
+    let (owner, id) = funded_wallet(&h, 700);
+
+    // Before any funding of asset B the custody read answers 0, never traps.
+    assert_eq!(h.client.custody_balance(&token_b), 0);
+
+    mint(&h, &owner, 700); // asset A
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+    sac_b.mint(&owner, &300);
+    h.client.deposit(&id, &owner, &token_b, &300);
+
+    assert_eq!(h.client.custody_balance(&h.token), 700);
+    assert_eq!(h.client.custody_balance(&token_b), 300);
+}
+
+/// `custody_balance` on an address that is not a token fails closed with a
+/// deterministic code instead of trapping the caller.
+#[test]
+fn custody_balance_of_a_non_token_address_fails_closed() {
+    let h = setup();
+    let not_a_token = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_custody_balance(&not_a_token),
+        Err(Ok(Error::InvalidState))
+    );
+}
+
+/// Balances stay per (wallet, asset) and internal bookkeeping mirrors real
+/// custody for each token.
+#[test]
+fn multi_token_balances_are_tracked_per_wallet_and_asset() {
+    let h = setup();
+    let token_b = second_asset(&h);
+    let owner_a = Address::generate(&h.env);
+    let owner_b = Address::generate(&h.env);
+    let id_a = h.client.create_wallet(&owner_a);
+    let id_b = h.client.create_wallet(&owner_b);
+
+    mint(&h, &owner_a, 500);
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+    sac_b.mint(&owner_b, &900);
+    h.client.deposit(&id_a, &owner_a, &h.token, &500);
+    h.client.deposit(&id_b, &owner_b, &token_b, &900);
+
+    assert_eq!(h.client.balance(&id_a, &h.token), 500);
+    assert_eq!(h.client.balance(&id_a, &token_b), 0);
+    assert_eq!(h.client.balance(&id_b, &h.token), 0);
+    assert_eq!(h.client.balance(&id_b, &token_b), 900);
+    assert_eq!(h.client.custody_balance(&h.token), 500);
+    assert_eq!(h.client.custody_balance(&token_b), 900);
+
+    // Spending asset A does not touch asset B or the other wallet.
+    let recipient = Address::generate(&h.env);
+    h.client
+        .transfer(&owner_a, &id_a, &recipient, &h.token, &200);
+    assert_eq!(h.client.balance(&id_a, &h.token), 300);
+    assert_eq!(h.client.balance(&id_a, &token_b), 0);
+    assert_eq!(h.client.balance(&id_b, &token_b), 900);
+    assert_eq!(h.client.custody_balance(&token_b), 900);
+}
+
+/// An outgoing spend is refused with `InsufficientFunds` when the wallet has
+/// no tracked balance for the asset — the uninitialized-pair case.
+#[test]
+fn transfer_of_an_untracked_asset_fails_with_insufficient_funds() {
+    let h = setup();
+    let token_b = second_asset(&h);
+    let (owner, id) = funded_wallet(&h, 400);
+    let recipient = Address::generate(&h.env);
+
+    // The wallet has never seen asset B.
+    assert_eq!(h.client.balance(&id, &token_b), 0);
+    let res = h.client.try_transfer(&owner, &id, &recipient, &token_b, &1);
+    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+    assert_eq!(token_balance(&h, &recipient), 0);
+}
+
+/// The preliminary allowance check runs before the policy and any token
+/// call, so a zero-amount spend on an empty wallet reports `InvalidAmount`.
+#[test]
+fn zero_amount_transfer_on_an_empty_wallet_fails_with_invalid_amount() {
+    let h = setup();
+    let token_b = second_asset(&h);
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let recipient = Address::generate(&h.env);
+
+    assert_eq!(
+        h.client.try_transfer(&owner, &id, &recipient, &token_b, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(h.client.custody_balance(&token_b), 0);
+}
+
+/// A tracked ledger that drifted above real custody cannot overdraw: the
+/// custody check refuses before the token is called.
+#[test]
+fn transfer_refused_when_real_custody_is_short_even_if_tracked_is_enough() {
+    let h = setup();
+    let (owner, id) = funded_wallet(&h, 500);
+    let recipient = Address::generate(&h.env);
+
+    // Simulate custody drifting out of sync: the ledger says 500 but only 100
+    // tokens remain under the contract's control.
+    h.env.as_contract(&h.contract_id, || {
+        h.env
+            .storage()
+            .persistent()
+            .set(&crate::DataKey::Balance(id, h.token.clone()), &500i128);
+        token::TokenClient::new(&h.env, &h.token).transfer(&h.contract_id, &owner, &400);
+    });
+    assert_eq!(h.client.balance(&id, &h.token), 500);
+    assert_eq!(h.client.custody_balance(&h.token), 100);
+
+    let res = h
+        .client
+        .try_transfer(&owner, &id, &recipient, &h.token, &300);
+    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+    assert_eq!(h.client.balance(&id, &h.token), 500);
+    assert_eq!(token_balance(&h, &recipient), 0);
+
+    // An amount within real custody still moves.
+    h.client.transfer(&owner, &id, &recipient, &h.token, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+}
+
+/// Withdrawals carry the same allowance verification as transfers, per asset.
+#[test]
+fn withdrawal_refused_without_sufficient_multi_token_funds() {
+    let h = setup();
+    let token_b = second_asset(&h);
+    let (owner, id) = funded_wallet(&h, 800);
+
+    // Asset B was never deposited: the tracked read refuses first.
+    let res = h.client.try_withdraw(&owner, &id, &token_b, &50);
+    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+
+    // Over the tracked balance of asset A: same code, nothing moves.
+    let res = h.client.try_withdraw(&owner, &id, &h.token, &801);
+    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+    assert_eq!(h.client.balance(&id, &h.token), 800);
+    assert_eq!(h.client.custody_balance(&h.token), 800);
+
+    // Within both balances the withdrawal pays out per asset.
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+    sac_b.mint(&owner, &200);
+    h.client.deposit(&id, &owner, &token_b, &200);
+    h.client.withdraw(&owner, &id, &token_b, &60);
+    assert_eq!(token_balance(&h, &owner), 0); // asset A untouched
+    assert_eq!(
+        token::TokenClient::new(&h.env, &token_b).balance(&owner),
+        60
+    );
+    assert_eq!(h.client.balance(&id, &token_b), 140);
+    assert_eq!(h.client.custody_balance(&token_b), 140);
+}
+
+/// The error order is deterministic: funds are verified before any balance
+/// changes, and a passing spend leaves custody and ledger in agreement.
+#[test]
+fn allowance_verification_leaves_ledger_and_custody_in_agreement() {
+    let h = setup();
+    let token_b = second_asset(&h);
+    let owner_a = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner_a);
+
+    mint(&h, &owner_a, 1_000);
+    let sac_b = token::StellarAssetClient::new(&h.env, &token_b);
+    sac_b.mint(&owner_a, &250);
+    h.client.deposit(&id, &owner_a, &h.token, &1_000);
+    h.client.deposit(&id, &owner_a, &token_b, &250);
+
+    let recipient = Address::generate(&h.env);
+    h.client.transfer(&owner_a, &id, &recipient, &h.token, &600);
+    h.client.transfer(&owner_a, &id, &recipient, &token_b, &250);
+
+    assert_eq!(h.client.balance(&id, &h.token), 400);
+    assert_eq!(h.client.balance(&id, &token_b), 0);
+    assert_eq!(h.client.custody_balance(&h.token), 400);
+    assert_eq!(h.client.custody_balance(&token_b), 0);
+    assert_eq!(token_balance(&h, &recipient), 600);
+
+    // The emptied pair refuses further spends deterministically.
+    assert_eq!(
+        h.client
+            .try_transfer(&owner_a, &id, &recipient, &token_b, &1),
+        Err(Ok(Error::InsufficientFunds))
+    );
 }

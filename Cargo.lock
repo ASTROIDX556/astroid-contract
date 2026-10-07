@@ -102,6 +102,7 @@ name = "astroid-proposal"
 version = "0.1.0"
 dependencies = [
  "astroid-interfaces",
+ "astroid-multisig",
  "astroid-shared",
  "soroban-sdk",
 ]

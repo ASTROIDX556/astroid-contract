@@ -27,10 +27,16 @@ pub mod policy_enforcement;
 #[cfg(test)]
 pub mod policy_test;
 #[cfg(test)]
+pub mod proposal_timelock;
+#[cfg(test)]
 pub mod proposal_to_wallet_execution;
 #[cfg(test)]
 pub mod registry_batch;
 #[cfg(test)]
+pub mod registry_pause;
+#[cfg(test)]
 pub mod registry_upgrade;
 #[cfg(test)]
 pub mod treasury_transfer_auth;
+#[cfg(test)]
+pub mod treasury_withdrawal_time_lock;
