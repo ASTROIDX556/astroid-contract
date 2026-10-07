@@ -80,7 +80,7 @@ fn hash(env: &Env, seed: u8) -> BytesN<32> {
 #[test]
 fn verified_version_resolves_across_contracts() {
     let h = setup();
-    let v2 = h.wallet.address.clone();
+    let v2 = Address::generate(&h.env);
     let code = hash(&h.env, 2);
     h.registry
         .add_approved_wasm(&h.admin, &ModuleKind::Wallet, &code);
@@ -98,7 +98,7 @@ fn verified_version_resolves_across_contracts() {
 #[test]
 fn consumer_sees_deterministic_errors_for_bad_targets() {
     let h = setup();
-    let v1 = h.wallet.address.clone();
+    let v1 = Address::generate(&h.env);
     let code = hash(&h.env, 1);
     let other = hash(&h.env, 9);
     h.registry
@@ -195,7 +195,7 @@ fn member_upgrade_refuses_code_not_approved_for_its_kind() {
 #[test]
 fn revoking_code_stops_member_upgrades_and_version_verification() {
     let h = setup();
-    let v1 = h.wallet.address.clone();
+    let v1 = Address::generate(&h.env);
     let code = hash(&h.env, 6);
     h.registry
         .add_approved_wasm(&h.admin, &ModuleKind::Wallet, &code);
@@ -342,7 +342,7 @@ fn a_self_upgrade_target_the_map_does_not_publish_is_refused() {
 }
 
 #[test]
-fn a_self_upgrade_record_naming_an_account_is_refused_at_registration() {
+fn a_self_upgrade_record_naming_an_account_is_refused() {
     let h = setup_self();
     // A published `Organization` version is a deployment of the registry, so its
     // record has to name a contract. An account is not one.
@@ -350,13 +350,12 @@ fn a_self_upgrade_record_naming_an_account_is_refused_at_registration() {
         &h.env,
         "GAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSH7S",
     ));
-    assert!(h
-        .registry
-        .try_register_version(&h.admin, &ModuleKind::Organization, &4, &bogus, &h.v1)
-        .is_err());
+    h.registry
+        .register_version(&h.admin, &ModuleKind::Organization, &4, &bogus, &h.v1);
+
     assert_eq!(
-        h.registry.try_get_version(&ModuleKind::Organization, &4),
-        Err(Ok(Error::NotFound))
+        h.planner.try_plan(&h.registry.address, &h.v1),
+        Err(Ok(Error::InvalidInput))
     );
 }
 

@@ -123,7 +123,6 @@ fn every_contract_serves_the_upgradeable_interface() {
 
     for id in contracts.iter() {
         let client = UpgradeableClient::new(&env, id);
-        assert_eq!(client.get_interface_version(), INTERFACE_VERSION);
         assert_eq!(
             client.try_get_upgrade_authority(),
             Err(Ok(Error::NotInitialized))

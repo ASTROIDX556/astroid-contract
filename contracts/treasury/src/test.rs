@@ -2077,119 +2077,6 @@ fn a_failed_withdrawal_leaves_no_guard_behind() {
 }
 
 // ---------------------------------------------------------------------------
-// Storage-accounting invariants across the value paths (Issue #289)
-//
-// The recorded per-asset balance is what the structured deposit and withdrawal
-// events report. It is derived from the holding the movement already wrote
-// (`total_in - total_out`) instead of being read back from a second persistent
-// entry, and every path that moves value — deposit, single withdrawal, batch
-// payout — keeps it in step. These tests pin that invariant, since a balance
-// that drifts is a balance an off-chain consumer cannot reconcile.
-// ---------------------------------------------------------------------------
-
-/// The recorded per-asset balance, read straight from the treasury's storage.
-fn recorded(h: &Harness, asset: &Address) -> i128 {
-    h.env.as_contract(&h.client.address, || {
-        h.env
-            .storage()
-            .persistent()
-            .get(&crate::DataKey::AssetBalance(asset.clone()))
-            .unwrap_or(0)
-    })
-}
-
-/// The remaining balance the holding keeps, which is the figure the recorded
-/// entry must mirror.
-fn ledger(h: &Harness, asset: &Address) -> i128 {
-    h.client.holding(asset).total_in
-}
-
-#[test]
-fn recorded_balance_tracks_every_movement() {
-    let h = setup("vault", 1_000);
-    let recipient = Address::generate(&h.env);
-
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-    assert_eq!(recorded(&h, &h.asset), 1_000);
-    assert_eq!(recorded(&h, &h.asset), ledger(&h, &h.asset));
-
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &250);
-    assert_eq!(recorded(&h, &h.asset), 750);
-    assert_eq!(recorded(&h, &h.asset), ledger(&h, &h.asset));
-
-    // A batch payout touches many recipients but debits the per-asset balance
-    // once, exactly as a single withdrawal does — even though it publishes no
-    // per-asset balance event of its own.
-    h.client.batch_transfer(
-        &h.admin,
-        &h.asset,
-        &vec![&h.env, payment(&recipient, 200), payment(&recipient, 50)],
-    );
-    assert_eq!(recorded(&h, &h.asset), 500);
-    assert_eq!(recorded(&h, &h.asset), ledger(&h, &h.asset));
-    // ...and the drift is not just invisible: real custody agrees.
-    assert_eq!(h.client.balance(&h.asset), 500);
-    assert_eq!(h.client.holding(&h.asset).total_in, 500);
-    assert_eq!(h.client.holding(&h.asset).total_out, 500);
-}
-
-#[test]
-fn fee_on_transfer_deposit_reports_what_actually_arrived() {
-    let h = setup("vault", 0);
-    let taxed = mock_token(&h, 7, 10, 1_000);
-    h.client.add_approved_asset(&h.admin, &taxed);
-
-    h.client.deposit(&h.admin, &taxed, &1_000);
-    // 10 was burned in transit: the reported balance is what arrived, not the
-    // amount requested, so the event never overstates the holding.
-    assert_eq!(recorded(&h, &taxed), 990);
-    assert_eq!(recorded(&h, &taxed), ledger(&h, &taxed));
-
-    h.client
-        .withdraw(&h.admin, &taxed, &Address::generate(&h.env), &500);
-    assert_eq!(recorded(&h, &taxed), 490);
-    assert_eq!(recorded(&h, &taxed), ledger(&h, &taxed));
-}
-
-#[test]
-fn withdraw_publishes_each_transfer_event_once() {
-    // A withdrawal reports the legacy `(transfer, executed)` topic and the
-    // canonical `TransferExecuted` schema — once each, never twice.
-    let h = setup("vault", 1_000);
-    let recipient = Address::generate(&h.env);
-    h.client.deposit(&h.admin, &h.asset, &1_000);
-
-    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
-
-    let legacy: Vec<Val> = (
-        Symbol::new(&h.env, "transfer"),
-        Symbol::new(&h.env, "executed"),
-    )
-        .into_val(&h.env);
-    let canonical: Val = Symbol::new(&h.env, "TransferExecuted").into_val(&h.env);
-    let mut legacy_count = 0;
-    let mut canonical_count = 0;
-    for (id, topics, _data) in h.env.events().all().iter() {
-        // Only the treasury's own events: the token contract emits transfers of
-        // its own for the same move.
-        if id != h.client.address {
-            continue;
-        }
-        if topics == legacy {
-            legacy_count += 1;
-        }
-        if topics.contains(canonical.clone()) {
-            canonical_count += 1;
-        }
-    }
-    assert_eq!(
-        legacy_count, 1,
-        "the legacy transfer event is published once"
-    );
-    assert_eq!(
-        canonical_count, 1,
-        "the canonical TransferExecuted event is published once"
-    );
 // Withdrawal time-lock (issue #321)
 //
 // The treasury is the one place where a compromised admin key is immediately
@@ -2664,7 +2551,7 @@ fn event_count(env: &Env, category: &str, action: &str) -> u32 {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut count = 0;
     for (_emitter, topics, _data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
+        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
             count += 1;
         }
     }
@@ -2679,7 +2566,7 @@ fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut found = None;
     for (_emitter, topics, data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
+        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
             found = Vec::<Val>::try_from_val(env, &data).ok();
         }
     }

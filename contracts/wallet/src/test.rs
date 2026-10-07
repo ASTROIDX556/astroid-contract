@@ -3,7 +3,6 @@ extern crate std;
 
 use crate::access::Role;
 use crate::{BatchAction, BatchReceipt, ContractCall, WalletContract, WalletContractClient};
-use astroid_shared::constants;
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::{Address as _, Ledger};
