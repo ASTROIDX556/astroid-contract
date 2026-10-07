@@ -208,6 +208,9 @@ enum DataKey {
     UpgradeProposal(ModuleKind),
     /// Immutable historical log of upgrade-lifecycle actions (instance).
     UpgradeAuditLog,
+    /// Persistent count and records for successful upgrades of this registry.
+    UpgradeHistoryCount,
+    UpgradeHistory(u32),
     /// The published `Organization` version whose code this contract is
     /// currently running (instance).
     ///
@@ -247,6 +250,18 @@ pub struct UpgradeProposal {
     pub proposer: Address,
     /// Unix timestamp after which the proposal can no longer be committed.
     pub expires_at: u64,
+}
+
+/// Persistent audit record for an applied registry upgrade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeRecord {
+    /// The authorized administrator who requested the upgrade.
+    pub caller: Address,
+    /// The approved WASM hash installed by the upgrade.
+    pub wasm_hash: BytesN<32>,
+    /// Ledger timestamp when the upgrade was applied.
+    pub timestamp: u64,
 }
 
 /// What kind of upgrade-lifecycle action an [`UpgradeAuditRecord`] captures.
@@ -372,9 +387,10 @@ impl VersionLookupCache {
     /// key in this invocation (matching `get_version` policy).
     fn get(&mut self, kind: ModuleKind, version: u32) -> Option<VersionRecord> {
         for i in 0..self.entries.len() {
-            let (k, v, rec) = self.entries.get(i).unwrap();
-            if k == kind && v == version {
-                return rec.clone();
+            if let Some((cached_kind, cached_version, record)) = self.entries.get(i) {
+                if cached_kind == kind && cached_version == version {
+                    return record;
+                }
             }
         }
         let rec = RegistryContract::read_version(&self.env, kind, version);
@@ -1448,6 +1464,26 @@ impl RegistryContract {
             .unwrap_or(0)
     }
 
+    /// Number of upgrades applied to this registry.
+    pub fn upgrade_history_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeHistoryCount)
+            .unwrap_or(0)
+    }
+
+    /// Read one upgrade audit record by its zero-based sequence number.
+    pub fn get_upgrade_record(env: Env, sequence: u32) -> Result<UpgradeRecord, Error> {
+        let key = DataKey::UpgradeHistory(sequence);
+        let record = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump(&env, &key);
+        Ok(record)
+    }
+
     /// Run every check [`Self::upgrade`] would run against the version upgrade
     /// map and return the version this registry would move to, writing nothing.
     ///
@@ -1633,7 +1669,7 @@ impl RegistryContract {
         // If the primary admin was removed, rotate DataKey::Admin to the first remaining admin.
         if let Some(primary) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
             if primary == admin {
-                let next_primary = new_admins.get(0).unwrap();
+                let next_primary = new_admins.get(0).ok_or(Error::InvalidInput)?;
                 env.storage().instance().set(&DataKey::Admin, &next_primary);
             }
         }
@@ -2462,6 +2498,21 @@ impl UpgradeableInterface for RegistryContract {
         // Gate 2: the version upgrade map. Run before anything is applied, so a
         // refusal leaves the running code and the recorded version untouched.
         let plan = Self::plan_registry_upgrade(&env, &wasm_hash)?;
+        let sequence = Self::upgrade_history_count(env.clone());
+        let next_sequence = sequence.checked_add(1).ok_or(Error::InvalidInput)?;
+        let history_key = DataKey::UpgradeHistory(sequence);
+        env.storage().persistent().set(
+            &history_key,
+            &UpgradeRecord {
+                caller: caller.clone(),
+                wasm_hash: wasm_hash.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Self::bump(&env, &history_key);
+        let count_key = DataKey::UpgradeHistoryCount;
+        env.storage().persistent().set(&count_key, &next_sequence);
+        Self::bump(&env, &count_key);
         // Gate 3. The pin moves with the code in the same invocation, so the
         // version this contract runs can never disagree with the code it runs.
         astroid_interfaces::upgrade::apply(&env, ModuleKind::Organization, wasm_hash)?;
@@ -2474,6 +2525,8 @@ impl UpgradeableInterface for RegistryContract {
         astroid_shared::events::publish(
             &env,
             ContractEvent::RegistryUpgraded {
+                sequence,
+                caller,
                 from_version: plan.from_version,
                 to_version: plan.to_version,
                 // The binding the map resolved, not the caller's spelling of it.

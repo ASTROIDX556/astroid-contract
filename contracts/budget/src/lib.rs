@@ -956,12 +956,12 @@ impl BudgetContract {
         // batch behind.
         let mut settled: Vec<AssetBudget> = Vec::new(&env);
         for i in 0..spends.len() {
-            let spend = spends.get(i).unwrap();
+            let spend = spends.get(i).ok_or(Error::InvalidInput)?;
             require_positive_amount(spend.amount)?;
             // A duplicate token would validate each leg against a stale
             // spent counter, letting the legs jointly exceed the cap.
             for j in 0..i {
-                if spends.get(j).unwrap().token == spend.token {
+                if spends.get(j).ok_or(Error::InvalidInput)?.token == spend.token {
                     return Err(Error::InvalidInput.into());
                 }
             }
@@ -983,10 +983,10 @@ impl BudgetContract {
 
         // Second pass: every leg validated — record the batch atomically.
         for i in 0..spends.len() {
-            let spend = spends.get(i).unwrap();
+            let spend = spends.get(i).ok_or(Error::InvalidInput)?;
             env.storage().persistent().set(
                 &DataKey::AssetBudget(budget_id.clone(), spend.token.clone()),
-                &settled.get(i).unwrap(),
+                &settled.get(i).ok_or(Error::InvalidState)?,
             );
             Self::bump_asset(&env, &budget_id, &spend.token);
             env.events().publish(

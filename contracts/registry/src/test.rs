@@ -9,7 +9,8 @@ use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use soroban_sdk::testutils::{storage::Persistent as _, Address as _, AuthorizedFunction, Ledger};
 use soroban_sdk::{
-    symbol_short, testutils::Events, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    symbol_short, testutils::Events, vec, Address, BytesN, Env, IntoVal, String, Symbol,
+    TryFromVal, Val, Vec,
 };
 
 #[soroban_sdk::contract]
@@ -1050,6 +1051,7 @@ struct UpgradeHarness {
     registry: RegistryContractClient<'static>,
     registry_id: Address,
     member: RegistryContractClient<'static>,
+    member_id: Address,
     admin: Address,
 }
 
@@ -1071,6 +1073,7 @@ fn setup_upgrade() -> UpgradeHarness {
         registry,
         registry_id,
         member,
+        member_id,
         admin,
     }
 }
@@ -1087,6 +1090,65 @@ fn upgrade_authority_is_recorded_and_readable() {
     let authority = h.member.get_upgrade_authority();
     assert_eq!(authority.admin, h.admin);
     assert_eq!(authority.registry, h.registry_id);
+}
+
+#[test]
+fn upgrade_authority_bootstrap_requires_registry_admin() {
+    let h = setup_upgrade();
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.member
+            .try_set_upgrade_authority(&stranger, &stranger, &h.registry_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.member.try_get_upgrade_authority(),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn approved_upgrade_records_history_and_emits_event() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.member_id);
+    let wasm_hash = h.env.deployer().upload_contract_wasm([0u8; 0].as_slice());
+    h.member
+        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &wasm_hash);
+    let version_address = h.env.register_contract(None, RegistryContract);
+    h.member.register_version(
+        &h.admin,
+        &ModuleKind::Organization,
+        &1,
+        &version_address,
+        &wasm_hash,
+    );
+
+    h.member.upgrade(&h.admin, &wasm_hash);
+
+    let record = h.member.get_upgrade_record(&0);
+    assert_eq!(record.caller, h.admin);
+    assert_eq!(record.wasm_hash, wasm_hash);
+    assert_eq!(h.member.upgrade_history_count(), 1);
+    assert_eq!(h.member.get_registry_version(), 1);
+    assert_eq!(
+        h.member.try_get_upgrade_record(&1),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(count_events(&h.env, "RegistryUpgraded"), 1);
+    assert_event(&h.env, "RegistryUpgraded");
+
+    let want: Val = Symbol::new(&h.env, "RegistryUpgraded").into_val(&h.env);
+    let event = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| topics.contains(want))
+        .expect("RegistryUpgraded must be emitted");
+    let payload: (u32, Address, u32, u32, BytesN<32>) =
+        TryFromVal::try_from_val(&h.env, &event.2).unwrap();
+    assert_eq!(payload, (0, h.admin, 0, 1, wasm_hash));
 }
 
 #[test]
