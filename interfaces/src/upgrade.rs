@@ -23,8 +23,8 @@
 //! generated cross-contract client, and here rather than in each contract
 //! because every member contract must enforce the identical rule.
 
+use crate::errors::Error;
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
-use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::{contractclient, contracttype, symbol_short, Address, BytesN, Env};
 

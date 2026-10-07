@@ -38,6 +38,29 @@
 //! recorded org owner and the protocol admin, so no grant can be used to
 //! escalate into ownership or to widen its own reach.
 //!
+//! ## Version upgrade validation (Issue #304)
+//!
+//! The registry is the single source of truth for contract version upgrades,
+//! so replacing deployed bytecode goes through a validated, two-step
+//! propose → commit flow ([`RegistryContract::propose_upgrade`],
+//! [`RegistryContract::commit_upgrade`], [`RegistryContract::reject_upgrade`])
+//! with every check re-applied at commit time:
+//!
+//! | Validation | Where | On failure |
+//! |------------|-------|------------|
+//! | Caller is protocol admin, org owner, or delegated `ModuleUpgrader` | propose | `Unauthorized` (`NotFound` for an unknown org) |
+//! | `version` non-zero and strictly greater than the kind's latest | propose + commit + `register_version` | `InvalidInput` / `InvalidState` (downgrade protection) |
+//! | `wasm_hash` well-formed (non-zero) via [`require_valid_wasm_hash`] | propose + commit + `add_approved_wasm` | `InvalidInput` |
+//! | Wasm hash not already approved for the kind | propose | `InvalidInput` (identical-WASM re-proposal) |
+//! | No other open proposal for the kind | propose | `InvalidState` |
+//! | Proposal not expired (1 week) | commit | `NotFound` |
+//! | Registry not frozen | every lifecycle entrypoint | `RegistryFrozen` |
+//!
+//! Successful lifecycle actions emit `UpgradeProposed` / `UpgradeCommitted` /
+//! `UpgradeRejected` (canonical and tuple-topic form) and are appended to the
+//! immutable audit log; refused attempts revert atomically with their error
+//! code. The admin-only [`RegistryContract::register_version`] escape hatch
+//! carries the same non-zero and downgrade guards as the flow.
 //! ## Upgrade paths
 //!
 //! [`RegistryContract::register_version`] publishes immutable `(kind, version)`
@@ -835,6 +858,18 @@ impl RegistryContract {
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
+        // Downgrade protection: the version table is monotonic per kind, so a
+        // registration may never lower or repeat the latest version. Direct
+        // registration is the admin escape hatch and carries the same guard as
+        // the propose/commit flow.
+        let latest: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(kind))
+            .unwrap_or(0);
+        ensure!(version > latest, Error::InvalidState);
+        let vkey = DataKey::Version(kind, version);
+        ensure!(!env.storage().persistent().has(&vkey), Error::AlreadyExists);
         // A pair is taken if either layout already holds it. The common case is
         // a single existence check; the legacy key is only consulted when the
         // consolidated one is free, so a fresh registration still pays one read.
