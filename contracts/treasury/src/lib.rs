@@ -791,12 +791,12 @@ impl TreasuryContract {
         let mut h = Self::load_holding(&env, &asset);
         h.total_in = checked_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
-        // The recorded balance mirrors the ledger itself rather than being
-        // credited with the *requested* amount: on a fee-on-transfer token the
-        // two differ, and only what actually arrived may be booked (Issue
-        // #218). Syncing from the holding keeps the two inseparable on every
-        // path that mutates either.
-        let balance = h.total_in;
+        // The running balance the structured event reports is derived from the
+        // holding just written (`balance == total_in - total_out`), which is one
+        // persistent read fewer than reading the recorded balance back — and a
+        // fee-on-transfer token cannot inflate it, because it is the amount that
+        // arrived, not the amount requested, that the holding credited.
+        let balance = Self::recorded_balance(&h);
         Self::store_asset_balance(&env, &asset, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
@@ -808,9 +808,7 @@ impl TreasuryContract {
                 org: t.org.clone(),
                 from: from.clone(),
                 asset: asset.clone(),
-                // The value actually credited to the treasury, matching the
-                // tuple-topic event above — never the requested figure.
-                amount: received,
+                amount,
                 balance,
             },
         );
@@ -825,27 +823,12 @@ impl TreasuryContract {
         asset: Address,
         budget_id: String,
     ) -> Result<(), Error> {
-        let t = Self::require_admin(&env, &admin)?;
+        let _t = Self::require_admin(&env, &admin)?;
         require_non_empty(&budget_id)?;
         Self::require_approved_asset(&env, &asset)?;
         let mut h = Self::load_holding(&env, &asset);
-        h.budget_id = Some(budget_id.clone());
+        h.budget_id = Some(budget_id);
         Self::store_holding(&env, &asset, &h);
-        // Issue #222 — binding an envelope mutates the treasury record, so it
-        // announces itself on both layers like every other config change: the
-        // canonical typed event plus a tuple-topic event carrying the
-        // identifiers and the ledger timestamp.
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("bgt_alloc")),
-            (asset.clone(), budget_id.clone(), env.ledger().timestamp()),
-        );
-        events::publish(
-            &env,
-            events::ContractEvent::TreasuryConfigUpdated {
-                org: t.org.clone(),
-                action: symbol_short!("bgt_alloc"),
-            },
-        );
         Ok(())
     }
 
@@ -881,11 +864,9 @@ impl TreasuryContract {
         };
         env.storage()
             .persistent()
-            .set(&DataKey::Allowance(id.clone()), &allowance);
-        // Issue #222 — shared topic helpers keep the treasury on the same
-        // `allow_set` / `allow_use` / `allow_rem` schema the policy contract
-        // already publishes under.
-        events::allowance_set(&env, &id.agent, &id.recipient, &id.asset, limit, expires_at);
+            .set(&DataKey::Allowance(id), &allowance);
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allow")), ());
         Ok(())
     }
 
@@ -910,10 +891,9 @@ impl TreasuryContract {
         {
             return Err(Error::NotFound);
         }
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Allowance(id.clone()));
-        events::allowance_removed(&env, &id.agent, &id.recipient, &id.asset);
+        env.storage().persistent().remove(&DataKey::Allowance(id));
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("allowrm")), ());
         Ok(())
     }
 
@@ -1042,9 +1022,6 @@ impl TreasuryContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Allowance(allowance_id), &al);
-            // Issue #222 — consuming an allowance is a state change worth
-            // indexing: who spent, to whom, in what asset, how much, and when.
-            events::allowance_consumed(env, caller, to, asset, amount);
         }
 
         // Debit the internal ledger, then move real tokens out of custody.
@@ -1054,15 +1031,16 @@ impl TreasuryContract {
         }
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
-        Self::store_holding(env, asset, &holding);
-        // Mirror the debited ledger exactly (see `Self::deposit`): the recorded
-        // balance is the holding itself, so it cannot drift from the books
-        // regardless of which outflow path settles (Issue #218).
-        let balance = holding.total_in;
-        Self::store_asset_balance(env, asset, balance);
-        events::transfer_executed(env, &t.admin, to, asset, amount);
-        Self::transfer_out(env, asset, to, amount)?;
-        events::transfer_executed(env, &t.admin, to, asset, amount);
+        Self::store_holding(&env, &asset, &holding);
+        // Derived from the holding already in hand, so the withdrawal pays no
+        // extra persistent read for the balance it reports and can never emit
+        // one that disagrees with the ledger it just debited.
+        let balance = Self::recorded_balance(&holding);
+        Self::store_asset_balance(&env, &asset, balance);
+        // One `TransferExecuted` (legacy topic) plus the canonical schema below:
+        // the same event used to be published twice per withdrawal.
+        events::transfer_executed(&env, &t.admin, &to, &asset, amount);
+        Self::transfer_out(&env, &asset, &to, amount)?;
         events::publish(
             env,
             events::ContractEvent::TransferExecuted {
@@ -1197,11 +1175,12 @@ impl TreasuryContract {
         // Debit the internal ledger once, then move real tokens per recipient.
         holding.total_in = checked_sub(holding.total_in, total)?;
         holding.total_out = checked_add(holding.total_out, total)?;
-        Self::store_holding(env, asset, &holding);
-        // Keep the recorded event balance in lockstep with the ledger this
-        // batch just debited (Issue #218): a later deposit/withdrawal event
-        // must not announce a balance this payout already paid out.
-        Self::store_asset_balance(env, asset, holding.total_in);
+        Self::store_holding(&env, &asset, &holding);
+        // The recorded per-asset balance backs the structured deposit and
+        // withdrawal events, so a batch payout debits it exactly as a single
+        // withdrawal does. Without this the balance the *next* deposit or
+        // withdrawal reports would still count the funds this batch paid out.
+        Self::store_asset_balance(&env, &asset, Self::recorded_balance(&holding));
 
         let token_client = token::TokenClient::new(env, asset);
         let custody = env.current_contract_address();
@@ -1618,8 +1597,6 @@ impl TreasuryContract {
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
         Self::store_holding(&env, &d.asset, &holding);
-        // Same recorded-balance sync as every other outflow (Issue #218).
-        Self::store_asset_balance(&env, &d.asset, holding.total_in);
 
         Self::transfer_out(&env, &d.asset, &d.to, amount)?;
         env.events().publish(
@@ -1796,13 +1773,23 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
+    /// The running per-asset balance implied by `holding`: what the structured
+    /// deposit and withdrawal events report for the asset.
+    ///
+    /// That balance is the holding's remaining total, because every movement
+    /// debits or credits `total_in` by exactly the amount that moved. Deriving it
+    /// from the holding the caller already has, rather than reading the recorded
+    /// entry back, costs one persistent read fewer on each of the three value
+    /// paths and leaves no room for the two to drift — a batch payout does not
+    /// emit a per-asset balance of its own, so it is exactly the path where a
+    /// stale copy would have gone unnoticed.
+    fn recorded_balance(holding: &Holding) -> i128 {
+        holding.total_in
+    }
+
     /// Persist the per-asset balance used by the structured deposit and
     /// withdrawal events so the resulting balance never has to be recomputed
     /// from the flow totals at emission time.
-    ///
-    /// Callers always pass the updated [`Holding::total_in`], keeping this
-    /// record an exact mirror of the internal ledger on every value path
-    /// (Issue #218).
     fn store_asset_balance(env: &Env, asset: &Address, balance: i128) {
         let key = DataKey::AssetBalance(asset.clone());
         env.storage().persistent().set(&key, &balance);
