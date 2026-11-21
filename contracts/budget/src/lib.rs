@@ -486,7 +486,15 @@ impl BudgetContract {
         Self::bump(&env, &budget_id);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("allocated")),
-            (budget_id, owner, limit),
+            (budget_id.clone(), owner, limit),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("allocated"),
+                amount: limit,
+            },
         );
         Ok(())
     }
@@ -577,7 +585,15 @@ impl BudgetContract {
         Self::store(&env, &budget_id, &budget);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("recurring")),
-            (budget_id, period, period_seconds, rollover_cap),
+            (budget_id.clone(), period, period_seconds, rollover_cap),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("recurring"),
+                amount: rollover_cap,
+            },
         );
         Ok(())
     }
@@ -616,7 +632,15 @@ impl BudgetContract {
         Self::store(&env, &budget_id, &budget);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("rollover")),
-            (budget_id, rollover_bps, max_rollover_cap),
+            (budget_id.clone(), rollover_bps, max_rollover_cap),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("rollover"),
+                amount: max_rollover_cap,
+            },
         );
         Ok(())
     }
@@ -632,8 +656,18 @@ impl BudgetContract {
         budget.rollover_credit = 0;
         budget.window_start = env.ledger().timestamp();
         Self::store(&env, &budget_id, &budget);
-        env.events()
-            .publish((symbol_short!("budget"), symbol_short!("reset")), budget_id);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("reset")),
+            budget_id.clone(),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("reset"),
+                amount: 0,
+            },
+        );
         Ok(())
     }
     /// Force a period transition for a budget (owner-gated). Rolls unspent
@@ -667,7 +701,15 @@ impl BudgetContract {
         Self::store(&env, &budget_id, &budget);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("setlimit")),
-            (budget_id, new_limit),
+            (budget_id.clone(), new_limit),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("setlimit"),
+                amount: new_limit,
+            },
         );
         Ok(())
     }
@@ -681,7 +723,15 @@ impl BudgetContract {
         Self::store(&env, &budget_id, &budget);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("frozen")),
-            budget_id,
+            budget_id.clone(),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("frozen"),
+                amount: 0,
+            },
         );
         Ok(())
     }
@@ -695,7 +745,15 @@ impl BudgetContract {
         Self::store(&env, &budget_id, &budget);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("unfrozen")),
-            budget_id,
+            budget_id.clone(),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("unfrozen"),
+                amount: 0,
+            },
         );
         Ok(())
     }
@@ -706,7 +764,15 @@ impl BudgetContract {
         Self::store(&env, &budget_id, &budget);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("archived")),
-            budget_id,
+            budget_id.clone(),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("archived"),
+                amount: 0,
+            },
         );
         Ok(())
     }
@@ -744,7 +810,23 @@ impl BudgetContract {
         Self::store(&env, &to_id, &to);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("realloc")),
-            (from_id, to_id, amount),
+            (from_id.clone(), to_id.clone(), amount),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: from_id.clone(),
+                action: symbol_short!("realloc"),
+                amount,
+            },
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: to_id.clone(),
+                action: symbol_short!("realloc"),
+                amount,
+            },
         );
         Ok(())
     }
@@ -781,7 +863,15 @@ impl BudgetContract {
         Self::bump_asset(&env, &budget_id, &token);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("set_ast")),
-            (budget_id, token, limit),
+            (budget_id.clone(), token.clone(), limit),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("set_ast"),
+                amount: limit,
+            },
         );
         Ok(())
     }
@@ -822,7 +912,15 @@ impl BudgetContract {
         Self::bump_asset(&env, &budget_id, &token);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("set_ast")),
-            (budget_id, token, limit),
+            (budget_id.clone(), token.clone(), limit),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("set_ast"),
+                amount: limit,
+            },
         );
         Ok(())
     }
@@ -865,7 +963,20 @@ impl BudgetContract {
         Self::bump_asset(&env, &budget_id, &token);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("ast_roll")),
-            (budget_id, token, rollover_bps, max_rollover_cap),
+            (
+                budget_id.clone(),
+                token.clone(),
+                rollover_bps,
+                max_rollover_cap,
+            ),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("ast_roll"),
+                amount: max_rollover_cap,
+            },
         );
         Ok(())
     }
@@ -911,7 +1022,15 @@ impl BudgetContract {
         Self::bump_asset(&env, &budget_id, &token);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("ast_spend")),
-            (budget_id, token, amount),
+            (budget_id.clone(), token.clone(), amount),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("ast_spend"),
+                amount,
+            },
         );
         Ok(())
     }
@@ -992,6 +1111,14 @@ impl BudgetContract {
             env.events().publish(
                 (symbol_short!("budget"), symbol_short!("ast_spend")),
                 (budget_id.clone(), spend.token.clone(), spend.amount),
+            );
+            events::publish(
+                &env,
+                ContractEvent::BudgetUpdated {
+                    budget_id: budget_id.clone(),
+                    action: symbol_short!("ast_spend"),
+                    amount: spend.amount,
+                },
             );
         }
         Ok(())
