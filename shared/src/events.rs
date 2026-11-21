@@ -633,6 +633,16 @@ pub fn proposal_approved(env: &Env, proposal_id: u64, approver: &Address, approv
         .publish(topics, (proposal_id, approver.clone(), approvals));
 }
 
+/// `ProposalExecuted` — topic `("proposal", "executed")`.
+///
+/// Published once a proposal's approval weight met the threshold and it was
+/// marked executed. The proposal id is the whole payload: execution is
+/// terminal and the id is never reused, so it is also the replay marker.
+pub fn proposal_executed(env: &Env, proposal_id: u64) {
+    let topics = (symbol_short!("proposal"), symbol_short!("executed"));
+    env.events().publish(topics, proposal_id);
+}
+
 /// `BudgetExceeded` — topic `("budget", "exceeded")`.
 pub fn budget_exceeded(env: &Env, budget_id: &String, requested: i128, remaining: i128) {
     let topics = (symbol_short!("budget"), symbol_short!("exceeded"));
