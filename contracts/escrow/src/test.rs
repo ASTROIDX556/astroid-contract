@@ -2,6 +2,7 @@ extern crate std;
 
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
+    symbol_short,
     testutils::{
         Address as _, AuthorizedFunction, AuthorizedInvocation, Events, Ledger, MockAuth,
         MockAuthInvoke,
@@ -3700,4 +3701,204 @@ fn refused_settlement_emits_no_fund_event() {
         Err(Ok(Error::TimeLockActive))
     );
     assert!(settlement_events(&h, ESCROW_FUNDS_REFUNDED, id).is_empty());
+}
+
+/// claim_refund tests (Issue #490)
+#[cfg(test)]
+mod claim_refund_tests {
+    use super::*;
+
+    #[test]
+    fn claim_refund_before_deadline_fails_escrow_not_expired() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+        // Before deadline: EscrowNotExpired
+        let res = h.client.try_claim_refund(&h.sender, &id);
+        assert_eq!(res, Err(Ok(Error::EscrowNotExpired)));
+        assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+        assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
+    }
+
+    #[test]
+    fn claim_refund_during_grace_period_fails_grace_active() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+        // During grace period: GraceActive
+        at(&h, START + 150);
+        let res = h.client.try_claim_refund(&h.sender, &id);
+        assert_eq!(res, Err(Ok(Error::GraceActive)));
+    }
+
+    #[test]
+    fn claim_refund_after_expiration_succeeds() {
+        let h = setup(5_000, 2_000);
+        let id = create(&h, &two_assets(&h, 5_000, 2_000), START + 100, 0);
+
+        // After deadline: claim_refund succeeds
+        at(&h, START + 200);
+        h.client.claim_refund(&h.sender, &id);
+        assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+        assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+        assert_eq!(balance(&h, &h.asset_b, &h.sender), 2_000);
+    }
+
+    #[test]
+    fn claim_refund_after_grace_period_succeeds() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+        // After grace period: claim_refund succeeds
+        at(&h, START + 100 + GRACE);
+        h.client.claim_refund(&h.sender, &id);
+        assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+        assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    }
+
+    #[test]
+    fn claim_refund_on_already_settled_escrow_fails() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+        // Release the escrow first
+        at(&h, START + 50);
+        h.client.release(&h.arbiter, &id, &5_000);
+        assert_eq!(h.client.get(&id).state, EscrowState::Released);
+
+        // Now claim_refund should fail with EscrowAlreadySettled
+        at(&h, START + 200);
+        let res = h.client.try_claim_refund(&h.sender, &id);
+        assert_eq!(res, Err(Ok(Error::EscrowAlreadySettled)));
+    }
+
+    #[test]
+    fn claim_refund_on_refunded_escrow_fails() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+        // Refund the escrow first
+        at(&h, START + 200);
+        h.client.refund(&h.sender, &id);
+        assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+
+        // Now claim_refund should fail with EscrowAlreadySettled
+        let res = h.client.try_claim_refund(&h.sender, &id);
+        assert_eq!(res, Err(Ok(Error::EscrowAlreadySettled)));
+    }
+
+    #[test]
+    fn claim_refund_unauthorized_for_non_sender() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+        at(&h, START + 200);
+        let res = h.client.try_claim_refund(&h.recipient, &id);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+        let res = h.client.try_claim_refund(&h.arbiter, &id);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+        let stranger = Address::generate(&h.env);
+        let res = h.client.try_claim_refund(&stranger, &id);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn claim_refund_emits_correct_events() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+        at(&h, START + 200);
+        h.client.claim_refund(&h.sender, &id);
+
+        // Check that the correct events were emitted
+        let events = h.env.events().all();
+        let has_claim_refund = events
+            .iter()
+            .any(|(_, topics, _)| topics.contains(&symbol_short!("claim_rfd").into_val(&h.env)));
+        assert!(has_claim_refund, "claim_refund event should be emitted");
+
+        // Check standard refunded event
+        let has_refunded = events.iter().any(|(_, topics, _)| {
+            topics.contains(&Symbol::new(&h.env, "EscrowRefunded").into_val(&h.env))
+        });
+        assert!(has_refunded, "EscrowRefunded event should be emitted");
+    }
+
+    #[test]
+    fn claim_refund_with_bounded_window_respects_window() {
+        let h = setup(5_000, 0);
+        // Create with refund_window of 50 seconds
+        let id = h.client.create_with_refund_window(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &one_asset(&h, 5_000),
+            &(START + 100),
+            &0,
+            &50,
+            &String::from_str(&h.env, "windowed"),
+            &no_signers(&h),
+            &0,
+        );
+
+        // Before window closes: should succeed
+        at(&h, START + 140);
+        h.client.claim_refund(&h.sender, &id);
+        assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    }
+
+    #[test]
+    fn claim_refund_after_bounded_window_closes_fails() {
+        let h = setup(5_000, 0);
+        let id = h.client.create_with_refund_window(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &one_asset(&h, 5_000),
+            &(START + 100),
+            &0,
+            &50,
+            &String::from_str(&h.env, "windowed"),
+            &no_signers(&h),
+            &0,
+        );
+
+        // After window closes: should fail with EscrowExpired
+        at(&h, START + 150);
+        let res = h.client.try_claim_refund(&h.sender, &id);
+        assert_eq!(res, Err(Ok(Error::EscrowExpired)));
+    }
+
+    #[test]
+    fn claim_refund_on_expired_marker_succeeds() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+        at(&h, START + 200);
+        // First mark as expired
+        h.client.expire(&id);
+        assert_eq!(h.client.get(&id).state, EscrowState::Expired);
+
+        // Then claim_refund should still work
+        h.client.claim_refund(&h.sender, &id);
+        assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    }
+
+    #[test]
+    fn claim_refund_on_milestone_escrow_rejected() {
+        let h = setup(10_000, 0);
+        let specs = vec![
+            &h.env,
+            milestone_spec(&h.env, "design", 4_000),
+            milestone_spec(&h.env, "build", 6_000),
+        ];
+        let id = deposit_milestones(&h, 10_000, START + 86_400, &specs);
+
+        // Even after deadline, milestone escrows reject claim_refund
+        at(&h, START + 100_000);
+        let res = h.client.try_claim_refund(&h.sender, &id);
+        assert_eq!(res, Err(Ok(Error::InvalidState)));
+    }
 }

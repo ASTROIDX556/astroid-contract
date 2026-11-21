@@ -107,7 +107,7 @@ fn bad_threshold_rejected_on_init() {
     sv.push_back(sw(&Address::generate(&env), 1));
     sv.push_back(sw(&Address::generate(&env), 1));
     let res = client.try_initialize(&sv, &3);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    assert_eq!(res, Err(Ok(Error::ThresholdExceeded)));
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn zero_weight_rejected_on_init() {
     sv.push_back(sw(&Address::generate(&env), 0));
     sv.push_back(sw(&Address::generate(&env), 1));
     let res = client.try_initialize(&sv, &1);
-    assert_eq!(res, Err(Ok(Error::InsufficientWeight)));
+    assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn duplicate_signer_rejected_on_init() {
     sv.push_back(sw(&a, 1));
     sv.push_back(sw(&a, 1));
     let res = client.try_initialize(&sv, &1);
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::DuplicateSigner)));
 }
 
 #[test]
@@ -482,12 +482,12 @@ fn full_capacity_unanimous_quorum_and_one_signer_too_many() {
     let extra = Address::generate(&h.env);
     assert_eq!(
         h.client.try_add_signer(&h.signers[0], &extra, &1),
-        Err(Ok(Error::TooManySigners))
+        Err(Ok(Error::InvalidSignerCount))
     );
     assert_eq!(
         h.client
             .try_propose_signer_addition(&h.signers[0], &extra, &1),
-        Err(Ok(Error::TooManySigners))
+        Err(Ok(Error::InvalidSignerCount))
     );
     assert!(!h.client.is_signer(&extra));
     assert_eq!(h.client.get_signers().len(), MAX_SIGNERS);
@@ -597,7 +597,7 @@ fn set_threshold_bounds_enforced() {
     let h = setup(&[1, 1, 1], 2);
     // Threshold larger than signer count is rejected.
     let res = h.client.try_set_threshold(&h.signers[0], &4);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    assert_eq!(res, Err(Ok(Error::ThresholdExceeded)));
     // Threshold of 0 is rejected (below MIN_THRESHOLD).
     let res = h.client.try_set_threshold(&h.signers[0], &0);
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
@@ -676,7 +676,7 @@ fn threshold_bounds_enforced_at_proposal_time() {
     // A threshold above the total weight can never be met, so it is not parked.
     assert_eq!(
         h.client.try_propose_threshold_change(&h.signers[0], &4),
-        Err(Ok(Error::InvalidThreshold))
+        Err(Ok(Error::ThresholdExceeded))
     );
     // Zero is below MIN_THRESHOLD.
     assert_eq!(
@@ -870,7 +870,7 @@ fn cannot_add_duplicate_signer() {
     let res = h
         .client
         .try_propose_signer_addition(&h.signers[0], &h.signers[1], &1);
-    assert_eq!(res, Err(Ok(Error::AlreadyExists)));
+    assert_eq!(res, Err(Ok(Error::DuplicateSigner)));
 }
 
 #[test]
@@ -1513,7 +1513,7 @@ fn pending_threshold_is_revalidated_on_finalize() {
         .set_sequence_number(100 + THRESHOLD_CHANGE_DELAY_LEDGERS);
     assert_eq!(
         h.client.try_finalize_threshold(&h.signers[0]),
-        Err(Ok(Error::InvalidThreshold))
+        Err(Ok(Error::ThresholdExceeded))
     );
     assert_eq!(h.client.get_threshold(), 1);
 }
@@ -1542,11 +1542,11 @@ fn signer_set_with_invalid_weights_or_duplicates_is_rejected() {
 
     assert_eq!(
         client.try_initialize(&vec![&env, sw(&a, 1), sw(&a, 1)], &1),
-        Err(Ok(Error::InvalidInput))
+        Err(Ok(Error::DuplicateSigner))
     );
     assert_eq!(
         client.try_initialize(&vec![&env, sw(&a, 1), sw(&b, 0)], &1),
-        Err(Ok(Error::InsufficientWeight))
+        Err(Ok(Error::InvalidSignerWeight))
     );
     assert_eq!(
         client.try_initialize(&vec![&env, sw(&a, u32::MAX), sw(&b, 1)], &1),
@@ -2104,7 +2104,7 @@ fn threshold_exceeding_total_weight_rejected_at_init() {
     sv.push_back(sw(&Address::generate(&env), 3));
     sv.push_back(sw(&Address::generate(&env), 2));
     let res = client.try_initialize(&sv, &6);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    assert_eq!(res, Err(Ok(Error::ThresholdExceeded)));
 }
 
 /// Threshold of zero is rejected at initialization (below MIN_THRESHOLD).
