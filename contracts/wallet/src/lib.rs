@@ -125,10 +125,6 @@
 use crate::access::Role;
 use astroid_interfaces::{BudgetClient, PolicyClient, RegistryClient, UpgradeableInterface};
 use astroid_shared::constants;
-use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
-};
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::events;
@@ -143,53 +139,9 @@ use soroban_sdk::{
 };
 
 pub mod access;
+mod storage;
 
-#[contracttype]
-#[derive(Clone)]
-enum DataKey {
-    /// Emergency/administrative address able to freeze any wallet (instance).
-    Admin,
-    /// Designated emergency guardian able to trip the breaker (instance).
-    Guardian,
-    /// Contract-wide emergency pause flag (instance).
-    Paused,
-    /// Monotonic wallet id counter (instance).
-    WalletCount,
-    /// Budget contract consulted when consuming batch action value (instance).
-    Budget,
-    /// Wallet record: id -> WalletData.
-    Wallet(u64),
-    /// Per-wallet, per-asset balance: (id, asset) -> i128.
-    Balance(u64, Address),
-    /// Org-wide Policy contract consulted before every outbound movement
-    /// (instance).
-    Policy,
-    /// Per-wallet opt-out from the policy gate: wallet id -> bool (persistent).
-    /// Present + `true` means the wallet spends without policy evaluation.
-    PolicyBypass(u64),
-    /// Velocity ceiling: (wallet id, asset) -> VelocityLimit (persistent).
-    VelocityLimit(u64, Address),
-    /// Rolling velocity usage: (wallet id, asset) -> VelocityUsage
-    /// (persistent). One fixed-size record per limited (wallet, asset), always
-    /// overwritten in place, so usage never grows the ledger footprint.
-    VelocityUsage(u64, Address),
-    /// Rate-limit config: wallet id -> RateLimitConfig (persistent). A missing
-    /// entry means rate limiting is off.
-    RateLimit(u64),
-    /// Rolling rate usage: wallet id -> RateUsage (persistent). One fixed-size
-    /// record per limited wallet, always overwritten in place.
-    RateLimitUsage(u64),
-    /// Registry contract for dynamic policy/budget resolution (instance).
-    Registry,
-    /// Organization slug for registry lookups (instance).
-    Org,
-    /// Re-entrancy lock flag (instance).
-    ReentrancyLock,
-    /// Default budget envelope id for single transfers (instance).
-    DefaultBudgetId,
-    /// Per-asset budget envelope id: asset -> budget_id (persistent).
-    AssetBudgetId(Address),
-}
+use storage::DataKey;
 
 /// Number of equal sub-buckets a velocity window is divided into. Spends are
 /// bucketed by ledger time; a bucket's volume counts against the limit until
@@ -558,11 +510,7 @@ impl WalletContract {
         let key = DataKey::PolicyBypass(wallet_id);
         if bypass {
             env.storage().persistent().set(&key, &true);
-            env.storage().persistent().extend_ttl(
-                &key,
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+            Self::bump_persistent(&env, &key);
         } else {
             env.storage().persistent().remove(&key);
         }
@@ -576,10 +524,7 @@ impl WalletContract {
 
     /// Whether a wallet is excused from the policy gate.
     pub fn get_policy_bypass(env: Env, wallet_id: u64) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PolicyBypass(wallet_id))
-            .unwrap_or(false)
+        storage::policy_bypass(&env, wallet_id)
     }
 
     /// Set the velocity ceiling for `asset` on a wallet ([`Role::Admin`]):
@@ -847,15 +792,12 @@ impl WalletContract {
         // or balance checks.
         Self::validate_transfer_recipient(&env, &to)?;
         Self::lock(&env)?;
-        let policy_bypass = Self::get_policy_bypass(env.clone(), wallet_id);
         // Atomic pre-execution: policy → budget → velocity, before any debit.
         // Resolves Policy/Budget via Registry when configured, so upgrades
         // take effect without re-wiring the wallet. Each fallible step
         // unlocks before returning so a failed spend never leaves the
         // contract locked (even if the host commits storage on Err).
-        if let Err(e) =
-            Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller, policy_bypass)
-        {
+        if let Err(e) = Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -869,13 +811,10 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
-        // Preliminary allowance verification before anything is approved: the
-        // tracked ledger and the real SAC custody must each cover the amount.
-        if let Err(e) = Self::require_custody_funds(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        if let Err(e) = Self::debit_and_transfer(&env, wallet_id, &asset, amount, &to) {
+        // Allowance verification, debit and payout share one read of the
+        // tracked balance: the tracked ledger and the real SAC custody must
+        // each cover the amount before anything moves.
+        if let Err(e) = Self::settle_outbound(&env, wallet_id, &asset, amount, &to) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -901,16 +840,9 @@ impl WalletContract {
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active_for_transfer(&wallet)?;
         Self::lock(&env)?;
-        let policy_bypass = Self::get_policy_bypass(env.clone(), wallet_id);
-        if let Err(e) = Self::pre_execute_checks(
-            &env,
-            wallet_id,
-            &asset,
-            &wallet.owner,
-            amount,
-            &caller,
-            policy_bypass,
-        ) {
+        if let Err(e) =
+            Self::pre_execute_checks(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
+        {
             Self::unlock(&env);
             return Err(e);
         }
@@ -924,14 +856,10 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
-        // Same preliminary allowance verification as `transfer`: tracked
-        // balance and real SAC custody both cover the amount before the
-        // debit or any token call.
-        if let Err(e) = Self::require_custody_funds(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        if let Err(e) = Self::debit_and_transfer(&env, wallet_id, &asset, amount, &wallet.owner) {
+        // Same single-read verification and debit as `transfer`: tracked
+        // balance and real SAC custody both cover the amount before any
+        // token call.
+        if let Err(e) = Self::settle_outbound(&env, wallet_id, &asset, amount, &wallet.owner) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -1065,9 +993,10 @@ impl WalletContract {
                 return Err(e);
             }
         };
-        let direct_policy: Option<Address> = env.storage().instance().get(&DataKey::Policy);
-        let direct_budget: Option<Address> = env.storage().instance().get(&DataKey::Budget);
-        let is_registry = env.storage().instance().has(&DataKey::Registry);
+        // `resolve_gates` already falls back to the instance-wired Policy /
+        // Budget addresses whenever the registry path does not apply, so its
+        // result is the gate for both wirings; re-reading `Policy`, `Budget`
+        // and `Registry` here would only repeat instance lookups (Issue #538).
 
         // Phase 1 — verify every action and aggregate its value with checked
         // math so a cumulative overflow is caught before any value moves.
@@ -1090,21 +1019,11 @@ impl WalletContract {
             };
 
             if !action.policy_id.is_empty() {
-                let policy_addr = if is_registry {
-                    match reg_policy.as_ref() {
-                        Some(a) => a,
-                        None => {
-                            Self::unlock(&env);
-                            return Err(Error::InvalidInput);
-                        }
-                    }
-                } else {
-                    match direct_policy.as_ref() {
-                        Some(a) => a,
-                        None => {
-                            Self::unlock(&env);
-                            return Err(Error::InvalidInput);
-                        }
+                let policy_addr = match reg_policy.as_ref() {
+                    Some(a) => a,
+                    None => {
+                        Self::unlock(&env);
+                        return Err(Error::InvalidInput);
                     }
                 };
                 if let Err(e) = Self::require_policy_check(
@@ -1131,21 +1050,11 @@ impl WalletContract {
             }
 
             if !action.budget_id.is_empty() {
-                let budget_addr = if is_registry {
-                    match reg_budget.as_ref() {
-                        Some(a) => a,
-                        None => {
-                            Self::unlock(&env);
-                            return Err(Error::InvalidInput);
-                        }
-                    }
-                } else {
-                    match direct_budget.as_ref() {
-                        Some(a) => a,
-                        None => {
-                            Self::unlock(&env);
-                            return Err(Error::InvalidInput);
-                        }
+                let budget_addr = match reg_budget.as_ref() {
+                    Some(a) => a,
+                    None => {
+                        Self::unlock(&env);
+                        return Err(Error::InvalidInput);
                     }
                 };
                 match BudgetClient::new(&env, budget_addr).try_consume(
@@ -1434,10 +1343,7 @@ impl WalletContract {
     /// Read a wallet's internal balance for an asset (0 if none recorded).
     /// Stays available while the breaker is tripped.
     pub fn balance(env: Env, wallet_id: u64, asset: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Balance(wallet_id, asset))
-            .unwrap_or(0)
+        storage::read_balance(&env, wallet_id, &asset)
     }
 
     /// Read the contract's real on-chain custody of `asset` — the SAC balance
@@ -1500,28 +1406,13 @@ impl WalletContract {
 
     /// Re-entrancy guard: refuse if a wallet entrypoint is already on the stack.
     fn lock(env: &Env) -> Result<(), Error> {
-        let locked: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReentrancyLock)
-            .unwrap_or(false);
-        ensure!(!locked, Error::InvalidState);
-        env.storage()
-            .instance()
-            .set(&DataKey::ReentrancyLock, &true);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        Ok(())
+        storage::acquire_lock(env)
     }
 
+    /// Release the re-entrancy lock without a second instance TTL bump (the
+    /// lock already extended it in this invocation).
     fn unlock(env: &Env) {
-        env.storage()
-            .instance()
-            .set(&DataKey::ReentrancyLock, &false);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        storage::release_lock(env);
     }
 
     /// Resolve Policy and Budget addresses, preferring the Registry when
@@ -1601,6 +1492,9 @@ impl WalletContract {
     /// debit. If registry is configured, addresses are resolved dynamically;
     /// otherwise falls back to instance-wired addresses. A bypassed wallet
     /// skips the policy gate but never the budget or velocity gates.
+    ///
+    /// The wallet's bypass flag is only read once a policy is actually wired,
+    /// so a wallet without a policy gate pays no persistent read for it.
     fn pre_execute_checks(
         env: &Env,
         wallet_id: u64,
@@ -1608,12 +1502,11 @@ impl WalletContract {
         recipient: &Address,
         amount: i128,
         caller: &Address,
-        policy_bypass: bool,
     ) -> Result<(), Error> {
         let (policy_addr, budget_addr) = Self::resolve_gates(env)?;
         // Policy gate (skipped when wallet is bypassed).
         if let Some(policy_addr) = policy_addr.as_ref() {
-            if !policy_bypass {
+            if !storage::policy_bypass(env, wallet_id) {
                 Self::require_policy_check(
                     env,
                     wallet_id,
@@ -1808,23 +1701,15 @@ impl WalletContract {
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage().persistent().extend_ttl(
-            key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+        storage::bump_persistent(env, key);
     }
 
     fn load_wallet(env: &Env, id: u64) -> Result<WalletData, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Wallet(id))
-            .ok_or(Error::NotFound)
+        storage::load_wallet(env, id)
     }
 
     fn store_wallet(env: &Env, id: u64, data: &WalletData) {
-        env.storage().persistent().set(&DataKey::Wallet(id), data);
-        Self::bump_wallet(env, id);
+        storage::store_wallet(env, id, data);
     }
 
     /// Authenticate `caller`, then require it to hold at least `required` on the
@@ -1863,10 +1748,7 @@ impl WalletContract {
     }
 
     fn paused(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        storage::is_paused(env)
     }
 
     /// The circuit breaker guard applied to every value-moving entrypoint.
@@ -1946,71 +1828,42 @@ impl WalletContract {
     }
 
     fn credit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
-        let key = DataKey::Balance(id, asset.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let updated = current.safe_add(amount)?;
-        env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(
-            &key,
-            constants::PERSISTENT_LIFETIME_THRESHOLD,
-            constants::PERSISTENT_BUMP_AMOUNT,
-        );
+        let updated = storage::read_balance(env, id, asset).safe_add(amount)?;
+        storage::write_balance(env, id, asset, updated);
         Ok(())
     }
 
-    /// Debit the wallet's tracked balance and transfer tokens in one atomic
-    /// operation. Combines `debit` and `safe_transfer` to avoid redundant
-    /// balance reads and ensure the tracked balance stays in sync with custody.
-    fn debit_and_transfer(
+    /// Verify, debit and pay out one outbound movement, reading the tracked
+    /// balance exactly once (Issue #538).
+    ///
+    /// Both the wallet's tracked balance for `asset` and the contract's real
+    /// SAC custody must cover `amount` before anything changes:
+    ///
+    /// * the tracked read comes first, so an uninitialized (never-funded)
+    ///   `(wallet, asset)` pair answers [`Error::InsufficientFunds`] exactly
+    ///   like a short balance;
+    /// * the custody read second, so a ledger that drifted above the tokens
+    ///   actually on hand cannot overdraw custody — a condition the token
+    ///   call would otherwise surface as a raw host trap instead of a code.
+    ///
+    /// The balance value read for verification is the one debited, so the
+    /// tracked entry costs one read and one write per movement instead of
+    /// the two reads a separate check-then-debit pass needed. A zero or
+    /// negative amount is refused with [`Error::InvalidAmount`].
+    fn settle_outbound(
         env: &Env,
         wallet_id: u64,
         asset: &Address,
         amount: i128,
         to: &Address,
     ) -> Result<(), Error> {
-        let key = DataKey::Balance(wallet_id, asset.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if current < amount {
-            return Err(Error::InsufficientFunds);
-        }
-        let updated = current.safe_sub(amount)?;
-
-        env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(
-            &key,
-            constants::PERSISTENT_LIFETIME_THRESHOLD,
-            constants::PERSISTENT_BUMP_AMOUNT,
-        );
-
-        safe_transfer(env, asset, &env.current_contract_address(), to, amount)
-    }
-
-    /// Preliminary allowance check for every outbound movement: both the
-    /// wallet's tracked balance for `asset` and the contract's real SAC
-    /// custody must cover `amount` before the spend is approved.
-    ///
-    /// The tracked read comes first so an uninitialized (never-funded)
-    /// `(wallet, asset)` pair answers [`Error::InsufficientFunds`] exactly
-    /// like a short balance, and the custody read second so a ledger that
-    /// drifted above the tokens actually on hand cannot overdraw custody —
-    /// a condition the later token call would otherwise surface as a raw
-    /// host trap instead of a code. A zero or negative amount is refused
-    /// with [`Error::InvalidAmount`]. Pure verification: no state changes.
-    fn require_custody_funds(
-        env: &Env,
-        wallet_id: u64,
-        asset: &Address,
-        amount: i128,
-    ) -> Result<(), Error> {
         require_positive_amount(amount)?;
-        let tracked: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(wallet_id, asset.clone()))
-            .unwrap_or(0);
+        let tracked = storage::read_balance(env, wallet_id, asset);
         validate_sufficient_balance(tracked, amount)?;
         let custody = Self::sac_balance(env, asset)?;
-        validate_sufficient_balance(custody, amount)
+        validate_sufficient_balance(custody, amount)?;
+        storage::write_balance(env, wallet_id, asset, tracked.safe_sub(amount)?);
+        safe_transfer(env, asset, &env.current_contract_address(), to, amount)
     }
 
     /// Query the contract's own SAC balance of `asset` without trapping; a
@@ -2032,17 +1885,11 @@ impl WalletContract {
     }
 
     fn bump_wallet(env: &Env, id: u64) {
-        env.storage().persistent().extend_ttl(
-            &DataKey::Wallet(id),
-            constants::PERSISTENT_LIFETIME_THRESHOLD,
-            constants::PERSISTENT_BUMP_AMOUNT,
-        );
+        storage::bump_wallet(env, id);
     }
 
     fn bump_instance(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        storage::bump_instance(env);
     }
 }
 
