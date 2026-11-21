@@ -3871,7 +3871,10 @@ fn evaluate_policy_names_the_single_transaction_ceiling_rule() {
         Some(PolicyDenialReason::AboveMaxTransactionLimit)
     );
     // The limit breach now maps to its own error code.
-    assert_eq!(decision.reason().unwrap().to_error(), Error::PolicyLimitExceeded);
+    assert_eq!(
+        decision.reason().unwrap().to_error(),
+        Error::PolicyLimitExceeded
+    );
 }
 
 #[test]
