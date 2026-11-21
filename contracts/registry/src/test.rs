@@ -3705,3 +3705,157 @@ fn multi_admin_and_multisig_module_upgrade_authorization() {
     );
     assert_eq!(client.lookup(&org, &ModuleKind::Wallet), mod_v3);
 }
+
+// ---------------------------------------------------------------------------
+// Module address resolution & owner-restricted upgrade routing (Issue #476)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn latest_verified_skips_revoked_versions() {
+    let h = setup_path();
+    let k = ModuleKind::Wallet;
+    assert_eq!(h.client.get_latest_verified(&k), (3, h.v3.clone()));
+
+    // Revoking v3's hash leaves `get_latest` on v3 but the verified view
+    // falls back to the newest version that still verifies.
+    h.client.remove_approved_wasm(&h.admin, &k, &h.h3);
+    assert_eq!(h.client.get_latest(&k), h.v3);
+    assert_eq!(h.client.get_latest_verified(&k), (2, h.v2.clone()));
+
+    h.client.remove_approved_wasm(&h.admin, &k, &h.h2);
+    assert_eq!(h.client.get_latest_verified(&k), (1, h.v1.clone()));
+
+    // Re-approval restores the newest version.
+    h.client.add_approved_wasm(&h.admin, &k, &h.h3);
+    assert_eq!(h.client.get_latest_verified(&k), (3, h.v3.clone()));
+}
+
+#[test]
+fn latest_verified_is_not_found_when_nothing_verifies() {
+    let h = setup_path();
+    // A kind with no published versions at all.
+    assert_eq!(
+        h.client.try_get_latest_verified(&ModuleKind::Escrow),
+        Err(Ok(Error::NotFound))
+    );
+    // Every published Wallet version revoked.
+    for seed in 1..=3u8 {
+        let hash = BytesN::from_array(&h.env, &[seed; 32]);
+        h.client
+            .remove_approved_wasm(&h.admin, &ModuleKind::Wallet, &hash);
+    }
+    assert_eq!(
+        h.client.try_get_latest_verified(&ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+/// The walk is bounded: a verified version further than the lookback window
+/// below the latest is not reached, and the answer is a deterministic
+/// `NotFound` instead of an unbounded scan.
+#[test]
+fn latest_verified_walk_is_bounded() {
+    let (env, client, admin) = setup();
+    let k = ModuleKind::Policy;
+    let good = approved_hash(&env, &client, &admin, k, 1);
+    let bad = approved_hash(&env, &client, &admin, k, 2);
+    let old = impl_address(&env);
+    client.register_version(&admin, &k, &1, &old, &good);
+    let far = crate::MAX_VERIFIED_LOOKBACK + 1;
+    client.register_version(&admin, &k, &far, &impl_address(&env), &bad);
+    client.remove_approved_wasm(&admin, &k, &bad);
+
+    assert_eq!(client.try_get_latest_verified(&k), Err(Ok(Error::NotFound)));
+
+    // A verified version inside the window is found.
+    let near = impl_address(&env);
+    client.register_version(&admin, &k, &(far - 1), &near, &good);
+    assert_eq!(client.get_latest_verified(&k), (far - 1, near));
+}
+
+/// Unregistered organizations and modules answer with deterministic codes on
+/// every read and write path.
+#[test]
+fn unregistered_modules_return_deterministic_errors() {
+    let h = setup_path();
+    let ghost_org = String::from_str(&h.env, "ghost");
+    let k = ModuleKind::Treasury; // never registered for `acme`
+
+    assert_eq!(h.client.try_lookup(&h.org, &k), Err(Ok(Error::NotFound)));
+    assert_eq!(
+        h.client.try_get_module_address(&h.org, &k),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_get_module_version(&h.org, &k),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_lookup(&ghost_org, &ModuleKind::Wallet),
+        Err(Ok(Error::NotFound))
+    );
+    // Writes against an unknown org are NotFound, never a silent success.
+    assert_eq!(
+        h.client
+            .try_register_module(&h.admin, &ghost_org, &k, &impl_address(&h.env)),
+        Err(Ok(Error::NotFound))
+    );
+    // Upgrading a module that was never registered is NotFound too; the
+    // versioned registration path is how a module starts.
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Policy, &1),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+/// Only the org owner, the protocol admin, or a delegated role that reaches
+/// the module kind may route an upgrade; everyone else is refused and the
+/// module stays exactly where it was.
+#[test]
+fn unauthorized_upgrade_attempts_are_rejected() {
+    let h = setup_path();
+    let k = ModuleKind::Wallet;
+    let stranger = Address::generate(&h.env);
+    let policy_mgr = Address::generate(&h.env);
+    h.client
+        .grant_role(&h.owner, &h.org, &policy_mgr, &RegistryRole::PolicyManager);
+
+    for intruder in [&stranger, &policy_mgr] {
+        assert_eq!(
+            h.client.try_upgrade_module(intruder, &h.org, &k, &2),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            h.client
+                .try_register_module_version(intruder, &h.org, &k, &3),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            h.client
+                .try_register_module(intruder, &h.org, &k, &impl_address(&h.env)),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            h.client.try_remove_module(intruder, &h.org, &k),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+    assert_eq!(pointed_at(&h), h.v1);
+    assert_eq!(pin(&h), 0);
+
+    // The owner routes the upgrade; a delegated upgrader may continue it.
+    assert_eq!(h.client.upgrade_module(&h.owner, &h.org, &k, &2), 2);
+    let upgrader = Address::generate(&h.env);
+    h.client
+        .grant_role(&h.owner, &h.org, &upgrader, &RegistryRole::ModuleUpgrader);
+    assert_eq!(h.client.upgrade_module(&upgrader, &h.org, &k, &3), 3);
+    assert_eq!(pointed_at(&h), h.v3);
+
+    // A revoked delegation loses the capability immediately.
+    h.client.revoke_role(&h.owner, &h.org, &upgrader);
+    assert_eq!(
+        h.client.try_remove_module(&upgrader, &h.org, &k),
+        Err(Ok(Error::Unauthorized))
+    );
+}

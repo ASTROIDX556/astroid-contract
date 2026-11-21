@@ -1030,30 +1030,16 @@ impl EscrowContract {
                 (id, caller, claimable),
             );
             Ok(claimable)
-        } else if matches!(escrow.state, EscrowState::Created) {
+        } else {
+            // `Created`: the escrow was initialized but never funded, so the
+            // contract holds nothing for it. Settling it here would mark it
+            // `Released` with zero value moved — permanently blocking the
+            // sender's `fund` call — and announce transfers that never
+            // happened. The time lock is still reported first so a premature
+            // claim keeps its familiar `TimeLockActive` code.
             if now < Self::grace_end(&escrow)? {
                 return Err(Error::TimeLockActive);
             }
-            Self::require_release_approvals(&env, id)?;
-            escrow.state = EscrowState::Released;
-            store_escrow(&env, id, &escrow);
-            let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
-            Self::transfer_all(&env, &escrow, &escrow.recipient, remaining)?;
-            for a in escrow.assets.iter() {
-                events::transfer_executed(
-                    &env,
-                    &escrow.sender,
-                    &escrow.recipient,
-                    &a.asset,
-                    a.amount,
-                );
-            }
-            env.events().publish(
-                (symbol_short!("escrow"), symbol_short!("claimed")),
-                (id, caller, escrow.funded_amount),
-            );
-            Ok(escrow.funded_amount)
-        } else {
             Err(Error::InvalidState)
         }
     }

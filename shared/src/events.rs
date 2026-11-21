@@ -650,6 +650,38 @@ pub fn budget_exceeded(env: &Env, budget_id: &String, requested: i128, remaining
         .publish(topics, (budget_id.clone(), requested, remaining));
 }
 
+/// `BudgetExhausted` — topic `("budget", "exhausted")`.
+///
+/// Published by a *successful* spend that leaves the current period with no
+/// headroom (`remaining <= 0`). Unlike [`budget_exceeded`], which accompanies a
+/// refused spend whose invocation reverts (and whose events are therefore
+/// discarded by the host), this event is durable: an indexer sees the moment a
+/// budget ran dry. `token` is `None` for the budget-level allowance and
+/// `Some(asset)` for a per-asset limit.
+pub fn budget_exhausted(
+    env: &Env,
+    budget_id: &String,
+    token: Option<Address>,
+    spent: i128,
+    capacity: i128,
+) {
+    let topics = (symbol_short!("budget"), symbol_short!("exhausted"));
+    env.events()
+        .publish(topics, (budget_id.clone(), token, spent, capacity));
+}
+
+/// `BudgetReplenished` — topic `("budget", "replenish")`.
+///
+/// Published whenever fresh allowance becomes spendable: a period rollover
+/// that re-arms the window, or an explicit owner top-up. `available` is the
+/// headroom the budget (or per-asset limit, when `token` is `Some`) holds
+/// immediately afterwards.
+pub fn budget_replenished(env: &Env, budget_id: &String, token: Option<Address>, available: i128) {
+    let topics = (symbol_short!("budget"), symbol_short!("replenish"));
+    env.events()
+        .publish(topics, (budget_id.clone(), token, available));
+}
+
 /// `PolicyViolation` — topic `("policy", "violation")`.
 pub fn policy_violation(env: &Env, policy_id: &String, reason: Symbol) {
     let topics = (symbol_short!("policy"), symbol_short!("violation"));
