@@ -33,6 +33,8 @@ pub mod policy_test;
 #[cfg(test)]
 pub mod policy_workflow;
 #[cfg(test)]
+pub mod proposal_integration;
+#[cfg(test)]
 pub mod proposal_timelock;
 #[cfg(test)]
 pub mod proposal_to_wallet_execution;
