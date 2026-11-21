@@ -1808,12 +1808,12 @@ fn only_the_owner_can_manage_the_blacklist() {
 
     assert_eq!(
         p.try_add_asset_blacklist(&stranger, &pid, &asset),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     p.add_asset_blacklist(&owner, &pid, &asset);
     assert_eq!(
         p.try_remove_asset_blacklist(&stranger, &pid, &asset),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
 }
 
@@ -2025,7 +2025,7 @@ fn duplicate_entries_cannot_split_past_the_per_transfer_max() {
             &recip,
             &vec![&env, entry(&asset, 600_000), entry(&asset, 400_001)]
         ),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::PolicyLimitExceeded))
     );
     assert_eq!(
         p.try_check_multi_asset_transfer(
@@ -2219,16 +2219,16 @@ fn only_the_owner_can_record_spend() {
     // A non-owner cannot burn the owner's allowance through either path.
     assert_eq!(
         p.try_record_multi_asset_spend(&stranger, &pid, &recip, &vec![&env, entry(&asset, 1_000)]),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         p.try_update_allowance(&stranger, &pid, &asset, &1_000),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(spent(&env, &p, &asset), 0);
     assert_eq!(
         p.try_set_recurring_allowance(&stranger, &pid, &asset, &1, &60, &0),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
 }
 
@@ -2783,15 +2783,15 @@ fn multi_rule_only_the_owner_can_manage_the_stack() {
     let tree = single_amount_tree(RuleOp::MaxAmount, 10, &env);
     assert_eq!(
         p.try_add_policy_rule(&stranger, &pid, &tree),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         p.try_remove_policy_rule(&stranger, &pid, &0),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         p.try_clear_policy_rules(&stranger, &pid),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
 
     // The owner's own stack is untouched by the rejected attempts.
@@ -3168,15 +3168,15 @@ fn non_owner_cannot_manage_whitelist() {
 
     assert_eq!(
         p.try_set_recipient_whitelist_enabled(&intruder, &pid, &true),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         p.try_add_recipient_to_whitelist(&intruder, &pid, &target),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         p.try_remove_recipient_from_whitelist(&intruder, &pid, &target),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     // The rejected attempts left the directory untouched.
     assert!(p.get_recipient_whitelist(&pid).is_empty());
@@ -3396,7 +3396,7 @@ fn whitelist_and_scalar_gates_are_conjunctive() {
     // Listed but over the cap: still denied by the scalar gate.
     assert_eq!(
         p.try_check_transfer(&pid, &asset, &vendor, &101),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::PolicyLimitExceeded))
     );
     // Within the cap but unlisted: denied by the whitelist gate.
     assert_eq!(
@@ -3758,7 +3758,7 @@ fn set_rule_combination_strategy_requires_owner() {
             &pid,
             &crate::PolicyCombinationStrategy::Any
         ),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
 
     // Owner can change strategy
@@ -3870,8 +3870,8 @@ fn evaluate_policy_names_the_single_transaction_ceiling_rule() {
         decision.reason(),
         Some(PolicyDenialReason::AboveMaxTransactionLimit)
     );
-    // The collapsed code is unchanged: existing callers still see PolicyDenied.
-    assert_eq!(decision.reason().unwrap().to_error(), Error::PolicyDenied);
+    // The limit breach now maps to its own error code.
+    assert_eq!(decision.reason().unwrap().to_error(), Error::PolicyLimitExceeded);
 }
 
 #[test]
@@ -4062,7 +4062,7 @@ fn evaluate_policy_reports_each_rule_exactly_once() {
     let before = env.events().all().len();
     assert_eq!(
         p.try_check_transfer(&policy_id, &asset, &recipient, &1_000_001),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::PolicyLimitExceeded))
     );
     let enforced = env.events().all().len() - before;
     assert_eq!(
@@ -4309,7 +4309,7 @@ fn window_config_requires_the_policy_owner() {
 
     assert_eq!(
         p.try_set_transfer_window(&stranger, &pid, &0, &100, &SECONDS_PER_DAY),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     // The configured window is untouched by the rejected call.
     assert_eq!(
@@ -4449,7 +4449,7 @@ fn enable_toggles_emit_standardized_events_with_identifiers_and_timestamp() {
     let stranger = Address::generate(&env);
     assert_eq!(
         p.try_set_enabled(&stranger, &policy_id, &false),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(event_count(&env, "policy", "enabled"), 2);
 }

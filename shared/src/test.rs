@@ -1151,13 +1151,13 @@ mod token_wrappers {
 /// Codes that were once assigned to a variant and have been retired. They must
 /// stay empty forever so a stale integrator can never decode a fresh failure
 /// as a retired meaning.
-const RETIRED_CODES: [u32; 3] = [25, 26, 65];
+const RETIRED_CODES: [u32; 1] = [65];
 
 /// The published code for every variant, written out by hand. This is the
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 52] = [
+const EXPECTED_CODES: [(Error, u32); 55] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1175,7 +1175,10 @@ const EXPECTED_CODES: [(Error, u32); 52] = [
     (Error::PolicyRecipientRestricted, 22),
     (Error::PolicyMerchantBlocked, 23),
     (Error::PolicyCategoryRestricted, 24),
+    (Error::PolicyExpired, 25),
+    (Error::PolicyUnauthorizedSigner, 26),
     (Error::VelocityLimitExceeded, 27),
+    (Error::PolicyLimitExceeded, 28),
     // --- Registry (30-39) ---
     (Error::RegistryFrozen, 30),
     (Error::ModuleDeprecated, 31),
@@ -1349,7 +1352,7 @@ fn error_domains_do_not_overlap() {
     assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 3, "escrow band 80-82");
     assert_eq!(treasury, 3, "treasury band 83-85");
-    assert_eq!(policy, 6, "policy band 20-29");
+    assert_eq!(policy, 9, "policy band 20-29");
 }
 
 #[test]

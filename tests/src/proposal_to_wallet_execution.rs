@@ -542,7 +542,7 @@ fn governance_can_suspend_and_restore_the_execution_path() {
     // that can switch it off. An outsider cannot.
     let policy_id = string(&h, POLICY_ID);
     let res = h.policy.try_set_enabled(&h.admin, &policy_id, &false);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(res, Err(Ok(Error::PolicyUnauthorizedSigner)));
     h.policy
         .set_enabled(&h.multisig.address, &policy_id, &false);
     assert!(!h.policy.get(&policy_id).enabled);

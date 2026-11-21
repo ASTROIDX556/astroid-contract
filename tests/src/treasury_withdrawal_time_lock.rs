@@ -272,7 +272,7 @@ fn parking_does_not_let_a_payout_escape_policy() {
     h.warp(T0 + MIN_TIMELOCK_DELAY);
     assert_eq!(
         h.treasury.try_execute_withdrawal(&h.admin, &id),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::PolicyLimitExceeded))
     );
     assert_eq!(h.ledger(), before, "a policy refusal must move nothing");
 
