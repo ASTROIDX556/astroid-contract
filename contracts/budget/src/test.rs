@@ -3358,3 +3358,252 @@ fn batch_spend_respects_a_scheduled_budgets_start_gate() {
         400
     );
 }
+
+// ---------------------------------------------------------------------------
+// Funding, exhaustion & replenishment events (Issue #475)
+// ---------------------------------------------------------------------------
+
+/// Data payloads of every `("budget", <action>)` event published by the most
+/// recent invocation.
+fn budget_events(env: &Env, action: &str) -> std::vec::Vec<Val> {
+    let ns: Val = Symbol::new(env, "budget").into_val(env);
+    let act: Val = Symbol::new(env, action).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_c, topics, _d)| topics.len() == 2 && topics.contains(ns) && topics.contains(act))
+        .map(|(_c, _t, data)| data)
+        .collect()
+}
+
+#[test]
+fn fund_tops_up_the_current_period_and_emits_replenish() {
+    let h = setup();
+    allocate(&h, "ops", 1_000, Period::Daily, false);
+    h.client.consume(&h.owner, &id(&h.env, "ops"), &1_000);
+    assert_eq!(h.client.remaining(&id(&h.env, "ops")), 0);
+
+    let new_limit = h.client.fund(&h.owner, &id(&h.env, "ops"), &500);
+    let replenish = budget_events(&h.env, "replenish");
+    assert_eq!(budget_events(&h.env, "funded").len(), 1);
+    assert_eq!(replenish.len(), 1);
+    let (bid, token, available): (String, Option<Address>, i128) = replenish[0].into_val(&h.env);
+    assert_eq!(bid, id(&h.env, "ops"));
+    assert_eq!(token, None);
+    assert_eq!(available, 500);
+
+    assert_eq!(new_limit, 1_500);
+    assert_eq!(h.client.get(&id(&h.env, "ops")).limit, 1_500);
+    assert_eq!(h.client.remaining(&id(&h.env, "ops")), 500);
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "ops"), &500), 0);
+}
+
+#[test]
+fn fund_is_owner_gated_and_validates_amount() {
+    let h = setup();
+    allocate(&h, "ops", 1_000, Period::None, false);
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_fund(&stranger, &id(&h.env, "ops"), &100),
+        Err(Ok(Error::Unauthorized))
+    );
+    for bad in [0_i128, -1] {
+        assert_eq!(
+            h.client.try_fund(&h.owner, &id(&h.env, "ops"), &bad),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+    assert_eq!(
+        h.client.try_fund(&h.owner, &id(&h.env, "missing"), &100),
+        Err(Ok(Error::NotFound))
+    );
+    h.client.archive(&h.owner, &id(&h.env, "ops"));
+    assert_eq!(
+        h.client.try_fund(&h.owner, &id(&h.env, "ops"), &100),
+        Err(Ok(Error::BudgetArchived))
+    );
+}
+
+#[test]
+fn fund_overflow_is_reported_not_wrapped() {
+    let h = setup();
+    allocate(&h, "ops", i128::MAX, Period::None, false);
+    assert_eq!(
+        h.client.try_fund(&h.owner, &id(&h.env, "ops"), &1),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(h.client.get(&id(&h.env, "ops")).limit, i128::MAX);
+}
+
+/// A spend that drains the period publishes a durable `exhausted` event; one
+/// that leaves headroom does not.
+#[test]
+fn spend_that_drains_the_budget_emits_exhausted() {
+    let h = setup();
+    allocate(&h, "agent", 1_000, Period::Daily, false);
+
+    h.client.consume(&h.owner, &id(&h.env, "agent"), &400);
+    assert!(budget_events(&h.env, "exhausted").is_empty());
+
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "agent"), &600), 0);
+    let ev = budget_events(&h.env, "exhausted");
+    assert_eq!(ev.len(), 1);
+    let (bid, token, spent, capacity): (String, Option<Address>, i128, i128) =
+        ev[0].into_val(&h.env);
+    assert_eq!(bid, id(&h.env, "agent"));
+    assert_eq!(token, None);
+    assert_eq!(spent, 1_000);
+    assert_eq!(capacity, 1_000);
+
+    // Further spend is refused with the shared BUDGET_EXCEEDED code and does
+    // not move the counter.
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "agent"), &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    assert_eq!(
+        BudgetError::BudgetExceeded as u32,
+        Error::BudgetExceeded as u32
+    );
+    assert_eq!(h.client.get(&id(&h.env, "agent")).spent, 1_000);
+}
+
+/// Exhaust a daily budget, cross the boundary, and the next spend first
+/// replenishes the window (with an event) and then succeeds.
+#[test]
+fn rollover_after_exhaustion_emits_replenish_and_restores_allowance() {
+    let h = setup();
+    allocate(&h, "agent", 1_000, Period::Daily, false);
+    h.client.consume(&h.owner, &id(&h.env, "agent"), &1_000);
+
+    h.env.ledger().set_timestamp(1_000 + DAY - 1);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "agent"), &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "agent"), &250), 750);
+    let ev = budget_events(&h.env, "replenish");
+    assert_eq!(ev.len(), 1);
+    let (_bid, token, available): (String, Option<Address>, i128) = ev[0].into_val(&h.env);
+    assert_eq!(token, None);
+    assert_eq!(available, 1_000);
+
+    // The next window re-arms the full allowance again.
+    h.env.ledger().set_timestamp(1_000 + 2 * DAY);
+    assert_eq!(h.client.remaining(&id(&h.env, "agent")), 1_000);
+}
+
+#[test]
+fn per_asset_limit_emits_exhausted_and_replenish() {
+    let h = setup();
+    allocate(&h, "agent", 10_000, Period::None, false);
+    let usdc = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "agent"), &usdc, &300, &DAY);
+
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "agent"), &usdc, &300);
+    let ev = budget_events(&h.env, "exhausted");
+    assert_eq!(ev.len(), 1);
+    let (_bid, token, spent, capacity): (String, Option<Address>, i128, i128) =
+        ev[0].into_val(&h.env);
+    assert_eq!(token, Some(usdc.clone()));
+    assert_eq!((spent, capacity), (300, 300));
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "agent"), &usdc, &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    h.client
+        .check_and_record_spend(&h.owner, &id(&h.env, "agent"), &usdc, &100);
+    let ev = budget_events(&h.env, "replenish");
+    assert_eq!(ev.len(), 1);
+    let (_bid, token, available): (String, Option<Address>, i128) = ev[0].into_val(&h.env);
+    assert_eq!(token, Some(usdc));
+    assert_eq!(available, 300);
+}
+
+/// Regression: the batch path used to check each leg against the bare limit,
+/// refusing a spend of banked rollover credit that the single-leg path
+/// accepts. Both paths now share one ceiling.
+#[test]
+fn batch_spend_honours_rollover_credit_like_single_spend() {
+    let h = setup();
+    allocate(&h, "agent", 100_000, Period::None, false);
+    let usdc = Address::generate(&h.env);
+    let xlm = Address::generate(&h.env);
+    for token in [&usdc, &xlm] {
+        h.client.set_budget_limit_with_rollover(
+            &h.owner,
+            &id(&h.env, "agent"),
+            token,
+            &1_000,
+            &DAY,
+            &true,
+            &5_000, // carry 50% of unspent
+            &0,
+        );
+    }
+    // Leave the first window untouched: 500 credit banks for each token.
+    h.env.ledger().set_timestamp(1_000 + DAY);
+
+    h.client.check_and_record_batch_spend(
+        &h.owner,
+        &id(&h.env, "agent"),
+        &vec![
+            &h.env,
+            AssetSpend {
+                token: usdc.clone(),
+                amount: 1_500,
+            },
+            AssetSpend {
+                token: xlm.clone(),
+                amount: 1_200,
+            },
+        ],
+    );
+    // usdc hit its full 1_500 capacity; xlm still has headroom.
+    let ev = budget_events(&h.env, "exhausted");
+    assert_eq!(ev.len(), 1);
+    let (_bid, token, _spent, capacity): (String, Option<Address>, i128, i128) =
+        ev[0].into_val(&h.env);
+    assert_eq!(token, Some(usdc.clone()));
+    assert_eq!(capacity, 1_500);
+
+    assert_eq!(
+        h.client.get_asset_budget(&id(&h.env, "agent"), &usdc).spent,
+        1_500
+    );
+    assert_eq!(
+        h.client.get_asset_budget(&id(&h.env, "agent"), &xlm).spent,
+        1_200
+    );
+
+    // Beyond limit + credit the batch is still refused atomically.
+    assert_eq!(
+        h.client.try_check_and_record_batch_spend(
+            &h.owner,
+            &id(&h.env, "agent"),
+            &vec![
+                &h.env,
+                AssetSpend {
+                    token: xlm.clone(),
+                    amount: 300
+                },
+                AssetSpend {
+                    token: usdc.clone(),
+                    amount: 1
+                },
+            ],
+        ),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    assert_eq!(
+        h.client.get_asset_budget(&id(&h.env, "agent"), &xlm).spent,
+        1_200
+    );
+}

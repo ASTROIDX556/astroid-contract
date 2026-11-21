@@ -3332,3 +3332,197 @@ fn escrow_locked_gates_the_signature_override_too() {
     h.client.override_release(&id, &nonce, &sigs);
     assert_eq!(h.client.get(&id).state, EscrowState::Released);
 }
+
+// --- Time-lock release & expiry refunds (Issue #474) ---
+
+/// A time-locked escrow pays out at exactly `unlock_time` and not one second
+/// earlier: the ledger clock is the only release condition.
+#[test]
+fn timelock_claim_boundary_is_inclusive_at_unlock_time() {
+    let h = setup(5_000, 0);
+    let unlock = START + 500;
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &unlock,
+        &String::from_str(&h.env, "boundary"),
+    );
+    let stored = h.client.get(&id);
+    assert_eq!(stored.sender, h.sender);
+    assert_eq!(stored.recipient, h.recipient);
+    assert_eq!(stored.funded_amount, 5_000);
+    assert_eq!(stored.schedule.cliff_time, unlock);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+
+    h.env.ledger().with_mut(|l| l.timestamp = unlock - 1);
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &1),
+        Err(Ok(Error::TimeLockActive))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+
+    h.env.ledger().with_mut(|l| l.timestamp = unlock);
+    assert_eq!(h.client.claim(&h.recipient, &id), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+}
+
+/// `create_timelock` refuses an unlock time that is not strictly in the future.
+#[test]
+fn timelock_creation_rejects_non_future_unlock_time() {
+    let h = setup(5_000, 0);
+    for unlock in [START - 1, START] {
+        assert_eq!(
+            h.client.try_create_timelock(
+                &h.sender,
+                &h.recipient,
+                &h.arbiter,
+                &one_asset(&h, 5_000),
+                &unlock,
+                &String::from_str(&h.env, "past"),
+            ),
+            Err(Ok(Error::InvalidInput))
+        );
+    }
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+}
+
+/// Nobody can pull funds out of a time lock early: the arbiter is refused by
+/// the release clock, every other party by identity.
+#[test]
+fn timelock_unauthorized_and_early_release_attempts_are_rejected() {
+    let h = setup(5_000, 0);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 500),
+        &String::from_str(&h.env, "early"),
+    );
+    let intruder = Address::generate(&h.env);
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+
+    assert_eq!(
+        h.client.try_release(&h.arbiter, &id, &5_000),
+        Err(Ok(Error::EscrowLocked))
+    );
+    assert_eq!(
+        h.client.try_release(&intruder, &id, &5_000),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.sender, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_refund_timelock(&h.recipient, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_refund_timelock(&h.sender, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+}
+
+/// Regression: an escrow that was initialized but never funded holds nothing,
+/// so the beneficiary cannot "claim" it after unlock. Previously this marked
+/// the escrow `Released` with zero value moved, which also locked the sender
+/// out of funding it.
+#[test]
+fn unfunded_timelock_cannot_be_claimed_and_stays_fundable() {
+    let h = setup(5_000, 0);
+    let unlock = START + 500;
+    let id = h.client.initialize_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &unlock,
+        &0,
+        &String::from_str(&h.env, "unfunded"),
+    );
+
+    h.env.ledger().with_mut(|l| l.timestamp = unlock - 1);
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    h.env.ledger().with_mut(|l| l.timestamp = unlock + 10);
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Created);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+
+    // The sender can still fund it, after which the matured lock pays out.
+    h.client.fund(&h.sender, &id);
+    assert_eq!(h.client.claim(&h.recipient, &id), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+}
+
+/// A time lock that expires without the beneficiary claiming is refundable to
+/// its creator exactly once, after which the beneficiary has nothing to claim.
+#[test]
+fn expired_timelock_refunds_creator_once_and_blocks_late_claim() {
+    let h = setup(5_000, 0);
+    let unlock = START + 500;
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &unlock,
+        &String::from_str(&h.env, "expiry"),
+    );
+
+    h.env.ledger().with_mut(|l| l.timestamp = unlock + 1);
+    h.client.refund_timelock(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+
+    assert_eq!(
+        h.client.try_refund_timelock(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+}
+
+/// An unfunded time lock that lapses can be closed out by its creator without
+/// any token movement.
+#[test]
+fn unfunded_expired_timelock_refund_moves_no_tokens() {
+    let h = setup(5_000, 0);
+    let unlock = START + 500;
+    let id = h.client.initialize_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &unlock,
+        &0,
+        &String::from_str(&h.env, "lapsed"),
+    );
+    h.env.ledger().with_mut(|l| l.timestamp = unlock);
+    h.client.refund_timelock(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}

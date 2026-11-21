@@ -713,6 +713,40 @@ impl BudgetContract {
         );
         Ok(())
     }
+    /// Fund (top up) a budget: raise its per-period `limit` by `amount`.
+    ///
+    /// Owner-gated, and refused on an archived budget. `amount` must be
+    /// strictly positive and the new limit is computed with checked math, so
+    /// a top-up can never wrap. Any pending period transition is applied
+    /// first, so the extra allowance lands in the *current* window. Emits
+    /// `("budget", "funded")`, the canonical `BudgetUpdated`, and
+    /// `("budget", "replenish")` with the headroom now available. Returns the
+    /// new limit.
+    pub fn fund(env: Env, caller: Address, budget_id: String, amount: i128) -> Result<i128, Error> {
+        require_positive_amount(amount)?;
+        let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
+        Self::require_not_archived(&budget)?;
+        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        budget.limit = checked_add(budget.limit, amount)?;
+        Self::store(&env, &budget_id, &budget);
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("funded")),
+            (budget_id.clone(), amount, budget.limit),
+        );
+        events::publish(
+            &env,
+            ContractEvent::BudgetUpdated {
+                budget_id: budget_id.clone(),
+                action: symbol_short!("funded"),
+                amount,
+            },
+        );
+        let available = Self::effective_remaining(&budget)
+            .unwrap_or(i128::MAX)
+            .max(0);
+        events::budget_replenished(&env, &budget_id, None, available);
+        Ok(budget.limit)
+    }
     /// Freeze a budget (owner-gated). Frozen budgets reject consumption.
     pub fn freeze(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
@@ -1008,11 +1042,7 @@ impl BudgetContract {
         Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &token, true);
 
         // Check if within limit (accounting for any rollover credit)
-        let capacity = if asset_budget.rollover_enabled {
-            checked_add(asset_budget.limit, asset_budget.rollover_credit)?
-        } else {
-            asset_budget.limit
-        };
+        let capacity = Self::asset_capacity(&asset_budget)?;
         let new_spent = checked_add(asset_budget.spent, amount)?;
         if new_spent > capacity {
             return Err(BudgetError::BudgetExceeded);
@@ -1024,6 +1054,9 @@ impl BudgetContract {
             (symbol_short!("budget"), symbol_short!("ast_spend")),
             (budget_id.clone(), token.clone(), amount),
         );
+        if new_spent >= capacity {
+            events::budget_exhausted(&env, &budget_id, Some(token.clone()), new_spent, capacity);
+        }
         events::publish(
             &env,
             ContractEvent::BudgetUpdated {
@@ -1092,8 +1125,11 @@ impl BudgetContract {
                 .ok_or(Error::AssetNotAuthorized)?;
             Self::asset_window_transition(&env, &mut asset_budget, &budget_id, &spend.token, true);
 
+            // Same ceiling as the single-leg path: the base limit plus any
+            // rollover credit banked from earlier windows. Checking against
+            // the bare limit refused spends `check_and_record_spend` accepts.
             let new_spent = checked_add(asset_budget.spent, spend.amount)?;
-            if new_spent > asset_budget.limit {
+            if new_spent > Self::asset_capacity(&asset_budget)? {
                 return Err(BudgetError::BudgetExceeded);
             }
             asset_budget.spent = new_spent;
@@ -1112,6 +1148,17 @@ impl BudgetContract {
                 (symbol_short!("budget"), symbol_short!("ast_spend")),
                 (budget_id.clone(), spend.token.clone(), spend.amount),
             );
+            let leg = settled.get(i).unwrap();
+            let capacity = Self::asset_capacity(&leg)?;
+            if leg.spent >= capacity {
+                events::budget_exhausted(
+                    &env,
+                    &budget_id,
+                    Some(spend.token.clone()),
+                    leg.spent,
+                    capacity,
+                );
+            }
             events::publish(
                 &env,
                 ContractEvent::BudgetUpdated {
@@ -1556,6 +1603,15 @@ impl BudgetContract {
                     amount: checked_sub(capacity, spent)?,
                 },
             );
+            // The window re-armed: announce the headroom now spendable so a
+            // consumer that saw `exhausted` knows the agent may spend again.
+            // Informational only: a capacity beyond `i128::MAX` saturates
+            // rather than failing the transition (the overflow is reported by
+            // whichever spend or view actually needs the exact figure).
+            let available = Self::effective_remaining(budget)
+                .unwrap_or(i128::MAX)
+                .max(0);
+            events::budget_replenished(env, budget_id, None, available);
         }
         Ok(())
     }
@@ -1625,6 +1681,7 @@ impl BudgetContract {
                 asset_budget.limit
             };
             Self::emit_asset_reset(env, budget_id, token, amount);
+            events::budget_replenished(env, budget_id, Some(token.clone()), amount);
         }
     }
 
@@ -1664,6 +1721,16 @@ impl BudgetContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+    /// Spendable ceiling of a per-asset limit in its current window: the base
+    /// limit plus banked rollover credit when rollover is enabled. Shared by
+    /// the single and batch spend paths so they can never disagree.
+    fn asset_capacity(asset_budget: &AssetBudget) -> Result<i128, Error> {
+        if asset_budget.rollover_enabled {
+            checked_add(asset_budget.limit, asset_budget.rollover_credit)
+        } else {
+            Ok(asset_budget.limit)
+        }
     }
     fn bump_asset(env: &Env, budget_id: &String, token: &Address) {
         env.storage().persistent().extend_ttl(
@@ -1714,8 +1781,9 @@ impl BudgetInterface for BudgetContract {
                 let remaining = checked_sub(capacity, new_spent)?;
                 env.events().publish(
                     (symbol_short!("budget"), symbol_short!("consumed")),
-                    (budget_id, amount, remaining),
+                    (budget_id.clone(), amount, remaining),
                 );
+                events::budget_exhausted(&env, &budget_id, None, new_spent, capacity);
                 return Ok(remaining);
             }
             let remaining = checked_sub(ceiling, budget.spent)?;
@@ -1727,8 +1795,11 @@ impl BudgetInterface for BudgetContract {
         let remaining = checked_sub(ceiling, budget.spent)?;
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("consumed")),
-            (budget_id, amount, remaining),
+            (budget_id.clone(), amount, remaining),
         );
+        if remaining <= 0 {
+            events::budget_exhausted(&env, &budget_id, None, budget.spent, ceiling);
+        }
         Ok(remaining)
     }
     /// Credit `amount` back to the budget (a refunded or cancelled spend).
