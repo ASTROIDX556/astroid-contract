@@ -252,6 +252,15 @@ pub enum ContractEvent {
         action: Symbol,
         amount: i128,
     },
+    /// A budget period rolled over: unspent allowance carried into the next period
+    /// (or reset when rollover is disabled). This is the canonical rollover event
+    /// off-chain consumers should index for period-boundary tracking.
+    BudgetRollover {
+        budget_id: String,
+        periods_elapsed: u64,
+        carry_over: i128,
+        new_window_start: u64,
+    },
     /// A policy rejected a transfer.
     PolicyViolation { policy_id: String, reason: Symbol },
     /// An escrow was created and funded: custody of the listed assets moved
@@ -518,6 +527,17 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "BudgetUpdated"),),
                 (budget_id, action, amount),
+            );
+        }
+        ContractEvent::BudgetRollover {
+            budget_id,
+            periods_elapsed,
+            carry_over,
+            new_window_start,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "BudgetRollover"),),
+                (budget_id, periods_elapsed, carry_over, new_window_start),
             );
         }
         ContractEvent::PolicyViolation { policy_id, reason } => {

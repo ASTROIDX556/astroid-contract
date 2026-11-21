@@ -544,7 +544,7 @@ fn budget_exhaustion_blocks_treasury_withdrawal() {
     let res = h
         .treasury
         .try_withdraw(&h.admin, &h.asset, &h.recipient, &1_000);
-    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(Error::BudgetLimitReached)));
     assert_eq!(h.treasury.holding(&h.asset).total_out, 0);
     assert_eq!(token_balance(&h, &h.recipient), 0);
 }

@@ -123,6 +123,12 @@ pub enum Error {
     /// ceiling. Nothing moves; the spend may succeed once older volume ages
     /// out of the window.
     VelocityLimitExceeded = 27,
+    /// A policy constraint was not satisfied: the transaction violates a
+    /// configured rule (e.g. recipient not whitelisted, asset not allowed,
+    /// category restricted, amount exceeds limit). This provides a more
+    /// specific error than [`Error::PolicyDenied`] for off-chain consumers
+    /// to distinguish policy constraint violations from a disabled/expired policy.
+    PolicyConstraintUnmet = 28,
 
     // --- Registry (30-39) ---
     /// The protocol registry is frozen: every mutating registry entrypoint
@@ -165,6 +171,16 @@ pub enum Error {
     /// authorizes spend. Distinct from
     /// [`BudgetError::BudgetNotActive`], which is the *not yet started* case.
     BudgetExpired = 44,
+    /// The budget's active period has ended and a new period has begun: the
+    /// period counter has rolled over, the spent counter is reset, and any
+    /// rollover credit has been applied. This is distinct from
+    /// [`Error::BudgetExpired`] which indicates the budget's overall expiration.
+    BudgetPeriodExpired = 45,
+    /// The budget's spending limit for the current period has been reached:
+    /// the spent counter equals or exceeds the effective capacity (base limit
+    /// plus any rollover credit). No further spend is permitted until the
+    /// period rolls over or the limit is increased.
+    BudgetLimitReached = 46,
 
     // --- Wallet (50-54) ---
     /// The wallet is frozen by its guardian, so configuration changes are
@@ -292,7 +308,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 52] = [
+    pub const ALL: [Error; 55] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -311,16 +327,19 @@ impl Error {
         Error::PolicyMerchantBlocked,
         Error::PolicyCategoryRestricted,
         Error::VelocityLimitExceeded,
+        Error::PolicyConstraintUnmet,
         // --- Registry (30-39) ---
         Error::RegistryFrozen,
         Error::ModuleDeprecated,
         Error::CircularUpgrade,
-        // --- Budget (40-44) ---
+        // --- Budget (40-46) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
         Error::BudgetArchived,
         Error::AssetNotAuthorized,
         Error::BudgetExpired,
+        Error::BudgetPeriodExpired,
+        Error::BudgetLimitReached,
         // --- Wallet (50-54) ---
         Error::WalletFrozen,
         Error::WalletArchived,
@@ -402,16 +421,19 @@ impl Error {
             Error::PolicyMerchantBlocked => "POLICY_MERCHANT_BLOCKED",
             Error::PolicyCategoryRestricted => "POLICY_CATEGORY_RESTRICTED",
             Error::VelocityLimitExceeded => "VELOCITY_LIMIT_EXCEEDED",
+            Error::PolicyConstraintUnmet => "POLICY_CONSTRAINT_UNMET",
             // --- Registry (30-39) ---
             Error::RegistryFrozen => "REGISTRY_FROZEN",
             Error::ModuleDeprecated => "MODULE_DEPRECATED",
             Error::CircularUpgrade => "CIRCULAR_UPGRADE",
-            // --- Budget (40-44) ---
+            // --- Budget (40-46) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
             Error::BudgetArchived => "BUDGET_ARCHIVED",
             Error::AssetNotAuthorized => "ASSET_NOT_AUTHORIZED",
             Error::BudgetExpired => "BUDGET_EXPIRED",
+            Error::BudgetPeriodExpired => "BUDGET_PERIOD_EXPIRED",
+            Error::BudgetLimitReached => "BUDGET_LIMIT_REACHED",
             // --- Wallet (50-54) ---
             Error::WalletFrozen => "WALLET_FROZEN",
             Error::WalletArchived => "WALLET_ARCHIVED",
@@ -524,6 +546,12 @@ pub enum BudgetError {
     /// The budget's window has closed: the ledger timestamp is at or past
     /// `expires_at`. Wire-compatible with [`Error::BudgetExpired`].
     BudgetExpired = 44,
+    /// The budget's spending limit for the current period has been reached.
+    /// Wire-compatible with [`Error::BudgetLimitReached`].
+    BudgetLimitReached = 46,
+    /// The budget's active period has ended and a new period has begun.
+    /// Wire-compatible with [`Error::BudgetPeriodExpired`].
+    BudgetPeriodExpired = 47,
     /// BUDGET_NOT_ACTIVE: the budget has not started yet — the ledger timestamp
     /// is before `starts_at` — so nothing may be spent. The "not yet begun"
     /// counterpart to [`BudgetError::BudgetExpired`] ("already over"), and the
@@ -539,7 +567,7 @@ impl BudgetError {
     /// declares them. The audit walks this list, so a variant added to (or
     /// removed from) the enum without a matching entry fails
     /// `budget_error_table_is_frozen`.
-    pub const ALL: [BudgetError; 11] = [
+    pub const ALL: [BudgetError; 13] = [
         BudgetError::NotFound,
         BudgetError::Unauthorized,
         BudgetError::InvalidInput,
@@ -551,6 +579,8 @@ impl BudgetError {
         BudgetError::AssetNotAuthorized,
         BudgetError::BudgetExpired,
         BudgetError::BudgetNotActive,
+        BudgetError::BudgetLimitReached,
+        BudgetError::BudgetPeriodExpired,
     ];
 
     /// The `u32` code this variant carries on the wire, identical to the value
@@ -577,6 +607,8 @@ impl BudgetError {
             BudgetError::AssetNotAuthorized => "ASSET_NOT_AUTHORIZED",
             BudgetError::BudgetExpired => "BUDGET_EXPIRED",
             BudgetError::BudgetNotActive => "BUDGET_NOT_ACTIVE",
+            BudgetError::BudgetLimitReached => "BUDGET_LIMIT_REACHED",
+            BudgetError::BudgetPeriodExpired => "BUDGET_PERIOD_EXPIRED",
         }
     }
 }
@@ -585,7 +617,7 @@ impl BudgetError {
 /// declaration order. Kept as a literal so a renumber or a reissued slot is
 /// caught by `budget_error_codes_are_frozen_and_unique` rather than passing
 /// silently.
-pub const BUDGET_ERROR_CODES: [u32; 11] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45];
+pub const BUDGET_ERROR_CODES: [u32; 13] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46, 47];
 
 impl From<Error> for BudgetError {
     fn from(error: Error) -> Self {
@@ -600,6 +632,8 @@ impl From<Error> for BudgetError {
             Error::BudgetArchived => Self::BudgetArchived,
             Error::AssetNotAuthorized => Self::AssetNotAuthorized,
             Error::BudgetExpired => Self::BudgetExpired,
+            Error::BudgetLimitReached => Self::BudgetLimitReached,
+            Error::BudgetPeriodExpired => Self::BudgetPeriodExpired,
             Error::InvalidState => Self::InvalidInput,
             _ => Self::InvalidInput,
         }
@@ -619,10 +653,11 @@ impl From<BudgetError> for Error {
             BudgetError::BudgetArchived => Self::BudgetArchived,
             BudgetError::AssetNotAuthorized => Self::AssetNotAuthorized,
             BudgetError::BudgetExpired | BudgetError::BudgetNotActive => Self::BudgetExpired,
+            BudgetError::BudgetLimitReached => Self::BudgetLimitReached,
+            BudgetError::BudgetPeriodExpired => Self::BudgetPeriodExpired,
         }
     }
 }
-
 /// Milestone-approval errors, kept separate from the protocol-wide [`Error`]
 /// enum so the escrow's milestone state machine can report dedicated,
 /// deterministic codes without pushing the canonical table past Soroban's

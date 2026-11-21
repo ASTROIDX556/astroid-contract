@@ -1157,7 +1157,7 @@ const RETIRED_CODES: [u32; 3] = [25, 26, 65];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 52] = [
+const EXPECTED_CODES: [(Error, u32); 55] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1176,16 +1176,19 @@ const EXPECTED_CODES: [(Error, u32); 52] = [
     (Error::PolicyMerchantBlocked, 23),
     (Error::PolicyCategoryRestricted, 24),
     (Error::VelocityLimitExceeded, 27),
+    (Error::PolicyConstraintUnmet, 28),
     // --- Registry (30-39) ---
     (Error::RegistryFrozen, 30),
     (Error::ModuleDeprecated, 31),
     (Error::CircularUpgrade, 32),
-    // --- Budget (40-44) ---
+    // --- Budget (40-46) ---
     (Error::BudgetExceeded, 40),
     (Error::BudgetFrozen, 41),
     (Error::BudgetArchived, 42),
     (Error::AssetNotAuthorized, 43),
     (Error::BudgetExpired, 44),
+    (Error::BudgetPeriodExpired, 45),
+    (Error::BudgetLimitReached, 46),
     // --- Wallet (50-54) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
@@ -1268,7 +1271,7 @@ fn error_code_bands_are_ascending() {
         (10, 12),
         (20, 29),
         (30, 39),
-        (40, 44),
+        (40, 46),
         (50, 54),
         (60, 69),
         (70, 79),
@@ -1315,7 +1318,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let budget = Error::ALL
         .iter()
-        .filter(|e| (40..45).contains(&e.code()))
+        .filter(|e| (40..47).contains(&e.code()))
         .count();
     let wallet = Error::ALL
         .iter()
@@ -1343,13 +1346,13 @@ fn error_domains_do_not_overlap() {
         .count();
 
     assert_eq!(registry, 3, "registry band 30-39");
-    assert_eq!(budget, 5, "budget band 40-44");
+    assert_eq!(budget, 7, "budget band 40-46");
     assert_eq!(wallet, 5, "wallet band 50-54");
     assert_eq!(multisig, 11, "multisig bands 61-69 and 90-92");
     assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 3, "escrow band 80-82");
     assert_eq!(treasury, 3, "treasury band 83-85");
-    assert_eq!(policy, 6, "policy band 20-29");
+    assert_eq!(policy, 7, "policy band 20-29");
 }
 
 #[test]
@@ -1482,15 +1485,24 @@ fn budget_error_codes_are_frozen_and_unique() {
     // than accidental.
     for variant in BudgetError::ALL {
         let canonical = Error::from(variant);
-        if variant == BudgetError::BudgetNotActive {
-            assert_eq!(canonical, Error::BudgetExpired);
-        } else {
-            assert_eq!(
-                canonical.code(),
-                variant.code(),
-                "{:?} must decode to the same number in the canonical table",
-                variant
-            );
+        match variant {
+            BudgetError::BudgetNotActive => {
+                assert_eq!(canonical, Error::BudgetExpired);
+            }
+            BudgetError::BudgetLimitReached => {
+                assert_eq!(canonical, Error::BudgetLimitReached);
+            }
+            BudgetError::BudgetPeriodExpired => {
+                assert_eq!(canonical, Error::BudgetPeriodExpired);
+            }
+            _ => {
+                assert_eq!(
+                    canonical.code(),
+                    variant.code(),
+                    "{:?} must decode to the same number in the canonical table",
+                    variant
+                );
+            }
         }
     }
 }

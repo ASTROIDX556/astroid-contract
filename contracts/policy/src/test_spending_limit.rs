@@ -254,8 +254,8 @@ fn spend_past_daily_cap_is_budget_exceeded_and_records_nothing() {
     t.limit(PER_TX, DAILY);
     t.record(1_000).unwrap();
     t.record(1_000).unwrap();
-    assert_eq!(t.check(501), Err(Error::BudgetExceeded));
-    assert_eq!(t.record(501), Err(Error::BudgetExceeded));
+    assert_eq!(t.check(501), Err(Error::BudgetLimitReached));
+    assert_eq!(t.record(501), Err(Error::BudgetLimitReached));
     assert_eq!(t.spent(), 2_000);
     // A smaller spend that fits still goes through.
     assert_eq!(t.record(500), Ok(0));
@@ -288,7 +288,7 @@ fn tightening_mid_day_counts_spend_already_recorded() {
     t.record(1_000).unwrap();
     t.record(1_000).unwrap();
     t.limit(PER_TX, 2_000);
-    assert_eq!(t.record(1), Err(Error::BudgetExceeded));
+    assert_eq!(t.record(1), Err(Error::BudgetLimitReached));
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn spend_without_a_limit_is_unrestricted_but_tracked() {
     assert_eq!(t.spent(), 2_000);
     // A limit introduced later the same day sees the real running total.
     t.limit(PER_TX, DAILY);
-    assert_eq!(t.record(600), Err(Error::BudgetExceeded));
+    assert_eq!(t.record(600), Err(Error::BudgetLimitReached));
     assert_eq!(t.record(500), Ok(0));
 }
 
@@ -316,7 +316,7 @@ fn window_resets_at_utc_midnight() {
     let midnight = (NOON / SECONDS_PER_DAY + 1) * SECONDS_PER_DAY;
     // One second before midnight is still the exhausted day.
     t.set_time(midnight - 1);
-    assert_eq!(t.check(1), Err(Error::BudgetExceeded));
+    assert_eq!(t.check(1), Err(Error::BudgetLimitReached));
 
     // Midnight itself opens the next window (start inclusive).
     t.set_time(midnight);
@@ -341,7 +341,7 @@ fn window_reset_after_multi_day_gap_does_not_accrue() {
     t.record(1_000).unwrap();
     t.record(1_000).unwrap();
     t.record(500).unwrap();
-    assert_eq!(t.record(1), Err(Error::BudgetExceeded));
+    assert_eq!(t.record(1), Err(Error::BudgetLimitReached));
 }
 
 #[test]

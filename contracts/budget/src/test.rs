@@ -104,7 +104,7 @@ fn over_budget_consume_fails_budget_exceeded() {
     );
     h.client.consume(&h.owner, &id(&h.env, "eng"), &800);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &300);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
     // Spend up to the exact limit is allowed.
     let rem = h.client.consume(&h.owner, &id(&h.env, "eng"), &200);
     assert_eq!(rem, 0);
@@ -209,7 +209,7 @@ fn daily_budget_auto_resets_after_window() {
     h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000);
     // Exhausted within the window.
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
     // Advance one full day; the window rolls over and spending resets.
     h.env.ledger().set_timestamp(1_000 + 86_400);
     assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
@@ -392,7 +392,7 @@ fn transfer_allocation_over_available_fails() {
     let res =
         h.client
             .try_transfer_allocation(&h.owner, &id(&h.env, "eng"), &id(&h.env, "ops"), &200);
-    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(Error::BudgetLimitReached)));
 }
 
 #[test]
@@ -707,7 +707,7 @@ fn consume_across_a_boundary_spends_the_replenished_allowance() {
     allocate(&h, "eng", 1_000, Period::Daily, false);
     h.client.consume(&h.owner, &id(&h.env, "eng"), &900);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &200);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // The disbursement itself evaluates the transition hook, so the very first
     // spend of the new period already sees the replenished allowance.
@@ -818,7 +818,7 @@ fn rollover_credit_does_not_compound_across_consecutive_periods() {
     // The whole carried balance is spendable in one call — and not a unit more.
     assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &3_400), 0);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 }
 
 /// Catch-up across several missed periods on top of an existing credit: every
@@ -971,7 +971,7 @@ fn expiry_at_the_rollover_boundary_wins_deterministically() {
     h.env.ledger().set_timestamp(1_000 + DAY - 1);
     assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     h.env.ledger().set_timestamp(1_000 + DAY);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
@@ -1000,7 +1000,7 @@ fn per_asset_limit_replenishes_on_its_own_window() {
     let res = h
         .client
         .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &30);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // The hour turns over and the per-asset allowance is whole again.
     h.env.ledger().set_timestamp(1_000 + 3_600);
@@ -1031,7 +1031,7 @@ fn per_asset_window_rolls_on_the_exact_boundary_timestamp() {
     let res = h
         .client
         .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     h.env.ledger().set_timestamp(1_000 + 3_600);
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 100);
@@ -1061,7 +1061,7 @@ fn per_asset_limit_without_a_window_never_resets() {
     let res = h
         .client
         .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 }
 
 #[test]
@@ -1110,7 +1110,7 @@ fn test_rollover_prevention() {
 
     // if they spend 50 more in same window, it should fail
     let res = client.try_check_and_record_spend(&owner, &b_id, &token, &50);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // fast forward 1 hour (3600 seconds)
     env.ledger().set_timestamp(100 + 3600 + 1);
@@ -1171,7 +1171,7 @@ fn deficit_carryforward_reduces_next_period() {
     assert_eq!(rem, 0);
     // One more unit should fail since effective capacity is exhausted
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 }
 
 #[test]
@@ -1187,7 +1187,7 @@ fn deficit_not_allowed_rejects_overspend() {
     );
     // Spending beyond limit should fail without allow_deficit
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1_200);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 }
 
 #[test]
@@ -1502,7 +1502,7 @@ fn window_rolls_over_at_exactly_the_boundary_timestamp() {
     // One second before the boundary the allowance is still exhausted...
     h.env.ledger().set_timestamp(1_000 + DAY - 1);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // ...and at the boundary itself the window is already expired: the very
     // first timestamp at-or-after `start + window` belongs to the next window.
@@ -1776,7 +1776,7 @@ fn zero_limit_budget_rejects_every_spend() {
     allocate(&h, "closed", 0, Period::None, false);
     assert_eq!(h.client.remaining(&id(&h.env, "closed")), 0);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "closed"), &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
     // Nothing was spent, so nothing can be released either.
     let res = h.client.try_release(&h.owner, &id(&h.env, "closed"), &1);
     assert_eq!(res, Err(Ok(Error::InvalidAmount)));
@@ -1788,7 +1788,7 @@ fn exact_limit_match_is_allowed_and_one_more_is_not() {
     allocate(&h, "eng", 1_000, Period::None, false);
     assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000), 0);
     let res = h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
     assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 1_000);
 }
 
@@ -2352,7 +2352,7 @@ fn batch_spend_rejects_the_whole_batch_when_one_leg_exceeds() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &batch);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &usdc), 500);
     assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &xlm), 500);
 
@@ -2478,7 +2478,7 @@ fn batch_spend_enforces_aggregate_window_consumption() {
     let res = h
         .client
         .try_check_and_record_batch_spend(&h.owner, &id(&h.env, "eng"), &over);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // A fresh window replenishes every registered token at once.
     h.env.ledger().set_timestamp(1_000 + 3_600);
@@ -2721,7 +2721,7 @@ fn negative_and_zero_caps_and_limits_are_rejected_consistently() {
     let res = h
         .client
         .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // A zero limit with no window is the one-shot form; still closed, still
     // creatable.
@@ -2730,7 +2730,7 @@ fn negative_and_zero_caps_and_limits_are_rejected_consistently() {
     let res = h
         .client
         .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 }
 
 // ---------------------------------------------------------------------------
@@ -2753,7 +2753,7 @@ fn ai_agent_sliding_window_rate_limiting_and_consumption_tracking() {
 
     // Total spent equals limit (5_000). Further spending breaches limit and returns BUDGET_EXCEEDED
     let res = h.client.try_consume(&h.owner, &agent_budget_id, &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // Advance ledger timestamp past the 24-hour sliding window boundary
     h.env.ledger().set_timestamp(1_000 + DAY);
@@ -2789,12 +2789,12 @@ fn ai_agent_sliding_window_custom_interval_rate_limiting() {
 
     // Spend exceeding limit is rejected with deterministic BudgetExceeded error
     let res = h.client.try_consume(&h.owner, &agent_budget_id, &100);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // 59 minutes later (still within sliding window): spend still rejected
     h.env.ledger().set_timestamp(1_000 + 3_540);
     let res = h.client.try_consume(&h.owner, &agent_budget_id, &100);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // Exactly on the 1-hour boundary (3,600s): sliding window resets spend counter
     h.env.ledger().set_timestamp(1_000 + hourly_window);
@@ -2844,7 +2844,7 @@ fn budget_rollover_with_custom_percentage_and_cap() {
     assert_eq!(h.client.consume(&h.owner, &budget_id, &1_000), 300);
     assert_eq!(h.client.consume(&h.owner, &budget_id, &300), 0);
     let res = h.client.try_consume(&h.owner, &budget_id, &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 }
 
 #[test]
@@ -3055,7 +3055,7 @@ fn multiple_period_rollovers_simulation() {
     assert_eq!(h.client.consume(&h.owner, &budget_id, &1_400), 0);
     assert_eq!(
         h.client.try_consume(&h.owner, &budget_id, &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
 
     // --- Period 4 (t = 1_000 + 3 * 86_400) ---
@@ -3139,7 +3139,7 @@ fn per_asset_budget_rollover_accounting() {
     let res = h
         .client
         .try_check_and_record_spend(&h.owner, &budget_id, &token, &1);
-    assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
 
     // Next window: unspent was 0 => credit = 0, capacity = 1_000
     h.env.ledger().set_timestamp(1_000 + 2 * window_seconds);
@@ -3199,12 +3199,12 @@ fn a_refused_spend_leaves_the_period_ledger_untouched() {
     // Over-limit attempts on every entrypoint are refused with the same code.
     assert_eq!(
         h.client.try_consume(&h.owner, &id(&h.env, "eng"), &300),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
     assert_eq!(
         h.client
             .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &200),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
     assert_eq!(
         h.client.try_check_and_record_batch_spend(
@@ -3212,7 +3212,7 @@ fn a_refused_spend_leaves_the_period_ledger_untouched() {
             &id(&h.env, "eng"),
             &vec![&h.env, asset_spend(&h.env, &token, 200)],
         ),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
 
     // Nothing was persisted by any of the refusals: the ledgers still hold
@@ -3244,12 +3244,12 @@ fn limit_exhaustion_blocks_every_spend_path_until_the_window_rolls() {
     // One more unit is refused identically by every entrypoint.
     assert_eq!(
         h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
     assert_eq!(
         h.client
             .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
     assert_eq!(
         h.client.try_check_and_record_batch_spend(
@@ -3257,7 +3257,7 @@ fn limit_exhaustion_blocks_every_spend_path_until_the_window_rolls() {
             &id(&h.env, "eng"),
             &vec![&h.env, asset_spend(&h.env, &token, 1)],
         ),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
 
     // The per-asset window rolls and replenishes; spending works again, and
@@ -3269,12 +3269,12 @@ fn limit_exhaustion_blocks_every_spend_path_until_the_window_rolls() {
     assert_eq!(
         h.client
             .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
     // The aggregate envelope is on its own weekly window: still exhausted.
     assert_eq!(
         h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
 }
 
@@ -3288,7 +3288,7 @@ fn over_limit_refusals_are_deterministic_across_attempts() {
     for _ in 0..3 {
         assert_eq!(
             h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1_001),
-            Err(Ok(BudgetError::BudgetExceeded))
+            Err(Ok(BudgetError::BudgetLimitReached))
         );
     }
     assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 0);
@@ -3299,7 +3299,7 @@ fn over_limit_refusals_are_deterministic_across_attempts() {
     assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &1_000), 0);
     assert_eq!(
         h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
 }
 
@@ -3459,11 +3459,11 @@ fn spend_that_drains_the_budget_emits_exhausted() {
     // not move the counter.
     assert_eq!(
         h.client.try_consume(&h.owner, &id(&h.env, "agent"), &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
     assert_eq!(
-        BudgetError::BudgetExceeded as u32,
-        Error::BudgetExceeded as u32
+        BudgetError::BudgetLimitReached as u32,
+        Error::BudgetLimitReached as u32
     );
     assert_eq!(h.client.get(&id(&h.env, "agent")).spent, 1_000);
 }
@@ -3479,7 +3479,7 @@ fn rollover_after_exhaustion_emits_replenish_and_restores_allowance() {
     h.env.ledger().set_timestamp(1_000 + DAY - 1);
     assert_eq!(
         h.client.try_consume(&h.owner, &id(&h.env, "agent"), &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
 
     h.env.ledger().set_timestamp(1_000 + DAY);
@@ -3514,7 +3514,7 @@ fn per_asset_limit_emits_exhausted_and_replenish() {
     assert_eq!(
         h.client
             .try_check_and_record_spend(&h.owner, &id(&h.env, "agent"), &usdc, &1),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
 
     h.env.ledger().set_timestamp(1_000 + DAY);
@@ -3600,7 +3600,7 @@ fn batch_spend_honours_rollover_credit_like_single_spend() {
                 },
             ],
         ),
-        Err(Ok(BudgetError::BudgetExceeded))
+        Err(Ok(BudgetError::BudgetLimitReached))
     );
     assert_eq!(
         h.client.get_asset_budget(&id(&h.env, "agent"), &xlm).spent,
