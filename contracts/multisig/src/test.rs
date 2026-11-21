@@ -2104,7 +2104,7 @@ fn threshold_exceeding_total_weight_rejected_at_init() {
     sv.push_back(sw(&Address::generate(&env), 3));
     sv.push_back(sw(&Address::generate(&env), 2));
     let res = client.try_initialize(&sv, &6);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    assert_eq!(res, Err(Ok(Error::ThresholdExceeded)));
 }
 
 /// Threshold of zero is rejected at initialization (below MIN_THRESHOLD).
