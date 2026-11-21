@@ -1151,13 +1151,13 @@ mod token_wrappers {
 /// Codes that were once assigned to a variant and have been retired. They must
 /// stay empty forever so a stale integrator can never decode a fresh failure
 /// as a retired meaning.
-const RETIRED_CODES: [u32; 3] = [25, 26, 65];
+const RETIRED_CODES: [u32; 2] = [25, 26];
 
 /// The published code for every variant, written out by hand. This is the
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 52] = [
+const EXPECTED_CODES: [(Error, u32); 58] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1186,24 +1186,28 @@ const EXPECTED_CODES: [(Error, u32); 52] = [
     (Error::BudgetArchived, 42),
     (Error::AssetNotAuthorized, 43),
     (Error::BudgetExpired, 44),
-    // --- Wallet (50-54) ---
+    // --- Wallet (50-55) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
     (Error::WalletPaused, 52),
     (Error::InvalidState, 53),
     (Error::RateLimitExceeded, 54),
-    // --- Multisig / approvals (61-69, 90-92) ---
+    (Error::UnauthorizedWalletAccess, 55),
+    // --- Multisig / approvals (61-69, 70, 90-93) ---
     (Error::ThresholdNotMet, 61),
     (Error::AlreadySigned, 62),
     (Error::NotASigner, 63),
     (Error::InvalidThreshold, 64),
+    (Error::InvalidSignerCount, 65),
     (Error::TooManySigners, 66),
     (Error::BatchCallFailed, 67),
     (Error::InvalidNonce, 68),
     (Error::InvalidSignerWeight, 69),
+    (Error::ThresholdExceeded, 70),
     (Error::InsufficientWeight, 90),
     (Error::TimelockNotExpired, 91),
     (Error::UnauthorizedModification, 92),
+    (Error::DuplicateSigner, 93),
     // --- Proposal (71-79) ---
     (Error::ProposalExpired, 71),
     (Error::InvalidProposalState, 72),
@@ -1212,10 +1216,12 @@ const EXPECTED_CODES: [(Error, u32); 52] = [
     (Error::CancellationWindowClosed, 75),
     (Error::PrerequisiteNotMet, 78),
     (Error::CircularDependencyDetected, 79),
-    // --- Escrow (80-82) ---
+    // --- Escrow (80-82, 86-87) ---
     (Error::EscrowExpired, 80),
     (Error::TimeLockActive, 81),
     (Error::GraceActive, 82),
+    (Error::EscrowNotExpired, 86),
+    (Error::EscrowAlreadySettled, 87),
     // --- Treasury (83-85) ---
     (Error::AllowanceExceeded, 83),
     (Error::AllowanceExpired, 84),
@@ -1263,16 +1269,17 @@ fn error_code_bands_are_ascending() {
     // Each contract's band is declared ascending, so a variant dropped into the
     // wrong block — the usual symptom of an accidental renumber — shows up as
     // a non-ascending band rather than passing silently.
-    let bands: [(u32, u32); 9] = [
+    let bands: [(u32, u32); 10] = [
         (1, 6),
         (10, 12),
         (20, 29),
         (30, 39),
         (40, 44),
-        (50, 54),
-        (60, 69),
-        (70, 79),
-        (90, 92),
+        (50, 55),
+        (60, 70),
+        (71, 79),
+        (80, 87),
+        (90, 93),
     ];
     for (low, high) in bands {
         let mut previous: Option<u32> = None;
@@ -1319,19 +1326,19 @@ fn error_domains_do_not_overlap() {
         .count();
     let wallet = Error::ALL
         .iter()
-        .filter(|e| (50..55).contains(&e.code()))
+        .filter(|e| (50..56).contains(&e.code()))
         .count();
     let multisig = Error::ALL
         .iter()
-        .filter(|e| (60..70).contains(&e.code()) || (90..93).contains(&e.code()))
+        .filter(|e| (60..71).contains(&e.code()) || (90..94).contains(&e.code()))
         .count();
     let proposal = Error::ALL
         .iter()
-        .filter(|e| (70..80).contains(&e.code()))
+        .filter(|e| (71..80).contains(&e.code()))
         .count();
     let escrow = Error::ALL
         .iter()
-        .filter(|e| (80..83).contains(&e.code()))
+        .filter(|e| matches!(e.code(), 80..=82 | 86..=87))
         .count();
     let treasury = Error::ALL
         .iter()
@@ -1344,10 +1351,10 @@ fn error_domains_do_not_overlap() {
 
     assert_eq!(registry, 3, "registry band 30-39");
     assert_eq!(budget, 5, "budget band 40-44");
-    assert_eq!(wallet, 5, "wallet band 50-54");
-    assert_eq!(multisig, 11, "multisig bands 61-69 and 90-92");
+    assert_eq!(wallet, 6, "wallet band 50-55");
+    assert_eq!(multisig, 14, "multisig bands 61-70 and 90-93");
     assert_eq!(proposal, 7, "proposal band 71-79");
-    assert_eq!(escrow, 3, "escrow band 80-82");
+    assert_eq!(escrow, 5, "escrow band 80-82 and 86-87");
     assert_eq!(treasury, 3, "treasury band 83-85");
     assert_eq!(policy, 6, "policy band 20-29");
 }

@@ -1549,6 +1549,60 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Claim a refund of the remaining escrowed funds back to the sender.
+    ///
+    /// This is a unified refund claim entrypoint that requires the escrow to have
+    /// reached its post-expiration state (deadline + grace_period elapsed). The
+    /// caller must be the original sender. Returns [`Error::EscrowNotExpired`] if
+    /// the settlement window is still open, and [`Error::EscrowAlreadySettled`]
+    /// if the escrow has already reached a terminal state (Released, Refunded,
+    /// or Closed).
+    pub fn claim_refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
+        // Only the sender may claim a refund.
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        // The escrow must be in a state where funds are still held and the
+        // settlement window has closed.
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::EscrowAlreadySettled);
+        }
+        let now = env.ledger().timestamp();
+        let grace_end = Self::grace_end(&escrow)?;
+        if now < escrow.deadline {
+            return Err(Error::EscrowNotExpired);
+        }
+        if now < grace_end {
+            return Err(Error::GraceActive);
+        }
+        Self::require_refund_window_open(&env, &escrow)?;
+
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+        Self::transfer_all(&env, &escrow, &escrow.sender, remaining)?;
+        for a in escrow.assets.iter() {
+            events::transfer_executed(&env, &escrow.sender, &escrow.sender, &a.asset, a.amount);
+        }
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
+        events::escrow_funds_refunded(&env, id, &escrow.sender, remaining);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("claim_rfd")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;

@@ -2876,3 +2876,190 @@ fn allowance_verification_leaves_ledger_and_custody_in_agreement() {
         Err(Ok(Error::InsufficientFunds))
     );
 }
+
+/// Unauthorized access tests (Issue #489)
+/// These verify that mutating wallet operations require proper authorization.
+#[cfg(test)]
+mod unauthorized_access_tests {
+    use super::*;
+
+    #[test]
+    fn transfer_without_agent_role_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let intruder = Address::generate(&h.env);
+        let recipient = Address::generate(&h.env);
+        mint(&h, &owner, 1_000);
+        h.client.deposit(&id, &owner, &h.token, &1_000);
+
+        // Intruder has no role on the wallet
+        let res = h.client.try_transfer(&intruder, &id, &recipient, &h.token, &100);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn withdraw_without_admin_role_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let agent = Address::generate(&h.env);
+        mint(&h, &owner, 1_000);
+        h.client.deposit(&id, &owner, &h.token, &1_000);
+
+        // Grant only Agent role, not Admin
+        h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+
+        // Agent cannot withdraw (requires Admin)
+        let res = h.client.try_withdraw(&agent, &id, &h.token, &100);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn freeze_without_agent_role_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let intruder = Address::generate(&h.env);
+
+        let res = h.client.try_freeze(&intruder, &id);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn pause_without_admin_role_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let agent = Address::generate(&h.env);
+        h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+
+        // Agent cannot pause (requires Admin)
+        let res = h.client.try_pause(&agent, &id);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn archive_without_admin_role_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let agent = Address::generate(&h.env);
+        h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+
+        // Agent cannot archive (requires Admin)
+        let res = h.client.try_archive(&agent, &id);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn grant_role_without_admin_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let agent = Address::generate(&h.env);
+        let target = Address::generate(&h.env);
+        h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+
+        // Agent cannot grant roles (requires Admin)
+        let res = h.client.try_grant_role(&agent, &id, &target, &Role::Agent);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn revoke_role_without_admin_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let agent = Address::generate(&h.env);
+        let target = Address::generate(&h.env);
+        h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+        h.client.grant_role(&owner, &id, &target, &Role::Agent);
+
+        // Agent cannot revoke roles (requires Admin)
+        let res = h.client.try_revoke_role(&agent, &id, &target);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn set_velocity_limit_without_admin_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let agent = Address::generate(&h.env);
+        h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+
+        // Agent cannot set velocity limit (requires Admin)
+        let res = h.client.try_set_velocity_limit(&agent, &id, &h.token, &100, &3_600);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn set_rate_limit_without_admin_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let agent = Address::generate(&h.env);
+        h.client.grant_role(&owner, &id, &agent, &Role::Agent);
+
+        // Agent cannot set rate limit (requires Admin)
+        let res = h.client.try_set_rate_limit(&agent, &id, &100, &10, &3_600);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn batch_execute_without_agent_role_fails() {
+        let h = setup();
+        let owner = Address::generate(&h.env);
+        let id = h.client.create_wallet(&owner);
+        let intruder = Address::generate(&h.env);
+        let recipient = Address::generate(&h.env);
+        mint(&h, &owner, 1_000);
+        h.client.deposit(&id, &owner, &h.token, &1_000);
+
+        let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+        actions.push_back(validated_action(
+            &h.env,
+            &h.token,
+            &h.contract_id,
+            &recipient,
+            100,
+            "",
+            "",
+        ));
+
+        // Intruder has no role
+        let res = h.client.try_batch_execute_validated(&intruder, &id, &actions);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn admin_only_functions_require_admin_auth() {
+        let h = setup();
+        let stranger = Address::generate(&h.env);
+
+        // set_policy requires admin
+        let res = h.client.try_set_policy(&stranger, &h.admin);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+        // clear_policy requires admin
+        let res = h.client.try_clear_policy(&stranger);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+        // set_guardian requires admin
+        let res = h.client.try_set_guardian(&stranger, &stranger);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+        // emergency_pause requires admin or guardian
+        let res = h.client.try_emergency_pause(&stranger);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+        // set_budget requires admin
+        let res = h.client.try_set_budget(&stranger, &h.admin);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+
+        // set_registry requires admin
+        let res = h.client.try_set_registry(&stranger, &h.admin);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    }
+}
