@@ -3526,3 +3526,178 @@ fn unfunded_expired_timelock_refund_moves_no_tokens() {
     assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
     assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #536: standardized fund release / refund events
+// ---------------------------------------------------------------------------
+
+/// Every `("escrow", action, id)` settlement event this contract published in
+/// the last invocation, decoded into the shared [`EscrowSettlement`] payload.
+fn settlement_events(
+    h: &Harness,
+    action: Symbol,
+    id: u64,
+) -> std::vec::Vec<astroid_shared::events::EscrowSettlement> {
+    use soroban_sdk::TryFromVal;
+    let want: Vec<Val> = (soroban_sdk::symbol_short!("escrow"), action, id).into_val(&h.env);
+    h.env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract, topics, _)| *contract == h.client.address && *topics == want)
+        .map(|(_, _, data)| {
+            astroid_shared::events::EscrowSettlement::try_from_val(&h.env, &data)
+                .expect("settlement payload decodes")
+        })
+        .collect()
+}
+
+fn assert_single_settlement(
+    h: &Harness,
+    action: Symbol,
+    id: u64,
+    recipient: &Address,
+    amount: i128,
+    timestamp: u64,
+) {
+    let found = settlement_events(h, action, id);
+    assert_eq!(found.len(), 1, "exactly one settlement event per call");
+    assert_eq!(
+        found[0],
+        astroid_shared::events::EscrowSettlement {
+            escrow_id: id,
+            recipient: recipient.clone(),
+            amount,
+            timestamp,
+        }
+    );
+}
+
+#[test]
+fn release_emits_standard_fund_released_event() {
+    use astroid_shared::events::{ESCROW_FUNDS_REFUNDED, ESCROW_FUNDS_RELEASED};
+    let h = setup(10_000, 5_000);
+    let id = create(&h, &two_assets(&h, 10_000, 5_000), START + 86_400, 0);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 50);
+    h.client.release(&h.arbiter, &id, &15_000);
+
+    // Amount is the custody value moved across both assets; the payload ends
+    // with the ledger timestamp of the settlement.
+    assert_single_settlement(
+        &h,
+        ESCROW_FUNDS_RELEASED,
+        id,
+        &h.recipient,
+        15_000,
+        START + 50,
+    );
+    assert!(settlement_events(&h, ESCROW_FUNDS_REFUNDED, id).is_empty());
+}
+
+#[test]
+fn override_release_emits_standard_fund_released_event() {
+    use astroid_shared::events::ESCROW_FUNDS_RELEASED;
+    let h = setup(5_000, 1_000);
+    let kp1 = keypair(1);
+    let kp2 = keypair(2);
+    let signers = vec![&h.env, public_key(&h.env, &kp1), public_key(&h.env, &kp2)];
+    let id = h.client.create(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &two_assets(&h, 5_000, 1_000),
+        &(START + 1_000),
+        &0,
+        &String::from_str(&h.env, "override"),
+        &signers,
+        &2,
+    );
+    let sigs = vec![
+        &h.env,
+        sign_override(&h, &kp1, id, 1),
+        sign_override(&h, &kp2, id, 1),
+    ];
+
+    h.client.override_release(&id, &1, &sigs);
+
+    assert_single_settlement(&h, ESCROW_FUNDS_RELEASED, id, &h.recipient, 6_000, START);
+}
+
+#[test]
+fn refund_emits_standard_fund_refunded_event() {
+    use astroid_shared::events::{ESCROW_FUNDS_REFUNDED, ESCROW_FUNDS_RELEASED};
+    let h = setup(5_000, 2_000);
+    let id = create(&h, &two_assets(&h, 5_000, 2_000), START + 100, 0);
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    h.client.refund(&h.sender, &id);
+
+    // A refund names the sender as the party the funds moved to.
+    assert_single_settlement(&h, ESCROW_FUNDS_REFUNDED, id, &h.sender, 7_000, START + 200);
+    assert!(settlement_events(&h, ESCROW_FUNDS_RELEASED, id).is_empty());
+}
+
+#[test]
+fn cancel_emits_standard_fund_refunded_event() {
+    use astroid_shared::events::ESCROW_FUNDS_REFUNDED;
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 1_000, GRACE);
+
+    h.client.cancel(&h.sender, &id);
+
+    assert_single_settlement(&h, ESCROW_FUNDS_REFUNDED, id, &h.sender, 5_000, START);
+}
+
+#[test]
+fn reclaim_emits_standard_fund_refunded_event() {
+    use astroid_shared::events::ESCROW_FUNDS_REFUNDED;
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    let after_grace = START + 100 + GRACE;
+    h.env.ledger().with_mut(|l| l.timestamp = after_grace);
+    h.client.reclaim(&h.sender, &id);
+
+    assert_single_settlement(&h, ESCROW_FUNDS_REFUNDED, id, &h.sender, 5_000, after_grace);
+}
+
+#[test]
+fn refund_timelock_emits_standard_fund_refunded_event() {
+    use astroid_shared::events::ESCROW_FUNDS_REFUNDED;
+    let h = setup(4_000, 0);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 4_000),
+        &(START + 500),
+        &String::from_str(&h.env, "locked"),
+    );
+
+    h.env.ledger().with_mut(|l| l.timestamp = START + 500);
+    h.client.refund_timelock(&h.sender, &id);
+
+    assert_single_settlement(&h, ESCROW_FUNDS_REFUNDED, id, &h.sender, 4_000, START + 500);
+}
+
+#[test]
+fn refused_settlement_emits_no_fund_event() {
+    use astroid_shared::events::{ESCROW_FUNDS_REFUNDED, ESCROW_FUNDS_RELEASED};
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+    // A refused release and a premature refund both roll back, so no
+    // settlement event can reach an indexer for funds that never moved.
+    let intruder = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_release(&intruder, &id, &5_000),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(settlement_events(&h, ESCROW_FUNDS_RELEASED, id).is_empty());
+    assert_eq!(
+        h.client.try_refund(&h.sender, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+    assert!(settlement_events(&h, ESCROW_FUNDS_REFUNDED, id).is_empty());
+}
