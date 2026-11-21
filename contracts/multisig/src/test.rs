@@ -2364,3 +2364,31 @@ fn removed_signer_can_be_readded_with_valid_weight() {
     assert!(h.client.is_signer(&new_signer));
     assert_eq!(h.client.get_signer_weight(&new_signer), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #493 — standardized event emission through shared/events.rs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signer_changes_emit_canonical_topics() {
+    use astroid_shared::events::topic;
+    use soroban_sdk::TryFromVal;
+    let h = setup(&[1, 1], 1);
+    let newcomer = Address::generate(&h.env);
+    h.client.add_signer(&h.signers[0], &newcomer, &3);
+
+    let cat: Val = topic::SIGNER.into_val(&h.env);
+    let act: Val = symbol_short!("added").into_val(&h.env);
+    let payload = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && topics.get(0).unwrap().shallow_eq(&cat)
+                && topics.get(1).unwrap().shallow_eq(&act)
+        })
+        .map(|(_, _, data)| <(Address, u32)>::try_from_val(&h.env, &data).unwrap());
+    assert_eq!(payload, Some((newcomer, 3)));
+}

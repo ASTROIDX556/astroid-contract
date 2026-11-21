@@ -2557,7 +2557,7 @@ fn event_count(env: &Env, category: &str, action: &str) -> u32 {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut count = 0;
     for (_emitter, topics, _data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
             count += 1;
         }
     }
@@ -2572,7 +2572,7 @@ fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut found = None;
     for (_emitter, topics, data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
             found = Vec::<Val>::try_from_val(env, &data).ok();
         }
     }
@@ -2872,4 +2872,24 @@ fn frozen_treasury_blocks_milestone_disbursement_and_release_emits_withdrawn() {
         treasury_flow_payload(&h.env, "TreasuryWithdrawn").map(|p| (p.1, p.3, p.4)),
         Some((to.clone(), 500, 500))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #493 — standardized event emission through shared/events.rs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn freeze_emits_canonical_tuple_and_typed_events() {
+    use astroid_shared::events::topic;
+    let h = setup("vault", 0);
+    h.client.freeze(&h.multisig);
+    let cat: Val = topic::TREASURY.into_val(&h.env);
+    let act: Val = Symbol::new(&h.env, "frozen").into_val(&h.env);
+    let tuple = h.env.events().all().iter().any(|(_, topics, _)| {
+        topics.len() == 2
+            && topics.get(0).unwrap().shallow_eq(&cat)
+            && topics.get(1).unwrap().shallow_eq(&act)
+    });
+    assert!(tuple, "expected (treasury, frozen)");
+    assert_event(&h.env, "TreasuryFrozen");
 }

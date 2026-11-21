@@ -162,6 +162,5 @@ pub fn require(sum: u32, threshold: u32, shortfall: Error) -> Result<(), Error> 
 /// so a stream of further approvals past the threshold does not re-announce a
 /// quorum that has already been reached.
 pub fn publish_threshold_met(env: &Env, category: Symbol, subject: u64, status: &QuorumStatus) {
-    env.events()
-        .publish((category, symbol_short!("quorum")), (subject, *status));
+    astroid_shared::events::emit(env, category, symbol_short!("quorum"), (subject, *status));
 }

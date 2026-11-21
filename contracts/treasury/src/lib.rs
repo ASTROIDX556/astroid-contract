@@ -513,8 +513,7 @@ impl TreasuryContract {
                 action: symbol_short!("registry"),
             },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("registry")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("registry"), ());
         Ok(())
     }
 
@@ -530,8 +529,7 @@ impl TreasuryContract {
                 action: symbol_short!("policy"),
             },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("policy")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("policy"), ());
         Ok(())
     }
 
@@ -547,8 +545,7 @@ impl TreasuryContract {
                 action: symbol_short!("budget"),
             },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("budget")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("budget"), ());
         Ok(())
     }
 
@@ -616,8 +613,7 @@ impl TreasuryContract {
                 action: symbol_short!("multisig"),
             },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("multisig")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("multisig"), ());
         Ok(())
     }
 
@@ -631,8 +627,7 @@ impl TreasuryContract {
             &env,
             events::ContractEvent::TreasuryFrozen { org: t.org.clone() },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("frozen")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("frozen"), ());
         Ok(())
     }
 
@@ -654,8 +649,7 @@ impl TreasuryContract {
             &env,
             events::ContractEvent::TreasuryUnfrozen { org: t.org.clone() },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("unfrozen")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("unfrozen"), ());
         Ok(())
     }
 
@@ -676,8 +670,7 @@ impl TreasuryContract {
                 action: symbol_short!("guardian"),
             },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("guardian")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("guardian"), ());
         Ok(())
     }
 
@@ -714,8 +707,7 @@ impl TreasuryContract {
                 action: symbol_short!("pause"),
             },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("paused")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("paused"), ());
         Ok(())
     }
 
@@ -745,8 +737,7 @@ impl TreasuryContract {
                 action: symbol_short!("unpause"),
             },
         );
-        env.events()
-            .publish((symbol_short!("treasury"), symbol_short!("unpaused")), ());
+        events::emit(&env, events::topic::TREASURY, symbol_short!("unpaused"), ());
         Ok(())
     }
 
@@ -798,8 +789,10 @@ impl TreasuryContract {
         // path that mutates either.
         let balance = h.total_in;
         Self::store_asset_balance(&env, &asset, balance);
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("deposited")),
+        events::emit(
+            &env,
+            events::topic::TREASURY,
+            symbol_short!("deposited"),
             (asset.clone(), received),
         );
         events::publish(
@@ -835,8 +828,10 @@ impl TreasuryContract {
         // announces itself on both layers like every other config change: the
         // canonical typed event plus a tuple-topic event carrying the
         // identifiers and the ledger timestamp.
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("bgt_alloc")),
+        events::emit(
+            &env,
+            events::topic::TREASURY,
+            symbol_short!("bgt_alloc"),
             (asset.clone(), budget_id.clone(), env.ledger().timestamp()),
         );
         events::publish(
@@ -1225,8 +1220,10 @@ impl TreasuryContract {
                 total,
             },
         );
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("batchpay")),
+        events::emit(
+            env,
+            events::topic::TREASURY,
+            symbol_short!("batchpay"),
             (asset.clone(), payments.len(), total),
         );
 
@@ -1278,8 +1275,10 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("timelock")),
+        events::emit(
+            &env,
+            events::topic::TREASURY,
+            symbol_short!("timelock"),
             (config.delay, config.threshold),
         );
         Ok(())
@@ -1432,8 +1431,10 @@ impl TreasuryContract {
             Self::settle_batch(&env, &t, &caller, &p.asset, p.payments.clone())?;
         }
 
-        env.events().publish(
-            (symbol_short!("timelock"), symbol_short!("executed")),
+        events::emit(
+            &env,
+            events::topic::TIMELOCK,
+            symbol_short!("executed"),
             (id, p.amount),
         );
         Ok(())
@@ -1464,8 +1465,7 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        env.events()
-            .publish((symbol_short!("timelock"), symbol_short!("canceled")), id);
+        events::emit(&env, events::topic::TIMELOCK, symbol_short!("canceled"), id);
         Ok(())
     }
 
@@ -1548,8 +1548,10 @@ impl TreasuryContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         env.storage().instance().set(&count_key, &count);
-        env.events().publish(
-            (symbol_short!("milestone"), symbol_short!("init")),
+        events::emit(
+            &env,
+            events::topic::MILESTONE,
+            symbol_short!("init"),
             (count, total_amount, milestones),
         );
         Ok(count)
@@ -1624,8 +1626,10 @@ impl TreasuryContract {
         Self::store_asset_balance(&env, &d.asset, holding.total_in);
 
         Self::transfer_out(&env, &d.asset, &d.to, amount)?;
-        env.events().publish(
-            (symbol_short!("milestone"), symbol_short!("disbursed")),
+        events::emit(
+            &env,
+            events::topic::MILESTONE,
+            symbol_short!("disbursed"),
             (milestone_id, d.disbursed, amount),
         );
         Self::emit_withdrawn(&env, &t, &d.to, &d.asset, amount, holding.total_in);
@@ -1807,8 +1811,7 @@ impl TreasuryContract {
     /// Publish a whitelist change under both the contract-local tuple topic and
     /// the canonical cross-cutting schema.
     fn emit_asset_change(env: &Env, t: &Treasury, asset: &Address, action: Symbol) {
-        env.events()
-            .publish((symbol_short!("treasury"), action.clone()), asset.clone());
+        events::emit(env, events::topic::TREASURY, action.clone(), asset.clone());
         events::publish(
             env,
             events::ContractEvent::TreasuryConfigUpdated {
@@ -1937,8 +1940,10 @@ impl TreasuryContract {
         amount: i128,
         balance: i128,
     ) {
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("withdrawn")),
+        events::emit(
+            env,
+            events::topic::TREASURY,
+            symbol_short!("withdrawn"),
             (asset.clone(), to.clone(), amount),
         );
         events::publish(
@@ -2060,8 +2065,10 @@ impl TreasuryContract {
         // Announced separately from the payout it describes: a queued request
         // is observable while it is still inert, which is the whole window an
         // organization has to notice a hostile request and cancel it.
-        env.events().publish(
-            (symbol_short!("timelock"), symbol_short!("queued")),
+        events::emit(
+            env,
+            events::topic::TIMELOCK,
+            symbol_short!("queued"),
             (id, amount, execute_after),
         );
         Ok(id)

@@ -3732,10 +3732,9 @@ mod window_boundary_tests {
         h.env.ledger().set_timestamp(1_000 + 3_600);
 
         // Next spend should see replenished allowance (500 base + 100 rollover = 600)
-        let rem =
-            h.client
-                .check_and_record_spend(&h.owner, &id(&h.env, "asset_boundary"), &token, &600);
-        assert_eq!(rem, ());
+        h.client
+            .check_and_record_spend(&h.owner, &id(&h.env, "asset_boundary"), &token, &600);
+        assert_eq!((), ());
         assert_eq!(
             h.client
                 .asset_remaining(&id(&h.env, "asset_boundary"), &token),
@@ -3839,4 +3838,299 @@ mod window_boundary_tests {
         assert_eq!(ab.spent, 0);
         assert_eq!(ab.rollover_credit, 100);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Budget window rollover and reset validation (Issue #495)
+// ---------------------------------------------------------------------------
+
+use crate::WindowStatus;
+use astroid_shared::events::BudgetWindowRollover;
+use soroban_sdk::TryFromVal;
+
+/// `setup()` starts the ledger at 1_000; a daily budget allocated then has
+/// its first window at `[1_000, 1_000 + DAY)`.
+const T0: u64 = 1_000;
+
+fn daily(h: &Harness, name: &str, limit: i128) -> String {
+    let bid = id(&h.env, name);
+    h.client
+        .allocate(&h.owner, &bid, &limit, &Period::Daily, &false, &0);
+    bid
+}
+
+/// Every decoded `("budget", "win_roll")` payload published so far.
+fn win_roll_events(env: &Env) -> std::vec::Vec<BudgetWindowRollover> {
+    let cat: Val = Symbol::new(env, "budget").into_val(env);
+    let act: Val = Symbol::new(env, "win_roll").into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| topics.len() == 2 && topics.contains(cat) && topics.contains(act))
+        .map(|(_, _, data)| BudgetWindowRollover::try_from_val(env, &data).unwrap())
+        .collect()
+}
+
+#[test]
+fn window_does_not_roll_one_second_before_the_boundary() {
+    let h = setup();
+    let bid = daily(&h, "w1", 1_000);
+    h.client.consume(&h.owner, &bid, &600);
+
+    h.env.ledger().set_timestamp(T0 + DAY - 1);
+    let status: WindowStatus = h.client.window_status(&bid);
+    assert!(!status.rolled_over);
+    assert_eq!(status.window_start, T0);
+    assert_eq!(status.window_end, T0 + DAY);
+    assert_eq!(status.spent, 600);
+    // Still the old window: 400 fits, one more unit does not.
+    h.client.consume(&h.owner, &bid, &400);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &bid, &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+}
+
+#[test]
+fn window_rolls_exactly_at_the_boundary_and_resets_spend() {
+    let h = setup();
+    let bid = daily(&h, "w2", 1_000);
+    h.client.consume(&h.owner, &bid, &1_000);
+
+    // The window end is exclusive: `T0 + DAY` already belongs to window 2.
+    h.env.ledger().set_timestamp(T0 + DAY);
+    assert_eq!(h.client.consume(&h.owner, &bid, &1_000), 0);
+    let b = h.client.get(&bid);
+    assert_eq!(b.window_start, T0 + DAY);
+    assert_eq!(b.spent, 1_000);
+
+    let rolls = win_roll_events(&h.env);
+    assert_eq!(rolls.len(), 1);
+    let roll = &rolls[0];
+    assert_eq!(roll.budget_id, bid);
+    assert_eq!(roll.periods, 1);
+    assert_eq!(roll.previous_spent, 1_000);
+    assert_eq!(roll.window_start, T0 + DAY);
+    assert_eq!(roll.window_end, T0 + 2 * DAY);
+    assert_eq!(roll.timestamp, T0 + DAY);
+}
+
+#[test]
+fn multi_epoch_rollover_settles_every_window_and_keeps_the_schedule() {
+    let h = setup();
+    let bid = daily(&h, "w3", 1_000);
+    h.client.consume(&h.owner, &bid, &300);
+
+    // Three whole windows and a bit later, nobody touched the budget.
+    h.env.ledger().set_timestamp(T0 + 3 * DAY + 10);
+    let status = h.client.sync_window(&bid);
+    assert!(status.rolled_over);
+    assert_eq!(status.periods, 3);
+    // Re-anchored to the boundary, never to "now", so windows do not drift.
+    assert_eq!(status.window_start, T0 + 3 * DAY);
+    assert_eq!(status.window_end, T0 + 4 * DAY);
+    assert_eq!(status.spent, 0);
+    assert_eq!(status.remaining, 1_000);
+
+    let rolls = win_roll_events(&h.env);
+    assert_eq!(rolls.len(), 1);
+    assert_eq!(rolls[0].periods, 3);
+    assert_eq!(rolls[0].previous_spent, 300);
+
+    // A second sync inside the same window is a no-op.
+    let again = h.client.sync_window(&bid);
+    assert!(!again.rolled_over);
+    assert_eq!(again.periods, 0);
+    assert_eq!(again.window_start, T0 + 3 * DAY);
+}
+
+#[test]
+fn rollover_retains_historical_budget_parameters() {
+    let h = setup();
+    let bid = id(&h.env, "w4");
+    let expires_at = T0 + 30 * DAY;
+    h.client
+        .allocate(&h.owner, &bid, &5_000, &Period::Weekly, &false, &expires_at);
+    h.client.consume(&h.owner, &bid, &4_000);
+    let before = h.client.get(&bid);
+
+    h.env.ledger().set_timestamp(T0 + 7 * DAY);
+    h.client.sync_window(&bid);
+    let after: Budget = h.client.get(&bid);
+    assert_eq!(after.spent, 0);
+    assert_eq!(after.window_start, T0 + 7 * DAY);
+    // Everything that defines the budget is untouched.
+    assert_eq!(after.limit, before.limit);
+    assert_eq!(after.period, before.period);
+    assert_eq!(after.period_seconds, before.period_seconds);
+    assert_eq!(after.rollover_enabled, before.rollover_enabled);
+    assert_eq!(after.rollover_cap, before.rollover_cap);
+    assert_eq!(after.rollover_bps, before.rollover_bps);
+    assert_eq!(after.allow_deficit, before.allow_deficit);
+    assert_eq!(after.expires_at, before.expires_at);
+    assert_eq!(after.owner, before.owner);
+    assert_eq!(after.state, before.state);
+}
+
+#[test]
+fn early_reset_re_anchors_the_window_and_defers_the_next_rollover() {
+    let h = setup();
+    let bid = daily(&h, "w5", 1_000);
+    h.env.ledger().set_timestamp(T0 + 50_000);
+    h.client.consume(&h.owner, &bid, &900);
+    // Owner resets early: counters clear and the window restarts now.
+    h.client.reset(&h.owner, &bid);
+    let b = h.client.get(&bid);
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.window_start, T0 + 50_000);
+
+    // The original boundary no longer rolls the window.
+    h.env.ledger().set_timestamp(T0 + DAY);
+    h.client.consume(&h.owner, &bid, &700);
+    assert!(!h.client.window_status(&bid).rolled_over);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &bid, &301),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+
+    // One full window after the reset, it does.
+    h.env.ledger().set_timestamp(T0 + 50_000 + DAY);
+    let status = h.client.sync_window(&bid);
+    assert!(status.rolled_over);
+    assert_eq!(status.spent, 0);
+    assert_eq!(status.window_start, T0 + 50_000 + DAY);
+}
+
+#[test]
+fn window_status_is_read_only() {
+    let h = setup();
+    let bid = daily(&h, "w6", 1_000);
+    h.client.consume(&h.owner, &bid, &250);
+    h.env.ledger().set_timestamp(T0 + 2 * DAY);
+
+    let preview = h.client.window_status(&bid);
+    assert!(preview.rolled_over);
+    assert_eq!(preview.periods, 2);
+    assert_eq!(preview.spent, 0);
+    // Nothing persisted and no rollover announced.
+    let stored = h.client.get(&bid);
+    assert_eq!(stored.window_start, T0);
+    assert_eq!(stored.spent, 250);
+    assert!(win_roll_events(&h.env).is_empty());
+}
+
+#[test]
+fn non_recurring_budget_never_rolls_over() {
+    let h = setup();
+    let bid = id(&h.env, "w7");
+    h.client
+        .allocate(&h.owner, &bid, &1_000, &Period::None, &false, &0);
+    h.client.consume(&h.owner, &bid, &400);
+    h.env.ledger().set_timestamp(T0 + 365 * DAY);
+    let status = h.client.sync_window(&bid);
+    assert!(!status.rolled_over);
+    assert_eq!(status.window_end, 0);
+    assert_eq!(status.spent, 400);
+    assert_eq!(status.remaining, 600);
+}
+
+#[test]
+fn custom_period_rolls_on_its_own_interval() {
+    let h = setup();
+    let bid = id(&h.env, "w8");
+    h.client
+        .allocate(&h.owner, &bid, &100, &Period::Custom, &false, &0);
+    h.client
+        .set_recurrence(&h.owner, &bid, &Period::Custom, &3_600, &false, &0, &0);
+    h.client.consume(&h.owner, &bid, &100);
+    h.env.ledger().set_timestamp(T0 + 3_599);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &bid, &1),
+        Err(Ok(BudgetError::BudgetExceeded))
+    );
+    h.env.ledger().set_timestamp(T0 + 3_600);
+    assert_eq!(h.client.consume(&h.owner, &bid, &100), 0);
+}
+
+#[test]
+fn sync_window_before_a_scheduled_start_changes_nothing() {
+    let h = setup();
+    let bid = id(&h.env, "w9");
+    let start = T0 + 10 * DAY;
+    h.client
+        .allocate_scheduled(&h.owner, &bid, &1_000, &Period::Daily, &false, &start, &0);
+    let status = h.client.sync_window(&bid);
+    assert!(!status.rolled_over);
+    assert_eq!(status.window_start, start);
+    assert_eq!(status.window_end, start + DAY);
+}
+
+#[test]
+fn sync_window_reports_lifecycle_errors() {
+    let h = setup();
+    assert_eq!(
+        h.client.try_sync_window(&id(&h.env, "nope")),
+        Err(Ok(Error::NotFound))
+    );
+
+    let archived = daily(&h, "w10", 1_000);
+    h.client.archive(&h.owner, &archived);
+    assert_eq!(
+        h.client.try_sync_window(&archived),
+        Err(Ok(Error::BudgetArchived))
+    );
+
+    let expiring = id(&h.env, "w11");
+    h.client.allocate(
+        &h.owner,
+        &expiring,
+        &1_000,
+        &Period::Daily,
+        &false,
+        &(T0 + DAY),
+    );
+    h.env.ledger().set_timestamp(T0 + DAY);
+    assert_eq!(
+        h.client.try_sync_window(&expiring),
+        Err(Ok(Error::BudgetExpired))
+    );
+}
+
+#[test]
+fn unrepresentable_window_end_is_rejected_without_panicking() {
+    let h = setup();
+    let bid = id(&h.env, "w12");
+    // A scheduled start so late that `start + DAY` overflows `u64`.
+    let start = u64::MAX - 10;
+    h.client
+        .allocate_scheduled(&h.owner, &bid, &1_000, &Period::Daily, &false, &start, &0);
+    assert_eq!(
+        h.client.try_window_status(&bid),
+        Err(Ok(Error::BudgetWindowInvalid))
+    );
+    h.env.ledger().set_timestamp(u64::MAX - 5);
+    assert_eq!(
+        h.client.try_sync_window(&bid),
+        Err(Ok(Error::BudgetWindowInvalid))
+    );
+    assert_eq!(
+        h.client.try_consume(&h.owner, &bid, &1),
+        Err(Ok(BudgetError::BudgetWindowInvalid))
+    );
+}
+
+#[test]
+fn rollover_with_carry_resets_spend_and_banks_credit() {
+    let h = setup();
+    let bid = id(&h.env, "w13");
+    h.client
+        .allocate(&h.owner, &bid, &1_000, &Period::Daily, &true, &0);
+    h.client.consume(&h.owner, &bid, &400);
+    h.env.ledger().set_timestamp(T0 + DAY);
+    let status = h.client.sync_window(&bid);
+    assert!(status.rolled_over);
+    assert_eq!(status.spent, 0);
+    // 600 unspent carried into the new window.
+    assert_eq!(status.remaining, 1_600);
+    assert_eq!(h.client.get(&bid).rollover_credit, 600);
 }

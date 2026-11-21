@@ -177,6 +177,7 @@ use astroid_shared::constants::{
     PROPOSAL_QUORUM_PERCENT,
 };
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_add_u64, checked_mul_u64};
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
@@ -298,10 +299,21 @@ impl VoteBars {
     /// identical integer. `percent` is clamped to 100, so a misconfigured
     /// percentage can never demand more than the whole allow-list.
     pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
+        // With `percent <= 100` the result never exceeds `eligible`, so the
+        // checked path cannot fail; should it ever, fail closed by demanding
+        // the whole allow-list rather than panicking (Issue #497).
+        Self::checked_quorum_required(eligible, percent).unwrap_or(eligible)
+    }
+
+    /// Checked form of [`Self::quorum_required`]: `ceil(eligible * percent /
+    /// 100)` through the shared checked `u64` helpers, so an out-of-range
+    /// intermediate is [`Error::Overflow`] instead of a wrap or a panic.
+    /// `percent` is clamped to 100.
+    pub fn checked_quorum_required(eligible: u32, percent: u32) -> Result<u32, Error> {
         let percent = percent.min(100);
-        let product = checked_mul_u64(eligible as u64, percent as u64)
-            .expect("quorum multiplication overflow");
-        product.div_ceil(100) as u32
+        let product = checked_mul_u64(eligible as u64, percent as u64)?;
+        let rounded_up = checked_add_u64(product, 99)? / 100;
+        u32::try_from(rounded_up).map_err(|_| Error::Overflow)
     }
 
     /// Majority check helper: the smallest number of approvals that exceeds
@@ -314,6 +326,12 @@ impl VoteBars {
     /// Whether `approvals` forms a strict majority of the `eligible` voters.
     pub fn has_majority(approvals: u32, eligible: u32) -> bool {
         approvals >= Self::majority_required(eligible)
+    }
+
+    /// The binding bar: the largest of the threshold, quorum and majority —
+    /// the approval count a tally must reach to clear all three at once.
+    pub fn required(&self) -> u32 {
+        self.threshold.max(self.quorum).max(self.majority)
     }
 
     /// Whether a tally of `approvals` clears *every* bar — the configured
@@ -333,6 +351,37 @@ impl VoteBars {
             Err(Error::ThresholdNotMet)
         }
     }
+}
+
+/// Live vote tally of one proposal against its bars (Issue #497), returned by
+/// [`ProposalContract::tally`].
+///
+/// Derived on every read from the recorded approvals and the *live* multisig
+/// (an approver removed from the signer set stops counting), with checked
+/// arithmetic throughout:
+///
+/// * `approvals` / `approval_weight` — verified votes and their signer weight;
+/// * `outstanding` — allow-listed approvers who are still signers and have
+///   not voted yet: the most the tally can still grow by;
+/// * `bars` — the threshold, quorum and majority the tally must clear;
+/// * `quorum_reached` / `majority_reached` / `threshold_reached` — each bar
+///   on its own (an exact tie never reaches the majority);
+/// * `passed` — every bar is cleared;
+/// * `defeated` — the proposal can no longer pass: even if every outstanding
+///   approver voted for it, `approvals + outstanding` would stay below
+///   [`VoteBars::required`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalTally {
+    pub approvals: u32,
+    pub approval_weight: u32,
+    pub outstanding: u32,
+    pub bars: VoteBars,
+    pub quorum_reached: bool,
+    pub majority_reached: bool,
+    pub threshold_reached: bool,
+    pub passed: bool,
+    pub defeated: bool,
 }
 
 #[contracttype]
@@ -501,10 +550,7 @@ impl ProposalContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("created")),
-            (id, proposer),
-        );
+        events::proposal_created(&env, id, &proposer);
         Ok(id)
     }
 
@@ -522,6 +568,9 @@ impl ProposalContract {
         let mut proposal = Self::load(&env, id)?;
         if Self::expire_if_due(&env, id, &mut proposal)? {
             return Ok(proposal.approvals);
+        }
+        if proposal.state == ProposalState::Defeated {
+            return Err(Error::ProposalDefeated);
         }
         if !matches!(
             proposal.state,
@@ -542,12 +591,20 @@ impl ProposalContract {
             return Err(Error::AlreadySigned);
         }
         let multisig_threshold = multisig_client.get_threshold();
-        let previous_weight = if proposal.state == ProposalState::Approved {
-            Self::live_approval_tally(&env, id, &proposal)?.1
+        let (previous_approvals, previous_weight) = if proposal.state == ProposalState::Approved {
+            Self::live_approval_tally(&env, id, &proposal)?
         } else {
-            0
+            (0, 0)
         };
-        if proposal.state == ProposalState::Approved && previous_weight >= multisig_threshold {
+        // A passed proposal stops accepting votes only once nothing more can
+        // be gained: the multisig weight is met *and* the tally clears every
+        // vote bar. Refusing earlier would strand a tied (or under-quorate)
+        // `Approved` proposal forever, since execution re-checks the bars
+        // (Issue #497).
+        if proposal.state == ProposalState::Approved
+            && previous_weight >= multisig_threshold
+            && VoteBars::for_proposal(&proposal).met_by(previous_approvals)
+        {
             return Err(Error::InvalidProposalState);
         }
         env.storage().persistent().set(&akey, &true);
@@ -566,14 +623,9 @@ impl ProposalContract {
         let crossed_multisig_threshold =
             previous_weight < multisig_threshold && approval_weight >= multisig_threshold;
         if proposal.state == ProposalState::Pending && proposal.approvals >= proposal.threshold {
-            // Issue #329 — every transition passes the canonical state
-            // machine; an entrypoint that fell out of sync with it aborts
-            // instead of corrupting the record.
-            assert!(
-                proposal.state.may_transition(ProposalState::Approved),
-                "approve: illegal transition"
-            );
-            proposal.state = ProposalState::Approved;
+            // Issue #329 / #497 — every transition passes the canonical state
+            // machine; an illegal edge is refused with an explicit error.
+            Self::transition(&env, id, &mut proposal, ProposalState::Approved)?;
             // Record the moment of approval: the timelock only starts counting
             // once, when the threshold is reached, and is re-applied verbatim
             // (approval signatures cannot be retracted).
@@ -583,15 +635,14 @@ impl ProposalContract {
         }
         Self::store(&env, id, &proposal);
         if crossed_multisig_threshold {
-            env.events().publish(
-                (symbol_short!("proposal"), symbol_short!("weightok")),
+            events::emit(
+                &env,
+                events::topic::PROPOSAL,
+                symbol_short!("weightok"),
                 (id, caller.clone(), approval_weight),
             );
         }
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("approved")),
-            (id, caller, proposal.approvals),
-        );
+        events::proposal_approved(&env, id, &caller, proposal.approvals);
         Ok(proposal.approvals)
     }
 
@@ -614,11 +665,7 @@ impl ProposalContract {
             return Err(Error::NotAnApprover);
         }
         // Issue #329 — every transition passes the canonical state machine.
-        assert!(
-            proposal.state.may_transition(ProposalState::Rejected),
-            "reject: illegal transition"
-        );
-        proposal.state = ProposalState::Rejected;
+        Self::transition(&env, id, &mut proposal, ProposalState::Rejected)?;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
                 &env.current_contract_address(),
@@ -627,8 +674,10 @@ impl ProposalContract {
             );
         }
         Self::store(&env, id, &proposal);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("rejected")),
+        events::emit(
+            &env,
+            events::topic::PROPOSAL,
+            symbol_short!("rejected"),
             (id, caller),
         );
         Ok(())
@@ -674,7 +723,7 @@ impl ProposalContract {
                 return Err(Error::CancellationWindowClosed);
             }
         }
-        proposal.state = ProposalState::Cancelled;
+        Self::transition(&env, id, &mut proposal, ProposalState::Cancelled)?;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
                 &env.current_contract_address(),
@@ -683,8 +732,12 @@ impl ProposalContract {
             );
         }
         Self::store(&env, id, &proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("cancelled")), id);
+        events::emit(
+            &env,
+            events::topic::PROPOSAL,
+            symbol_short!("cancelled"),
+            id,
+        );
         Ok(())
     }
 
@@ -765,8 +818,10 @@ impl ProposalContract {
             }
         }
         if pruned > 0 {
-            env.events().publish(
-                (symbol_short!("proposal"), symbol_short!("pruned_b")),
+            events::emit(
+                &env,
+                events::topic::PROPOSAL,
+                symbol_short!("pruned_b"),
                 pruned,
             );
         }
@@ -796,8 +851,10 @@ impl ProposalContract {
             }
         }
         if pruned > 0 {
-            env.events().publish(
-                (symbol_short!("proposal"), symbol_short!("pruned_r")),
+            events::emit(
+                &env,
+                events::topic::PROPOSAL,
+                symbol_short!("pruned_r"),
                 pruned,
             );
         }
@@ -836,6 +893,9 @@ impl ProposalContract {
     pub fn execute(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut proposal = Self::load(&env, id)?;
+        if proposal.state == ProposalState::Defeated {
+            return Err(Error::ProposalDefeated);
+        }
         if proposal.is_expired(&env) {
             return Err(Error::ProposalExpired);
         }
@@ -863,11 +923,7 @@ impl ProposalContract {
         require_timelock_elapsed(&env, &proposal)?;
         Self::ensure_dependencies_met(&env, id, &proposal)?;
         // Issue #329 — every transition passes the canonical state machine.
-        assert!(
-            proposal.state.may_transition(ProposalState::Executed),
-            "execute: illegal transition"
-        );
-        proposal.state = ProposalState::Executed;
+        Self::transition(&env, id, &mut proposal, ProposalState::Executed)?;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(&env, &dep.asset).transfer(
                 &env.current_contract_address(),
@@ -876,8 +932,7 @@ impl ProposalContract {
             );
         }
         Self::store(&env, id, &proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("executed")), id);
+        events::proposal_executed(&env, id);
         Ok(())
     }
 
@@ -903,14 +958,9 @@ impl ProposalContract {
             return Err(Error::ProposalNotApproved);
         }
         // Issue #329 — every transition passes the canonical state machine.
-        assert!(
-            proposal.state.may_transition(ProposalState::Failed),
-            "fail: illegal transition"
-        );
-        proposal.state = ProposalState::Failed;
+        Self::transition(&env, id, &mut proposal, ProposalState::Failed)?;
         Self::store(&env, id, &proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("failed")), id);
+        events::emit(&env, events::topic::PROPOSAL, symbol_short!("failed"), id);
         Ok(())
     }
 
@@ -934,15 +984,58 @@ impl ProposalContract {
             return Err(Error::InvalidProposalState);
         }
         // Issue #329 — every transition passes the canonical state machine.
-        assert!(
-            proposal.state.may_transition(ProposalState::Closed),
-            "close: illegal transition"
-        );
-        proposal.state = ProposalState::Closed;
+        Self::transition(&env, id, &mut proposal, ProposalState::Closed)?;
         Self::store(&env, id, &proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("closed")), id);
+        events::emit(&env, events::topic::PROPOSAL, symbol_short!("closed"), id);
         Ok(())
+    }
+
+    /// Settle the vote of proposal `id` against its bars (Issue #497).
+    /// Permissionless: the verdict is a pure function of on-chain state and
+    /// the ledger clock, so anyone may record it.
+    ///
+    /// * A stale proposal is settled to `Expired` first (deposit refunded).
+    /// * A live (`Pending` / `Approved`) proposal that can no longer pass —
+    ///   see [`ProposalTally::defeated`] — moves to the terminal `Defeated`
+    ///   state, refunds the deposit and publishes `("proposal", "defeated")`
+    ///   plus the standard state-change event.
+    /// * Anything else is left as-is.
+    ///
+    /// Returns the proposal's state after settlement.
+    pub fn finalize(env: Env, id: u64) -> Result<ProposalState, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        if Self::expire_if_due(&env, id, &mut proposal)? {
+            return Ok(proposal.state);
+        }
+        if !proposal.state.is_live() {
+            return Ok(proposal.state);
+        }
+        let tally = Self::compute_tally(&env, id, &proposal)?;
+        if !tally.defeated {
+            return Ok(proposal.state);
+        }
+        proposal.approvals = tally.approvals;
+        proposal.approval_weight = tally.approval_weight;
+        Self::transition(&env, id, &mut proposal, ProposalState::Defeated)?;
+        Self::refund_deposit(&env, &proposal);
+        Self::store(&env, id, &proposal);
+        events::emit(
+            &env,
+            events::topic::PROPOSAL,
+            symbol_short!("defeated"),
+            (id, tally.approvals, tally.bars.required()),
+        );
+        Ok(proposal.state)
+    }
+
+    /// The live vote tally of proposal `id` against its bars (Issue #497):
+    /// verified approvals and weight, outstanding eligible votes, each bar,
+    /// and whether the vote has passed or can no longer pass. Read through
+    /// the same settle-first path as every view.
+    pub fn tally(env: Env, id: u64) -> Result<ProposalTally, Error> {
+        let mut proposal = Self::load(&env, id)?;
+        Self::expire_if_due(&env, id, &mut proposal)?;
+        Self::compute_tally(&env, id, &proposal)
     }
 
     // --- views ---
@@ -1031,11 +1124,7 @@ impl ProposalContract {
 
         // Issue #329 — the expiry transition passes the canonical state
         // machine too (it is reachable only from the two live states).
-        assert!(
-            proposal.state.may_transition(ProposalState::Expired),
-            "expire: illegal transition"
-        );
-        proposal.state = ProposalState::Expired;
+        Self::transition(env, id, proposal, ProposalState::Expired)?;
         if let Some(dep) = proposal.deposit.first() {
             TokenClient::new(env, &dep.asset).transfer(
                 &env.current_contract_address(),
@@ -1044,9 +1133,73 @@ impl ProposalContract {
             );
         }
         Self::store(env, id, proposal);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("expired")), id);
+        events::emit(env, events::topic::PROPOSAL, symbol_short!("expired"), id);
         Ok(true)
+    }
+
+    /// Move `proposal` to `next` through the canonical state machine
+    /// (Issue #497). An edge the table does not admit is refused with
+    /// [`Error::InvalidProposalState`] — never a panic — and every accepted
+    /// edge publishes the standard `("proposal", "state", id)` event carrying
+    /// the `from` / `to` discriminants. The caller persists the record.
+    fn transition(
+        env: &Env,
+        id: u64,
+        proposal: &mut Proposal,
+        next: ProposalState,
+    ) -> Result<(), Error> {
+        let from = proposal.state;
+        if !from.may_transition(next) {
+            return Err(Error::InvalidProposalState);
+        }
+        proposal.state = next;
+        events::proposal_state_changed(env, id, from as u32, next as u32);
+        Ok(())
+    }
+
+    /// Return the proposer's deposit, if any.
+    fn refund_deposit(env: &Env, proposal: &Proposal) {
+        if let Some(dep) = proposal.deposit.first() {
+            TokenClient::new(env, &dep.asset).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &dep.amount,
+            );
+        }
+    }
+
+    /// Derive the [`ProposalTally`] from recorded votes and the live
+    /// multisig. Checked arithmetic throughout; nothing is persisted.
+    fn compute_tally(env: &Env, id: u64, proposal: &Proposal) -> Result<ProposalTally, Error> {
+        let (approvals, approval_weight) = Self::live_approval_tally(env, id, proposal)?;
+        let multisig = Self::multisig(env)?;
+        let multisig_client = MultisigClient::new(env, &multisig);
+        let mut outstanding = 0u32;
+        for approver in proposal.approvers.iter() {
+            let voted: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Approval(id, approver.clone()))
+                .unwrap_or(false);
+            if !voted && multisig_client.is_signer(&approver) {
+                outstanding = outstanding.checked_add(1).ok_or(Error::Overflow)?;
+            }
+        }
+        let bars = VoteBars::for_proposal(proposal);
+        let eligible = proposal.approvers.len();
+        let reachable = approvals.checked_add(outstanding).ok_or(Error::Overflow)?;
+        let passed = bars.met_by(approvals);
+        Ok(ProposalTally {
+            approvals,
+            approval_weight,
+            outstanding,
+            bars,
+            quorum_reached: approvals >= bars.quorum,
+            majority_reached: VoteBars::has_majority(approvals, eligible),
+            threshold_reached: approvals >= bars.threshold,
+            passed,
+            defeated: !passed && reachable < bars.required(),
+        })
     }
 
     fn load(env: &Env, id: u64) -> Result<Proposal, Error> {
@@ -1193,15 +1346,19 @@ impl ProposalContract {
         for dep in proposal.dependencies.iter() {
             let prerequisite = Self::load(env, dep)?;
             if !prerequisite.state.has_executed() {
-                env.events().publish(
-                    (symbol_short!("proposal"), symbol_short!("dep_fail")),
+                events::emit(
+                    env,
+                    events::topic::PROPOSAL,
+                    symbol_short!("dep_fail"),
                     (id, dep),
                 );
                 return Err(Error::PrerequisiteNotMet);
             }
         }
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("dep_ok")),
+        events::emit(
+            env,
+            events::topic::PROPOSAL,
+            symbol_short!("dep_ok"),
             (id, proposal.dependencies.clone()),
         );
         Ok(())
@@ -1222,10 +1379,8 @@ impl ProposalContract {
                 .persistent()
                 .remove(&DataKey::Approval(id, approver));
         }
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("pruned")), id);
-        env.events()
-            .publish((symbol_short!("proposal"), symbol_short!("cleaned")), id);
+        events::emit(env, events::topic::PROPOSAL, symbol_short!("pruned"), id);
+        events::emit(env, events::topic::PROPOSAL, symbol_short!("cleaned"), id);
     }
 }
 

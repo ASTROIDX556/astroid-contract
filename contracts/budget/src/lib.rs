@@ -236,6 +236,24 @@ pub struct RolloverOutcome {
     pub is_due: bool,
 }
 
+/// Snapshot of a budget's active spending window (Issue #495), returned by
+/// [`BudgetContract::sync_window`] and [`BudgetContract::window_status`].
+///
+/// The window is half-open, `[window_start, window_end)`; `window_end` is `0`
+/// for a budget that does not recur. `rolled_over` / `periods` report whether
+/// the call settled (or, for the read-only view, would settle) a boundary and
+/// how many whole windows that covered.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowStatus {
+    pub window_start: u64,
+    pub window_end: u64,
+    pub spent: i128,
+    pub remaining: i128,
+    pub rolled_over: bool,
+    pub periods: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -484,8 +502,10 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &budget);
         Self::bump(&env, &budget_id);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("allocated")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("allocated"),
             (budget_id.clone(), owner, limit),
         );
         events::publish(
@@ -547,7 +567,7 @@ impl BudgetContract {
         } else {
             // Settle what the old policy already owes before adopting the new
             // one; preserve a future start when configuring a scheduled budget.
-            Self::window_transition(&env, &mut budget, &budget_id, true)?;
+            Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
         }
 
         budget.period = period;
@@ -583,8 +603,10 @@ impl BudgetContract {
             budget.window_start = now;
         }
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("recurring")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("recurring"),
             (budget_id.clone(), period, period_seconds, rollover_cap),
         );
         events::publish(
@@ -616,7 +638,7 @@ impl BudgetContract {
         Self::require_active(&budget)?;
         Self::require_not_expired(&env, &budget)?;
         // Settle pending transition if due
-        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
 
         budget.rollover_enabled = rollover_enabled;
         budget.rollover_bps = rollover_bps;
@@ -630,8 +652,10 @@ impl BudgetContract {
             );
         }
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("rollover")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("rollover"),
             (budget_id.clone(), rollover_bps, max_rollover_cap),
         );
         events::publish(
@@ -656,8 +680,10 @@ impl BudgetContract {
         budget.rollover_credit = 0;
         budget.window_start = env.ledger().timestamp();
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("reset")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("reset"),
             budget_id.clone(),
         );
         events::publish(
@@ -678,7 +704,7 @@ impl BudgetContract {
     pub fn rollover(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_not_archived(&budget)?;
-        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
         Self::store(&env, &budget_id, &budget);
         Ok(())
     }
@@ -693,14 +719,16 @@ impl BudgetContract {
         Self::require_valid_limit(new_limit)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_not_archived(&budget)?;
-        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
         if new_limit < budget.spent {
             return Err(Error::InvalidInput);
         }
         budget.limit = new_limit;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("setlimit")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("setlimit"),
             (budget_id.clone(), new_limit),
         );
         events::publish(
@@ -726,11 +754,13 @@ impl BudgetContract {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_not_archived(&budget)?;
-        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
         budget.limit = checked_add(budget.limit, amount)?;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("funded")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("funded"),
             (budget_id.clone(), amount, budget.limit),
         );
         events::publish(
@@ -755,8 +785,10 @@ impl BudgetContract {
         }
         budget.state = ResourceState::Frozen;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("frozen")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("frozen"),
             budget_id.clone(),
         );
         events::publish(
@@ -777,8 +809,10 @@ impl BudgetContract {
         }
         budget.state = ResourceState::Active;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("unfrozen")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("unfrozen"),
             budget_id.clone(),
         );
         events::publish(
@@ -796,8 +830,10 @@ impl BudgetContract {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         budget.state = ResourceState::Archived;
         Self::store(&env, &budget_id, &budget);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("archived")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("archived"),
             budget_id.clone(),
         );
         events::publish(
@@ -842,8 +878,10 @@ impl BudgetContract {
         to.limit = checked_add(to.limit, amount)?;
         Self::store(&env, &from_id, &from);
         Self::store(&env, &to_id, &to);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("realloc")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("realloc"),
             (from_id.clone(), to_id.clone(), amount),
         );
         events::publish(
@@ -895,8 +933,10 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("set_ast")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("set_ast"),
             (budget_id.clone(), token.clone(), limit),
         );
         events::publish(
@@ -944,8 +984,10 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("set_ast")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("set_ast"),
             (budget_id.clone(), token.clone(), limit),
         );
         events::publish(
@@ -995,8 +1037,10 @@ impl BudgetContract {
         }
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("ast_roll")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("ast_roll"),
             (
                 budget_id.clone(),
                 token.clone(),
@@ -1050,8 +1094,10 @@ impl BudgetContract {
         asset_budget.spent = new_spent;
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("ast_spend")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("ast_spend"),
             (budget_id.clone(), token.clone(), amount),
         );
         if new_spent >= capacity {
@@ -1144,8 +1190,10 @@ impl BudgetContract {
                 &settled.get(i).unwrap(),
             );
             Self::bump_asset(&env, &budget_id, &spend.token);
-            env.events().publish(
-                (symbol_short!("budget"), symbol_short!("ast_spend")),
+            events::emit(
+                &env,
+                events::topic::BUDGET,
+                symbol_short!("ast_spend"),
                 (budget_id.clone(), spend.token.clone(), spend.amount),
             );
             let leg = settled.get(i).unwrap();
@@ -1204,6 +1252,53 @@ impl BudgetContract {
             asset_budget.limit
         };
         checked_sub(capacity, asset_budget.spent)
+    }
+
+    /// Settle a budget's spending window against the ledger clock
+    /// (Issue #495). Permissionless: the outcome is a pure function of the
+    /// stored record and `env.ledger().timestamp()`, so a keeper (or any
+    /// client) may trigger it — exactly as every spend does lazily through
+    /// [`Self::check_and_rollover_window`].
+    ///
+    /// When the current ledger timestamp is at or past the active window end
+    /// (`window_start + duration`, half-open), every elapsed window is settled
+    /// at once: the spend counter resets to zero, rollover credit is
+    /// recomputed, `window_start` re-anchors to the boundary, and the
+    /// `("budget", "win_roll")` event is published. The budget's parameters
+    /// (limit, period, rollover and deficit configuration, expiry) are never
+    /// touched. Before the boundary — or before a scheduled budget starts —
+    /// nothing changes and `rolled_over` is `false`.
+    ///
+    /// Errors: [`Error::NotFound`], [`Error::BudgetArchived`],
+    /// [`Error::BudgetExpired`] past `expires_at`, and
+    /// [`Error::BudgetWindowInvalid`] for a window record that cannot be
+    /// settled deterministically.
+    pub fn sync_window(env: Env, budget_id: String) -> Result<WindowStatus, Error> {
+        let mut budget = Self::load(&env, &budget_id)?;
+        Self::require_not_archived(&budget)?;
+        if env.ledger().timestamp() < budget.window_start {
+            return Self::window_status_of(&budget, 0);
+        }
+        let periods = Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
+        if periods > 0 {
+            Self::store(&env, &budget_id, &budget);
+        }
+        Self::window_status_of(&budget, periods)
+    }
+
+    /// Read-only counterpart of [`Self::sync_window`]: the window the budget
+    /// is in right now, as it would be after settling any lapsed boundary.
+    /// Persists and publishes nothing.
+    pub fn window_status(env: Env, budget_id: String) -> Result<WindowStatus, Error> {
+        let mut budget = Self::load(&env, &budget_id)?;
+        if env.ledger().timestamp() < budget.window_start {
+            return Self::window_status_of(&budget, 0);
+        }
+        Self::validate_window(&budget)?;
+        let before = budget.window_start;
+        Self::window_transition(&env, &mut budget, &budget_id, false)?;
+        let periods = Self::periods_between(&budget, before);
+        Self::window_status_of(&budget, periods)
     }
 
     /// Read-only preview of the rollover calculation for `budget_id`
@@ -1509,6 +1604,77 @@ impl BudgetContract {
         Ok(now >= end)
     }
 
+    /// Window rollover check invoked at the start of every spend validation
+    /// (Issue #495).
+    ///
+    /// Validates that the window record can be settled deterministically,
+    /// then applies [`Self::window_transition`]: when the ledger timestamp is
+    /// at or past the active window end, every elapsed window is settled at
+    /// once — spend counter reset to zero, rollover credit recomputed,
+    /// `window_start` re-anchored to the boundary — and the rollover events
+    /// (including the standard `("budget", "win_roll")`) are published. The
+    /// budget's configured parameters are left untouched.
+    ///
+    /// Returns the number of whole windows rolled over (`0` when the current
+    /// window is still open or the budget does not recur). Mutates `budget`
+    /// in place; the caller persists it. Never panics: all time arithmetic is
+    /// checked, and an abnormal record reports
+    /// [`Error::BudgetWindowInvalid`].
+    fn check_and_rollover_window(
+        env: &Env,
+        budget_id: &String,
+        budget: &mut Budget,
+    ) -> Result<u64, Error> {
+        Self::validate_window(budget)?;
+        let before = budget.window_start;
+        Self::window_transition(env, budget, budget_id, true)?;
+        Ok(Self::periods_between(budget, before))
+    }
+
+    /// Reject a window record a rollover cannot settle deterministically: a
+    /// window end that is not representable as a ledger timestamp, or a
+    /// negative counter (neither is reachable through the public API, so
+    /// either indicates corrupted state).
+    fn validate_window(budget: &Budget) -> Result<(), Error> {
+        if budget.spent < 0 || budget.limit < 0 || budget.rollover_credit < 0 {
+            return Err(Error::BudgetWindowInvalid);
+        }
+        if let Some(window) = Self::window_of(budget.period, budget.period_seconds) {
+            budget
+                .window_start
+                .checked_add(window)
+                .ok_or(Error::BudgetWindowInvalid)?;
+        }
+        Ok(())
+    }
+
+    /// Whole windows between a previous `window_start` and the current one.
+    fn periods_between(budget: &Budget, previous_start: u64) -> u64 {
+        match Self::window_of(budget.period, budget.period_seconds) {
+            Some(window) => budget.window_start.saturating_sub(previous_start) / window,
+            None => 0,
+        }
+    }
+
+    /// Build a [`WindowStatus`] for `budget` after `periods` rollovers.
+    fn window_status_of(budget: &Budget, periods: u64) -> Result<WindowStatus, Error> {
+        let window_end = match Self::window_of(budget.period, budget.period_seconds) {
+            Some(window) => budget
+                .window_start
+                .checked_add(window)
+                .ok_or(Error::BudgetWindowInvalid)?,
+            None => 0,
+        };
+        Ok(WindowStatus {
+            window_start: budget.window_start,
+            window_end,
+            spent: budget.spent,
+            remaining: Self::effective_remaining(budget)?,
+            rolled_over: periods > 0,
+            periods,
+        })
+    }
+
     /// The conditional execution hook for recurring allowances.
     ///
     /// Applies every period transition that is due (auto-reset / rollover) and
@@ -1536,8 +1702,10 @@ impl BudgetContract {
         let now = env.ledger().timestamp();
         if budget.expires_at != 0 && now >= budget.expires_at {
             if publish {
-                env.events().publish(
-                    (symbol_short!("budget"), symbol_short!("expired")),
+                events::emit(
+                    env,
+                    events::topic::BUDGET,
+                    symbol_short!("expired"),
                     budget_id.clone(),
                 );
             }
@@ -1586,8 +1754,10 @@ impl BudgetContract {
             } else {
                 checked_sub(capacity, spent)?
             };
-            env.events().publish(
-                (symbol_short!("budget"), action.clone()),
+            events::emit(
+                env,
+                events::topic::BUDGET,
+                action.clone(),
                 (budget_id.clone(), amount),
             );
             events::publish(
@@ -1612,6 +1782,17 @@ impl BudgetContract {
                 .unwrap_or(i128::MAX)
                 .max(0);
             events::budget_replenished(env, budget_id, None, available);
+            // Issue #495 — the standard window-rollover event: how many
+            // windows were settled, the closed window's spend, and the new
+            // active window.
+            events::budget_window_rolled(
+                env,
+                budget_id,
+                periods as u64,
+                spent,
+                budget.window_start,
+                budget.window_start.saturating_add(window),
+            );
         }
         Ok(())
     }
@@ -1686,8 +1867,10 @@ impl BudgetContract {
     }
 
     fn emit_asset_reset(env: &Env, budget_id: &String, token: &Address, limit: i128) {
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("ast_reset")),
+        events::emit(
+            env,
+            events::topic::BUDGET,
+            symbol_short!("ast_reset"),
             (budget_id.clone(), token.clone(), limit),
         );
         events::publish(
@@ -1758,7 +1941,7 @@ impl BudgetInterface for BudgetContract {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
         Self::require_started(&env, &budget)?;
-        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         // When a deficit exists from prior periods, the effective spending
         // ceiling is reduced.  When no deficit exists yet, `allow_deficit`
@@ -1779,8 +1962,10 @@ impl BudgetInterface for BudgetContract {
                 // Checked: a genuine i128 overflow surfaces as [`Error::Overflow`]
                 // instead of a panic; a negative result (deficit) is expected.
                 let remaining = checked_sub(capacity, new_spent)?;
-                env.events().publish(
-                    (symbol_short!("budget"), symbol_short!("consumed")),
+                events::emit(
+                    &env,
+                    events::topic::BUDGET,
+                    symbol_short!("consumed"),
                     (budget_id.clone(), amount, remaining),
                 );
                 events::budget_exhausted(&env, &budget_id, None, new_spent, capacity);
@@ -1793,8 +1978,10 @@ impl BudgetInterface for BudgetContract {
         budget.spent = new_spent;
         Self::store(&env, &budget_id, &budget);
         let remaining = checked_sub(ceiling, budget.spent)?;
-        env.events().publish(
-            (symbol_short!("budget"), symbol_short!("consumed")),
+        events::emit(
+            &env,
+            events::topic::BUDGET,
+            symbol_short!("consumed"),
             (budget_id.clone(), amount, remaining),
         );
         if remaining <= 0 {
@@ -1811,7 +1998,7 @@ impl BudgetInterface for BudgetContract {
         require_positive_amount(amount)?;
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
-        Self::window_transition(&env, &mut budget, &budget_id, true)?;
+        Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
         if amount > budget.spent {
             return Err(Error::InvalidAmount);
         }

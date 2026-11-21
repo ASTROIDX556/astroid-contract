@@ -9,7 +9,8 @@ use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use soroban_sdk::testutils::{storage::Persistent as _, Address as _, AuthorizedFunction, Ledger};
 use soroban_sdk::{
-    symbol_short, testutils::Events, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    symbol_short, testutils::Events, vec, Address, BytesN, Env, IntoVal, String, Symbol,
+    TryFromVal, Val, Vec,
 };
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
@@ -3863,4 +3864,28 @@ fn unauthorized_upgrade_attempts_are_rejected() {
         h.client.try_remove_module(&upgrader, &h.org, &k),
         Err(Ok(Error::Unauthorized))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #493 — standardized event emission through shared/events.rs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn org_registration_emits_canonical_category_action_subject_topics() {
+    use astroid_shared::events::topic;
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let cat: Val = topic::ORG.into_val(&env);
+    let act: Val = symbol_short!("register").into_val(&env);
+    let found = env.events().all().iter().any(|(_, topics, data)| {
+        topics.len() == 3
+            && topics.get(0).unwrap().shallow_eq(&cat)
+            && topics.get(1).unwrap().shallow_eq(&act)
+            && String::try_from_val(&env, &topics.get(2).unwrap()).ok() == Some(org.clone())
+            && Address::try_from_val(&env, &data).ok() == Some(owner.clone())
+    });
+    assert!(found, "expected (org, register, org_id) -> owner");
 }

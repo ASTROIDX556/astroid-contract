@@ -176,6 +176,11 @@ pub enum Error {
     /// authorizes spend. Distinct from
     /// [`BudgetError::BudgetNotActive`], which is the *not yet started* case.
     BudgetExpired = 44,
+    /// The budget's spending-window record is in an abnormal state that a
+    /// rollover cannot settle deterministically: the window end
+    /// (`window_start + duration`) is not representable as a ledger
+    /// timestamp, or a counter the window tracks is negative (Issue #495).
+    BudgetWindowInvalid = 46,
 
     // --- Wallet (50-55) ---
     /// The wallet is frozen by its guardian, so configuration changes are
@@ -277,6 +282,10 @@ pub enum Error {
     /// The proposer attempted to cancel after the cancellation window (grace
     /// period) closed. Only the executor or governance may proceed from here.
     CancellationWindowClosed = 75,
+    /// The proposal was defeated: its tally can no longer clear the quorum,
+    /// majority and threshold bars, so it may not be approved or executed
+    /// (Issue #497).
+    ProposalDefeated = 76,
     /// A prerequisite proposal has not executed, so the dependent proposal may
     /// not execute yet.
     PrerequisiteNotMet = 78,
@@ -325,7 +334,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 60] = [
+    pub const ALL: [Error; 62] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -356,6 +365,7 @@ impl Error {
         Error::BudgetArchived,
         Error::AssetNotAuthorized,
         Error::BudgetExpired,
+        Error::BudgetWindowInvalid,
         // --- Wallet (50-55) ---
         Error::WalletFrozen,
         Error::WalletArchived,
@@ -384,6 +394,7 @@ impl Error {
         Error::ProposalNotApproved,
         Error::NotAnApprover,
         Error::CancellationWindowClosed,
+        Error::ProposalDefeated,
         Error::PrerequisiteNotMet,
         Error::CircularDependencyDetected,
         // --- Escrow (80-82) ---
@@ -456,6 +467,7 @@ impl Error {
             Error::BudgetArchived => "BUDGET_ARCHIVED",
             Error::AssetNotAuthorized => "ASSET_NOT_AUTHORIZED",
             Error::BudgetExpired => "BUDGET_EXPIRED",
+            Error::BudgetWindowInvalid => "BUDGET_WINDOW_INVALID",
             // --- Wallet (50-55) ---
             Error::WalletFrozen => "WALLET_FROZEN",
             Error::WalletArchived => "WALLET_ARCHIVED",
@@ -486,6 +498,7 @@ impl Error {
             Error::CancellationWindowClosed => "CANCELLATION_WINDOW_CLOSED",
             Error::PrerequisiteNotMet => "PREREQUISITE_NOT_MET",
             Error::CircularDependencyDetected => "CIRCULAR_DEPENDENCY_DETECTED",
+            Error::ProposalDefeated => "PROPOSAL_DEFEATED",
             // --- Escrow (80-82, 86-87) ---
             Error::EscrowExpired => "ESCROW_EXPIRED",
             Error::TimeLockActive => "TIME_LOCK_ACTIVE",
@@ -582,6 +595,10 @@ pub enum BudgetError {
     /// [`Error::BudgetExpired`], so a consumer that wants to tell the two apart
     /// must decode this table directly.
     BudgetNotActive = 45,
+    /// BUDGET_WINDOW_INVALID: the spending window cannot be rolled over
+    /// deterministically (unrepresentable window end or a negative counter).
+    /// Wire-compatible with [`Error::BudgetWindowInvalid`] (Issue #495).
+    BudgetWindowInvalid = 46,
 }
 
 impl BudgetError {
@@ -589,7 +606,7 @@ impl BudgetError {
     /// declares them. The audit walks this list, so a variant added to (or
     /// removed from) the enum without a matching entry fails
     /// `budget_error_table_is_frozen`.
-    pub const ALL: [BudgetError; 11] = [
+    pub const ALL: [BudgetError; 12] = [
         BudgetError::NotFound,
         BudgetError::Unauthorized,
         BudgetError::InvalidInput,
@@ -601,6 +618,7 @@ impl BudgetError {
         BudgetError::AssetNotAuthorized,
         BudgetError::BudgetExpired,
         BudgetError::BudgetNotActive,
+        BudgetError::BudgetWindowInvalid,
     ];
 
     /// The `u32` code this variant carries on the wire, identical to the value
@@ -627,6 +645,7 @@ impl BudgetError {
             BudgetError::AssetNotAuthorized => "ASSET_NOT_AUTHORIZED",
             BudgetError::BudgetExpired => "BUDGET_EXPIRED",
             BudgetError::BudgetNotActive => "BUDGET_NOT_ACTIVE",
+            BudgetError::BudgetWindowInvalid => "BUDGET_WINDOW_INVALID",
         }
     }
 }
@@ -635,7 +654,7 @@ impl BudgetError {
 /// declaration order. Kept as a literal so a renumber or a reissued slot is
 /// caught by `budget_error_codes_are_frozen_and_unique` rather than passing
 /// silently.
-pub const BUDGET_ERROR_CODES: [u32; 11] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45];
+pub const BUDGET_ERROR_CODES: [u32; 12] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46];
 
 impl From<Error> for BudgetError {
     fn from(error: Error) -> Self {
@@ -650,6 +669,7 @@ impl From<Error> for BudgetError {
             Error::BudgetArchived => Self::BudgetArchived,
             Error::AssetNotAuthorized => Self::AssetNotAuthorized,
             Error::BudgetExpired => Self::BudgetExpired,
+            Error::BudgetWindowInvalid => Self::BudgetWindowInvalid,
             Error::InvalidState => Self::InvalidInput,
             _ => Self::InvalidInput,
         }
@@ -669,6 +689,7 @@ impl From<BudgetError> for Error {
             BudgetError::BudgetArchived => Self::BudgetArchived,
             BudgetError::AssetNotAuthorized => Self::AssetNotAuthorized,
             BudgetError::BudgetExpired | BudgetError::BudgetNotActive => Self::BudgetExpired,
+            BudgetError::BudgetWindowInvalid => Self::BudgetWindowInvalid,
         }
     }
 }

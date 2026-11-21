@@ -409,8 +409,7 @@ impl WalletContract {
         }
         env.storage().instance().set(&DataKey::Paused, &true);
         Self::bump_instance(&env);
-        env.events()
-            .publish((Symbol::new(&env, "WalletPaused"),), caller);
+        events::publish(&env, events::ContractEvent::WalletPaused { by: caller });
         Ok(())
     }
 
@@ -425,8 +424,7 @@ impl WalletContract {
         }
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::bump_instance(&env);
-        env.events()
-            .publish((Symbol::new(&env, "WalletUnpaused"),), caller);
+        events::publish(&env, events::ContractEvent::WalletUnpaused { by: caller });
         Ok(())
     }
 
@@ -1161,8 +1159,12 @@ impl WalletContract {
         require_non_empty(&org)?;
         env.storage().instance().set(&DataKey::Org, &org);
         Self::bump_instance(&env);
-        env.events()
-            .publish((symbol_short!("wallet"), symbol_short!("org")), org.clone());
+        events::emit(
+            &env,
+            events::topic::WALLET,
+            symbol_short!("org"),
+            org.clone(),
+        );
         Ok(())
     }
 
@@ -1873,8 +1875,7 @@ impl WalletContract {
     }
 
     fn emit_state(env: &Env, id: u64, action: soroban_sdk::Symbol) {
-        env.events()
-            .publish((symbol_short!("wallet"), action.clone()), id);
+        events::emit(env, events::topic::WALLET, action.clone(), id);
         events::publish(
             env,
             events::ContractEvent::WalletStateChanged {

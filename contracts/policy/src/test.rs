@@ -4390,7 +4390,7 @@ fn event_count(env: &Env, category: &str, action: &str) -> u32 {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut count = 0;
     for (_emitter, topics, _data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
             count += 1;
         }
     }
@@ -4405,7 +4405,7 @@ fn event_payload(env: &Env, category: &str, action: &str) -> Option<Vec<Val>> {
     let act: Val = Symbol::new(env, action).into_val(env);
     let mut found = None;
     for (_emitter, topics, data) in env.events().all().iter() {
-        if topics.len() == 2 && topics.contains(cat.clone()) && topics.contains(act.clone()) {
+        if topics.len() == 2 && topics.contains(cat) && topics.contains(act) {
             found = Vec::<Val>::try_from_val(env, &data).ok();
         }
     }
@@ -4487,4 +4487,466 @@ fn asset_whitelist_mode_toggle_emits_its_own_standardized_topic() {
     p.set_recipient_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
     assert_eq!(event_count(&env, "policy", "wl_mode"), 1);
     assert_eq!(event_count(&env, "policy", "awl_mode"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Composite policy evaluation with sub-reasons (Issue #494)
+// ---------------------------------------------------------------------------
+
+use crate::{CompositeVerdict, PolicyCombinationStrategy, RuleDenial, RuleSource};
+
+/// A composite fixture: the `max_txn` policy plus one asset and one
+/// whitelisted recipient.
+struct Composite<'a> {
+    env: Env,
+    p: PolicyContractClient<'a>,
+    owner: Address,
+    pid: String,
+    asset: Address,
+    listed: Address,
+}
+
+fn rule_fixture<'a>() -> Composite<'a> {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let listed = Address::generate(&env);
+    p.add_recipient_to_whitelist(&owner, &pid, &listed);
+    Composite {
+        env,
+        p,
+        owner,
+        pid,
+        asset,
+        listed,
+    }
+}
+
+fn payload(c: &Composite, recipient: &Address, amount: i128) -> TransactionPayload {
+    TransactionPayload {
+        asset: c.asset.clone(),
+        recipient: recipient.clone(),
+        amount,
+    }
+}
+
+/// `And(children...)` with the children laid out at indices `1..=n`.
+fn and_of(env: &Env, children: &[RuleNode]) -> RuleTree {
+    branch_of(env, RuleOp::And, children)
+}
+
+fn branch_of(env: &Env, op: RuleOp, children: &[RuleNode]) -> RuleTree {
+    let mut tree = soroban_sdk::Vec::new(env);
+    tree.push_back(RuleNode {
+        op,
+        value_i128: 0,
+        value_address: Address::generate(env),
+        children_start: 1,
+        children_end: 1 + children.len() as u32,
+    });
+    for child in children {
+        tree.push_back(child.clone());
+    }
+    tree
+}
+
+/// `And(RecipientWhitelisted, WithinAllowance)` — whitelist verification plus
+/// a velocity limit, the canonical composite rule from the issue.
+fn whitelist_and_velocity(env: &Env) -> RuleTree {
+    and_of(
+        env,
+        &[
+            leaf(RuleOp::RecipientWhitelisted, env),
+            leaf(RuleOp::WithinAllowance, env),
+        ],
+    )
+}
+
+fn denial(c: &Composite, v: CompositeVerdict) -> RuleDenial {
+    let _ = c;
+    match v {
+        CompositeVerdict::Denied(d) => d,
+        CompositeVerdict::Allowed => panic!("expected a composite denial"),
+    }
+}
+
+fn rule_deny_events(env: &Env) -> u32 {
+    let cat: Val = Symbol::new(env, "policy").into_val(env);
+    let act: Val = Symbol::new(env, "rule_deny").into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| topics.len() == 3 && topics.contains(cat) && topics.contains(act))
+        .count() as u32
+}
+
+#[test]
+fn composite_whitelist_and_velocity_allows_when_every_condition_holds() {
+    let c = rule_fixture();
+    c.p.set_recurring_allowance(&c.owner, &c.pid, &c.asset, &500, &3_600, &0);
+    c.p.set_composite_rule(&c.owner, &c.pid, &whitelist_and_velocity(&c.env));
+
+    let v =
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 500));
+    assert_eq!(v, CompositeVerdict::Allowed);
+    assert_eq!(rule_deny_events(&c.env), 0);
+    assert!(c
+        .p
+        .try_check_composite_policy(&c.pid, &payload(&c, &c.listed, 500))
+        .is_ok());
+    // The full transfer path agrees.
+    assert!(c
+        .p
+        .try_check_transfer(&c.pid, &c.asset, &c.listed, &500)
+        .is_ok());
+}
+
+#[test]
+fn composite_denies_unlisted_recipient_with_whitelist_sub_reason() {
+    let c = rule_fixture();
+    c.p.set_recurring_allowance(&c.owner, &c.pid, &c.asset, &500, &3_600, &0);
+    c.p.set_composite_rule(&c.owner, &c.pid, &whitelist_and_velocity(&c.env));
+    let stranger = Address::generate(&c.env);
+
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 10)),
+    );
+    assert_eq!(d.reason, PolicyDenialReason::CompositeRuleDenied);
+    assert_eq!(d.source, RuleSource::CompositeTree);
+    assert_eq!(d.rule_index, 0);
+    assert_eq!(d.leaf, RuleOp::RecipientWhitelisted);
+    assert_eq!(d.leaf.sub_reason(), "rule_not_whitelisted");
+    assert_eq!(rule_deny_events(&c.env), 1);
+
+    assert_eq!(
+        c.p.try_check_composite_policy(&c.pid, &payload(&c, &stranger, 10)),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(
+        c.p.try_check_transfer(&c.pid, &c.asset, &stranger, &10),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn composite_velocity_leaf_denies_once_window_is_spent_and_recovers_next_window() {
+    let c = rule_fixture();
+    c.p.set_recurring_allowance(&c.owner, &c.pid, &c.asset, &500, &3_600, &0);
+    c.p.set_composite_rule(&c.owner, &c.pid, &whitelist_and_velocity(&c.env));
+    // Spend 400 of the 500 window allowance.
+    c.p.update_allowance(&c.owner, &c.pid, &c.asset, &400);
+
+    // 100 still fits; 101 breaches the velocity limit.
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 100)),
+        CompositeVerdict::Allowed
+    );
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 101)),
+    );
+    assert_eq!(d.leaf, RuleOp::WithinAllowance);
+    assert_eq!(d.leaf.sub_reason(), "rule_velocity");
+    assert_eq!(
+        c.p.try_check_composite_policy(&c.pid, &payload(&c, &c.listed, 101)),
+        Err(Ok(Error::PolicyDenied))
+    );
+
+    // Exactly at the window boundary the velocity window has rolled over.
+    c.env.ledger().set_timestamp(10_000 + 3_600);
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 500)),
+        CompositeVerdict::Allowed
+    );
+}
+
+#[test]
+fn composite_velocity_leaf_fails_closed_on_lapsed_allowance() {
+    let c = rule_fixture();
+    c.p.set_recurring_allowance(&c.owner, &c.pid, &c.asset, &500, &0, &20_000);
+    c.p.set_composite_rule(
+        &c.owner,
+        &c.pid,
+        &single_amount_tree(RuleOp::WithinAllowance, 0, &c.env),
+    );
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 1)),
+        CompositeVerdict::Allowed
+    );
+    c.env.ledger().set_timestamp(20_000);
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 1)),
+    );
+    assert_eq!(d.leaf, RuleOp::WithinAllowance);
+}
+
+#[test]
+fn composite_velocity_leaf_without_allowance_is_permissive() {
+    let c = rule_fixture();
+    c.p.set_composite_rule(
+        &c.owner,
+        &c.pid,
+        &single_amount_tree(RuleOp::WithinAllowance, 0, &c.env),
+    );
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 999_999)),
+        CompositeVerdict::Allowed
+    );
+}
+
+#[test]
+fn composite_asset_whitelist_and_amount_band_leaves() {
+    let c = rule_fixture();
+    // And(AssetWhitelisted, MinAmount 10, MaxAmount 100)
+    c.p.set_composite_rule(
+        &c.owner,
+        &c.pid,
+        &and_of(
+            &c.env,
+            &[
+                leaf(RuleOp::AssetWhitelisted, &c.env),
+                leaf_amount(RuleOp::MinAmount, 10, &c.env),
+                leaf_amount(RuleOp::MaxAmount, 100, &c.env),
+            ],
+        ),
+    );
+    // Asset not listed yet: the first leaf decides.
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 50)),
+    );
+    assert_eq!(d.leaf, RuleOp::AssetWhitelisted);
+    assert_eq!(d.leaf.sub_reason(), "rule_asset_not_listed");
+
+    c.p.add_asset_to_whitelist(&c.owner, &c.pid, &c.asset);
+    // Inclusive bounds on both ends.
+    for ok in [10, 100] {
+        assert_eq!(
+            c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, ok)),
+            CompositeVerdict::Allowed
+        );
+    }
+    let below = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 9)),
+    );
+    assert_eq!(below.leaf, RuleOp::MinAmount);
+    let above = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 101)),
+    );
+    assert_eq!(above.leaf, RuleOp::MaxAmount);
+}
+
+#[test]
+fn composite_or_and_not_report_the_deciding_leaf() {
+    let c = rule_fixture();
+    // Or(RecipientWhitelisted, MaxAmount 10): either condition suffices.
+    c.p.set_composite_rule(
+        &c.owner,
+        &c.pid,
+        &branch_of(
+            &c.env,
+            RuleOp::Or,
+            &[
+                leaf(RuleOp::RecipientWhitelisted, &c.env),
+                leaf_amount(RuleOp::MaxAmount, 10, &c.env),
+            ],
+        ),
+    );
+    let stranger = Address::generate(&c.env);
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 1_000)),
+        CompositeVerdict::Allowed
+    );
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 10)),
+        CompositeVerdict::Allowed
+    );
+    // Both fail: an all-false `Or` is decided by its last child.
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 11)),
+    );
+    assert_eq!(d.leaf, RuleOp::MaxAmount);
+
+    // Not(RecipientBlacklisted): a blacklisted recipient flips the leaf.
+    c.p.set_composite_rule(
+        &c.owner,
+        &c.pid,
+        &branch_of(
+            &c.env,
+            RuleOp::Not,
+            &[leaf(RuleOp::RecipientBlacklisted, &c.env)],
+        ),
+    );
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 1)),
+        CompositeVerdict::Allowed
+    );
+    c.p.add_blacklist(&c.owner, &c.pid, &stranger);
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 1)),
+    );
+    assert_eq!(d.leaf, RuleOp::RecipientBlacklisted);
+}
+
+#[test]
+fn rule_stack_all_reports_first_failing_rule_index() {
+    let c = rule_fixture();
+    // rule 0: amount <= 1_000 (passes), rule 1: recipient whitelisted,
+    // rule 2: amount >= 5 (would also fail for 1, but is never reached).
+    c.p.add_policy_rule(
+        &c.owner,
+        &c.pid,
+        &single_amount_tree(RuleOp::MaxAmount, 1_000, &c.env),
+    );
+    let mut wl = soroban_sdk::Vec::new(&c.env);
+    wl.push_back(leaf(RuleOp::RecipientWhitelisted, &c.env));
+    c.p.add_policy_rule(&c.owner, &c.pid, &wl);
+    c.p.add_policy_rule(
+        &c.owner,
+        &c.pid,
+        &single_amount_tree(RuleOp::MinAmount, 5, &c.env),
+    );
+
+    let stranger = Address::generate(&c.env);
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 1)),
+    );
+    assert_eq!(d.reason, PolicyDenialReason::RuleStackDenied);
+    assert_eq!(d.source, RuleSource::RuleStack);
+    assert_eq!(d.rule_index, 1);
+    assert_eq!(d.leaf, RuleOp::RecipientWhitelisted);
+
+    // A listed recipient now trips rule 2.
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 1)),
+    );
+    assert_eq!(d.rule_index, 2);
+    assert_eq!(d.leaf, RuleOp::MinAmount);
+
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 5)),
+        CompositeVerdict::Allowed
+    );
+    assert_eq!(
+        c.p.try_check_transfer(&c.pid, &c.asset, &stranger, &5),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+#[test]
+fn rule_stack_any_passes_on_one_rule_and_reports_first_rule_when_all_fail() {
+    let c = rule_fixture();
+    c.p.set_rule_combination_strategy(&c.owner, &c.pid, &PolicyCombinationStrategy::Any);
+    let mut wl = soroban_sdk::Vec::new(&c.env);
+    wl.push_back(leaf(RuleOp::RecipientWhitelisted, &c.env));
+    c.p.add_policy_rule(&c.owner, &c.pid, &wl);
+    c.p.add_policy_rule(
+        &c.owner,
+        &c.pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &c.env),
+    );
+    let stranger = Address::generate(&c.env);
+
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 10)),
+        CompositeVerdict::Allowed
+    );
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 1_000)),
+        CompositeVerdict::Allowed
+    );
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 11)),
+    );
+    assert_eq!(d.rule_index, 0);
+    assert_eq!(d.leaf, RuleOp::RecipientWhitelisted);
+}
+
+#[test]
+fn composite_tree_is_evaluated_before_rule_stack() {
+    let c = rule_fixture();
+    c.p.set_composite_rule(
+        &c.owner,
+        &c.pid,
+        &single_amount_tree(RuleOp::MaxAmount, 10, &c.env),
+    );
+    c.p.add_policy_rule(
+        &c.owner,
+        &c.pid,
+        &single_amount_tree(RuleOp::MaxAmount, 5, &c.env),
+    );
+    // Both refuse 20; the composite tree is reported because it runs first.
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 20)),
+    );
+    assert_eq!(d.source, RuleSource::CompositeTree);
+    // 7 passes the tree and fails the stack.
+    let d = denial(
+        &c,
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 7)),
+    );
+    assert_eq!(d.source, RuleSource::RuleStack);
+    assert_eq!(d.rule_index, 0);
+}
+
+#[test]
+fn composite_evaluation_is_deterministic_and_persists_nothing() {
+    let c = rule_fixture();
+    c.p.set_recurring_allowance(&c.owner, &c.pid, &c.asset, &500, &3_600, &0);
+    c.p.set_composite_rule(&c.owner, &c.pid, &whitelist_and_velocity(&c.env));
+    let stranger = Address::generate(&c.env);
+    let first =
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 10));
+    let second =
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &stranger, 10));
+    assert_eq!(first, second);
+    // Allowance was not consumed by the dry runs.
+    assert_eq!(c.p.get_allowance(&c.pid, &c.asset).spent, 0);
+}
+
+#[test]
+fn composite_policy_with_no_rules_is_allowed_and_inputs_are_validated() {
+    let c = rule_fixture();
+    assert_eq!(
+        c.p.evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 1)),
+        CompositeVerdict::Allowed
+    );
+    assert_eq!(
+        c.p.try_evaluate_composite_policy(&c.pid, &payload(&c, &c.listed, 0)),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        c.p.try_evaluate_composite_policy(
+            &String::from_str(&c.env, "missing"),
+            &payload(&c, &c.listed, 1)
+        ),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn transfer_dry_run_publishes_rule_deny_sub_reason_event() {
+    let c = rule_fixture();
+    c.p.set_composite_rule(&c.owner, &c.pid, &whitelist_and_velocity(&c.env));
+    let stranger = Address::generate(&c.env);
+    let decision: PolicyDecision = c.p.evaluate_policy(&c.pid, &payload(&c, &stranger, 1));
+    assert_eq!(
+        decision.reason(),
+        Some(PolicyDenialReason::CompositeRuleDenied)
+    );
+    assert_eq!(rule_deny_events(&c.env), 1);
 }
