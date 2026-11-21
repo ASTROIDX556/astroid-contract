@@ -1060,9 +1060,7 @@ impl TreasuryContract {
         // regardless of which outflow path settles (Issue #218).
         let balance = holding.total_in;
         Self::store_asset_balance(env, asset, balance);
-        events::transfer_executed(env, &t.admin, to, asset, amount);
         Self::transfer_out(env, asset, to, amount)?;
-        events::transfer_executed(env, &t.admin, to, asset, amount);
         events::publish(
             env,
             events::ContractEvent::TransferExecuted {

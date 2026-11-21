@@ -847,12 +847,15 @@ impl WalletContract {
         // or balance checks.
         Self::validate_transfer_recipient(&env, &to)?;
         Self::lock(&env)?;
+        let policy_bypass = Self::get_policy_bypass(env.clone(), wallet_id);
         // Atomic pre-execution: policy → budget → velocity, before any debit.
         // Resolves Policy/Budget via Registry when configured, so upgrades
         // take effect without re-wiring the wallet. Each fallible step
         // unlocks before returning so a failed spend never leaves the
         // contract locked (even if the host commits storage on Err).
-        if let Err(e) = Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller) {
+        if let Err(e) =
+            Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller, policy_bypass)
+        {
             Self::unlock(&env);
             return Err(e);
         }
@@ -872,14 +875,7 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
-        if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Funds were verified above, so the token call cannot refuse for
-        // balance reasons; any remaining refusal maps to a deterministic
-        // error instead of trapping the invocation.
-        if let Err(e) = safe_transfer(&env, &asset, &env.current_contract_address(), &to, amount) {
+        if let Err(e) = Self::debit_and_transfer(&env, wallet_id, &asset, amount, &to) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -905,9 +901,16 @@ impl WalletContract {
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active_for_transfer(&wallet)?;
         Self::lock(&env)?;
-        if let Err(e) =
-            Self::pre_execute_checks(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
-        {
+        let policy_bypass = Self::get_policy_bypass(env.clone(), wallet_id);
+        if let Err(e) = Self::pre_execute_checks(
+            &env,
+            wallet_id,
+            &asset,
+            &wallet.owner,
+            amount,
+            &caller,
+            policy_bypass,
+        ) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -928,17 +931,7 @@ impl WalletContract {
             Self::unlock(&env);
             return Err(e);
         }
-        if let Err(e) = Self::debit(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        if let Err(e) = safe_transfer(
-            &env,
-            &asset,
-            &env.current_contract_address(),
-            &wallet.owner,
-            amount,
-        ) {
+        if let Err(e) = Self::debit_and_transfer(&env, wallet_id, &asset, amount, &wallet.owner) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -1615,11 +1608,12 @@ impl WalletContract {
         recipient: &Address,
         amount: i128,
         caller: &Address,
+        policy_bypass: bool,
     ) -> Result<(), Error> {
         let (policy_addr, budget_addr) = Self::resolve_gates(env)?;
         // Policy gate (skipped when wallet is bypassed).
         if let Some(policy_addr) = policy_addr.as_ref() {
-            if !Self::get_policy_bypass(env.clone(), wallet_id) {
+            if !policy_bypass {
                 Self::require_policy_check(
                     env,
                     wallet_id,
@@ -1964,8 +1958,17 @@ impl WalletContract {
         Ok(())
     }
 
-    fn debit(env: &Env, id: u64, asset: &Address, amount: i128) -> Result<(), Error> {
-        let key = DataKey::Balance(id, asset.clone());
+    /// Debit the wallet's tracked balance and transfer tokens in one atomic
+    /// operation. Combines `debit` and `safe_transfer` to avoid redundant
+    /// balance reads and ensure the tracked balance stays in sync with custody.
+    fn debit_and_transfer(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        amount: i128,
+        to: &Address,
+    ) -> Result<(), Error> {
+        let key = DataKey::Balance(wallet_id, asset.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if current < amount {
             return Err(Error::InsufficientFunds);
@@ -1978,7 +1981,8 @@ impl WalletContract {
             constants::PERSISTENT_LIFETIME_THRESHOLD,
             constants::PERSISTENT_BUMP_AMOUNT,
         );
-        Ok(())
+
+        safe_transfer(env, asset, &env.current_contract_address(), to, amount)
     }
 
     /// Preliminary allowance check for every outbound movement: both the

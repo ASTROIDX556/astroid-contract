@@ -177,7 +177,7 @@ use astroid_shared::constants::{
     PROPOSAL_QUORUM_PERCENT,
 };
 use astroid_shared::errors::Error;
-use astroid_shared::math::checked_add;
+use astroid_shared::math::{checked_add, checked_add_u64, checked_mul_u64};
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
@@ -294,12 +294,14 @@ impl VoteBars {
     /// allow-list, rounded **up**.
     ///
     /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
-    /// [`u64::div_ceil`] — never floating point, so every node derives the
+    /// checked arithmetic — never floating point, so every node derives the
     /// identical integer. `percent` is clamped to 100, so a misconfigured
     /// percentage can never demand more than the whole allow-list.
     pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
         let percent = percent.min(100);
-        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
+        let product = checked_mul_u64(eligible as u64, percent as u64)
+            .expect("quorum multiplication overflow");
+        product.div_ceil(100) as u32
     }
 
     /// Majority check helper: the smallest number of approvals that exceeds
@@ -648,11 +650,17 @@ impl ProposalContract {
             return Err(Error::InvalidProposalState);
         }
         if proposal.grace_period != 0 {
-            // Saturating end-of-window: `created_at + grace_period` that does
-            // not fit a ledger timestamp describes a window so long it never
-            // closes, which must not wrap into the past (and trap) — the
-            // deadline above still bounds how long it can be relied on.
-            let grace_end = proposal.created_at.saturating_add(proposal.grace_period);
+            // Checked end-of-window: `created_at + grace_period` must be
+            // representable as a ledger timestamp. An unrepresentable sum means
+            // the window is effectively infinite (never closes), so cancellation
+            // remains allowed — the deadline still bounds the proposal. This
+            // avoids both a panic (from wrapping) and a silent saturation that
+            // could mask a misconfiguration.
+            let grace_end = match checked_add_u64(proposal.created_at, proposal.grace_period) {
+                Ok(end) => end,
+                Err(Error::Overflow) => u64::MAX,
+                Err(e) => return Err(e),
+            };
             if env.ledger().timestamp() > grace_end {
                 return Err(Error::CancellationWindowClosed);
             }
