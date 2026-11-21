@@ -3643,7 +3643,9 @@ mod window_boundary_tests {
         h.env.ledger().set_timestamp(1_000 + DAY - 1);
 
         // Spend should still be limited by old period
-        let res = h.client.try_consume(&h.owner, &id(&h.env, "boundary"), &600);
+        let res = h
+            .client
+            .try_consume(&h.owner, &id(&h.env, "boundary"), &600);
         assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
     }
 
@@ -3718,16 +3720,27 @@ mod window_boundary_tests {
         );
 
         // Spend 300 in first window
-        h.client.check_and_record_spend(&h.owner, &id(&h.env, "asset_boundary"), &token, &300);
-        assert_eq!(h.client.asset_remaining(&id(&h.env, "asset_boundary"), &token), 200);
+        h.client
+            .check_and_record_spend(&h.owner, &id(&h.env, "asset_boundary"), &token, &300);
+        assert_eq!(
+            h.client
+                .asset_remaining(&id(&h.env, "asset_boundary"), &token),
+            200
+        );
 
         // Advance to exact window boundary (1 hour)
         h.env.ledger().set_timestamp(1_000 + 3_600);
 
         // Next spend should see replenished allowance (500 base + 100 rollover = 600)
-        let rem = h.client.check_and_record_spend(&h.owner, &id(&h.env, "asset_boundary"), &token, &600);
+        let rem =
+            h.client
+                .check_and_record_spend(&h.owner, &id(&h.env, "asset_boundary"), &token, &600);
         assert_eq!(rem, ());
-        assert_eq!(h.client.asset_remaining(&id(&h.env, "asset_boundary"), &token), 0);
+        assert_eq!(
+            h.client
+                .asset_remaining(&id(&h.env, "asset_boundary"), &token),
+            0
+        );
     }
 
     #[test]
@@ -3764,7 +3777,9 @@ mod window_boundary_tests {
 
         // Period 2: rollover credit = 400, capacity = 1400
         // Spend 1400 (full capacity)
-        let rem = h.client.consume(&h.owner, &id(&h.env, "cumulative"), &1_400);
+        let rem = h
+            .client
+            .consume(&h.owner, &id(&h.env, "cumulative"), &1_400);
         assert_eq!(rem, 0);
         h.env.ledger().set_timestamp(1_000 + 2 * DAY);
 
@@ -3782,7 +3797,8 @@ mod window_boundary_tests {
     fn consume_with_zero_rollover_bps_does_not_accumulate_credit() {
         let h = setup();
         allocate(&h, "zero_bps", 1_000, Period::Daily, true);
-        h.client.set_rollover_config(&h.owner, &id(&h.env, "zero_bps"), &true, &0, &500);
+        h.client
+            .set_rollover_config(&h.owner, &id(&h.env, "zero_bps"), &true, &0, &500);
 
         // Spend 600, leave 400 unspent
         h.client.consume(&h.owner, &id(&h.env, "zero_bps"), &600);
@@ -3811,12 +3827,15 @@ mod window_boundary_tests {
         );
 
         // Window 1: spend 800
-        h.client.check_and_record_spend(&h.owner, &id(&h.env, "asset_reset"), &token, &800);
+        h.client
+            .check_and_record_spend(&h.owner, &id(&h.env, "asset_reset"), &token, &800);
         h.env.ledger().set_timestamp(1_000 + DAY);
 
         // Window 2: rollover 100 (50% of 200), capacity 1100
         // Spent should be 0 for the new window
-        let ab = h.client.get_asset_budget(&id(&h.env, "asset_reset"), &token);
+        let ab = h
+            .client
+            .get_asset_budget(&id(&h.env, "asset_reset"), &token);
         assert_eq!(ab.spent, 0);
         assert_eq!(ab.rollover_credit, 100);
     }

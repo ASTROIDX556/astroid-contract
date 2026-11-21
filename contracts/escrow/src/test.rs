@@ -2,12 +2,12 @@ extern crate std;
 
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
+    symbol_short,
     testutils::{
         Address as _, AuthorizedFunction, AuthorizedInvocation, Events, Ledger, MockAuth,
         MockAuthInvoke,
     },
     token, vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
-    symbol_short,
 };
 
 use astroid_shared::errors::{Error, MilestoneError};
@@ -3804,7 +3804,7 @@ mod claim_refund_tests {
         assert_eq!(res, Err(Ok(Error::Unauthorized)));
     }
 
-#[test]
+    #[test]
     fn claim_refund_emits_correct_events() {
         let h = setup(5_000, 0);
         let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
@@ -3814,9 +3814,9 @@ mod claim_refund_tests {
 
         // Check that the correct events were emitted
         let events = h.env.events().all();
-        let has_claim_refund = events.iter().any(|(_, topics, _)| {
-            topics.contains(&symbol_short!("claim_rfd").into_val(&h.env))
-        });
+        let has_claim_refund = events
+            .iter()
+            .any(|(_, topics, _)| topics.contains(&symbol_short!("claim_rfd").into_val(&h.env)));
         assert!(has_claim_refund, "claim_refund event should be emitted");
 
         // Check standard refunded event

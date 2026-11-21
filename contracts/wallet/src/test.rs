@@ -2894,7 +2894,9 @@ mod unauthorized_access_tests {
         h.client.deposit(&id, &owner, &h.token, &1_000);
 
         // Intruder has no role on the wallet
-        let res = h.client.try_transfer(&intruder, &id, &recipient, &h.token, &100);
+        let res = h
+            .client
+            .try_transfer(&intruder, &id, &recipient, &h.token, &100);
         assert_eq!(res, Err(Ok(Error::Unauthorized)));
     }
 
@@ -2990,7 +2992,9 @@ mod unauthorized_access_tests {
         h.client.grant_role(&owner, &id, &agent, &Role::Agent);
 
         // Agent cannot set velocity limit (requires Admin)
-        let res = h.client.try_set_velocity_limit(&agent, &id, &h.token, &100, &3_600);
+        let res = h
+            .client
+            .try_set_velocity_limit(&agent, &id, &h.token, &100, &3_600);
         assert_eq!(res, Err(Ok(Error::Unauthorized)));
     }
 
@@ -3029,7 +3033,9 @@ mod unauthorized_access_tests {
         ));
 
         // Intruder has no role
-        let res = h.client.try_batch_execute_validated(&intruder, &id, &actions);
+        let res = h
+            .client
+            .try_batch_execute_validated(&intruder, &id, &actions);
         assert_eq!(res, Err(Ok(Error::Unauthorized)));
     }
 

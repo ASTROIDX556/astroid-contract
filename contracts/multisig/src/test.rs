@@ -2174,7 +2174,9 @@ mod signer_validation_tests {
     #[test]
     fn propose_signer_addition_duplicate_fails() {
         let h = setup(&[1, 1], 1);
-        let res = h.client.try_propose_signer_addition(&h.signers[0], &h.signers[1], &1);
+        let res = h
+            .client
+            .try_propose_signer_addition(&h.signers[0], &h.signers[1], &1);
         assert_eq!(res, Err(Ok(Error::DuplicateSigner)));
     }
 
@@ -2190,14 +2192,18 @@ mod signer_validation_tests {
         // Now we have MAX_SIGNERS signers in the live set
         // Proposing another addition should fail at proposal time
         let extra = Address::generate(&h.env);
-        let res = h.client.try_propose_signer_addition(&h.signers[0], &extra, &1);
+        let res = h
+            .client
+            .try_propose_signer_addition(&h.signers[0], &extra, &1);
         assert_eq!(res, Err(Ok(Error::InvalidSignerCount)));
     }
 
     #[test]
     fn propose_weight_change_to_zero_fails() {
         let h = setup(&[1, 1], 1);
-        let res = h.client.try_propose_weight_change(&h.signers[0], &h.signers[1], &0);
+        let res = h
+            .client
+            .try_propose_weight_change(&h.signers[0], &h.signers[1], &0);
         assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
     }
 
@@ -2206,7 +2212,9 @@ mod signer_validation_tests {
         let h = setup(&[5, 5], 8);
         // Total weight = 10, threshold = 8. Changing one signer from 5 to 2
         // would make total = 7 < 8 (threshold)
-        let res = h.client.try_propose_weight_change(&h.signers[0], &h.signers[1], &2);
+        let res = h
+            .client
+            .try_propose_weight_change(&h.signers[0], &h.signers[1], &2);
         assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
     }
 
@@ -2214,7 +2222,9 @@ mod signer_validation_tests {
     fn propose_signer_removal_dropping_below_threshold_fails() {
         let h = setup(&[5, 5], 8);
         // Removing one signer would leave weight 5 < 8
-        let res = h.client.try_propose_signer_removal(&h.signers[0], &h.signers[1]);
+        let res = h
+            .client
+            .try_propose_signer_removal(&h.signers[0], &h.signers[1]);
         assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
     }
 
@@ -2230,7 +2240,9 @@ mod signer_validation_tests {
         // Now total weight = 1 (only signer[0] remains), threshold = 2 would exceed
 
         // Execution should fail because threshold exceeds total weight
-        let res = h.client.try_execute_threshold_change(&h.signers[0], &change_id);
+        let res = h
+            .client
+            .try_execute_threshold_change(&h.signers[0], &change_id);
         assert_eq!(res, Err(Ok(Error::ThresholdExceeded)));
     }
 
@@ -2238,14 +2250,18 @@ mod signer_validation_tests {
     fn execute_signer_addition_revalidates_duplicate() {
         let h = setup(&[1, 1], 1);
         let new_signer = Address::generate(&h.env);
-        let change_id = h.client.propose_signer_addition(&h.signers[0], &new_signer, &1);
+        let change_id = h
+            .client
+            .propose_signer_addition(&h.signers[0], &new_signer, &1);
         advance(&h, MIN_TIMELOCK_DELAY);
 
         // Add the same signer directly before executing the proposal
         h.client.add_signer(&h.signers[0], &new_signer, &1);
 
         // Execution should fail because signer now exists
-        let res = h.client.try_execute_threshold_change(&h.signers[0], &change_id);
+        let res = h
+            .client
+            .try_execute_threshold_change(&h.signers[0], &change_id);
         assert_eq!(res, Err(Ok(Error::DuplicateSigner)));
     }
 
@@ -2259,7 +2275,9 @@ mod signer_validation_tests {
         }
         // Now at MAX_SIGNERS - 1, propose one more addition
         let new_signer = Address::generate(&h.env);
-        let change_id = h.client.propose_signer_addition(&h.signers[0], &new_signer, &1);
+        let change_id = h
+            .client
+            .propose_signer_addition(&h.signers[0], &new_signer, &1);
         advance(&h, MIN_TIMELOCK_DELAY);
 
         // Add one more signer directly, reaching MAX_SIGNERS
@@ -2267,7 +2285,9 @@ mod signer_validation_tests {
         h.client.add_signer(&h.signers[0], &another_signer, &1);
 
         // Execution should fail because capacity exceeded
-        let res = h.client.try_execute_threshold_change(&h.signers[0], &change_id);
+        let res = h
+            .client
+            .try_execute_threshold_change(&h.signers[0], &change_id);
         assert_eq!(res, Err(Ok(Error::InvalidSignerCount)));
     }
 
@@ -2292,7 +2312,9 @@ mod signer_validation_tests {
     #[test]
     fn signer_weight_validation_on_add_rejects_zero_weight() {
         let h = setup(&[1, 1], 1);
-        let res = h.client.try_add_signer(&h.signers[0], &Address::generate(&h.env), &0);
+        let res = h
+            .client
+            .try_add_signer(&h.signers[0], &Address::generate(&h.env), &0);
         assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
     }
 
