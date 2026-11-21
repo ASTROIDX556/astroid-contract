@@ -141,6 +141,17 @@ pub enum Error {
     /// upgrade paths can tell a cycle apart from a malformed request and stop
     /// walking rather than retrying.
     CircularUpgrade = 32,
+    /// INVALID_UPGRADE_ADDRESS: the target address for a module registration or
+    /// upgrade is a zero address (all bytes zero) or otherwise not a valid
+    /// contract principal. Distinct from [`Error::InvalidInput`] so off-chain
+    /// tooling can distinguish an invalid address from other malformed arguments.
+    InvalidUpgradeAddress = 33,
+    /// VERSION_NOT_MONOTONIC: a version registration or upgrade would violate
+    /// strict monotonicity — the target version is not strictly greater than the
+    /// module's current pinned version. Distinct from [`Error::CircularUpgrade`]
+    /// to allow callers to differentiate a backwards jump from a cycle onto the
+    /// same version.
+    VersionNotMonotonic = 34,
 
     // --- Budget (40-44) ---
     /// The spend would breach the budget: the per-asset limit for this token,
@@ -292,7 +303,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 52] = [
+    pub const ALL: [Error; 54] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -315,6 +326,8 @@ impl Error {
         Error::RegistryFrozen,
         Error::ModuleDeprecated,
         Error::CircularUpgrade,
+        Error::InvalidUpgradeAddress,
+        Error::VersionNotMonotonic,
         // --- Budget (40-44) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
@@ -406,6 +419,8 @@ impl Error {
             Error::RegistryFrozen => "REGISTRY_FROZEN",
             Error::ModuleDeprecated => "MODULE_DEPRECATED",
             Error::CircularUpgrade => "CIRCULAR_UPGRADE",
+            Error::InvalidUpgradeAddress => "INVALID_UPGRADE_ADDRESS",
+            Error::VersionNotMonotonic => "VERSION_NOT_MONOTONIC",
             // --- Budget (40-44) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",

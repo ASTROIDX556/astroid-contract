@@ -1,179 +1,172 @@
 # astroid-budget
 
-Budget contract: spending envelopes that every outflow is debited against.
-
-The treasury (or any contract holding a `BudgetClient`) calls
-[`consume`](src/lib.rs) before value moves. A spend that would push the
-budget past its ceiling reverts with `BudgetExceeded`, so an agent can never
-spend more than the organization allocated, however many transactions it
-sends.
+Budget contract — time-windowed spending limits with rollover, deficit carryforward, and per-asset allowances.
 
 ## Responsibilities
 
-- Hold one spending envelope per backend-owned `budget_id`, owned by the
-  address that allocated it (normally the treasury admin or the org owner).
-- Enforce `spent + amount <= limit + rollover_credit` on every debit, with
-  checked `i128` math. The limit grows by `deficit_amount` instead when the
-  budget allows a deficit.
-- Reset recurring budgets lazily at period boundaries (`Daily`, `Weekly`,
-  `Monthly`, or `Custom` seconds). This needs no cron or keeper.
-- Optionally carry unspent allowance into the next period (rollover), bounded
-  by an absolute cap and a percentage ceiling.
-- Track independent per-token allowances under the same budget id, and debit
-  several tokens atomically.
-- Lifecycle controls: freeze / unfreeze, archive (terminal), expiry,
-  scheduled start, and moving allocation between two budgets.
+- `initialize(admin)` — protocol admin bootstraps the contract.
+- `allocate(owner, budget_id, limit, period, rollover_enabled, expires_at)` — create a one-shot or recurring budget scoped to an owner.
+- `allocate_with_deficit(..., allow_deficit)` — create a budget that permits spending beyond its limit, accumulating a deficit repaid in future periods.
+- `allocate_scheduled(..., start_at, expires_at)` — create a budget that activates at a future timestamp.
+- `allocate_with_rollover(..., rollover_bps, max_rollover_cap)` — create a budget with explicit rollover percentage and cap.
+- `set_recurrence(budget_id, period, period_seconds, rollover_enabled, rollover_cap, rollover_max_bps)` — configure or change the recurring window and rollover policy.
+- `set_rollover_config(budget_id, rollover_enabled, rollover_bps, max_rollover_cap)` — adjust rollover accounting mid-cycle.
+- `consume(owner, budget_id, amount)` — debit the budget; reverts with `BudgetExceeded` when the effective ceiling (limit + rollover_credit − deficit) is breached.
+- `check_and_record_spend(owner, budget_id, token, amount)` — atomic per-asset spend against a registered token allowance (Issue #294).
+- `check_and_record_batch_spend(owner, budget_id, spends[])` — validate and record multi-token spends atomically; duplicate tokens rejected.
+- `release(owner, budget_id, amount)` — credit amount back (refund/cancel); cannot exceed spent.
+- `reset(owner, budget_id)` — zero spent and rollover_credit; re-anchor window to now.
+- `rollover(owner, budget_id)` — force a period transition, applying rollover/deficit logic.
+- `set_limit(owner, budget_id, new_limit)` — raise or lower the base limit (must be ≥ spent).
+- `transfer_allocation(owner, from_id, to_id, amount)` — move unspent allocation between two budgets sharing the same owner.
+- `freeze(owner, budget_id)` / `unfreeze(owner, budget_id)` — pause/resume consumption without archiving.
+- `archive(owner, budget_id)` — terminal state; no further spends or config changes.
+- `set_budget_limit(owner, budget_id, token, limit, window_seconds)` — register a per-asset recurring allowance.
+- `set_budget_limit_with_rollover(..., rollover_enabled, rollover_bps, max_rollover_cap)` — register per-asset allowance with rollover.
+- `set_asset_rollover_config(budget_id, token, rollover_enabled, rollover_bps, max_rollover_cap)` — adjust per-asset rollover.
+- `remaining(budget_id)` — view current effective allowance (limit + rollover_credit − deficit − spent).
+- `asset_remaining(budget_id, token)` — view per-asset allowance in current window.
+- `get(budget_id)` — full budget record.
+- `get_asset_budget(budget_id, token)` — full per-asset record (settles window first).
+- `rollover_preview(budget_id)` — read-only preview of the next period transition (Issue #313).
 
-## Public interface
+## Invariants
 
-All mutating functions are owner-gated (`caller.require_auth()` plus an
-owner match) unless noted.
+A `consume` succeeds only when:
 
-### Setup and allocation
+1. Caller is the recorded owner (`require_auth` gated).
+2. Budget is `Active` (not `Frozen`, `Paused`, or `Archived`).
+3. Ledger time ≥ `window_start` (scheduled budgets wait for activation).
+4. Ledger time < `expires_at` (if set).
+5. `amount > 0`.
+6. `spent + amount ≤ limit + rollover_credit − deficit_amount`.
 
-| Function | Description |
-|---|---|
-| `initialize(admin)` | One-time setup. Records a protocol admin; budget operations remain owner-gated. |
-| `allocate(owner, budget_id, limit, period, rollover_enabled, expires_at)` | Create a budget. `expires_at = 0` means it never expires. |
-| `allocate_with_deficit(owner, budget_id, limit, period, rollover_enabled, allow_deficit, expires_at)` | As `allocate`, optionally allowing overspend that is carried as a deficit into the next period. A deficit requires a `Daily` / `Weekly` / `Monthly` period. |
-| `allocate_scheduled(owner, budget_id, limit, period, rollover_enabled, start_at, expires_at)` | Create a budget that only becomes spendable at `start_at`. |
-| `allocate_with_rollover(owner, budget_id, limit, period, rollover_enabled, rollover_bps, max_rollover_cap, expires_at)` | Create a budget with explicit rollover percentage and cap. |
+Period transitions are **lazy and catch-up correct**: every view or spend evaluates the transition hook first. If `n` whole windows elapsed since `window_start`, all `n` settle at once and `window_start` re-anchors to the period boundary — never to "now" — so windows never drift.
 
-### Configuration
+Rollover credit is **clamped to the effective cap** = `min(rollover_cap, limit × rollover_max_bps / 10_000)`. The closing balance **replaces** the carried credit rather than stacking, so an idle budget gains exactly one base limit per period.
 
-| Function | Description |
-|---|---|
-| `set_recurrence(caller, budget_id, period, period_seconds, rollover_enabled, rollover_cap, rollover_max_bps)` | Change cadence and rollover policy. Settles any transition already due, then re-anchors the window to now. |
-| `set_rollover_config(caller, budget_id, rollover_enabled, rollover_bps, max_rollover_cap)` | Change rollover accounting only. |
-| `set_limit(caller, budget_id, new_limit)` | Change the limit. It must stay `>=` the amount spent in the current window. |
-| `transfer_allocation(caller, from_id, to_id, amount)` | Move unused allocation between two budgets with the same owner. |
+Deficit carryforward (`allow_deficit`) requires a recurring period (`Daily`, `Weekly`, or `Monthly` with interval). The overspend becomes `deficit_amount` on transition, reducing next period's effective capacity by that amount.
 
-### Spending (`BudgetInterface`)
+Per-asset allowances (`set_budget_limit`) have independent windows. `check_and_record_batch_spend` validates all legs before persisting any; duplicate tokens are rejected to prevent cap bypass.
 
-| Function | Description |
-|---|---|
-| `consume(caller, budget_id, amount) -> i128` | Debit `amount` and return what remains. Applies any pending period transition first. |
-| `release(caller, budget_id, amount) -> i128` | Credit back a refunded or cancelled spend. The amount cannot exceed what was spent this period. |
-| `remaining(budget_id) -> i128` | Remaining allocation, read as of the current period. |
+## Storage Layout
 
-### Lifecycle
+### Instance Storage
 
-| Function | Description |
-|---|---|
-| `reset(caller, budget_id)` | Zero the spent counter and refresh the window. |
-| `rollover(caller, budget_id)` | Force a period transition. This is the only manual rollover path. |
-| `freeze` / `unfreeze(caller, budget_id)` | Block / restore consumption. |
-| `archive(caller, budget_id)` | Terminal. The budget can no longer be spent. |
+| Key | Type | Description |
+|-----|------|-------------|
+| `Admin` | `Address` | Protocol admin (initialize only; all operations owner-gated). |
 
-### Per-token allowances
+### Persistent Storage
 
-| Function | Description |
-|---|---|
-| `set_budget_limit(caller, budget_id, token, limit, window_seconds)` | Register a per-token limit that recurs every `window_seconds`. `0` means it never resets. |
-| `set_budget_limit_with_rollover(caller, budget_id, token, limit, window_seconds, rollover_enabled, rollover_bps, max_rollover_cap)` | As above, with rollover. |
-| `set_asset_rollover_config(caller, budget_id, token, rollover_enabled, rollover_bps, max_rollover_cap)` | Change per-token rollover only. |
-| `check_and_record_spend(caller, budget_id, token, amount)` | Debit one token's allowance. |
-| `check_and_record_batch_spend(caller, budget_id, spends: Vec<AssetSpend>)` | All-or-nothing debit across up to `MAX_BATCH_TOKENS` distinct tokens. Duplicate tokens are rejected. |
+| Key | Type | Description |
+|-----|------|-------------|
+| `Budget(String)` | `Budget` | Main budget record keyed by `budget_id`. |
+| `AssetBudget(String, Address)` | `AssetBudget` | Per-asset allowance record keyed by `(budget_id, token)`. |
 
-### Views
+### Budget Record Fields
 
-| Function | Description |
-|---|---|
-| `get(budget_id) -> Budget` | Stored budget record. |
-| `get_asset_budget(budget_id, token) -> AssetBudget` | Per-token record, with any due window reset applied. |
-| `asset_remaining(budget_id, token) -> i128` | Remaining per-token allowance in the current window. |
-| `rollover_preview(budget_id) -> RolloverOutcome` | Pure preview of what the next period boundary would carry over. |
+- `owner: Address` — authorized consumer and administrator.
+- `limit: i128` — base spending limit per period.
+- `spent: i128` — cumulative spend in current window.
+- `period: Period` — `None` (one-shot), `Daily`, `Weekly`, `Monthly`, or `Custom`.
+- `period_seconds: u64` — interval for `Custom`; 0 otherwise.
+- `window_start: u64` — start of current window (unix seconds); also scheduled activation time.
+- `rollover_enabled: bool` — whether unspent carries forward.
+- `rollover_credit: i128` — unspent carried from prior periods (clamped to effective cap).
+- `rollover_cap: i128` — absolute cap on rollover_credit (0 = uncapped).
+- `rollover_max_bps: i128` — protocol percentage ceiling on rollover (0 = uncapped).
+- `rollover_bps: i128` — percentage of unspent to carry (basis points).
+- `allow_deficit: bool` — whether overspend is permitted.
+- `deficit_amount: i128` — overspend carried from prior periods.
+- `expires_at: u64` — expiry timestamp (0 = never).
+- `state: ResourceState` — `Active`, `Frozen`, `Paused`, `Archived`.
 
-### Upgrades (`UpgradeableInterface`)
+### AssetBudget Record Fields
 
-`set_upgrade_authority`, `get_upgrade_authority`, and `upgrade(caller,
-wasm_hash)`. An upgrade requires the recorded upgrade admin and a Wasm hash
-the registry approved for `ModuleKind::Budget`.
+- `limit: i128` — per-asset base limit.
+- `spent: i128` — cumulative spend in current asset window.
+- `window_seconds: u64` — asset window length (0 = one-shot).
+- `window_start: u64` — start of current asset window.
+- `rollover_enabled: bool` — whether unspent carries forward.
+- `rollover_credit: i128` — unspent carried from prior asset periods.
+- `rollover_bps: i128` — rollover percentage (basis points).
+- `max_rollover_cap: i128` — absolute cap on asset rollover_credit.
 
-## Period and rollover rules
+## Error Codes
 
-- Windows are half-open: `[window_start, window_start + duration)`. A ledger
-  timestamp equal to the window end already belongs to the next window.
-- When `n` whole windows have elapsed, the transition settles all of them in
-  one step and re-anchors `window_start` to the boundary, not to "now", so
-  windows never drift.
-- Rollover does not compound across idle windows. The carried credit is
-  clamped to the effective cap, which is the smaller of `rollover_cap`
-  (absolute, `0` means uncapped) and `rollover_max_bps` of the base limit
-  (`0` means uncapped). A dormant budget therefore cannot build up several
-  periods of allowance for an agent to drain at once.
-- `Period` values: `None = 0`, `Daily = 1` (86 400 s), `Weekly = 2`
-  (604 800 s), `Monthly = 3` (2 592 000 s), `Custom = 4` (`period_seconds`).
+All errors use the shared [`Error`] enum from `astroid-shared` (re-exported as `BudgetError` for budget-specific codes):
 
-## Storage layout
+| Condition | Error Code |
+|-----------|------------|
+| Spend/release/transfer amount ≤ 0 | `InvalidAmount` (12) |
+| Negative limit or rollover cap | `InvalidAmount` (12) |
+| Limit below spent, expiry passed, malformed period | `InvalidInput` (4) |
+| Spend exceeds effective ceiling | `BudgetExceeded` (40) |
+| Checked arithmetic overflow | `Overflow` (11) |
+| Caller not budget owner | `Unauthorized` (3) |
+| Budget frozen | `BudgetFrozen` (41) |
+| Budget archived | `BudgetArchived` (42) |
+| Budget expired (time) | `BudgetExpired` (44) |
+| Budget not yet active (scheduled) | `BudgetNotActive` (45) — `BudgetError` only |
+| Token not registered for per-asset spend | `AssetNotAuthorized` (43) |
+| Duplicate token in batch spend | `InvalidInput` (4) |
 
-| Key (`DataKey`) | Tier | Value |
-|---|---|---|
-| `Admin` | instance | `Address`: protocol admin set at `initialize`. |
-| `Budget(budget_id: String)` | persistent | `Budget` record (below). |
-| `AssetBudget(budget_id: String, token: Address)` | persistent | `AssetBudget` record (below). |
-
-`Budget` fields: `owner`, `limit`, `spent`, `period`, `period_seconds`,
-`window_start` (also the scheduled activation time), `rollover_enabled`,
-`rollover_credit`, `rollover_cap`, `rollover_max_bps`, `rollover_bps`,
-`allow_deficit`, `deficit_amount`, `expires_at`, `state: ResourceState`.
-
-`AssetBudget` fields: `limit`, `spent`, `window_seconds`, `window_start`,
-`rollover_enabled`, `rollover_credit`, `rollover_bps`, `max_rollover_cap`.
-
-## Error codes
-
-Codes come from the shared table in `shared/src/errors.rs`. `consume`,
-`check_and_record_spend` and `check_and_record_batch_spend` return
-`BudgetError`, which uses the same numeric codes plus `BudgetNotActive`.
-
-| Code | Name | When |
-|---|---|---|
-| 1 | `NotFound` | Unknown `budget_id`. |
-| 2 | `AlreadyExists` | `allocate*` with an id that is already in use. |
-| 3 | `Unauthorized` | Caller is not the budget owner. |
-| 4 | `InvalidInput` | Limit below spent, expiry in the past, malformed period, duplicate batch token, empty or oversized batch. |
-| 6 | `AlreadyInitialized` | `initialize` called twice. |
-| 11 | `Overflow` | Checked arithmetic would leave the `i128` range. |
-| 12 | `InvalidAmount` | Spend, release, or transfer `<= 0`, or a negative limit or cap. |
-| 40 | `BudgetExceeded` | The spend would pass the effective ceiling. Nothing is spent. |
-| 41 | `BudgetFrozen` | Budget is frozen. |
-| 42 | `BudgetArchived` | Budget is archived. |
-| 43 | `AssetNotAuthorized` | Token has no per-asset allowance registered. |
-| 44 | `BudgetExpired` | Ledger time is at or past `expires_at`. |
-| 45 | `BudgetNotActive` | Ledger time is before a scheduled start (`BudgetError` only). |
+Budget-specific codes (`BudgetError`) mirror the shared codes where applicable. `BudgetNotActive` (45) is unique to `BudgetError`; it folds to `BudgetExpired` when converted to the shared `Error`.
 
 ## Events
 
-Contract-local tuple topics, all under the `budget` category:
+- `("budget", "allocated")` — `(budget_id, owner, limit)` on creation.
+- `("budget", "recurring")` — `(budget_id, period, period_seconds, rollover_cap)` on `set_recurrence`.
+- `("budget", "rollover")` — `(budget_id, rollover_bps, max_rollover_cap)` on `set_rollover_config`.
+- `("budget", "reset")` — `budget_id` on manual reset.
+- `("budget", "frozen")` / `("budget", "unfrozen")` / `("budget", "archived")` — lifecycle changes.
+- `("budget", "setlimit")` — `(budget_id, new_limit)` on limit change.
+- `("budget", "realloc")` — `(from_id, to_id, amount)` on `transfer_allocation`.
+- `("budget", "set_ast")` — `(budget_id, token, limit)` on `set_budget_limit`.
+- `("budget", "set_ast")` — same topic on `set_budget_limit_with_rollover`.
+- `("budget", "ast_roll")` — `(budget_id, token, rollover_bps, max_rollover_cap)` on `set_asset_rollover_config`.
+- `("budget", "ast_spend")` — `(budget_id, token, amount)` on per-asset spend.
+- `BudgetUpdated` (canonical `ContractEvent`) — emitted on every state change.
 
-| Topic | Data |
-|---|---|
-| `("budget", "allocated")` | `(budget_id, owner, limit)` |
-| `("budget", "recurring")` | `(budget_id, period, period_seconds, rollover_cap)` |
-| `("budget", "rollover")` | `(budget_id, rollover_bps, max_rollover_cap)` on config change; `(budget_id, amount)` on a period transition |
-| `("budget", "reset")` | `budget_id` (manual reset); `(budget_id, amount)` on a period transition |
-| `("budget", "deficit")` | `(budget_id, amount)`: period transition that carried an overspend forward |
-| `("budget", "expired")` | `budget_id` |
-| `("budget", "setlimit")` | `(budget_id, new_limit)` |
-| `("budget", "frozen")` / `("budget", "unfrozen")` / `("budget", "archived")` | `budget_id` |
-| `("budget", "realloc")` | `(from_id, to_id, amount)` |
-| `("budget", "consumed")` | `(budget_id, amount, remaining)` |
-| `("budget", "set_ast")` / `("budget", "ast_roll")` | per-token limit / rollover config |
-| `("budget", "ast_spend")` / `("budget", "ast_reset")` | per-token debit / window reset |
+## Cross-contract Flow
 
-Standard events from `shared/src/events.rs`: `ContractEvent::BudgetUpdated` on
-period transitions and per-token resets, and `budget_exceeded` (`("budget",
-"exceeded")`) on the refusal path of `consume`. The refusal path returns an
-error, so on-chain that event is rolled back together with the failed
-invocation. It is visible in simulation, and the error code is the durable
-signal.
+```text
+Treasury.withdraw ──► BudgetClient.consume(caller, budget_id, amount)
+                     ──► returns remaining or BudgetExceeded
+```
+
+The Treasury contract calls `BudgetClient::consume` before moving tokens. The budget debits atomically; if the spend would breach the ceiling the call reverts and no tokens move.
+
+## Design Notes
+
+- **No external cron**: Period transitions are evaluated lazily on every read/spend. A dormant budget catches up correctly when next accessed.
+- **Half-open windows**: `[window_start, window_start + duration)`. The boundary timestamp belongs to the *next* period.
+- **Rollover does not compound across gaps**: Idle periods contribute one base limit each; the prior window's remainder carries once. The effective cap prevents runaway accrual.
+- **Deficit repayment**: On transition, `deficit_amount` is subtracted from the next period's effective capacity. The budget must "earn back" the overspend.
+- **Scheduled activation**: `allocate_scheduled` with `start_at > now` blocks all spends until the ledger reaches that timestamp (`BudgetNotActive`).
+- **Checked arithmetic everywhere**: All value math uses shared helpers that return `Error::Overflow` instead of panicking.
+- **Per-asset atomicity**: `check_and_record_batch_spend` validates the full batch before writing any leg, so a partial failure leaves all allowances untouched.
+
+## Constants
+
+- `MAX_BATCH_TOKENS` — maximum tokens in a single `check_and_record_batch_spend` (bounds gas).
+- `BPS_DENOMINATOR = 10_000` — basis point denominator for rollover percentages.
+- `SECONDS_PER_DAY = 86_400`, `SECONDS_PER_WEEK = 604_800`, `SECONDS_PER_MONTH = 2_629_746`.
 
 ## Testing
 
-```sh
+Run the unit test suite:
+
+```bash
 cargo test -p astroid-budget
 ```
 
-The treasury → budget path is also covered end to end in
-`tests/src/e2e_agent_spending.rs` and `tests/src/policy_workflow.rs`.
+Key test modules cover:
+- Basic allocation, consumption, reset, freeze, archive.
+- Recurring windows: daily/weekly/monthly/custom, catch-up, drift prevention.
+- Rollover: enabled/disabled, caps (absolute + percentage), credit replacement.
+- Deficit carryforward: overspend, repayment, combined with rollover.
+- Per-asset allowances: independent windows, batch atomicity, duplicate rejection.
+- Boundary conditions: exact timestamps, expiry vs rollover, max values, overflow safety.
+- Rollover preview: read-only equivalence with live transition.

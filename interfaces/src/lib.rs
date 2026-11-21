@@ -44,7 +44,7 @@ pub use proposal::{ProposalClient, ProposalInterface, ProposalState};
 mod test;
 
 use astroid_shared::errors::{BudgetError, Error};
-use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind, WalletData};
+use astroid_shared::types::{AssetBalance, ModuleId, ModuleInfo, ModuleKind, WalletData};
 use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env, String, Vec};
 
 /// Version of the interface surface declared in this crate. Bump it whenever a
@@ -198,6 +198,12 @@ pub trait TreasuryInterface {
     /// Live on-chain balance the treasury holds of `asset`. Fails with
     /// [`Error::AssetNotAuthorized`] when `asset` is not on the approved list.
     fn balance(env: Env, asset: Address) -> Result<i128, Error>;
+
+    /// Batch balance query for multiple assets. Returns the live custody balance
+    /// for each approved asset in the input vector. Fails with
+    /// [`Error::AssetNotAuthorized`] if any asset is not approved, or
+    /// [`Error::InvalidInput`] for duplicates or oversized lists.
+    fn get_balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error>;
 
     /// Whether `asset` is currently approved for routing through the treasury.
     fn is_approved_asset(env: Env, asset: Address) -> bool;

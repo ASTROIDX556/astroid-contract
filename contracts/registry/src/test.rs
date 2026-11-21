@@ -2635,7 +2635,7 @@ fn a_target_that_is_not_a_contract_is_refused() {
     assert_eq!(
         h.client
             .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &5),
-        Err(Ok(Error::InvalidInput))
+        Err(Ok(Error::InvalidUpgradeAddress))
     );
     assert_eq!(pointed_at(&h), h.v1);
     assert_eq!(pin(&h), 0);
@@ -2651,7 +2651,7 @@ fn an_upgrade_cannot_repeat_the_version_it_already_runs() {
     assert_eq!(
         h.client
             .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
     assert_eq!(pointed_at(&h), h.v2);
     assert_eq!(pin(&h), 2);
@@ -2665,17 +2665,17 @@ fn an_upgrade_cannot_walk_back_to_an_earlier_version() {
     assert_eq!(pointed_at(&h), h.v3);
 
     // v2 is published, approved and perfectly valid — it is simply behind the
-    // module now, so returning to it would close the loop v1 → v3 → v2 → v3.
+    // module now, so returning to it would violate monotonicity.
     for behind in [1u32, 2] {
         assert_eq!(
             h.client
                 .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &behind),
-            Err(Ok(Error::CircularUpgrade))
+            Err(Ok(Error::VersionNotMonotonic))
         );
         assert_eq!(
             h.client
                 .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &behind),
-            Err(Ok(Error::CircularUpgrade))
+            Err(Ok(Error::VersionNotMonotonic))
         );
     }
     assert_eq!(pointed_at(&h), h.v3);
@@ -2848,8 +2848,8 @@ fn validation_predicts_every_refusal_of_the_write_path() {
     let cases = [
         (0u32, Error::InvalidInput),
         (99, Error::NotFound),
-        (2, Error::CircularUpgrade),
-        (1, Error::CircularUpgrade),
+        (2, Error::VersionNotMonotonic),
+        (1, Error::VersionNotMonotonic),
     ];
     for (version, expected) in cases {
         assert_eq!(
@@ -3230,35 +3230,38 @@ fn versioned_registration_moves_an_existing_module_forward() {
     );
 }
 
+/// Equal version: the degenerate cycle both validated paths refuse. Now fails
+/// with VERSION_NOT_MONOTONIC (target_version must be strictly greater than
+/// from_version).
 #[test]
 fn versioned_registration_refuses_the_version_the_module_already_runs() {
     let h = setup_path();
     h.client
         .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
 
-    // Equal version: the degenerate cycle both validated paths refuse.
     assert_eq!(
         h.client
             .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
     assert_eq!(pointed_at(&h), h.v2);
     assert_eq!(pin(&h), 2);
 }
 
+/// Older version: refused, and nothing is written, so the module cannot be
+/// rolled back through the registration path. Now fails with
+/// VERSION_NOT_MONOTONIC.
 #[test]
 fn versioned_registration_cannot_walk_backwards() {
     let h = setup_path();
     h.client
         .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
 
-    // Older version: refused, and nothing is written, so the module cannot be
-    // rolled back through the registration path.
     let before = h.env.events().all().len();
     assert_eq!(
         h.client
             .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
     assert_eq!(pointed_at(&h), h.v3);
     assert_eq!(pin(&h), 3);
@@ -3370,10 +3373,12 @@ fn versioned_registration_agrees_with_the_upgrade_validation() {
             .register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
         2
     );
+    // After registering v2, validating an upgrade to v2 again fails with
+    // VERSION_NOT_MONOTONIC (target_version must be strictly greater than from_version).
     assert_eq!(
         h.client
             .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
 }
 
@@ -3704,4 +3709,192 @@ fn multi_admin_and_multisig_module_upgrade_authorization() {
         3
     );
     assert_eq!(client.lookup(&org, &ModuleKind::Wallet), mod_v3);
+}
+
+// --- Deterministic error handling for upgrade mapping (Issue #487) ---
+
+/// An account address is not a valid contract principal and must be rejected
+/// with INVALID_UPGRADE_ADDRESS when registering a module.
+#[test]
+fn register_module_rejects_account_address() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    // Use a genuine account address (strkey G...) which is not a contract.
+    let account = account_address(&env);
+
+    let res = client.try_register_module(&owner, &org, &ModuleKind::Wallet, &account);
+    assert_eq!(res, Err(Ok(Error::InvalidUpgradeAddress)));
+}
+
+/// An account address is also rejected when registering a module version
+/// (upgrade path) because the version record contains an invalid address.
+#[test]
+fn register_module_version_rejects_account_address_in_record() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let account = account_address(&env);
+
+    // First register the version with account address (admin can do this)
+    let res = client.try_register_version(&admin, &ModuleKind::Wallet, &1, &account, &h1);
+    assert!(res.is_ok());
+
+    // But registering the module version should fail with INVALID_UPGRADE_ADDRESS
+    let res = client.try_register_module_version(&owner, &org, &ModuleKind::Wallet, &1);
+    assert_eq!(res, Err(Ok(Error::InvalidUpgradeAddress)));
+}
+
+/// Upgrading to a version that is not strictly greater than the current pinned
+/// version is rejected with VERSION_NOT_MONOTONIC (not CIRCULAR_UPGRADE).
+#[test]
+fn upgrade_module_rejects_non_monotonic_version() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let mod_v1 = env.register_contract(None, RegistryContract);
+    let mod_v2 = env.register_contract(None, RegistryContract);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &mod_v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &mod_v2, &h2);
+
+    // Register module at v1
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &mod_v1);
+    // Upgrade to v2
+    client.upgrade_module(&owner, &org, &ModuleKind::Wallet, &2);
+
+    // Now try to "upgrade" to v1 again (downgrade) - should fail with VERSION_NOT_MONOTONIC
+    let res = client.try_upgrade_module(&owner, &org, &ModuleKind::Wallet, &1);
+    assert_eq!(res, Err(Ok(Error::VersionNotMonotonic)));
+
+    // Try to "upgrade" to v2 again (same version) - should fail with VERSION_NOT_MONOTONIC
+    let res = client.try_upgrade_module(&owner, &org, &ModuleKind::Wallet, &2);
+    assert_eq!(res, Err(Ok(Error::VersionNotMonotonic)));
+}
+
+/// Registering a module version that is not strictly greater than the current
+/// pinned version is rejected with VERSION_NOT_MONOTONIC.
+#[test]
+fn register_module_version_rejects_non_monotonic_version() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let mod_v1 = env.register_contract(None, RegistryContract);
+    let mod_v2 = env.register_contract(None, RegistryContract);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &mod_v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &mod_v2, &h2);
+
+    // Register module at v1
+    client.register_module_version(&owner, &org, &ModuleKind::Wallet, &1);
+    // Upgrade to v2 via register_module_version
+    client.register_module_version(&owner, &org, &ModuleKind::Wallet, &2);
+
+    // Try to register v1 again (downgrade) - should fail with VERSION_NOT_MONOTONIC
+    let res = client.try_register_module_version(&owner, &org, &ModuleKind::Wallet, &1);
+    assert_eq!(res, Err(Ok(Error::VersionNotMonotonic)));
+
+    // Try to register v2 again (same version) - should fail with VERSION_NOT_MONOTONIC
+    let res = client.try_register_module_version(&owner, &org, &ModuleKind::Wallet, &2);
+    assert_eq!(res, Err(Ok(Error::VersionNotMonotonic)));
+}
+
+/// Valid upgrades (strictly increasing versions) succeed.
+#[test]
+fn valid_monotonic_upgrades_succeed() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let mod_v1 = env.register_contract(None, RegistryContract);
+    let mod_v2 = env.register_contract(None, RegistryContract);
+    let mod_v3 = env.register_contract(None, RegistryContract);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+    let h3 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 3);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &mod_v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &mod_v2, &h2);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &mod_v3, &h3);
+
+    // Register at v1
+    assert_eq!(
+        client.register_module_version(&owner, &org, &ModuleKind::Wallet, &1),
+        1
+    );
+    // Upgrade to v2
+    assert_eq!(
+        client.register_module_version(&owner, &org, &ModuleKind::Wallet, &2),
+        2
+    );
+    // Upgrade to v3
+    assert_eq!(
+        client.register_module_version(&owner, &org, &ModuleKind::Wallet, &3),
+        3
+    );
+
+    // Also test upgrade_module path
+    let org2 = String::from_str(&env, "acme2");
+    let owner2 = Address::generate(&env);
+    client.register_org(&admin, &org2, &owner2);
+    client.register_module(&owner2, &org2, &ModuleKind::Wallet, &mod_v1);
+
+    assert_eq!(
+        client.upgrade_module(&owner2, &org2, &ModuleKind::Wallet, &2),
+        2
+    );
+    assert_eq!(
+        client.upgrade_module(&owner2, &org2, &ModuleKind::Wallet, &3),
+        3
+    );
+}
+
+/// validate_upgrade also reports VERSION_NOT_MONOTONIC for non-monotonic targets.
+#[test]
+fn validate_upgrade_reports_version_not_monotonic() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let mod_v1 = env.register_contract(None, RegistryContract);
+    let mod_v2 = env.register_contract(None, RegistryContract);
+    let h1 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 1);
+    let h2 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 2);
+
+    client.register_version(&admin, &ModuleKind::Wallet, &1, &mod_v1, &h1);
+    client.register_version(&admin, &ModuleKind::Wallet, &2, &mod_v2, &h2);
+
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &mod_v1);
+    client.upgrade_module(&owner, &org, &ModuleKind::Wallet, &2);
+
+    // Validate downgrade fails with VERSION_NOT_MONOTONIC
+    let res = client.try_validate_upgrade(&org, &ModuleKind::Wallet, &1);
+    assert_eq!(res, Err(Ok(Error::VersionNotMonotonic)));
+
+    // Validate same version fails with VERSION_NOT_MONOTONIC
+    let res = client.try_validate_upgrade(&org, &ModuleKind::Wallet, &2);
+    assert_eq!(res, Err(Ok(Error::VersionNotMonotonic)));
+
+    // Validate forward upgrade succeeds
+    let mod_v3 = env.register_contract(None, RegistryContract);
+    let h3 = approved_hash(&env, &client, &admin, ModuleKind::Wallet, 3);
+    client.register_version(&admin, &ModuleKind::Wallet, &3, &mod_v3, &h3);
+
+    let res = client.validate_upgrade(&org, &ModuleKind::Wallet, &3);
+    assert_eq!(res, mod_v3);
 }

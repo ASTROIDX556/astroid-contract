@@ -1640,27 +1640,6 @@ impl TreasuryContract {
         Self::load_holding(&env, &asset)
     }
 
-    pub fn balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error> {
-        if assets.len() > MAX_BALANCE_ASSETS {
-            return Err(Error::InvalidInput);
-        }
-        for i in 0..assets.len() {
-            let asset = assets.get_unchecked(i);
-            for j in (i + 1)..assets.len() {
-                if assets.get_unchecked(j) == asset {
-                    return Err(Error::InvalidInput);
-                }
-            }
-        }
-
-        let mut report = Vec::new(&env);
-        for asset in assets.iter() {
-            let balance = Self::read_token_balance(&env, &asset)?;
-            report.push_back(AssetBalance { asset, balance });
-        }
-        Ok(report)
-    }
-
     /// Live balances for every approved token, bounded by `MAX_TREASURY_ASSETS`.
     pub fn get_all_balances(env: Env) -> Result<Vec<(Address, i128)>, Error> {
         let mut report = Vec::new(&env);
@@ -2151,6 +2130,31 @@ impl TreasuryContract {
 impl TreasuryInterface for TreasuryContract {
     fn balance(env: Env, asset: Address) -> Result<i128, Error> {
         Self::read_token_balance(&env, &asset)
+    }
+
+    /// Batch balance query for multiple assets. Returns the live custody balance
+    /// for each approved asset in the input vector. Fails with
+    /// [`Error::AssetNotAuthorized`] if any asset is not approved, or
+    /// [`Error::InvalidInput`] for duplicates or oversized lists.
+    fn get_balances(env: Env, assets: Vec<Address>) -> Result<Vec<AssetBalance>, Error> {
+        if assets.len() > MAX_BALANCE_ASSETS {
+            return Err(Error::InvalidInput);
+        }
+        for i in 0..assets.len() {
+            let asset = assets.get_unchecked(i);
+            for j in (i + 1)..assets.len() {
+                if assets.get_unchecked(j) == asset {
+                    return Err(Error::InvalidInput);
+                }
+            }
+        }
+
+        let mut report = Vec::new(&env);
+        for asset in assets.iter() {
+            let balance = Self::read_token_balance(&env, &asset)?;
+            report.push_back(AssetBalance { asset, balance });
+        }
+        Ok(report)
     }
 
     /// Whether `asset` is currently approved for routing.

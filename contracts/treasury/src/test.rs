@@ -481,7 +481,7 @@ fn balance_reports_actual_custody_across_assets() {
     assert_eq!(h.client.balance(&second), 250);
 
     let assets: Vec<Address> = vec![&h.env, second.clone(), h.asset.clone()];
-    let report = h.client.balances(&assets);
+    let report = h.client.get_balances(&assets);
     assert_eq!(report.len(), 2);
     assert_eq!(report.get(0).unwrap().asset, second);
     assert_eq!(report.get(0).unwrap().balance, 250);
@@ -500,7 +500,7 @@ fn balance_queries_require_approved_assets() {
     );
     let assets: Vec<Address> = vec![&h.env, rogue];
     assert_eq!(
-        h.client.try_balances(&assets),
+        h.client.try_get_balances(&assets),
         Err(Ok(Error::AssetNotAuthorized))
     );
 }
@@ -510,7 +510,10 @@ fn balance_report_rejects_duplicate_assets() {
     let h = setup("vault", 0);
     let assets: Vec<Address> = vec![&h.env, h.asset.clone(), h.asset.clone()];
 
-    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        h.client.try_get_balances(&assets),
+        Err(Ok(Error::InvalidInput))
+    );
 }
 
 #[test]
@@ -521,7 +524,10 @@ fn balance_report_rejects_oversized_asset_lists() {
         assets.push_back(Address::generate(&h.env));
     }
 
-    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        h.client.try_get_balances(&assets),
+        Err(Ok(Error::InvalidInput))
+    );
 }
 
 #[test]
@@ -529,7 +535,7 @@ fn balance_report_is_empty_for_no_assets() {
     let h = setup("vault", 0);
     let assets: Vec<Address> = Vec::new(&h.env);
 
-    assert!(h.client.balances(&assets).is_empty());
+    assert!(h.client.get_balances(&assets).is_empty());
 }
 
 #[test]
