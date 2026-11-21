@@ -57,6 +57,10 @@
 //! is clamped to `[MIN_TIMELOCK_DELAY, MAX_TIMELOCK_DELAY]`, so no single
 //! signer can shrink the review window to nothing.
 //!
+//! The proposal lifecycle events (`proposal/created`, `proposal/approved`,
+//! `proposal/executed`) are published through the standard helpers in
+//! `astroid_shared::events`, so every contract emits them identically.
+//!
 //! Events: `signer/added`, `signer/removed`, `signer/weight`,
 //! `threshold/changed`, `timelock/changed`, `govchange/proposed`,
 //! `govchange/executed`, `govchange/cancelled`, `proposal/approved`,
@@ -80,6 +84,7 @@ use astroid_shared::constants::{
     PERSISTENT_LIFETIME_THRESHOLD, THRESHOLD_CHANGE_DELAY_LEDGERS,
 };
 use astroid_shared::errors::Error;
+use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::validation::require_time_reached;
 use soroban_sdk::{
@@ -479,10 +484,7 @@ impl MultiSigContract {
             .set(&DataKey::ProposalCount, &count);
         Self::bump_instance(&env);
 
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("created")),
-            (id, proposer),
-        );
+        events::proposal_created(&env, id, &proposer);
         // The proposer's own weight counts toward the threshold, so a heavy
         // signer can satisfy it alone at creation time — announce that once,
         // with the same verified tally every later approval is measured against.
@@ -528,10 +530,9 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         Self::bump_proposal(&env, proposal_id);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("approved")),
-            (proposal_id, caller, proposal.approval_weight),
-        );
+        // Standard shared event: `approvals` carries the aggregated signer
+        // weight, which is what the threshold is measured in.
+        events::proposal_approved(&env, proposal_id, &caller, proposal.approval_weight);
         // Threshold reached by this very approval: announce the quorum once,
         // carrying the tally that satisfied it. Later approvals past the
         // threshold stay quiet.
@@ -571,10 +572,7 @@ impl MultiSigContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         Self::bump_proposal(&env, proposal_id);
-        env.events().publish(
-            (symbol_short!("proposal"), symbol_short!("executed")),
-            proposal_id,
-        );
+        events::proposal_executed(&env, proposal_id);
         Ok(())
     }
 

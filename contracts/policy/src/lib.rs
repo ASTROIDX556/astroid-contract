@@ -122,7 +122,7 @@
 //! their behaviour until governance opts in.
 
 use astroid_interfaces::{PolicyInterface, UpgradeableInterface};
-use astroid_shared::constants::SECONDS_PER_MONTH;
+use astroid_shared::constants::{SECONDS_PER_DAY, SECONDS_PER_MONTH};
 use astroid_shared::errors::Error;
 use astroid_shared::events::ContractEvent;
 use astroid_shared::math::{checked_add, checked_sub};
@@ -636,6 +636,12 @@ enum DataKey {
     /// Stack of independently registered rule trees for a policy (all must
     /// pass; managed through `add_policy_rule` / `remove_policy_rule`).
     PolicyRules(String),
+    /// Per-(policy, agent) spending limit: per-transaction and daily caps
+    /// (Issue #471).
+    AgentLimit(String, Address),
+    /// Per-(policy, agent) cumulative spend in the current UTC day
+    /// (Issue #471).
+    AgentDailySpend(String, Address),
 }
 
 /// A per-asset spending allowance attached to a policy.
@@ -687,6 +693,53 @@ fn settle_window(allowance: &mut AssetAllowance, now: u64) -> Result<(), Error> 
         .ok_or(Error::Overflow)?;
     allowance.spent = 0;
     Ok(())
+}
+
+/// Deterministic spending limits for one AI agent under one policy
+/// (Issue #471).
+///
+/// Both caps are in the asset's base units and evaluated with checked
+/// arithmetic. A cap of `0` disables that gate, so a limit can constrain only
+/// the transaction size, only the daily total, or both.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSpendLimit {
+    /// Largest single spend the agent may make. `0` = no per-transaction cap.
+    pub per_tx_limit: i128,
+    /// Largest cumulative spend the agent may make in one UTC day.
+    /// `0` = no daily cap.
+    pub daily_limit: i128,
+}
+
+/// An agent's cumulative spend in the current daily window (Issue #471).
+///
+/// Windows are aligned to UTC midnight in ledger time: `day_start` is always
+/// a multiple of [`SECONDS_PER_DAY`]. The record resets itself lazily — the
+/// first read or spend in a later day sees `spent == 0` — so no cron or keeper
+/// is needed for the window to roll over.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentDailySpend {
+    /// Ledger timestamp of the UTC midnight that opened the current window.
+    pub day_start: u64,
+    /// Amount already spent inside the window.
+    pub spent: i128,
+}
+
+/// The UTC-midnight boundary that opens the daily window containing `now`.
+fn day_start_of(now: u64) -> u64 {
+    now - now % SECONDS_PER_DAY
+}
+
+/// Roll `record` onto the window containing `now`. A record from an earlier
+/// day resets to zero; a record from the current day (or, defensively, a later
+/// one) is kept as-is so recorded spend is never silently discarded.
+fn settle_daily_spend(record: &mut AgentDailySpend, now: u64) {
+    let today = day_start_of(now);
+    if record.day_start < today {
+        record.day_start = today;
+        record.spent = 0;
+    }
 }
 
 #[contract]
@@ -1628,6 +1681,145 @@ impl PolicyContract {
         Ok(())
     }
 
+    // --- per-agent spending limits (Issue #471) ---
+
+    /// Set (or replace) the spending limit for `agent` under `policy_id`.
+    /// Policy `owner` only.
+    ///
+    /// `per_tx_limit` caps a single spend and `daily_limit` caps the agent's
+    /// cumulative spend per UTC day; `0` disables either gate. Negative caps
+    /// are [`Error::InvalidAmount`]; a per-transaction cap above a non-zero
+    /// daily cap could never be used in full and is rejected as
+    /// [`Error::InvalidInput`]. Spend already recorded today is kept, so
+    /// tightening a limit mid-day takes effect against the real running total.
+    pub fn set_agent_spend_limit(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        agent: Address,
+        per_tx_limit: i128,
+        daily_limit: i128,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        require_non_negative_amount(per_tx_limit)?;
+        require_non_negative_amount(daily_limit)?;
+        if per_tx_limit > 0 && daily_limit > 0 && per_tx_limit > daily_limit {
+            return Err(Error::InvalidInput);
+        }
+        env.storage().persistent().set(
+            &DataKey::AgentLimit(policy_id.clone(), agent.clone()),
+            &AgentSpendLimit {
+                per_tx_limit,
+                daily_limit,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("agt_limit")),
+            (policy_id, agent, per_tx_limit, daily_limit),
+        );
+        Ok(())
+    }
+
+    /// Remove the spending limit for `agent` under `policy_id`, together with
+    /// its daily spend record. Policy `owner` only. [`Error::NotFound`] when no
+    /// limit is configured.
+    pub fn remove_agent_spend_limit(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        agent: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let key = DataKey::AgentLimit(policy_id.clone(), agent.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AgentDailySpend(policy_id.clone(), agent.clone()));
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("agt_rem")),
+            (policy_id, agent),
+        );
+        Ok(())
+    }
+
+    /// Read the spending limit for `agent` under `policy_id`.
+    /// [`Error::NotFound`] when none is configured.
+    pub fn get_agent_spend_limit(
+        env: Env,
+        policy_id: String,
+        agent: Address,
+    ) -> Result<AgentSpendLimit, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentLimit(policy_id, agent))
+            .ok_or(Error::NotFound)
+    }
+
+    /// Read `agent`'s spend in the current UTC day under `policy_id`. A window
+    /// that has rolled over reports `spent == 0` even before the next spend
+    /// persists the reset; an agent with no history reports today's window
+    /// with nothing spent.
+    pub fn get_agent_daily_spend(env: Env, policy_id: String, agent: Address) -> AgentDailySpend {
+        Self::current_daily_spend(&env, &policy_id, &agent)
+    }
+
+    /// Check whether `agent` may spend `amount` under `policy_id` without
+    /// recording anything. Returns the daily headroom that would remain after
+    /// the spend (`i128::MAX` when no daily cap applies).
+    ///
+    /// Gates, in order, with deterministic codes from the shared error table:
+    ///
+    /// | Condition                                   | Error                     |
+    /// |---------------------------------------------|---------------------------|
+    /// | `amount <= 0`                               | [`Error::InvalidAmount`]  |
+    /// | unknown `policy_id`                         | [`Error::NotFound`]       |
+    /// | `amount > per_tx_limit`                     | [`Error::PolicyDenied`]   |
+    /// | today's spend + `amount` > `daily_limit`    | [`Error::BudgetExceeded`] |
+    /// | the running total would overflow `i128`     | [`Error::Overflow`]       |
+    ///
+    /// An agent without a configured limit is not restricted by this gate; the
+    /// policy's own scalar gates still apply through `check_transfer`. Spending
+    /// exactly the remaining daily headroom is allowed.
+    pub fn check_spending_limit(
+        env: Env,
+        policy_id: String,
+        agent: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        let (_, remaining) = Self::evaluate_agent_spend(&env, &policy_id, &agent, amount)?;
+        Ok(remaining)
+    }
+
+    /// Evaluate a spend exactly as [`Self::check_spending_limit`] and, only if
+    /// it passes, add it to `agent`'s running daily total. Policy `owner` only
+    /// (the treasury / wallet admin that executes the agent's transfer).
+    /// Returns the remaining daily headroom. A denied spend records nothing.
+    ///
+    /// Spend is tracked even for an agent with no limit configured, so a
+    /// limit introduced mid-day is enforced against the real running total.
+    pub fn record_agent_spend(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        agent: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        let (record, remaining) = Self::evaluate_agent_spend(&env, &policy_id, &agent, amount)?;
+        env.storage().persistent().set(
+            &DataKey::AgentDailySpend(policy_id.clone(), agent.clone()),
+            &record,
+        );
+        env.events().publish(
+            (symbol_short!("policy"), symbol_short!("agt_spend")),
+            (policy_id, agent, amount, record.spent),
+        );
+        Ok(remaining)
+    }
+
     // --- granular rule evaluation (Issue #314) ---
 
     /// Evaluate `payload` against a policy and return the granular decision:
@@ -2038,6 +2230,60 @@ impl PolicyContract {
         Ok(Some(allowance))
     }
 
+    /// The agent's daily spend record rolled onto the window containing the
+    /// current ledger time. Nothing is persisted.
+    fn current_daily_spend(env: &Env, policy_id: &String, agent: &Address) -> AgentDailySpend {
+        let now = env.ledger().timestamp();
+        let mut record: AgentDailySpend = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentDailySpend(policy_id.clone(), agent.clone()))
+            .unwrap_or(AgentDailySpend {
+                day_start: day_start_of(now),
+                spent: 0,
+            });
+        settle_daily_spend(&mut record, now);
+        record
+    }
+
+    /// Shared evaluation behind [`Self::check_spending_limit`] and
+    /// [`Self::record_agent_spend`]: returns the daily record with `amount`
+    /// added and the remaining daily headroom, or the error that denies the
+    /// spend. Nothing is persisted.
+    fn evaluate_agent_spend(
+        env: &Env,
+        policy_id: &String,
+        agent: &Address,
+        amount: i128,
+    ) -> Result<(AgentDailySpend, i128), Error> {
+        require_positive_amount(amount)?;
+        // The policy must exist: limits hang off a real rule set.
+        Self::load(env, policy_id)?;
+        let limit: Option<AgentSpendLimit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentLimit(policy_id.clone(), agent.clone()));
+        let mut record = Self::current_daily_spend(env, policy_id, agent);
+        let new_spent = checked_add(record.spent, amount)?;
+
+        let mut remaining = i128::MAX;
+        if let Some(limit) = limit {
+            if limit.per_tx_limit > 0 && amount > limit.per_tx_limit {
+                events_policy_violation(env, policy_id, "above_agent_tx_limit");
+                return Err(Error::PolicyDenied);
+            }
+            if limit.daily_limit > 0 {
+                if new_spent > limit.daily_limit {
+                    events_policy_violation(env, policy_id, "daily_limit_exceeded");
+                    return Err(Error::BudgetExceeded);
+                }
+                remaining = checked_sub(limit.daily_limit, new_spent)?;
+            }
+        }
+        record.spent = new_spent;
+        Ok((record, remaining))
+    }
+
     /// Store an allowance returned by [`Self::consume_allowance`] and emit the
     /// `allow_use` event.
     fn persist_spend(env: &Env, allowance: &AssetAllowance, amount: i128) {
@@ -2402,3 +2648,5 @@ impl UpgradeableInterface for PolicyContract {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_spending_limit;

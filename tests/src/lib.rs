@@ -23,9 +23,13 @@ pub mod gated_fund_flows;
 #[cfg(test)]
 pub mod interface_compliance;
 #[cfg(test)]
+pub mod multisig_integration;
+#[cfg(test)]
 pub mod policy_enforcement;
 #[cfg(test)]
 pub mod policy_test;
+#[cfg(test)]
+pub mod policy_workflow;
 #[cfg(test)]
 pub mod proposal_timelock;
 #[cfg(test)]
