@@ -341,7 +341,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 60] = [
+    pub const ALL: [Error; 63] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -367,12 +367,14 @@ impl Error {
         Error::CircularUpgrade,
         Error::InvalidUpgradeAddress,
         Error::VersionNotMonotonic,
-        // --- Budget (40-44) ---
+        // --- Budget (40-46) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
         Error::BudgetArchived,
         Error::AssetNotAuthorized,
         Error::BudgetExpired,
+        Error::BudgetPeriodExpired,
+        Error::BudgetLimitReached,
         // --- Wallet (50-55) ---
         Error::WalletFrozen,
         Error::WalletArchived,
@@ -468,12 +470,14 @@ impl Error {
             Error::CircularUpgrade => "CIRCULAR_UPGRADE",
             Error::InvalidUpgradeAddress => "INVALID_UPGRADE_ADDRESS",
             Error::VersionNotMonotonic => "VERSION_NOT_MONOTONIC",
-            // --- Budget (40-44) ---
+            // --- Budget (40-46) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
             Error::BudgetArchived => "BUDGET_ARCHIVED",
             Error::AssetNotAuthorized => "ASSET_NOT_AUTHORIZED",
             Error::BudgetExpired => "BUDGET_EXPIRED",
+            Error::BudgetPeriodExpired => "BUDGET_PERIOD_EXPIRED",
+            Error::BudgetLimitReached => "BUDGET_LIMIT_REACHED",
             // --- Wallet (50-55) ---
             Error::WalletFrozen => "WALLET_FROZEN",
             Error::WalletArchived => "WALLET_ARCHIVED",

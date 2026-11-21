@@ -3646,7 +3646,7 @@ mod window_boundary_tests {
         let res = h
             .client
             .try_consume(&h.owner, &id(&h.env, "boundary"), &600);
-        assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+        assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
     }
 
     #[test]
@@ -3762,7 +3762,7 @@ mod window_boundary_tests {
 
         // Cannot spend more in period 4
         let res = h.client.try_consume(&h.owner, &id(&h.env, "gap"), &1);
-        assert_eq!(res, Err(Ok(BudgetError::BudgetExceeded)));
+        assert_eq!(res, Err(Ok(BudgetError::BudgetLimitReached)));
     }
 
     #[test]
