@@ -2488,3 +2488,54 @@ fn a_late_approval_does_not_buy_a_fresh_cooling_off_window() {
     h.client.execute(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Executed);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #537: threshold verification survives long approval rounds
+// ---------------------------------------------------------------------------
+
+/// Recorded approvals carry the proposal's persistent TTL, so votes cast
+/// early in a long approval round still count when the proposal executes
+/// days of ledgers later instead of being archived out of the tally.
+#[test]
+fn early_approvals_still_count_after_many_ledgers() {
+    use astroid_shared::constants::DAY_IN_LEDGERS;
+    let h = setup_with_weights(&[1, 1, 1], 2, 0);
+    let id = create(&h, 2, 1_000_000);
+
+    h.client.approve(&h.approvers[0], &id);
+    h.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += 3 * DAY_IN_LEDGERS);
+    h.client.approve(&h.approvers[1], &id);
+    h.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += 3 * DAY_IN_LEDGERS);
+
+    assert!(h.client.can_execute(&id));
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+/// The multisig gate is applied through one helper by both `execute` and
+/// `can_execute`, so an engaged emergency lock refuses execution with the
+/// shared `EmergencyLock` code and the view reports `false`.
+#[test]
+fn execution_refused_while_multisig_is_locked() {
+    let h = setup_with_weights(&[1, 1, 1], 2, 0);
+    let id = create(&h, 2, 1_000_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+
+    let multisig = MultiSigContractClient::new(&h.env, &h.multisig);
+    multisig.set_emergency_lock(&h.approvers[0], &true);
+    assert!(!h.client.can_execute(&id));
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::EmergencyLock))
+    );
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    multisig.set_emergency_lock(&h.approvers[0], &false);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}

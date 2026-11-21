@@ -619,6 +619,70 @@ pub fn transfer_executed(env: &Env, from: &Address, to: &Address, asset: &Addres
         .publish(topics, (from.clone(), to.clone(), asset.clone(), amount));
 }
 
+/// Typed payload of the standardized escrow settlement events (Issue #536).
+///
+/// Shared by [`escrow_funds_released`] and [`escrow_funds_refunded`] so an
+/// indexer decodes one schema for both outcomes of an escrow:
+///
+/// * `escrow_id` — the escrow that settled (also carried as the third topic,
+///   so a subscriber can filter one escrow without decoding payloads);
+/// * `recipient` — the account the funds moved to: the escrow's recipient on
+///   a release, its sender on a refund;
+/// * `amount` — the custody value this call moved, summed across every
+///   asset the escrow holds (the same unit as `Escrow::funded_amount`);
+/// * `timestamp` — the ledger timestamp of the settlement, following the
+///   payload-ends-with-timestamp convention from Issue #222.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowSettlement {
+    pub escrow_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Topic action symbol of [`escrow_funds_released`].
+pub const ESCROW_FUNDS_RELEASED: Symbol = symbol_short!("fund_rel");
+/// Topic action symbol of [`escrow_funds_refunded`].
+pub const ESCROW_FUNDS_REFUNDED: Symbol = symbol_short!("fund_ref");
+
+/// `EscrowFundsReleased` — topic `("escrow", "fund_rel", escrow_id)`, data
+/// [`EscrowSettlement`].
+///
+/// Published on every path that pays an escrow's held funds out to its
+/// recipient (arbiter release and signature-override release).
+pub fn escrow_funds_released(env: &Env, escrow_id: u64, recipient: &Address, amount: i128) {
+    publish_escrow_settlement(env, ESCROW_FUNDS_RELEASED, escrow_id, recipient, amount);
+}
+
+/// `EscrowFundsRefunded` — topic `("escrow", "fund_ref", escrow_id)`, data
+/// [`EscrowSettlement`].
+///
+/// Published on every path that returns an escrow's held funds to its sender
+/// (timed-out refund, time-lock refund, pre-deadline cancel and post-grace
+/// reclaim).
+pub fn escrow_funds_refunded(env: &Env, escrow_id: u64, recipient: &Address, amount: i128) {
+    publish_escrow_settlement(env, ESCROW_FUNDS_REFUNDED, escrow_id, recipient, amount);
+}
+
+fn publish_escrow_settlement(
+    env: &Env,
+    action: Symbol,
+    escrow_id: u64,
+    recipient: &Address,
+    amount: i128,
+) {
+    env.events().publish(
+        (symbol_short!("escrow"), action, escrow_id),
+        EscrowSettlement {
+            escrow_id,
+            recipient: recipient.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+        },
+    );
+}
+
 /// `ProposalCreated` — topic `("proposal", "created")`.
 pub fn proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
     let topics = (symbol_short!("proposal"), symbol_short!("created"));
@@ -648,6 +712,38 @@ pub fn budget_exceeded(env: &Env, budget_id: &String, requested: i128, remaining
     let topics = (symbol_short!("budget"), symbol_short!("exceeded"));
     env.events()
         .publish(topics, (budget_id.clone(), requested, remaining));
+}
+
+/// `BudgetExhausted` — topic `("budget", "exhausted")`.
+///
+/// Published by a *successful* spend that leaves the current period with no
+/// headroom (`remaining <= 0`). Unlike [`budget_exceeded`], which accompanies a
+/// refused spend whose invocation reverts (and whose events are therefore
+/// discarded by the host), this event is durable: an indexer sees the moment a
+/// budget ran dry. `token` is `None` for the budget-level allowance and
+/// `Some(asset)` for a per-asset limit.
+pub fn budget_exhausted(
+    env: &Env,
+    budget_id: &String,
+    token: Option<Address>,
+    spent: i128,
+    capacity: i128,
+) {
+    let topics = (symbol_short!("budget"), symbol_short!("exhausted"));
+    env.events()
+        .publish(topics, (budget_id.clone(), token, spent, capacity));
+}
+
+/// `BudgetReplenished` — topic `("budget", "replenish")`.
+///
+/// Published whenever fresh allowance becomes spendable: a period rollover
+/// that re-arms the window, or an explicit owner top-up. `available` is the
+/// headroom the budget (or per-asset limit, when `token` is `Some`) holds
+/// immediately afterwards.
+pub fn budget_replenished(env: &Env, budget_id: &String, token: Option<Address>, available: i128) {
+    let topics = (symbol_short!("budget"), symbol_short!("replenish"));
+    env.events()
+        .publish(topics, (budget_id.clone(), token, available));
 }
 
 /// `PolicyViolation` — topic `("policy", "violation")`.

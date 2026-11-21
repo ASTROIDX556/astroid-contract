@@ -706,13 +706,6 @@ impl MultiSigContract {
             .ok_or(Error::NotFound)
     }
 
-    pub fn is_locked(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::EmergencyLock)
-            .unwrap_or(false)
-    }
-
     /// Read a pending (or already executed/cancelled) governance change.
     pub fn get_pending_change(env: Env, proposal_id: u64) -> Result<PendingChange, Error> {
         Self::load_change(&env, proposal_id)
@@ -1284,6 +1277,17 @@ impl MultisigInterface for MultiSigContract {
 
     fn get_threshold(env: Env) -> Result<u32, Error> {
         Self::threshold(&env)
+    }
+
+    /// Whether the global emergency lock is engaged (see
+    /// [`MultiSigContract::set_emergency_lock`]). Exposed through the shared
+    /// interface so the proposal contract can refuse to enact a decision while
+    /// the multisig that backs it is locked (Issue #537).
+    fn is_locked(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyLock)
+            .unwrap_or(false)
     }
 }
 

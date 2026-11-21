@@ -177,7 +177,7 @@ use astroid_shared::constants::{
     PROPOSAL_QUORUM_PERCENT,
 };
 use astroid_shared::errors::Error;
-use astroid_shared::math::checked_add;
+use astroid_shared::math::{checked_add, checked_add_u64, checked_mul_u64};
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
@@ -294,12 +294,14 @@ impl VoteBars {
     /// allow-list, rounded **up**.
     ///
     /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
-    /// [`u64::div_ceil`] — never floating point, so every node derives the
+    /// checked arithmetic — never floating point, so every node derives the
     /// identical integer. `percent` is clamped to 100, so a misconfigured
     /// percentage can never demand more than the whole allow-list.
     pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
         let percent = percent.min(100);
-        ((eligible as u64) * (percent as u64)).div_ceil(100) as u32
+        let product = checked_mul_u64(eligible as u64, percent as u64)
+            .expect("quorum multiplication overflow");
+        product.div_ceil(100) as u32
     }
 
     /// Majority check helper: the smallest number of approvals that exceeds
@@ -549,6 +551,15 @@ impl ProposalContract {
             return Err(Error::InvalidProposalState);
         }
         env.storage().persistent().set(&akey, &true);
+        // Issue #537 — a vote must live as long as the proposal it backs: an
+        // archived approval would silently drop out of the execution tally
+        // (and make `execute` unreachable until restored), so it gets the same
+        // persistent TTL as the proposal record.
+        env.storage().persistent().extend_ttl(
+            &akey,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         let (approvals, approval_weight) = Self::live_approval_tally(&env, id, &proposal)?;
         proposal.approvals = approvals;
         proposal.approval_weight = approval_weight;
@@ -648,11 +659,17 @@ impl ProposalContract {
             return Err(Error::InvalidProposalState);
         }
         if proposal.grace_period != 0 {
-            // Saturating end-of-window: `created_at + grace_period` that does
-            // not fit a ledger timestamp describes a window so long it never
-            // closes, which must not wrap into the past (and trap) — the
-            // deadline above still bounds how long it can be relied on.
-            let grace_end = proposal.created_at.saturating_add(proposal.grace_period);
+            // Checked end-of-window: `created_at + grace_period` must be
+            // representable as a ledger timestamp. An unrepresentable sum means
+            // the window is effectively infinite (never closes), so cancellation
+            // remains allowed — the deadline still bounds the proposal. This
+            // avoids both a panic (from wrapping) and a silent saturation that
+            // could mask a misconfiguration.
+            let grace_end = match checked_add_u64(proposal.created_at, proposal.grace_period) {
+                Ok(end) => end,
+                Err(Error::Overflow) => u64::MAX,
+                Err(e) => return Err(e),
+            };
             if env.ledger().timestamp() > grace_end {
                 return Err(Error::CancellationWindowClosed);
             }
@@ -797,6 +814,13 @@ impl ProposalContract {
     /// notes). Reaching `Approved` once is therefore not a licence forever —
     /// an under-supported or merely-tied tally can never fire.
     ///
+    /// The live multisig is then consulted (Issue #537): an engaged emergency
+    /// lock refuses with [`Error::EmergencyLock`], a zero weighted threshold
+    /// fails closed with [`Error::InvalidThreshold`], and verified approval
+    /// weight below the threshold currently in force refuses with
+    /// [`Error::ThresholdNotMet`] — so raising the threshold or removing an
+    /// approving signer after approval is honoured at execution time.
+    ///
     /// Every declared prerequisite must have executed first, otherwise the call
     /// fails with [`Error::PrerequisiteNotMet`] and nothing changes. This is
     /// checked after the timelock so that a proposal blocked only by its chain
@@ -825,17 +849,10 @@ impl ProposalContract {
             return Err(Error::ProposalNotApproved);
         }
         // Re-check the tally that earned `Approved` — quorum participation,
-        // the configured threshold and a strict majority — so execution can
-        // never out-run the votes that authorised it.
-        let (approvals, approval_weight) = Self::live_approval_tally(&env, id, &proposal)?;
-        proposal.approvals = approvals;
-        proposal.approval_weight = approval_weight;
-        Self::ensure_vote_valid(&proposal)?;
-        let multisig = Self::multisig(&env)?;
-        let multisig_threshold = MultisigClient::new(&env, &multisig).get_threshold();
-        if approval_weight < multisig_threshold {
-            return Err(Error::ThresholdNotMet);
-        }
+        // the configured threshold and a strict majority — and the live
+        // multisig state (emergency lock, threshold sanity, signer weight) so
+        // execution can never out-run the votes that authorised it.
+        Self::verify_execution_threshold(&env, id, &mut proposal)?;
         // Mandatory timelock: an approved proposal may not be executed until
         // `timelock` seconds have elapsed since it was approved. Guards against
         // a sudden takeover executing freshly-approved proposals before honest
@@ -1068,17 +1085,81 @@ impl ProposalContract {
         VoteBars::for_proposal(proposal).ensure_met(proposal.approvals)
     }
 
+    /// Issue #537 — the single threshold gate every execution path goes
+    /// through (`execute` and the `can_execute` view), so the entrypoint and
+    /// the view can never disagree about whether a proposal may fire.
+    ///
+    /// Re-derives the tally from storage and the *live* multisig — never the
+    /// counters cached on the record — refreshes those counters on `proposal`,
+    /// and then requires, in order:
+    ///
+    /// 1. the allow-list vote bars (configured `threshold`, participation
+    ///    quorum, strict majority) — [`Error::ThresholdNotMet`];
+    /// 2. the multisig gate, see [`Self::ensure_multisig_threshold`].
+    ///
+    /// Read-only: nothing is persisted here, so a refusal leaves the stored
+    /// proposal untouched and free to be re-attempted once support recovers.
+    fn verify_execution_threshold(
+        env: &Env,
+        id: u64,
+        proposal: &mut Proposal,
+    ) -> Result<(), Error> {
+        let (approvals, approval_weight) = Self::live_approval_tally(env, id, proposal)?;
+        proposal.approvals = approvals;
+        proposal.approval_weight = approval_weight;
+        Self::ensure_vote_valid(proposal)?;
+        Self::ensure_multisig_threshold(env, approval_weight)
+    }
+
+    /// Require the backing multisig to authorize enacting a decision carrying
+    /// `approval_weight` of verified signer weight:
+    ///
+    /// * the multisig's emergency lock must be released — a locked multisig
+    ///   cannot enact governance, so execution fails with
+    ///   [`Error::EmergencyLock`];
+    /// * the weighted threshold in force must be non-zero — a zero threshold
+    ///   would let any (even empty) approval set through, so it fails closed
+    ///   with [`Error::InvalidThreshold`] instead of executing;
+    /// * the verified approval weight must meet or exceed that threshold,
+    ///   otherwise [`Error::ThresholdNotMet`] (the protocol's
+    ///   insufficient-signers code).
+    ///
+    /// The threshold is read on every call, so a threshold raised (or a signer
+    /// removed) after a proposal reached `Approved` is honoured at execution.
+    fn ensure_multisig_threshold(env: &Env, approval_weight: u32) -> Result<(), Error> {
+        let multisig = Self::multisig(env)?;
+        let multisig_client = MultisigClient::new(env, &multisig);
+        if multisig_client.is_locked() {
+            return Err(Error::EmergencyLock);
+        }
+        let multisig_threshold = multisig_client.get_threshold();
+        if multisig_threshold == 0 {
+            return Err(Error::InvalidThreshold);
+        }
+        if approval_weight < multisig_threshold {
+            return Err(Error::ThresholdNotMet);
+        }
+        Ok(())
+    }
+
     fn live_approval_tally(env: &Env, id: u64, proposal: &Proposal) -> Result<(u32, u32), Error> {
         let multisig = Self::multisig(env)?;
         let multisig_client = MultisigClient::new(env, &multisig);
         let mut approvals = 0u32;
         let mut weight = 0i128;
         for approver in proposal.approvers.iter() {
-            let approved: bool = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Approval(id, approver.clone()))
-                .unwrap_or(false);
+            let akey = DataKey::Approval(id, approver.clone());
+            let approved: bool = env.storage().persistent().get(&akey).unwrap_or(false);
+            if approved {
+                // Keep every recorded vote alive alongside the proposal each
+                // time the tally is taken (approve / execute), so a slow
+                // approval round can never lose its earliest votes.
+                env.storage().persistent().extend_ttl(
+                    &akey,
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+            }
             if approved && multisig_client.is_signer(&approver) {
                 approvals = checked_add(approvals as i128, 1)? as u32;
                 weight = checked_add(weight, multisig_client.get_signer_weight(&approver) as i128)?;
@@ -1237,14 +1318,7 @@ impl ProposalInterface for ProposalContract {
         if !proposal.can_execute(&env) {
             return Ok(false);
         }
-        let (approvals, approval_weight) = Self::live_approval_tally(&env, id, &proposal)?;
-        proposal.approvals = approvals;
-        proposal.approval_weight = approval_weight;
-        if Self::ensure_vote_valid(&proposal).is_err() {
-            return Ok(false);
-        }
-        let multisig = Self::multisig(&env)?;
-        if approval_weight < MultisigClient::new(&env, &multisig).get_threshold() {
+        if Self::verify_execution_threshold(&env, id, &mut proposal).is_err() {
             return Ok(false);
         }
         Ok(Self::ensure_dependencies_met(&env, id, &proposal).is_ok())

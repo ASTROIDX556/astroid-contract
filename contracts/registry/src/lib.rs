@@ -148,6 +148,12 @@ use soroban_sdk::{
 /// a rolling deployment advances the latest version first.
 const MAX_UPGRADE_SCAN: u32 = 64;
 
+/// How many versions below (and including) the latest
+/// [`RegistryContract::get_latest_verified`] inspects before giving up with
+/// [`Error::NotFound`]. Same rationale as [`MAX_UPGRADE_SCAN`]: the walk's cost
+/// must be bounded by a constant, not by the version number an admin chose.
+pub const MAX_VERIFIED_LOOKBACK: u32 = 32;
+
 /// Storage keys. `Admin` lives in instance storage; everything else is keyed
 /// per organization/module in persistent storage.
 #[contracttype]
@@ -1460,6 +1466,47 @@ impl RegistryContract {
             .ok_or(Error::NotFound)?;
         Self::bump(&env, &key);
         Self::get_version(env, kind, latest)
+    }
+
+    /// Resolve the newest *verified* implementation of `kind`: the highest
+    /// published version whose bound WASM hash is still approved. Returns
+    /// `(version, address)`.
+    ///
+    /// [`Self::get_latest`] answers "what was published last", which keeps
+    /// pointing at a version even after governance revokes its hash. A
+    /// consumer routing new interactions wants "what may I safely run", so
+    /// this view walks down from the latest version and skips any version
+    /// that is missing (a gap in the numbering), was published before hashes
+    /// were bound, or whose hash has since been revoked — exactly the
+    /// versions [`Self::verify_version`] would refuse.
+    ///
+    /// The walk is bounded to [`MAX_VERIFIED_LOOKBACK`] versions below (and
+    /// including) the latest, so the cost is constant no matter how long the
+    /// history grows. Errors: [`Error::NotFound`] when `kind` has no
+    /// published versions, or none within the window verifies — a
+    /// deterministic code a caller can branch on. Read-only, no auth, not
+    /// gated on the freeze flag (matching [`Self::get_latest`]).
+    pub fn get_latest_verified(env: Env, kind: ModuleKind) -> Result<(u32, Address), Error> {
+        let latest: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(kind))
+            .ok_or(Error::NotFound)?;
+        let floor = latest.saturating_sub(MAX_VERIFIED_LOOKBACK - 1).max(1);
+        let mut version = latest;
+        while version >= floor {
+            if let Some(VersionRecord {
+                address,
+                hash: BoundHash::Bound(hash),
+            }) = Self::read_version(&env, kind, version)
+            {
+                if Self::is_wasm_approved(env.clone(), kind, hash) {
+                    return Ok((version, address));
+                }
+            }
+            version -= 1;
+        }
+        Err(Error::NotFound)
     }
 
     /// Batch counterpart of [`Self::get_version`]: resolve up to

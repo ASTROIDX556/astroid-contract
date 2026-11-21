@@ -234,6 +234,11 @@ pub trait MultisigInterface {
 
     /// The weighted approval threshold currently in force.
     fn get_threshold(env: Env) -> Result<u32, Error>;
+
+    /// Whether the multisig's emergency lock is engaged. While locked, no
+    /// governance decision backed by this multisig may be enacted, so
+    /// dependants (e.g. proposal execution) must refuse to act.
+    fn is_locked(env: Env) -> bool;
 }
 
 /// Escrow lifecycle read surface. An escrow holds one party's funds until a

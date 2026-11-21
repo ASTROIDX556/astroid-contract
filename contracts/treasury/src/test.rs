@@ -2718,3 +2718,158 @@ fn allowance_lifecycle_events_follow_the_shared_topic_schema() {
         1_700_000_000
     );
 }
+
+// --- Deposit / withdrawal flows & accounting (Issue #473) ---
+
+/// Payloads of every `("treasury", "withdrawn")` tuple event in the most
+/// recent invocation, decoded as `(asset, to, amount)`.
+fn withdrawn_tuples(env: &Env) -> std::vec::Vec<(Address, Address, i128)> {
+    let ns: Val = Symbol::new(env, "treasury").into_val(env);
+    let act: Val = Symbol::new(env, "withdrawn").into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_c, topics, _d)| topics.len() == 2 && topics.contains(ns) && topics.contains(act))
+        .map(|(_c, _t, data)| <(Address, Address, i128)>::try_from_val(env, &data).unwrap())
+        .collect()
+}
+
+/// Two approved tokens keep fully independent books: deposits, withdrawals,
+/// custody and the per-asset events never bleed into each other.
+#[test]
+fn multi_token_deposits_and_withdrawals_keep_independent_books() {
+    let h = setup("vault", 1_000);
+    let usdc = unapproved_token(&h, 5_000);
+    h.client.add_approved_asset(&h.admin, &usdc);
+    let usdc_balance = |who: &Address| token::TokenClient::new(&h.env, &usdc).balance(who);
+    let recipient = Address::generate(&h.env);
+
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryDeposited").map(|p| (p.2, p.3, p.4)),
+        Some((h.asset.clone(), 1_000, 1_000))
+    );
+    h.client.deposit(&h.admin, &usdc, &5_000);
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryDeposited").map(|p| (p.2, p.3, p.4)),
+        Some((usdc.clone(), 5_000, 5_000))
+    );
+
+    h.client.withdraw(&h.admin, &usdc, &recipient, &1_250);
+    assert_eq!(
+        withdrawn_tuples(&h.env),
+        [(usdc.clone(), recipient.clone(), 1_250)]
+    );
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryWithdrawn").map(|p| (p.2, p.3, p.4)),
+        Some((usdc.clone(), 1_250, 3_750))
+    );
+
+    // The untouched asset's books are unchanged by the other asset's outflow.
+    let native = h.client.holding(&h.asset);
+    assert_eq!((native.total_in, native.total_out), (1_000, 0));
+    let stable = h.client.holding(&usdc);
+    assert_eq!((stable.total_in, stable.total_out), (3_750, 1_250));
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+    assert_eq!(usdc_balance(&h.client.address), 3_750);
+    assert_eq!(usdc_balance(&recipient), 1_250);
+
+    // Balance validation is per asset: plenty of USDC does not fund a native
+    // withdrawal beyond the native holding.
+    assert_eq!(
+        h.client
+            .try_withdraw(&h.admin, &h.asset, &recipient, &1_001),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    let all = h.client.get_all_balances();
+    assert_eq!(all.len(), 2);
+}
+
+/// Only the recorded admin may withdraw, a zero or negative amount is
+/// refused, and nothing moves on any refusal.
+#[test]
+fn withdrawal_guards_reject_unauthorized_and_invalid_requests() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let recipient = Address::generate(&h.env);
+
+    assert_eq!(
+        h.client
+            .try_withdraw(&h.multisig, &h.asset, &recipient, &10),
+        Err(Ok(Error::Unauthorized))
+    );
+    for bad in [0_i128, -5] {
+        assert_eq!(
+            h.client.try_withdraw(&h.admin, &h.asset, &recipient, &bad),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+    assert_eq!(
+        h.client.try_deposit(&h.admin, &h.asset, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+    assert_eq!(token_balance(&h, &recipient), 0);
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+}
+
+/// Regression: a queued batch is balance-checked at settlement, not only when
+/// it was requested. With unbooked tokens sitting in custody, settling a batch
+/// larger than the recorded holding used to drive `total_in` negative.
+#[test]
+fn queued_batch_cannot_overdraw_the_recorded_holding() {
+    let (h, to) = timelocked(MIN_TIMELOCK_DELAY, 500, 1_000);
+    warp(&h, 1_000);
+    // Tokens sent straight to custody are never booked by `deposit`.
+    token::StellarAssetClient::new(&h.env, &h.asset).mint(&h.client.address, &5_000);
+
+    let payments: Vec<Payment> = vec![&h.env, payment(&to, 900)];
+    let id = h.client.queue_batch_transfer(&h.admin, &h.asset, &payments);
+
+    // A sub-threshold withdrawal shrinks the recorded holding meanwhile.
+    h.client
+        .withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &400);
+    assert_eq!(h.client.holding(&h.asset).total_in, 600);
+
+    warp(&h, 1_000 + MIN_TIMELOCK_DELAY);
+    assert_eq!(
+        h.client.try_execute_withdrawal(&h.admin, &id),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    let holding = h.client.holding(&h.asset);
+    assert_eq!((holding.total_in, holding.total_out), (600, 400));
+    assert_eq!(token_balance(&h, &to), 0);
+    assert!(h.client.pending_withdrawal(&id).is_pending());
+}
+
+/// Regression: milestone disbursement is an outflow like any other, so an
+/// emergency freeze stops it too. It also announces itself with the same
+/// withdrawal events as `withdraw`.
+#[test]
+fn frozen_treasury_blocks_milestone_disbursement_and_release_emits_withdrawn() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let to = Address::generate(&h.env);
+    let mid = h
+        .client
+        .init_milestone_disbursement(&h.admin, &h.asset, &to, &1_000, &2);
+
+    h.client.freeze(&h.multisig);
+    assert_eq!(
+        h.client.try_release_next_milestone(&h.admin, &mid),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(token_balance(&h, &to), 0);
+
+    h.client.unfreeze(&h.multisig);
+    h.client.release_next_milestone(&h.admin, &mid);
+    assert_eq!(token_balance(&h, &to), 500);
+    assert_eq!(
+        withdrawn_tuples(&h.env),
+        [(h.asset.clone(), to.clone(), 500)]
+    );
+    assert_eq!(
+        treasury_flow_payload(&h.env, "TreasuryWithdrawn").map(|p| (p.1, p.3, p.4)),
+        Some((to.clone(), 500, 500))
+    );
+}

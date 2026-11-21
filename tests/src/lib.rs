@@ -17,6 +17,8 @@ pub mod e2e_agent_spending;
 #[cfg(test)]
 pub mod error_codes;
 #[cfg(test)]
+pub mod escrow_integration;
+#[cfg(test)]
 pub mod escrow_lifecycle;
 #[cfg(test)]
 pub mod gated_fund_flows;
@@ -30,6 +32,8 @@ pub mod policy_enforcement;
 pub mod policy_test;
 #[cfg(test)]
 pub mod policy_workflow;
+#[cfg(test)]
+pub mod proposal_integration;
 #[cfg(test)]
 pub mod proposal_timelock;
 #[cfg(test)]

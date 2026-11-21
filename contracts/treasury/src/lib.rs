@@ -1060,9 +1060,7 @@ impl TreasuryContract {
         // regardless of which outflow path settles (Issue #218).
         let balance = holding.total_in;
         Self::store_asset_balance(env, asset, balance);
-        events::transfer_executed(env, &t.admin, to, asset, amount);
         Self::transfer_out(env, asset, to, amount)?;
-        events::transfer_executed(env, &t.admin, to, asset, amount);
         events::publish(
             env,
             events::ContractEvent::TransferExecuted {
@@ -1072,16 +1070,7 @@ impl TreasuryContract {
                 amount,
             },
         );
-        events::publish(
-            env,
-            events::ContractEvent::TreasuryWithdrawn {
-                org: t.org.clone(),
-                to: to.clone(),
-                asset: asset.clone(),
-                amount,
-                balance,
-            },
-        );
+        Self::emit_withdrawn(env, t, to, asset, amount, balance);
         Self::unlock(env);
         Ok(())
     }
@@ -1195,6 +1184,14 @@ impl TreasuryContract {
         }
 
         // Debit the internal ledger once, then move real tokens per recipient.
+        // The recorded balance is re-checked here, not only in
+        // `batch_transfer`: a queued batch settles through this path via
+        // `execute_withdrawal` long after it was requested, and custody can
+        // hold unbooked tokens (sent directly, never deposited) that would
+        // otherwise let the payout drive `total_in` negative.
+        if holding.total_in < total {
+            return Err(Error::InsufficientFunds);
+        }
         holding.total_in = checked_sub(holding.total_in, total)?;
         holding.total_out = checked_add(holding.total_out, total)?;
         Self::store_holding(env, asset, &holding);
@@ -1570,7 +1567,12 @@ impl TreasuryContract {
         milestone_id: u64,
     ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
+        // A frozen or deactivated treasury moves nothing: the milestone
+        // payout is an outflow like `withdraw` and `batch_transfer`, which
+        // both refuse here.
+        Self::check_frozen(&env)?;
         let t = Self::require_admin(&env, &caller)?;
+        Self::require_active(&t)?;
         // Issue #308 — verify the caller before the ledger is touched.
         Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
         // Take the same reentrancy guard the other two outflows take, before
@@ -1626,6 +1628,7 @@ impl TreasuryContract {
             (symbol_short!("milestone"), symbol_short!("disbursed")),
             (milestone_id, d.disbursed, amount),
         );
+        Self::emit_withdrawn(&env, &t, &d.to, &d.asset, amount, holding.total_in);
         Self::unlock(&env);
         Ok(())
     }
@@ -1920,6 +1923,34 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::ReentrancyLock, &true);
         Ok(())
+    }
+
+    /// Announce a settled single-recipient outflow under both the tuple topic
+    /// `("treasury", "withdrawn")` — the counterpart of `deposit`'s
+    /// `("treasury", "deposited")` — and the canonical `TreasuryWithdrawn`
+    /// schema. `balance` is the recorded holding after the debit.
+    fn emit_withdrawn(
+        env: &Env,
+        t: &Treasury,
+        to: &Address,
+        asset: &Address,
+        amount: i128,
+        balance: i128,
+    ) {
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("withdrawn")),
+            (asset.clone(), to.clone(), amount),
+        );
+        events::publish(
+            env,
+            events::ContractEvent::TreasuryWithdrawn {
+                org: t.org.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+                balance,
+            },
+        );
     }
 
     /// Release the reentrancy guard at the end of a movement.
