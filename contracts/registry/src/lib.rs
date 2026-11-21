@@ -567,6 +567,11 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
+        // Reject zero addresses (all bytes zero) — an invalid contract principal
+        // cannot serve as a module and must be caught before storage is written.
+        if !Self::is_contract_address(&address) {
+            return Err(Error::InvalidUpgradeAddress);
+        }
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
@@ -1913,13 +1918,14 @@ impl RegistryContract {
         // that makes an upgrade path acyclic: a module can never re-enter a
         // version it has already left, and never move backwards onto one. An
         // unpinned module (0) is at the start of its path, so any version is
-        // forward of it.
+        // forward of it. Use VERSION_NOT_MONOTONIC to distinguish a backwards
+        // jump from a cycle onto the same version (CircularUpgrade).
         let from_version: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::ModuleVersion(org.clone(), kind))
             .unwrap_or(0);
-        ensure!(target_version > from_version, Error::CircularUpgrade);
+        ensure!(target_version > from_version, Error::VersionNotMonotonic);
 
         // Existence, then integrity: the target must be a published version of
         // *this* kind, bound to code that is still approved for it.
@@ -1937,10 +1943,11 @@ impl RegistryContract {
         );
         // A module must be routable, and only a contract can be called. Without
         // this, a version record naming an account would leave the module
-        // permanently unroutable.
+        // permanently unroutable. Use INVALID_UPGRADE_ADDRESS for an invalid
+        // contract principal.
         ensure!(
             Self::is_contract_address(&record.address),
-            Error::InvalidInput
+            Error::InvalidUpgradeAddress
         );
         // A "move" onto the contract the module already runs is the degenerate
         // cycle: it changes no code and no routing, so it is refused rather than

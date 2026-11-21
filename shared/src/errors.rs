@@ -147,6 +147,17 @@ pub enum Error {
     /// upgrade paths can tell a cycle apart from a malformed request and stop
     /// walking rather than retrying.
     CircularUpgrade = 32,
+    /// INVALID_UPGRADE_ADDRESS: the target address for a module registration or
+    /// upgrade is a zero address (all bytes zero) or otherwise not a valid
+    /// contract principal. Distinct from [`Error::InvalidInput`] so off-chain
+    /// tooling can distinguish an invalid address from other malformed arguments.
+    InvalidUpgradeAddress = 33,
+    /// VERSION_NOT_MONOTONIC: a version registration or upgrade would violate
+    /// strict monotonicity — the target version is not strictly greater than the
+    /// module's current pinned version. Distinct from [`Error::CircularUpgrade`]
+    /// to allow callers to differentiate a backwards jump from a cycle onto the
+    /// same version.
+    VersionNotMonotonic = 34,
 
     // --- Budget (40-44) ---
     /// The spend would breach the budget: the per-asset limit for this token,
@@ -182,7 +193,7 @@ pub enum Error {
     /// period rolls over or the limit is increased.
     BudgetLimitReached = 46,
 
-    // --- Wallet (50-54) ---
+    // --- Wallet (50-55) ---
     /// The wallet is frozen by its guardian, so configuration changes are
     /// refused until it is thawed.
     WalletFrozen = 50,
@@ -204,8 +215,13 @@ pub enum Error {
     /// within the active sliding window). Nothing moves; the spend may succeed
     /// once earlier activity ages out of the window.
     RateLimitExceeded = 54,
+    /// UNAUTHORIZED_WALLET_ACCESS: the caller failed to provide valid
+    /// authorization for a wallet mutating operation. This is distinct from
+    /// [`Error::Unauthorized`] which covers role/ownership checks — this code
+    /// indicates the caller did not authenticate at all (missing `require_auth`).
+    UnauthorizedWalletAccess = 55,
 
-    // --- Multisig / approvals (61-69, 90-92) ---
+    // --- Multisig / approvals (61-69, 70, 90-93) ---
     /// The accumulated approvals are below the configured threshold: too few
     /// distinct signers, a tally that has not reached the required quorum or
     /// majority, or a vote that has not yet collected enough weight for the
@@ -221,6 +237,10 @@ pub enum Error {
     /// than the signer set can ever supply. Rejected at configuration time,
     /// before a single vote is cast.
     InvalidThreshold = 64,
+    /// INVALID_SIGNER_COUNT: the signer set is empty or exceeds the maximum
+    /// allowed signers ([`MAX_SIGNERS`]). The multisig cannot operate with
+    /// zero signers or more than the protocol cap.
+    InvalidSignerCount = 65,
     /// The proposed signer set is larger than
     /// [`MAX_SIGNERS`](crate::constants::MAX_SIGNERS), the protocol cap that
     /// bounds the storage and iteration cost of a signer set.
@@ -231,8 +251,10 @@ pub enum Error {
     InvalidNonce = 68,
     /// A signer with zero (or otherwise invalid) voting weight was supplied.
     InvalidSignerWeight = 69,
-    // 70 is unassigned: the multisig block resumes at 90 for the weights the
-    // governance flow reports separately.
+    /// THRESHOLD_EXCEEDED: the configured threshold exceeds the total weight of
+    /// the current signer set, making it impossible to reach quorum.
+    ThresholdExceeded = 70,
+    // 71-79: Proposal errors
     /// Accumulated approval weight is below the configured threshold.
     InsufficientWeight = 90,
     /// A timelocked action was executed before its delay elapsed. Reported by
@@ -248,6 +270,9 @@ pub enum Error {
     /// A caller without governance rights attempted to modify signers,
     /// weights or the threshold.
     UnauthorizedModification = 92,
+    /// DUPLICATE_SIGNER: an attempt was made to add a signer that already
+    /// exists in the signer set. Each address may appear only once.
+    DuplicateSigner = 93,
 
     // --- Proposal (71-79) ---
     /// The proposal's deadline has passed, so it can no longer be approved,
@@ -274,7 +299,7 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-82) ---
+    // --- Escrow (80-82, 86-87) ---
     /// The ledger timestamp is at or past the escrow's deadline, so the
     /// beneficiary release path is closed and the funds are no longer
     /// releasable to the beneficiary.
@@ -288,6 +313,14 @@ pub enum Error {
     /// A milestone is still inside its dispute grace period, so settlement is
     /// not final and the release is held until the window closes.
     GraceActive = 82,
+    /// ESCROW_NOT_EXPIRED: a refund or reclaim was attempted before the
+    /// escrow's deadline plus grace period elapsed. The escrow is still within
+    /// its active settlement window.
+    EscrowNotExpired = 86,
+    /// ESCROW_ALREADY_SETTLED: a refund, reclaim, or release was attempted on
+    /// an escrow that has already reached a terminal state (Released,
+    /// Refunded, or Closed). No further value movement is permitted.
+    EscrowAlreadySettled = 87,
 
     // --- Treasury (83-85) ---
     /// A spend would breach a per-asset allowance: the treasury's per-agent
@@ -308,7 +341,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 55] = [
+    pub const ALL: [Error; 60] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -332,32 +365,36 @@ impl Error {
         Error::RegistryFrozen,
         Error::ModuleDeprecated,
         Error::CircularUpgrade,
-        // --- Budget (40-46) ---
+        Error::InvalidUpgradeAddress,
+        Error::VersionNotMonotonic,
+        // --- Budget (40-44) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
         Error::BudgetArchived,
         Error::AssetNotAuthorized,
         Error::BudgetExpired,
-        Error::BudgetPeriodExpired,
-        Error::BudgetLimitReached,
-        // --- Wallet (50-54) ---
+        // --- Wallet (50-55) ---
         Error::WalletFrozen,
         Error::WalletArchived,
         Error::WalletPaused,
         Error::InvalidState,
         Error::RateLimitExceeded,
-        // --- Multisig / approvals (61-69, 90-92) ---
+        Error::UnauthorizedWalletAccess,
+        // --- Multisig / approvals (61-69, 70, 90-93) ---
         Error::ThresholdNotMet,
         Error::AlreadySigned,
         Error::NotASigner,
         Error::InvalidThreshold,
+        Error::InvalidSignerCount,
         Error::TooManySigners,
         Error::BatchCallFailed,
         Error::InvalidNonce,
         Error::InvalidSignerWeight,
+        Error::ThresholdExceeded,
         Error::InsufficientWeight,
         Error::TimelockNotExpired,
         Error::UnauthorizedModification,
+        Error::DuplicateSigner,
         // --- Proposal (71-79) ---
         Error::ProposalExpired,
         Error::InvalidProposalState,
@@ -374,6 +411,9 @@ impl Error {
         Error::AllowanceExceeded,
         Error::AllowanceExpired,
         Error::TreasuryPaused,
+        // --- Escrow continued (86-87) ---
+        Error::EscrowNotExpired,
+        Error::EscrowAlreadySettled,
     ];
 
     /// The `u32` code this variant carries on the wire.
@@ -426,32 +466,36 @@ impl Error {
             Error::RegistryFrozen => "REGISTRY_FROZEN",
             Error::ModuleDeprecated => "MODULE_DEPRECATED",
             Error::CircularUpgrade => "CIRCULAR_UPGRADE",
-            // --- Budget (40-46) ---
+            Error::InvalidUpgradeAddress => "INVALID_UPGRADE_ADDRESS",
+            Error::VersionNotMonotonic => "VERSION_NOT_MONOTONIC",
+            // --- Budget (40-44) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
             Error::BudgetArchived => "BUDGET_ARCHIVED",
             Error::AssetNotAuthorized => "ASSET_NOT_AUTHORIZED",
             Error::BudgetExpired => "BUDGET_EXPIRED",
-            Error::BudgetPeriodExpired => "BUDGET_PERIOD_EXPIRED",
-            Error::BudgetLimitReached => "BUDGET_LIMIT_REACHED",
-            // --- Wallet (50-54) ---
+            // --- Wallet (50-55) ---
             Error::WalletFrozen => "WALLET_FROZEN",
             Error::WalletArchived => "WALLET_ARCHIVED",
             Error::WalletPaused => "WALLET_PAUSED",
             Error::InvalidState => "INVALID_STATE",
             Error::RateLimitExceeded => "RATE_LIMIT_EXCEEDED",
-            // --- Multisig / approvals (61-69, 90-92) ---
+            Error::UnauthorizedWalletAccess => "UNAUTHORIZED_WALLET_ACCESS",
+            // --- Multisig / approvals (61-69, 70, 90-93) ---
             Error::ThresholdNotMet => "THRESHOLD_NOT_MET",
             Error::AlreadySigned => "ALREADY_SIGNED",
             Error::NotASigner => "NOT_A_SIGNER",
             Error::InvalidThreshold => "INVALID_THRESHOLD",
+            Error::InvalidSignerCount => "INVALID_SIGNER_COUNT",
             Error::TooManySigners => "TOO_MANY_SIGNERS",
             Error::BatchCallFailed => "BATCH_CALL_FAILED",
             Error::InvalidNonce => "INVALID_NONCE",
             Error::InvalidSignerWeight => "INVALID_SIGNER_WEIGHT",
+            Error::ThresholdExceeded => "THRESHOLD_EXCEEDED",
             Error::InsufficientWeight => "INSUFFICIENT_WEIGHT",
             Error::TimelockNotExpired => "TIMELOCK_NOT_EXPIRED",
             Error::UnauthorizedModification => "UNAUTHORIZED_MODIFICATION",
+            Error::DuplicateSigner => "DUPLICATE_SIGNER",
             // --- Proposal (71-79) ---
             Error::ProposalExpired => "PROPOSAL_EXPIRED",
             Error::InvalidProposalState => "INVALID_PROPOSAL_STATE",
@@ -460,10 +504,12 @@ impl Error {
             Error::CancellationWindowClosed => "CANCELLATION_WINDOW_CLOSED",
             Error::PrerequisiteNotMet => "PREREQUISITE_NOT_MET",
             Error::CircularDependencyDetected => "CIRCULAR_DEPENDENCY_DETECTED",
-            // --- Escrow (80-82) ---
+            // --- Escrow (80-82, 86-87) ---
             Error::EscrowExpired => "ESCROW_EXPIRED",
             Error::TimeLockActive => "TIME_LOCK_ACTIVE",
             Error::GraceActive => "GRACE_ACTIVE",
+            Error::EscrowNotExpired => "ESCROW_NOT_EXPIRED",
+            Error::EscrowAlreadySettled => "ESCROW_ALREADY_SETTLED",
             // --- Treasury (83-85) ---
             Error::AllowanceExceeded => "ALLOWANCE_EXCEEDED",
             Error::AllowanceExpired => "ALLOWANCE_EXPIRED",

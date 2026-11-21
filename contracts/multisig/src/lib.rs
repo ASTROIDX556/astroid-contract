@@ -114,11 +114,11 @@ impl MultiSigContract {
         }
         let n = signers.len();
         if n == 0 || n > MAX_SIGNERS {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidSignerCount);
         }
         for s in signers.iter() {
             if s.weight == 0 {
-                return Err(Error::InsufficientWeight);
+                return Err(Error::InvalidSignerWeight);
             }
         }
         // Validate the signer set itself before deriving quorum rules from it:
@@ -160,10 +160,10 @@ impl MultiSigContract {
         }
         let mut signers = Self::signers(&env)?;
         if signers.iter().any(|s| s.address == signer) {
-            return Err(Error::AlreadyExists);
+            return Err(Error::DuplicateSigner);
         }
         if signers.len() >= MAX_SIGNERS {
-            return Err(Error::TooManySigners);
+            return Err(Error::InvalidSignerCount);
         }
         // The aggregate weight must stay representable, or every later
         // threshold check would fail with `Overflow` and brick the multisig.
@@ -1023,10 +1023,10 @@ impl MultiSigContract {
                     return Err(Error::InvalidSignerWeight);
                 }
                 if signers.iter().any(|s| &s.address == signer) {
-                    return Err(Error::AlreadyExists);
+                    return Err(Error::DuplicateSigner);
                 }
                 if signers.len() >= MAX_SIGNERS {
-                    return Err(Error::TooManySigners);
+                    return Err(Error::InvalidSignerCount);
                 }
                 // Total weight only grows here, so the threshold stays
                 // satisfiable; the check is purely an overflow guard.
@@ -1171,8 +1171,11 @@ impl MultiSigContract {
     }
 
     fn validate_threshold(threshold: u32, n: u32) -> Result<(), Error> {
-        if threshold < MIN_THRESHOLD || threshold > n {
+        if threshold < MIN_THRESHOLD {
             return Err(Error::InvalidThreshold);
+        }
+        if threshold > n {
+            return Err(Error::ThresholdExceeded);
         }
         Ok(())
     }
@@ -1185,7 +1188,7 @@ impl MultiSigContract {
             let mut j = i + 1;
             while j < len {
                 if a == signers.get(j).unwrap().address {
-                    return Err(Error::InvalidInput);
+                    return Err(Error::DuplicateSigner);
                 }
                 j += 1;
             }
