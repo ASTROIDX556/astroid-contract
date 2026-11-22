@@ -168,10 +168,13 @@ impl MultiSigContract {
         }
         // The aggregate weight must stay representable, or every later
         // threshold check would fail with `Overflow` and brick the multisig.
-        Self::to_weight(checked_add(
+        let new_total = Self::to_weight(checked_add(
             Self::total_weight(&signers)? as i128,
             weight as i128,
         )?)?;
+        // Co-locate the threshold invariant with the signer-set mutation: a
+        // threshold that is already unsatisfiable must not survive an add.
+        Self::validate_threshold(Self::threshold(&env)?, new_total)?;
         signers.push_back(SignerWeight {
             address: signer.clone(),
             weight,
@@ -196,9 +199,7 @@ impl MultiSigContract {
             Self::total_weight(&signers)? as i128,
             signers.get(idx).unwrap().weight as i128,
         )?;
-        if remaining_total < threshold as i128 {
-            return Err(Error::InvalidThreshold);
-        }
+        Self::validate_threshold(threshold, Self::to_weight(remaining_total)?)?;
         signers.remove(idx);
         env.storage().instance().set(&DataKey::Signers, &signers);
         Self::bump_instance(&env);
@@ -1118,10 +1119,7 @@ impl MultiSigContract {
                 // `signers` is already loaded above — do not read it again.
                 let current = Self::weight_in(&signers, signer)?;
                 let new_total = checked_add(checked_sub(total, current as i128)?, *weight as i128)?;
-                Self::to_weight(new_total)?;
-                if new_total < threshold as i128 {
-                    return Err(Error::InvalidThreshold);
-                }
+                Self::validate_threshold(threshold, Self::to_weight(new_total)?)?;
                 Ok(())
             }
             GovernanceChange::AddSigner(signer, weight) => {
@@ -1141,10 +1139,8 @@ impl MultiSigContract {
             }
             GovernanceChange::RemoveSigner(signer) => {
                 let removed = Self::weight_in(&signers, signer)?;
-                if checked_sub(total, removed as i128)? < threshold as i128 {
-                    return Err(Error::InvalidThreshold);
-                }
-                Ok(())
+                let remaining = Self::to_weight(checked_sub(total, removed as i128)?)?;
+                Self::validate_threshold(threshold, remaining)
             }
             GovernanceChange::TimelockDelay(delay) => {
                 if *delay < MIN_TIMELOCK_DELAY || *delay > MAX_TIMELOCK_DELAY {
@@ -1158,6 +1154,9 @@ impl MultiSigContract {
     /// Commit a validated governance change and emit the matching effect event,
     /// so consumers of the pre-timelock events keep working unchanged.
     fn apply_change(env: &Env, change: &GovernanceChange) -> Result<(), Error> {
+        // Gate the write itself, not just the caller: every mutation of the
+        // signer set or threshold must leave a satisfiable quorum behind.
+        Self::validate_change(env, change)?;
         match change {
             GovernanceChange::Threshold(new_threshold) => {
                 env.storage()

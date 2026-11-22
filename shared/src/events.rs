@@ -246,6 +246,18 @@ pub enum ContractEvent {
         amount: i128,
         balance: i128,
     },
+    /// Audit trail for a treasury outflow: who invoked the withdrawal, who
+    /// received it, and whether the registry verified that caller as the
+    /// organization's recorded governance module.
+    TreasuryWithdrawalAudit {
+        org: String,
+        caller: Address,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        registry_verified: bool,
+        recorded_at: u64,
+    },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
         budget_id: String,
@@ -554,6 +566,28 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "TreasuryWithdrawn"),),
                 (org, to, asset, amount, balance),
+            );
+        }
+        ContractEvent::TreasuryWithdrawalAudit {
+            org,
+            caller,
+            to,
+            asset,
+            amount,
+            registry_verified,
+            recorded_at,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryWithdrawalAudit"),),
+                (
+                    org,
+                    caller,
+                    to,
+                    asset,
+                    amount,
+                    registry_verified,
+                    recorded_at,
+                ),
             );
         }
         ContractEvent::EscrowCreated {

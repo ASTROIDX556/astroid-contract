@@ -61,6 +61,35 @@ fn treasury_flow_payload(
     found
 }
 
+/// Decode the most recent `TreasuryWithdrawalAudit` event as
+/// `(org, caller, to, asset, amount, registry_verified, recorded_at)`.
+fn treasury_audit_payload(
+    env: &Env,
+    variant: &str,
+) -> Option<(String, Address, Address, Address, i128, bool, u64)> {
+    let topic: Val = Symbol::new(env, variant).into_val(env);
+    let mut found = None;
+    for (_emitter, topics, data) in env.events().all().iter() {
+        if !topics.contains(topic) {
+            continue;
+        }
+        let fields = match Vec::<Val>::try_from_val(env, &data) {
+            Ok(fields) if fields.len() == 7 => fields,
+            _ => continue,
+        };
+        found = Some((
+            String::try_from_val(env, &fields.get(0).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(1).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(2).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(3).unwrap()).unwrap(),
+            i128::try_from_val(env, &fields.get(4).unwrap()).unwrap(),
+            bool::try_from_val(env, &fields.get(5).unwrap()).unwrap(),
+            u64::try_from_val(env, &fields.get(6).unwrap()).unwrap(),
+        ));
+    }
+    found
+}
+
 struct Harness<'a> {
     env: Env,
     client: TreasuryContractClient<'a>,
@@ -1081,6 +1110,64 @@ fn setup_gated(funded: i128) -> GatedHarness<'static> {
     }
 }
 
+/// Harness whose treasury admin is itself a contract, so a successful registry
+/// lookup can be observed on an outbound withdrawal rather than only on a
+/// deposit. The admin contract is recorded as the org's Multisig module.
+struct ContractGatedHarness<'a> {
+    env: Env,
+    registry: RegistryContractClient<'a>,
+    client: TreasuryContractClient<'a>,
+    /// Account that owns the org and bootstraps the registry.
+    owner: Address,
+    /// Contract admin of the treasury and org-recorded Multisig module.
+    admin: Address,
+    asset: Address,
+    org: String,
+}
+
+fn setup_contract_gated(funded: i128) -> ContractGatedHarness<'static> {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = account_address(&env);
+    let admin = env.register_contract(None, RegistryContract);
+    let org = String::from_str(&env, GATED_ORG);
+
+    let registry_id = env.register_contract(None, RegistryContract);
+    let registry = RegistryContractClient::new(&env, &registry_id);
+    registry.initialize(&owner);
+    registry.register_org(&owner, &org.clone(), &owner);
+
+    let treasury_id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &treasury_id);
+    client.initialize(&org.clone(), &admin);
+    client.set_registry(&admin, &Some(registry_id.clone()));
+    registry.register_module(&owner, &org.clone(), &ModuleKind::Treasury, &treasury_id);
+    registry.register_module(&owner, &org.clone(), &ModuleKind::Multisig, &admin);
+
+    let funder = env.register_contract(None, RegistryContract);
+    registry.register_module(&owner, &org.clone(), &ModuleKind::Wallet, &funder);
+
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.add_approved_asset(&admin, &asset);
+    if funded > 0 {
+        token::StellarAssetClient::new(&env, &asset).mint(&funder, &funded);
+        client.deposit(&funder, &asset, &funded);
+    }
+
+    ContractGatedHarness {
+        env,
+        registry,
+        client,
+        owner,
+        admin,
+        asset,
+        org,
+    }
+}
+
 /// A hostile, unregistered contract cannot deposit into the treasury: the
 /// deposit gate verifies a contract depositor against the org's Wallet
 /// module record and refuses everything else with `Unauthorized`.
@@ -1157,6 +1244,67 @@ fn account_callers_bypass_the_registry_gate() {
     h.client
         .withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &100);
     assert_eq!(h.client.holding(&h.asset).total_out, 100);
+}
+
+#[test]
+fn account_withdrawal_emits_audit_event() {
+    let h = setup_gated(2_000);
+    h.client.deposit(&h.funder, &h.asset, &1_000);
+    let to = Address::generate(&h.env);
+    h.env.ledger().set_timestamp(1_700_000_100);
+
+    h.client.withdraw(&h.admin, &h.asset, &to, &100);
+
+    let (org, caller, recipient, asset, amount, verified, recorded_at) =
+        treasury_audit_payload(&h.env, "TreasuryWithdrawalAudit").unwrap();
+    assert_eq!(org, h.org);
+    assert_eq!(caller, h.admin);
+    assert_eq!(recipient, to);
+    assert_eq!(asset, h.asset);
+    assert_eq!(amount, 100);
+    assert!(!verified, "an account caller has no registry vouch");
+    assert_eq!(recorded_at, 1_700_000_100);
+}
+
+#[test]
+fn registry_verified_withdrawal_emits_audit_event() {
+    let h = setup_contract_gated(1_000);
+    let to = Address::generate(&h.env);
+    h.env.ledger().set_timestamp(1_700_000_200);
+
+    h.client.withdraw(&h.admin, &h.asset, &to, &100);
+
+    let (org, caller, recipient, asset, amount, verified, recorded_at) =
+        treasury_audit_payload(&h.env, "TreasuryWithdrawalAudit").unwrap();
+    assert_eq!(org, h.org);
+    assert_eq!(caller, h.admin);
+    assert_eq!(recipient, to);
+    assert_eq!(asset, h.asset);
+    assert_eq!(amount, 100);
+    assert!(
+        verified,
+        "the admin contract is the recorded Multisig module"
+    );
+    assert_eq!(recorded_at, 1_700_000_200);
+}
+
+#[test]
+fn contract_admin_recorded_under_the_wrong_module_cannot_withdraw() {
+    let h = setup_contract_gated(1_000);
+    // The admin contract is legitimate under a different module kind, but the
+    // outbound gate resolves (org, Multisig) and must not accept it.
+    h.registry
+        .remove_module(&h.owner, &h.org.clone(), &ModuleKind::Multisig);
+    h.registry
+        .register_module(&h.owner, &h.org.clone(), &ModuleKind::Proposal, &h.admin);
+
+    let to = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &to, &100),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+    assert!(treasury_audit_payload(&h.env, "TreasuryWithdrawalAudit").is_none());
 }
 
 /// Clearing the registry (admin-gated) restores the pre-registry behaviour:
