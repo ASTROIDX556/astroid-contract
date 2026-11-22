@@ -622,7 +622,7 @@ fn custom_period_requires_an_interval() {
         &0,
         &0,
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
 
     let res = h.client.try_set_recurrence(
         &h.owner,
@@ -1203,7 +1203,7 @@ fn deficit_without_period_rejected() {
         &true, // allow_deficit
         &0,
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
 }
 
 #[test]
@@ -1826,7 +1826,7 @@ fn allocation_with_past_expiry_is_rejected() {
             &false,
             &expires_at,
         );
-        assert_eq!(res, Err(Ok(Error::InvalidInput)));
+        assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
     }
     // A future expiry (and 0 = never) are accepted.
     allocate(&h, "never", 1_000, Period::None, false);
@@ -1983,7 +1983,7 @@ fn scheduled_budget_rejects_expiry_at_or_before_start() {
             &2_000,
             &expires_at,
         );
-        assert_eq!(result, Err(Ok(Error::InvalidInput)));
+        assert_eq!(result, Err(Ok(Error::InvalidTimeWindow)));
     }
 }
 
@@ -2563,7 +2563,12 @@ fn deficit_is_rejected_on_every_non_recurring_period() {
             &true, // allow_deficit
             &0,
         );
-        assert_eq!(res, Err(Ok(Error::InvalidInput)), "period {:?}", period);
+        assert_eq!(
+            res,
+            Err(Ok(Error::InvalidTimeWindow)),
+            "period {:?}",
+            period
+        );
         // Nothing was written by the rejection.
         let res = h.client.try_get(&id(&h.env, name));
         assert_eq!(res, Err(Ok(Error::NotFound)), "period {:?}", period);
@@ -2623,7 +2628,7 @@ fn a_custom_period_budget_cannot_accrue_an_unrepayable_deficit() {
         &true,
         &0,
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
     // A `Custom` budget without a deficit policy is still creatable and still
     // recurs once `set_recurrence` supplies an interval.
     allocate(&h, "custom", 1_000, Period::Custom, false);
@@ -2677,7 +2682,7 @@ fn negative_limits_are_rejected_on_every_creation_entrypoint() {
         &2_000,
         &2_000,
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
 
     for bid in ["a", "b", "c"] {
         let res = h.client.try_get(&id(&h.env, bid));
@@ -3838,5 +3843,132 @@ mod window_boundary_tests {
             .get_asset_budget(&id(&h.env, "asset_reset"), &token);
         assert_eq!(ab.spent, 0);
         assert_eq!(ab.rollover_credit, 100);
+    }
+}
+
+// --- Issue #503: deterministic, named budget error codes ---
+
+/// The named budget codes are wire-stable: the two aliases keep the codes
+/// consumers already decode, and `InvalidTimeWindow` is the new budget-band
+/// code, identical in both tables.
+#[test]
+fn named_budget_error_codes_are_wire_stable() {
+    assert_eq!(Error::BudgetNotFound, Error::NotFound);
+    assert_eq!(Error::BudgetNotFound.code(), 1);
+    assert_eq!(Error::ExceededSpendLimit, Error::BudgetExceeded);
+    assert_eq!(Error::ExceededSpendLimit.code(), 40);
+    assert_eq!(Error::BudgetExpired.code(), 44);
+    assert_eq!(Error::InvalidTimeWindow.code(), 46);
+    assert_eq!(Error::InvalidTimeWindow.wire_name(), "INVALID_TIME_WINDOW");
+
+    assert_eq!(BudgetError::BudgetNotFound.code(), 1);
+    assert_eq!(BudgetError::ExceededSpendLimit.code(), 40);
+    assert_eq!(BudgetError::BudgetExpired.code(), 44);
+    assert_eq!(BudgetError::InvalidTimeWindow.code(), 46);
+    assert_eq!(
+        BudgetError::from(Error::InvalidTimeWindow),
+        BudgetError::InvalidTimeWindow
+    );
+    assert_eq!(
+        Error::from(BudgetError::InvalidTimeWindow),
+        Error::InvalidTimeWindow
+    );
+}
+
+#[test]
+fn spend_on_unknown_budget_returns_budget_not_found() {
+    let h = setup();
+    let res = h.client.try_consume(&h.owner, &id(&h.env, "ghost"), &10);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetNotFound)));
+    let res = h.client.try_get(&id(&h.env, "ghost"));
+    assert_eq!(res, Err(Ok(Error::BudgetNotFound)));
+    let token = Address::generate(&h.env);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "ghost"), &token, &10);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetNotFound)));
+}
+
+#[test]
+fn overspend_returns_exceeded_spend_limit_and_records_nothing() {
+    let h = setup();
+    let bid = id(&h.env, "ops");
+    h.client
+        .allocate(&h.owner, &bid, &1_000, &Period::None, &false, &0);
+    h.client.consume(&h.owner, &bid, &900);
+    let res = h.client.try_consume(&h.owner, &bid, &101);
+    assert_eq!(res, Err(Ok(BudgetError::ExceededSpendLimit)));
+    assert_eq!(h.client.get(&bid).spent, 900);
+
+    // Per-asset limit breaches report the same named code.
+    let token = Address::generate(&h.env);
+    h.client.set_budget_limit(&h.owner, &bid, &token, &50, &0);
+    let res = h
+        .client
+        .try_check_and_record_spend(&h.owner, &bid, &token, &51);
+    assert_eq!(res, Err(Ok(BudgetError::ExceededSpendLimit)));
+}
+
+#[test]
+fn spend_after_window_closes_returns_budget_expired() {
+    let h = setup();
+    let bid = id(&h.env, "q4");
+    h.client
+        .allocate(&h.owner, &bid, &1_000, &Period::None, &false, &2_000);
+    h.env.ledger().set_timestamp(2_000);
+    let res = h.client.try_consume(&h.owner, &bid, &1);
+    assert_eq!(res, Err(Ok(BudgetError::BudgetExpired)));
+    let res = h.client.try_rollover_preview(&bid);
+    assert_eq!(res, Err(Ok(Error::BudgetExpired)));
+}
+
+#[test]
+fn malformed_windows_return_invalid_time_window() {
+    let h = setup();
+    // Expiry already in the past.
+    let res = h.client.try_allocate(
+        &h.owner,
+        &id(&h.env, "past"),
+        &1_000,
+        &Period::None,
+        &false,
+        &500,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
+    // Expiry exactly now.
+    let res = h.client.try_allocate(
+        &h.owner,
+        &id(&h.env, "now"),
+        &1_000,
+        &Period::None,
+        &false,
+        &1_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
+    // Scheduled budget that expires before it starts.
+    let res = h.client.try_allocate_scheduled(
+        &h.owner,
+        &id(&h.env, "sched"),
+        &1_000,
+        &Period::None,
+        &false,
+        &5_000,
+        &4_000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
+    // Custom recurrence with a zero-second interval.
+    let bid = id(&h.env, "custom");
+    h.client
+        .allocate(&h.owner, &bid, &1_000, &Period::None, &false, &0);
+    let res = h
+        .client
+        .try_set_recurrence(&h.owner, &bid, &Period::Custom, &0, &false, &0, &0);
+    assert_eq!(res, Err(Ok(Error::InvalidTimeWindow)));
+    // None of the rejected budgets were written.
+    for name in ["past", "now", "sched"] {
+        assert_eq!(
+            h.client.try_get(&id(&h.env, name)),
+            Err(Ok(Error::BudgetNotFound))
+        );
     }
 }

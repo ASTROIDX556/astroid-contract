@@ -33,7 +33,7 @@
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
 //! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
-//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`,
+//! `set_policy_bypass`, `evaluate_policy`, `batch_execute_validated`, `set_budget`,
 //! `set_rate_limit`, `clear_rate_limit`, `custody_balance`.
 //!
 //! ## Multi-token custody verification
@@ -525,6 +525,51 @@ impl WalletContract {
     /// Whether a wallet is excused from the policy gate.
     pub fn get_policy_bypass(env: Env, wallet_id: u64) -> bool {
         storage::policy_bypass(&env, wallet_id)
+    }
+
+    /// Non-reverting policy pre-flight for an agent spend (Issue #504).
+    ///
+    /// Evaluates a would-be `transfer` of `amount` of `asset` to `to` against
+    /// the wallet's policy gate exactly as the spend path does — same
+    /// `"active"` policy id, same bypass rule — without moving value or
+    /// touching budgets, velocity or rate limits. Requires [`Role::Agent`] on
+    /// the wallet (an admin also qualifies).
+    ///
+    /// Returns `Ok(true)` when the policy permits the spend (or no policy gate
+    /// applies) and `Ok(false)` when it refuses. A refusal publishes the
+    /// standardized [`events::PolicyViolationEvent`] under
+    /// `("wallet", "pol_viol", agent)`; because this call succeeds, that event
+    /// is committed on-chain, giving off-chain monitoring a durable record of
+    /// every policy evaluation failure an agent triggers.
+    pub fn evaluate_policy(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<bool, Error> {
+        require_positive_amount(amount)?;
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
+        let (policy_addr, _) = Self::resolve_gates(&env)?;
+        let policy_addr = match policy_addr {
+            Some(addr) => addr,
+            None => return Ok(true),
+        };
+        if storage::policy_bypass(&env, wallet_id) {
+            return Ok(true);
+        }
+        let violation = Self::evaluate_policy_gate(
+            &env,
+            wallet_id,
+            &caller,
+            &policy_addr,
+            &String::from_str(&env, "active"),
+            &asset,
+            &to,
+            amount,
+        );
+        Ok(violation.is_none())
     }
 
     /// Set the velocity ceiling for `asset` on a wallet ([`Role::Admin`]):
@@ -1029,6 +1074,7 @@ impl WalletContract {
                 if let Err(e) = Self::require_policy_check(
                     &env,
                     wallet_id,
+                    &caller,
                     policy_addr,
                     &action.policy_id,
                     &action.asset,
@@ -1373,20 +1419,53 @@ impl WalletContract {
     /// wallet-facing error. Only a successful policy response authorizes spend.
     ///
     /// Records a [`events::ContractEvent::WalletPolicyChecked`] on the passing
-    /// path. No event is published for a denial: the invocation is about to
-    /// revert, which discards anything already published, and the policy module
-    /// emits its own [`events::ContractEvent::PolicyViolation`] for the reason
-    /// - duplicating it here would double-count every refusal.
+    /// path. On a refusal it publishes the standardized
+    /// [`events::PolicyViolationEvent`] (Issue #504) carrying the agent, the
+    /// wallet, the evaluated policy id and the refusal's reason/code before
+    /// returning [`Error::PolicyDenied`]. On the reverting spend paths the host
+    /// discards that event with the rest of the invocation (it remains visible
+    /// in simulation and diagnostics); [`WalletContract::evaluate_policy`] is
+    /// the non-reverting path whose event is committed on-chain.
     fn require_policy_check(
         env: &Env,
         wallet_id: u64,
+        agent: &Address,
         policy_addr: &Address,
         policy_id: &String,
         asset: &Address,
         recipient: &Address,
         amount: i128,
     ) -> Result<(), Error> {
-        match PolicyClient::new(env, policy_addr)
+        match Self::evaluate_policy_gate(
+            env,
+            wallet_id,
+            agent,
+            policy_addr,
+            policy_id,
+            asset,
+            recipient,
+            amount,
+        ) {
+            None => Ok(()),
+            Some(_) => Err(Error::PolicyDenied),
+        }
+    }
+
+    /// Consult the policy contract once. Returns `None` when the spend is
+    /// permitted (publishing `WalletPolicyChecked`), or `Some(event)` after
+    /// publishing the [`events::PolicyViolationEvent`] for a refusal. Never
+    /// returns an error itself, so callers decide whether a refusal reverts.
+    fn evaluate_policy_gate(
+        env: &Env,
+        wallet_id: u64,
+        agent: &Address,
+        policy_addr: &Address,
+        policy_id: &String,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Option<events::PolicyViolationEvent> {
+        let (reason, code) = match PolicyClient::new(env, policy_addr)
             .try_check_transfer(policy_id, asset, recipient, &amount)
         {
             Ok(Ok(())) => {
@@ -1398,10 +1477,26 @@ impl WalletContract {
                         amount,
                     },
                 );
-                Ok(())
+                return None;
             }
-            Ok(Err(_)) | Err(_) => Err(Error::PolicyDenied),
-        }
+            // The policy contract refused with a deterministic contract error:
+            // report its own wire name and code so monitoring can tell a cap
+            // breach from a blocked recipient or an unapproved asset.
+            Err(Ok(e)) => (e.wire_name(), e.code()),
+            // The call itself failed (missing contract, trap, undecodable
+            // response): fail closed and say so.
+            Ok(Err(_)) | Err(Err(_)) => ("POLICY_UNAVAILABLE", Error::PolicyDenied.code()),
+        };
+        let event = events::PolicyViolationEvent {
+            agent: agent.clone(),
+            wallet_id,
+            policy_id: policy_id.clone(),
+            reason: events::reason(env, reason),
+            code,
+            timestamp: env.ledger().timestamp(),
+        };
+        events::wallet_policy_violation(env, &event);
+        Some(event)
     }
 
     /// Re-entrancy guard: refuse if a wallet entrypoint is already on the stack.
@@ -1510,6 +1605,7 @@ impl WalletContract {
                 Self::require_policy_check(
                     env,
                     wallet_id,
+                    caller,
                     policy_addr,
                     &String::from_str(env, "active"),
                     asset,

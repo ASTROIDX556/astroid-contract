@@ -2,8 +2,8 @@
 extern crate std;
 
 use crate::{
-    quorum, BatchCall, GovernanceChange, MultiSigContract, MultiSigContractClient, QuorumStatus,
-    SignerWeight,
+    quorum, BatchApproval, BatchCall, GovernanceChange, MultiSigContract, MultiSigContractClient,
+    QuorumStatus, SignerWeight,
 };
 use astroid_shared::constants::{
     GOVERNANCE_GRACE_PERIOD, MAX_BATCH_CALLS, MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY,
@@ -13,7 +13,7 @@ use astroid_shared::errors::Error;
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events, Ledger};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
-    Val, Vec,
+    TryFromVal, Val, Vec,
 };
 
 /// Minimal stateful contract used as a batch sub-call target: it stores values
@@ -2384,4 +2384,227 @@ fn removed_signer_can_be_readded_with_valid_weight() {
     h.client.add_signer(&h.signers[0], &new_signer, &3);
     assert!(h.client.is_signer(&new_signer));
     assert_eq!(h.client.get_signer_weight(&new_signer), 3);
+}
+
+// --- Issue #501: batched threshold confirmations ---
+
+fn ba(signer: &Address, proposal_id: u64) -> BatchApproval {
+    BatchApproval {
+        signer: signer.clone(),
+        proposal_id,
+    }
+}
+
+fn new_proposal(h: &Harness, proposer: usize) -> u64 {
+    h.client.propose(
+        &h.signers[proposer],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    )
+}
+
+#[test]
+fn batch_confirms_several_proposals_in_one_call() {
+    // Weights 1,1,1,1 threshold 3: each proposal needs two more approvals.
+    let h = setup(&[1, 1, 1, 1], 3);
+    let p1 = new_proposal(&h, 0);
+    let p2 = new_proposal(&h, 0);
+    let p3 = new_proposal(&h, 0);
+
+    let batch = vec![
+        &h.env,
+        ba(&h.signers[1], p1),
+        ba(&h.signers[2], p1),
+        ba(&h.signers[1], p2),
+        ba(&h.signers[2], p2),
+        ba(&h.signers[1], p3),
+    ];
+    let weights = h.client.approve_batch(&batch);
+    // Final per-proposal weight, reported for every entry in batch order.
+    assert_eq!(weights, vec![&h.env, 3u32, 3, 3, 3, 2]);
+    assert_eq!(h.client.get_proposal(&p1).approval_weight, 3);
+    assert_eq!(h.client.get_proposal(&p2).approval_weight, 3);
+    assert_eq!(h.client.get_proposal(&p3).approval_weight, 2);
+
+    // Threshold successes are executable; the partial one is not.
+    h.client.execute(&h.signers[0], &p1);
+    h.client.execute(&h.signers[0], &p2);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &p3),
+        Err(Ok(Error::InsufficientWeight))
+    );
+}
+
+#[test]
+fn partial_batch_accumulates_with_later_single_approvals() {
+    let h = setup(&[2, 1, 1], 4);
+    let p = new_proposal(&h, 1); // weight 1
+    let weights = h.client.approve_batch(&vec![&h.env, ba(&h.signers[2], p)]);
+    assert_eq!(weights, vec![&h.env, 2u32]);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &p),
+        Err(Ok(Error::InsufficientWeight))
+    );
+    assert_eq!(h.client.approve(&h.signers[0], &p), 4);
+    h.client.execute(&h.signers[0], &p);
+}
+
+#[test]
+fn weighted_batch_meets_threshold() {
+    let h = setup(&[5, 3, 2], 8);
+    let p = new_proposal(&h, 2); // weight 2
+    let weights = h
+        .client
+        .approve_batch(&vec![&h.env, ba(&h.signers[0], p), ba(&h.signers[1], p)]);
+    assert_eq!(weights, vec![&h.env, 10u32, 10]);
+    h.client.execute(&h.signers[2], &p);
+    assert!(h.client.get_proposal(&p).executed);
+}
+
+#[test]
+fn batch_with_an_invalid_signer_records_nothing() {
+    let h = setup(&[1, 1, 1], 2);
+    let p1 = new_proposal(&h, 0);
+    let p2 = new_proposal(&h, 0);
+    let outsider = Address::generate(&h.env);
+    let res = h
+        .client
+        .try_approve_batch(&vec![&h.env, ba(&h.signers[1], p1), ba(&outsider, p2)]);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+    // The valid first entry was rolled back with the rest of the batch.
+    assert_eq!(h.client.get_proposal(&p1).approval_weight, 1);
+    assert_eq!(h.client.approve(&h.signers[1], &p1), 2);
+}
+
+#[test]
+fn removed_signer_is_not_an_active_batch_signer() {
+    let h = setup(&[1, 1, 1], 2);
+    let p = new_proposal(&h, 0);
+    h.client.remove_signer(&h.signers[0], &h.signers[2]);
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[2], p)]),
+        Err(Ok(Error::NotASigner))
+    );
+}
+
+#[test]
+fn duplicate_signature_in_one_batch_is_refused() {
+    let h = setup(&[1, 1, 1], 3);
+    let p = new_proposal(&h, 0);
+    let res = h
+        .client
+        .try_approve_batch(&vec![&h.env, ba(&h.signers[1], p), ba(&h.signers[1], p)]);
+    assert_eq!(res, Err(Ok(Error::DuplicateSigner)));
+    assert_eq!(h.client.get_proposal(&p).approval_weight, 1);
+}
+
+#[test]
+fn batch_cannot_resign_an_existing_approval() {
+    let h = setup(&[1, 1, 1], 3);
+    let p = new_proposal(&h, 0);
+    // The proposer's approval is already on-chain.
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[0], p)]),
+        Err(Ok(Error::AlreadySigned))
+    );
+}
+
+#[test]
+fn batch_rejects_unknown_executed_empty_and_oversized_inputs() {
+    let h = setup(&[3, 1, 1], 3);
+    let done = new_proposal(&h, 0);
+    h.client.execute(&h.signers[0], &done);
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[1], done)]),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[1], 999)]),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(
+        h.client.try_approve_batch(&Vec::new(&h.env)),
+        Err(Ok(Error::InvalidInput))
+    );
+    let mut big = Vec::new(&h.env);
+    for i in 0..(MAX_BATCH_CALLS as u64 + 1) {
+        big.push_back(ba(&h.signers[1], i + 100));
+    }
+    assert_eq!(
+        h.client.try_approve_batch(&big),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn batch_is_refused_under_emergency_lock() {
+    let h = setup(&[1, 1, 1], 2);
+    let p = new_proposal(&h, 0);
+    h.client.set_emergency_lock(&h.signers[0], &true);
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[1], p)]),
+        Err(Ok(Error::EmergencyLock))
+    );
+}
+
+#[test]
+fn every_distinct_batch_signer_authorizes_the_call() {
+    let h = setup(&[1, 1, 1, 1], 4);
+    let p1 = new_proposal(&h, 0);
+    let p2 = new_proposal(&h, 0);
+    let batch = vec![
+        &h.env,
+        ba(&h.signers[1], p1),
+        ba(&h.signers[2], p1),
+        ba(&h.signers[1], p2),
+    ];
+    h.client.approve_batch(&batch);
+    let auths = h.env.auths();
+    for signer in [&h.signers[1], &h.signers[2]] {
+        let n = auths
+            .iter()
+            .filter(|(addr, inv)| {
+                addr == signer
+                    && matches!(
+                        &inv.function,
+                        AuthorizedFunction::Contract((c, f, _))
+                            if *c == h.client.address && *f == Symbol::new(&h.env, "approve_batch")
+                    )
+            })
+            .count();
+        assert_eq!(n, 1, "each distinct signer authorizes exactly once");
+    }
+    // A signer not in the batch was never asked to authorize.
+    assert!(!auths.iter().any(|(addr, _)| *addr == h.signers[3]));
+}
+
+#[test]
+fn batch_emits_a_concise_summary_event() {
+    let h = setup(&[1, 1, 1], 2);
+    let p1 = new_proposal(&h, 0);
+    let p2 = new_proposal(&h, 0);
+    h.client
+        .approve_batch(&vec![&h.env, ba(&h.signers[1], p1), ba(&h.signers[1], p2)]);
+    let topic: Vec<Val> = (
+        Symbol::new(&h.env, "proposal"),
+        Symbol::new(&h.env, "batch_apr"),
+    )
+        .into_val(&h.env);
+    let summaries: std::vec::Vec<(u32, Vec<u64>, u64)> = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|(id, topics, _)| *id == h.client.address && *topics == topic)
+        .map(|(_, _, data)| <(u32, Vec<u64>, u64)>::try_from_val(&h.env, &data).unwrap())
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].0, 2);
+    assert_eq!(summaries[0].1, vec![&h.env, p1, p2]);
 }
