@@ -46,6 +46,37 @@ pub struct UpgradeAudit {
     pub recorded_at: u64,
 }
 
+/// Typed payload of [`ContractEvent::EscrowExpired`].
+///
+/// Published when an escrow reaches its expiration deadline or when a keeper
+/// reclaims an expired escrow's remaining custody. `amount` is the value still
+/// held for the sender at that instant; `expired_at` is the ledger timestamp
+/// that made the escrow expire.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowExpiration {
+    pub escrow_id: u64,
+    pub sender: Address,
+    pub amount: i128,
+    pub expired_at: u64,
+}
+
+/// Typed payload of [`ContractEvent::DepositRecorded`].
+///
+/// A compact, self-describing record of value entering protocol custody: who
+/// sent it, which asset and amount actually arrived, the custodian's recorded
+/// balance afterwards, and the ledger timestamp that made the deposit final.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositRecorded {
+    pub org: String,
+    pub from: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub balance: i128,
+    pub recorded_at: u64,
+}
+
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
 /// Publish with `events::publish(env, ContractEvent::Variant { .. })`. Each
@@ -237,6 +268,10 @@ pub enum ContractEvent {
         amount: i128,
         balance: i128,
     },
+    /// A deposit was recorded by any protocol custodian (treasury, wallet or
+    /// escrow). Carries [`DepositRecorded`], one stable schema across all of
+    /// them (Issue #520).
+    DepositRecorded { record: DepositRecorded },
     /// Value was withdrawn from a treasury. `balance` is the treasury's
     /// recorded balance of `asset` after the withdrawal.
     TreasuryWithdrawn {
@@ -245,6 +280,18 @@ pub enum ContractEvent {
         asset: Address,
         amount: i128,
         balance: i128,
+    },
+    /// Audit trail for a treasury outflow: who invoked the withdrawal, who
+    /// received it, and whether the registry verified that caller as the
+    /// organization's recorded governance module.
+    TreasuryWithdrawalAudit {
+        org: String,
+        caller: Address,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        registry_verified: bool,
+        recorded_at: u64,
     },
     /// A budget was allocated, consumed or rolled over (`action` describes which).
     BudgetUpdated {
@@ -287,6 +334,10 @@ pub enum ContractEvent {
         sender: Address,
         assets: Vec<AssetAmount>,
     },
+    /// An escrow reached its expiration deadline, or an expired escrow's
+    /// remaining custody was reclaimed and its storage entries removed
+    /// (Issue #521). Carries [`EscrowExpiration`].
+    EscrowExpired { expiration: EscrowExpiration },
     /// Gas usage telemetry for a single operation execution.
     GasTelemetry {
         operation: Symbol,
@@ -564,6 +615,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (org, from, asset, amount, balance),
             );
         }
+        ContractEvent::DepositRecorded { record } => {
+            env.events()
+                .publish((Symbol::new(env, "DepositRecorded"),), record);
+        }
         ContractEvent::TreasuryWithdrawn {
             org,
             to,
@@ -574,6 +629,28 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "TreasuryWithdrawn"),),
                 (org, to, asset, amount, balance),
+            );
+        }
+        ContractEvent::TreasuryWithdrawalAudit {
+            org,
+            caller,
+            to,
+            asset,
+            amount,
+            registry_verified,
+            recorded_at,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "TreasuryWithdrawalAudit"),),
+                (
+                    org,
+                    caller,
+                    to,
+                    asset,
+                    amount,
+                    registry_verified,
+                    recorded_at,
+                ),
             );
         }
         ContractEvent::EscrowCreated {
@@ -607,6 +684,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (Symbol::new(env, "EscrowRefunded"),),
                 (escrow_id, sender, assets),
             );
+        }
+        ContractEvent::EscrowExpired { expiration } => {
+            env.events()
+                .publish((Symbol::new(env, "EscrowExpired"),), expiration);
         }
         ContractEvent::GasTelemetry {
             operation,
@@ -683,6 +764,25 @@ pub fn escrow_funds_released(env: &Env, escrow_id: u64, recipient: &Address, amo
 /// reclaim).
 pub fn escrow_funds_refunded(env: &Env, escrow_id: u64, recipient: &Address, amount: i128) {
     publish_escrow_settlement(env, ESCROW_FUNDS_REFUNDED, escrow_id, recipient, amount);
+}
+
+/// `EscrowExpired` — topic `("EscrowExpired",)`, data [`EscrowExpiration`].
+///
+/// Published by `escrow::expire` when a keeper marks a timed-out escrow and by
+/// `escrow::cleanup_expired` when the remaining custody is refunded and the
+/// escrow's ledger entries are removed (Issue #521).
+pub fn escrow_expired(env: &Env, escrow_id: u64, sender: &Address, amount: i128) {
+    publish(
+        env,
+        ContractEvent::EscrowExpired {
+            expiration: EscrowExpiration {
+                escrow_id,
+                sender: sender.clone(),
+                amount,
+                expired_at: env.ledger().timestamp(),
+            },
+        },
+    );
 }
 
 fn publish_escrow_settlement(
@@ -890,4 +990,196 @@ pub fn upgrade_committed(
 pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
     let topics = (symbol_short!("wallet"), symbol_short!("batch"));
     env.events().publish(topics, (wallet_id, call_count));
+}
+
+// ---------------------------------------------------------------------------
+// Wallet policy evaluation failures (Issue #504)
+// ---------------------------------------------------------------------------
+
+/// Typed payload of the standardized wallet policy-failure event (Issue #504).
+///
+/// Published by the wallet whenever its pre-execution policy gate refuses an
+/// outbound movement, so off-chain monitoring sees one concise, uniform record
+/// per refusal regardless of which rule fired:
+///
+/// * `agent` — the account that attempted the movement (the AI agent's key;
+///   also carried as the third topic so a subscriber can follow one agent
+///   without decoding payloads);
+/// * `wallet_id` — the wallet the movement would have debited;
+/// * `policy_id` — the policy envelope that was evaluated (`"active"` for the
+///   wallet's standing gate, or a batch action's own `policy_id`);
+/// * `reason` — the `UPPER_SNAKE_CASE` wire name of the refusal
+///   ([`crate::errors::Error::wire_name`]), e.g. `POLICY_DENIED`, or
+///   `POLICY_UNAVAILABLE` when the policy contract could not be invoked;
+/// * `code` — the numeric contract error code matching `reason`;
+/// * `timestamp` — the ledger timestamp, following the
+///   payload-ends-with-timestamp convention from Issue #222.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyViolationEvent {
+    pub agent: Address,
+    pub wallet_id: u64,
+    pub policy_id: String,
+    pub reason: Symbol,
+    pub code: u32,
+    pub timestamp: u64,
+}
+
+/// Topic category symbol of [`wallet_policy_violation`].
+pub const WALLET_TOPIC: Symbol = symbol_short!("wallet");
+/// Topic action symbol of [`wallet_policy_violation`].
+pub const POLICY_VIOLATION_ACTION: Symbol = symbol_short!("pol_viol");
+
+/// `WalletPolicyViolation` — topic `("wallet", "pol_viol", agent)`, data
+/// [`PolicyViolationEvent`].
+///
+/// Note on durability: Soroban rolls back every event of an invocation that
+/// returns an error. The wallet therefore publishes this both on its reverting
+/// spend paths (visible in simulation / diagnostic traces) and on the
+/// non-reverting `evaluate_policy` pre-flight entrypoint, whose event is
+/// committed on-chain.
+pub fn wallet_policy_violation(env: &Env, event: &PolicyViolationEvent) {
+    env.events().publish(
+        (WALLET_TOPIC, POLICY_VIOLATION_ACTION, event.agent.clone()),
+        event.clone(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multisig batch confirmations (Issue #501)
+// ---------------------------------------------------------------------------
+
+/// `ProposalBatchApproved` — topic `("proposal", "batch_apr")`, data
+/// `(approvals, proposal_ids, timestamp)`.
+///
+/// One concise event per batched confirmation call: `approvals` is the number
+/// of (signer, proposal) confirmations recorded and `proposal_ids` lists the
+/// proposals they touched, in batch order (duplicates collapsed). Per-proposal
+/// `("proposal", "approved")` events are still published so existing indexers
+/// keep their running tallies.
+pub fn proposal_batch_approved(env: &Env, approvals: u32, proposal_ids: Vec<u64>) {
+    let topics = (symbol_short!("proposal"), symbol_short!("batch_apr"));
+    env.events()
+        .publish(topics, (approvals, proposal_ids, env.ledger().timestamp()));
+}
+
+// ---------------------------------------------------------------------------
+// Treasury sub-allocations and emergency sweep (Issue #502)
+// ---------------------------------------------------------------------------
+
+/// `AllocationLimitSet` — topic `("treasury", "alloc_cap")`, data
+/// `(category, asset, max_amount, timestamp)`.
+pub fn treasury_allocation_limit_set(env: &Env, category: &Symbol, asset: &Address, max: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("alloc_cap"));
+    env.events().publish(
+        topics,
+        (
+            category.clone(),
+            asset.clone(),
+            max,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// `AllocationChanged` — topic `("treasury", action)` where `action` is
+/// `alloc` (reserve) or `dealloc` (release), data
+/// `(category, asset, amount, reserved_after, timestamp)`.
+pub fn treasury_allocation_changed(
+    env: &Env,
+    action: Symbol,
+    category: &Symbol,
+    asset: &Address,
+    amount: i128,
+    reserved_after: i128,
+) {
+    let topics = (symbol_short!("treasury"), action);
+    env.events().publish(
+        topics,
+        (
+            category.clone(),
+            asset.clone(),
+            amount,
+            reserved_after,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// `RecoveryAddressSet` — topic `("treasury", "recov_set")`, data
+/// `(recovery, actor, timestamp)`.
+pub fn treasury_recovery_set(env: &Env, recovery: &Address, actor: &Address) {
+    let topics = (symbol_short!("treasury"), symbol_short!("recov_set"));
+    env.events().publish(
+        topics,
+        (recovery.clone(), actor.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// `EmergencySweep` — topic `("treasury", "em_sweep", asset)`, data
+/// `(actor, recovery, amount, timestamp)`. Published once per swept asset.
+pub fn treasury_emergency_sweep(
+    env: &Env,
+    actor: &Address,
+    recovery: &Address,
+    asset: &Address,
+    amount: i128,
+) {
+    let topics = (
+        symbol_short!("treasury"),
+        symbol_short!("em_sweep"),
+        asset.clone(),
+    );
+    env.events().publish(
+        topics,
+        (
+            actor.clone(),
+            recovery.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deposit tracking (Issue #520)
+// ---------------------------------------------------------------------------
+
+/// `DepositRecorded` — typed topic `("DepositRecorded",)` carrying a
+/// [`DepositRecorded`] payload, plus the legacy tuple topic
+/// `("treasury", "deposit")` with `(org, from, asset, amount, balance,
+/// timestamp)` for dashboards that predate the typed layer.
+///
+/// Both use the standard Soroban event encoding: topics are symbols, the data
+/// tuple is a single `contracttype`-compatible value, and the timestamp comes
+/// from the deterministic ledger clock rather than the caller.
+pub fn deposit_recorded(
+    env: &Env,
+    org: &String,
+    from: &Address,
+    asset: &Address,
+    amount: i128,
+    balance: i128,
+) {
+    let recorded_at = env.ledger().timestamp();
+    let record = DepositRecorded {
+        org: org.clone(),
+        from: from.clone(),
+        asset: asset.clone(),
+        amount,
+        balance,
+        recorded_at,
+    };
+    publish(env, ContractEvent::DepositRecorded { record });
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("deposit")),
+        (
+            org.clone(),
+            from.clone(),
+            asset.clone(),
+            amount,
+            balance,
+            recorded_at,
+        ),
+    );
 }

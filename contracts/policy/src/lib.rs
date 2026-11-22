@@ -2554,6 +2554,30 @@ impl PolicyContract {
             }
         }
     }
+
+    /// Validate an incoming agent spending request against the policy's
+    /// recipient whitelist and per-transaction maximum amount (Issue #523).
+    ///
+    /// This is the deterministic pre-flight hook for the Wallet → Policy →
+    /// Execution flow. It walks the same rules as `check_transfer`, so the two
+    /// entrypoints can never disagree on whether a payload is in policy, but
+    /// collapses every refusal to [`Error::PolicyDenied`] while still emitting
+    /// the single `PolicyViolation` event that names the rule that refused it.
+    /// A non-positive amount is malformed input ([`Error::InvalidAmount`]) and
+    /// an unknown policy is [`Error::NotFound`]; neither is a policy refusal.
+    pub fn validate_agent_spending_request(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<(), Error> {
+        require_positive_amount(payload.amount)?;
+        let decision = Self::evaluate_policy_decision(&env, &policy_id, &payload)?;
+        if let Some(reason) = decision.reason() {
+            Self::report_denial(&env, &policy_id, reason);
+            return Err(Error::PolicyDenied);
+        }
+        Ok(())
+    }
 }
 
 /// Allow the interface trait to call `check_transfer` on this contract.
