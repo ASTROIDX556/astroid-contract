@@ -2611,6 +2611,87 @@ fn batch_emits_a_concise_summary_event() {
 }
 
 // ---------------------------------------------------------------------------
+// Weighted quorum verification helper (issue #522)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_weight_covers_insufficient_exact_and_excess_totals() {
+    let env = Env::default();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    let signers = vec![&env, sw(&a, 4), sw(&b, 3), sw(&c, 3)];
+    let all = |_s: &SignerWeight| true;
+    let without_c = |s: &SignerWeight| s.address != c;
+
+    assert_eq!(
+        quorum::verify_weight(&signers, &without_c, 10, 10, Error::InsufficientWeight).unwrap_err(),
+        Error::InsufficientWeight
+    );
+
+    let exact = quorum::verify_weight(&signers, &all, 10, 10, Error::InsufficientWeight).unwrap();
+    assert_eq!(exact.approval_weight, 10);
+    assert_eq!(exact.approvers, 3);
+    assert_eq!(exact.remaining, 0);
+    assert!(exact.met);
+
+    // Exceeding the bar is a pass and the tally is the real sum, not clamped.
+    let excess = quorum::verify_weight(&signers, &all, 8, 10, Error::ThresholdNotMet).unwrap();
+    assert_eq!(excess.approval_weight, 10);
+    assert_eq!(excess.approvers, 3);
+    assert_eq!(excess.remaining, 0);
+    assert!(excess.met);
+}
+
+#[test]
+fn verify_weight_refuses_an_unrepresentable_sum() {
+    let env = Env::default();
+    let signers = vec![
+        &env,
+        sw(&Address::generate(&env), u32::MAX),
+        sw(&Address::generate(&env), 1),
+    ];
+    let all = |_s: &SignerWeight| true;
+
+    assert_eq!(
+        quorum::verify_weight(&signers, &all, 1, u32::MAX, Error::InsufficientWeight).unwrap_err(),
+        Error::Overflow
+    );
+}
+
+#[test]
+fn verify_proposal_weight_rejects_short_and_accepts_exact_and_excess() {
+    // Threshold 8 with weights 4, 3, 3: two approvals are still short (7), the
+    // third lands at 10, which both meets the bar and exceeds a lower one.
+    let h = setup(&[4, 3, 3], 8);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(
+        h.client.try_verify_proposal_weight(&id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    h.client.approve(&h.signers[1], &id);
+    assert_eq!(
+        h.client.try_verify_proposal_weight(&id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    h.client.approve(&h.signers[2], &id);
+    let status = h.client.verify_proposal_weight(&id);
+    assert_eq!(status.approval_weight, 10);
+    assert_eq!(status.approvers, 3);
+    assert_eq!(status.threshold, 8);
+    assert_eq!(status.total_weight, 10);
+    assert_eq!(status.remaining, 0);
+    assert!(status.met);
+}
+
+// ---------------------------------------------------------------------------
 // Issue #517: proposal creation, voting and execution state machine
 // ---------------------------------------------------------------------------
 
