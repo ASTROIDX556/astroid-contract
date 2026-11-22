@@ -4488,3 +4488,114 @@ fn asset_whitelist_mode_toggle_emits_its_own_standardized_topic() {
     assert_eq!(event_count(&env, "policy", "wl_mode"), 1);
     assert_eq!(event_count(&env, "policy", "awl_mode"), 1);
 }
+
+// --- agent spending request validation hook (issue #523) -------------------
+
+#[test]
+fn validate_agent_spending_request_allows_payload_within_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(
+            &policy_id,
+            &transfer_payload(&asset, &recipient, 999_999)
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 0);
+}
+
+#[test]
+fn validate_agent_spending_request_denies_unwhitelisted_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let approved = Address::generate(&env);
+    let untrusted = Address::generate(&env);
+
+    p.add_recipient_to_whitelist(&owner, &policy_id, &approved);
+    p.set_recipient_whitelist_enabled(&owner, &policy_id, &true);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(
+            &policy_id,
+            &transfer_payload(&asset, &untrusted, 10)
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 1);
+}
+
+#[test]
+fn validate_agent_spending_request_denies_amount_above_maximum() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(
+            &policy_id,
+            &transfer_payload(&asset, &recipient, 1_000_001)
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 1);
+}
+
+#[test]
+fn validate_agent_spending_request_agrees_with_check_transfer_and_emits_one_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let over = transfer_payload(&asset, &recipient, 1_000_001);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recipient, &over.amount),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 1);
+    assert_eq!(
+        p.try_validate_agent_spending_request(&policy_id, &over),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 2);
+}
+
+#[test]
+fn validate_agent_spending_request_rejects_malformed_amount_and_unknown_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let unknown = String::from_str(&env, "missing");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(&policy_id, &transfer_payload(&asset, &recipient, 0)),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        p.try_validate_agent_spending_request(&unknown, &transfer_payload(&asset, &recipient, 1)),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 0);
+}
