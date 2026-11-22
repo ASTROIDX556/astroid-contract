@@ -4119,3 +4119,101 @@ mod refund_expired_tests {
         assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
     }
 }
+
+/// `cleanup_expired` tests (Issue #521)
+#[cfg(test)]
+mod cleanup_expired_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_expired_publishes_shared_event_and_frees_storage() {
+        let h = setup(5_000, 2_000);
+        let id = create(&h, &two_assets(&h, 5_000, 2_000), START + 100, GRACE);
+        let contract = h.client.address.clone();
+
+        at(&h, START + 100 + GRACE);
+        h.client.cleanup_expired(&id);
+
+        assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+        assert_eq!(balance(&h, &h.asset_b, &h.sender), 2_000);
+        assert_eq!(balance(&h, &h.asset_a, &contract), 0);
+        assert_eq!(balance(&h, &h.asset_b, &contract), 0);
+        assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+
+        let events = h.env.events().all();
+        assert!(events.iter().any(|(_, topics, _)| {
+            let topic: Val = Symbol::new(&h.env, "EscrowExpired").into_val(&h.env);
+            topics.contains(topic)
+        }));
+        assert!(events.iter().any(|(_, topics, _)| {
+            let topic: Val = Symbol::new(&h.env, "EscrowRefunded").into_val(&h.env);
+            topics.contains(topic)
+        }));
+        assert!(events.iter().any(|(_, topics, _)| {
+            let topic: Val = Symbol::new(&h.env, "clean_exp").into_val(&h.env);
+            topics.contains(topic)
+        }));
+    }
+
+    #[test]
+    fn cleanup_expired_refunds_only_unclaimed_remainder() {
+        let h = setup(5_000, 0);
+        let schedule = ReleaseSchedule {
+            release_type: ReleaseType::Linear,
+            start_time: START,
+            cliff_time: START + 10,
+            end_time: START + 100,
+        };
+        let id = h.client.create_scheduled(
+            &h.sender,
+            &h.recipient,
+            &h.arbiter,
+            &one_asset(&h, 5_000),
+            &schedule,
+            &(START + 100),
+            &String::from_str(&h.env, "vesting"),
+        );
+
+        at(&h, START + 40);
+        assert_eq!(h.client.withdraw(&h.recipient, &id, &2_000), 2_000);
+
+        at(&h, START + 101);
+        h.client.cleanup_expired(&id);
+
+        assert_eq!(balance(&h, &h.asset_a, &h.recipient), 2_000);
+        assert_eq!(balance(&h, &h.asset_a, &h.sender), 3_000);
+        assert_eq!(h.client.try_get(&id), Err(Ok(Error::NotFound)));
+    }
+
+    #[test]
+    fn cleanup_expired_rejects_settled_escrow() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+        h.client.release(&h.arbiter, &id, &5_000);
+        at(&h, START + 200);
+        assert_eq!(
+            h.client.try_cleanup_expired(&id),
+            Err(Ok(Error::EscrowAlreadySettled))
+        );
+        assert_eq!(h.client.get(&id).state, EscrowState::Released);
+        assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    }
+
+    #[test]
+    fn expire_publishes_shared_expired_event() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, 0);
+
+        at(&h, START + 101);
+        h.client.expire(&id);
+
+        let events = h.env.events().all();
+        assert!(events.iter().any(|(_, topics, _)| {
+            let topic: Val = Symbol::new(&h.env, "EscrowExpired").into_val(&h.env);
+            topics.contains(topic)
+        }));
+        assert_eq!(h.client.get(&id).state, EscrowState::Expired);
+        assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+    }
+}
