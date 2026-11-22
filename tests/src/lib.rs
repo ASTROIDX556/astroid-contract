@@ -29,6 +29,8 @@ pub mod interface_compliance;
 #[cfg(test)]
 pub mod multisig_integration;
 #[cfg(test)]
+pub mod policy_composition;
+#[cfg(test)]
 pub mod policy_enforcement;
 #[cfg(test)]
 pub mod policy_test;
