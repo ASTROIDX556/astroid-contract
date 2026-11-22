@@ -123,6 +123,7 @@
 //! plus wallet-scoped state-change and role-administration events.
 
 use crate::access::Role;
+use astroid_interfaces::upgrade::{UpgradeAuthorizationClient, UpgradeRegistryClient};
 use astroid_interfaces::{BudgetClient, PolicyClient, RegistryClient, UpgradeableInterface};
 use astroid_shared::constants;
 use astroid_shared::ensure;
@@ -134,8 +135,8 @@ pub use astroid_shared::types::WalletData;
 use astroid_shared::types::{ModuleId, ModuleKind, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, String,
+    Symbol, Val, Vec,
 };
 
 pub mod access;
@@ -1164,7 +1165,7 @@ impl WalletContract {
 
     /// Read the configured registry, if any.
     pub fn get_registry(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Registry)
+        storage::registry(&env)
     }
 
     /// Set the organization slug used for registry lookups (admin only).
@@ -1180,7 +1181,7 @@ impl WalletContract {
 
     /// Read the configured org slug, if any.
     pub fn get_org(env: Env) -> Option<String> {
-        env.storage().instance().get(&DataKey::Org)
+        storage::org(&env)
     }
 
     /// Set the default budget envelope id consumed by single transfers (admin only).
@@ -1480,8 +1481,8 @@ impl WalletContract {
     /// `Registry` + `Org` are configured. Uses a single `get_modules_batch`
     /// call to fetch both in one cross-contract invocation for gas savings.
     fn resolve_gates(env: &Env) -> Result<(Option<Address>, Option<Address>), Error> {
-        let reg: Option<Address> = env.storage().instance().get(&DataKey::Registry);
-        let org: Option<String> = env.storage().instance().get(&DataKey::Org);
+        let reg = storage::registry(env);
+        let org = storage::org(env);
         if let (Some(reg), Some(org)) = (reg, org) {
             let mut ids = Vec::new(env);
             ids.push_back(ModuleId {
@@ -1964,6 +1965,54 @@ impl WalletContract {
         storage::bump_wallet(env, id);
     }
 
+    /// Registry that authorizes a code swap: the instance `Registry` entry
+    /// first, then the legacy upgrade-authority registry for deployments wired
+    /// before this entrypoint became registry-sourced. Either way the registry,
+    /// not a locally stored admin, is the authority consulted.
+    fn upgrade_registry(env: &Env) -> Result<Address, Error> {
+        storage::registry(env)
+            .or_else(|| {
+                astroid_interfaces::upgrade::get_authority(env)
+                    .ok()
+                    .map(|authority| authority.registry)
+            })
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Ask the registry whether `caller` may roll wallet code forward. The
+    /// protocol admins, their multisig governance and the org's delegated
+    /// maintainers all answer through `is_upgrade_authorized`; a refusal, a
+    /// registry error or an undecodable answer fail closed.
+    fn require_registry_upgrader(
+        env: &Env,
+        registry: &Address,
+        caller: &Address,
+    ) -> Result<(), Error> {
+        let org = storage::org(env).unwrap_or_else(|| String::from_str(env, ""));
+        match UpgradeAuthorizationClient::new(env, registry).try_is_upgrade_authorized(
+            &org,
+            caller,
+            &ModuleKind::Wallet,
+        ) {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(Error::Unauthorized),
+        }
+    }
+
+    /// Confirm the registry still approves `wasm_hash` for wallet code.
+    fn require_approved_wasm(
+        env: &Env,
+        registry: &Address,
+        wasm_hash: &BytesN<32>,
+    ) -> Result<(), Error> {
+        match UpgradeRegistryClient::new(env, registry)
+            .try_is_wasm_approved(&ModuleKind::Wallet, wasm_hash)
+        {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(Error::Unauthorized),
+        }
+    }
+
     fn bump_instance(env: &Env) {
         storage::bump_instance(env);
     }
@@ -1974,9 +2023,11 @@ impl WalletContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for WalletContract {
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    /// Record (or rotate) the legacy upgrade authority. The shared interface
+    /// keeps this bootstrapping surface; the wallet's `upgrade` sources its
+    /// registry from the instance `Registry` entry (falling back to the one
+    /// recorded here) and asks that registry who may upgrade, so a local admin
+    /// record alone never authorizes a code swap.
     fn set_upgrade_authority(
         env: Env,
         caller: Address,
@@ -1986,7 +2037,7 @@ impl UpgradeableInterface for WalletContract {
         astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
     }
 
-    /// Read the recorded upgrade authority.
+    /// Read the recorded legacy upgrade authority.
     fn get_upgrade_authority(
         env: Env,
     ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
@@ -1995,16 +2046,19 @@ impl UpgradeableInterface for WalletContract {
 
     /// Replace this contract's code with `wasm_hash`.
     ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for `ModuleKind::Wallet` in the registry.
-    /// Any other outcome leaves the contract running its current code.
-    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Wallet,
-            wasm_hash,
-        )
+    /// Both questions are put to the registry wired in instance storage:
+    /// `is_upgrade_authorized` must recognize `caller` as a protocol maintainer
+    /// or DAO governance for the org, and `is_wasm_approved` must still approve
+    /// the hash for [`ModuleKind::Wallet`]. A missing registry is
+    /// [`Error::NotInitialized`]; every refusal or failed cross-call is the
+    /// deterministic [`Error::Unauthorized`]. No code is swapped unless both
+    /// answers come back positive.
+    fn upgrade(env: Env, caller: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
+        caller.require_auth();
+        let registry = Self::upgrade_registry(&env)?;
+        Self::require_registry_upgrader(&env, &registry, &caller)?;
+        Self::require_approved_wasm(&env, &registry, &wasm_hash)?;
+        astroid_interfaces::upgrade::apply(&env, ModuleKind::Wallet, wasm_hash)
     }
 }
 
