@@ -41,9 +41,10 @@
 //!   fires **once**, on the transition from "short" to "met", carrying the
 //!   full verified tally as [`QuorumStatus`].
 
+use crate::storage::SignerWeight;
 use astroid_shared::errors::Error;
 use astroid_shared::math::checked_add;
-use soroban_sdk::{contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Env, Symbol, Vec};
 
 /// The verified tally for a proposal or batch against the current signer set.
 ///
@@ -95,8 +96,8 @@ impl QuorumStatus {
     }
 
     /// Refuse a tally short of the threshold, reporting the caller's own
-    /// shortfall code ([`Error::InsufficientWeight`] for proposal approvals,
-    /// [`Error::ThresholdNotMet`] for signature-verified batches), so every
+    /// shortfall code ([`Error::InsufficientWeight`] for approval progress,
+    /// [`Error::QUORUM_NOT_MET`] for signature-verified quorums), so every
     /// quorum decision reports failure in one place.
     pub fn ensure_met(&self, shortfall: Error) -> Result<(), Error> {
         if self.met {
@@ -122,7 +123,7 @@ pub fn add_weight(total: i128, weight: u32) -> Result<i128, Error> {
 /// rejected instead of being wrapped down into a smaller number that would
 /// wrongly fail a legitimate quorum.
 pub fn narrow(total: i128) -> Result<u32, Error> {
-    if total > u32::MAX as i128 {
+    if total < 0 || total > u32::MAX as i128 {
         return Err(Error::Overflow);
     }
     Ok(total as u32)
@@ -153,6 +154,51 @@ pub fn require(sum: u32, threshold: u32, shortfall: Error) -> Result<(), Error> 
     } else {
         Err(shortfall)
     }
+}
+
+/// Accumulate the weights of the signers selected by `is_selected` and count
+/// how many distinct signers that was.
+///
+/// The signer set stores one entry per address, so iterating it and applying
+/// the predicate can never count one key twice. Every addition goes through
+/// [`add_weight`] and the result through [`narrow`], so an unrepresentable sum
+/// is refused with [`Error::Overflow`] instead of wrapping into a tally that
+/// could wrongly satisfy or fail a quorum. The approver count uses standard
+/// checked arithmetic for the same reason.
+pub fn accumulate_selected(
+    signers: &Vec<SignerWeight>,
+    is_selected: &dyn Fn(&SignerWeight) -> bool,
+) -> Result<(u32, u32), Error> {
+    let mut total: i128 = 0;
+    let mut approvers: u32 = 0;
+    for s in signers.iter() {
+        if is_selected(&s) {
+            total = add_weight(total, s.weight)?;
+            approvers = approvers.checked_add(1).ok_or(Error::Overflow)?;
+        }
+    }
+    Ok((narrow(total)?, approvers))
+}
+
+/// Accumulate the selected signers' weights and verify the total against the
+/// configured threshold in one fail-closed step (Issue #522).
+///
+/// Returns the full [`QuorumStatus`] on success — including an exact match and
+/// any excess weight — or `shortfall` (`Error::InsufficientWeight` for approval
+/// progress, `Error::QUORUM_NOT_MET` for signature-verified quorums) when the
+/// aggregate falls below the threshold. A sum that cannot be represented as
+/// `u32` surfaces as [`Error::Overflow`] before any comparison is made.
+pub fn verify_weight(
+    signers: &Vec<SignerWeight>,
+    is_selected: &dyn Fn(&SignerWeight) -> bool,
+    threshold: u32,
+    total_weight: u32,
+    shortfall: Error,
+) -> Result<QuorumStatus, Error> {
+    let (approval_weight, approvers) = accumulate_selected(signers, is_selected)?;
+    let status = QuorumStatus::evaluate(approval_weight, approvers, threshold, total_weight);
+    status.ensure_met(shortfall)?;
+    Ok(status)
 }
 
 /// Publish the threshold-met event for a subject (`(id, tally)`), under the

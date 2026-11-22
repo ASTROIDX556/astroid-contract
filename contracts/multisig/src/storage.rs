@@ -7,6 +7,7 @@
 //! governance/threshold state. The contract logic in `lib.rs` re-exports these
 //! items, so their public paths are unchanged.
 
+use astroid_interfaces::ProposalState;
 use soroban_sdk::{contracttype, Address, Bytes, Symbol, Val, Vec};
 
 #[contracttype]
@@ -24,6 +25,8 @@ pub(crate) enum DataKey {
     Proposal(u64),
     /// Relationship: whether a signer approved a proposal (persistent).
     Approval(u64, Address),
+    /// Relationship: whether a signer rejected a proposal (persistent).
+    Rejection(u64, Address),
     /// State: last used batch nonce (instance); batches must use a greater one.
     LastBatchNonce,
     /// Config: timelock delay applied to governance changes (instance, seconds).
@@ -68,9 +71,19 @@ pub struct MsProposal {
     pub payload: Bytes,
     /// Accumulated approval weight (sum of approver weights).
     pub approval_weight: u32,
+    /// Accumulated rejection weight (sum of rejecter weights).
+    pub rejection_weight: u32,
     pub executed: bool,
     /// Earliest timestamp at which execution is allowed (time lock; 0 = none).
     pub unlock_at: u64,
+    /// Voting deadline: after this timestamp no approval or rejection is
+    /// accepted (0 = no deadline). Kept separate from `unlock_at` so a
+    /// timelocked proposal still has a finite voting window.
+    pub expires_at: u64,
+    /// Position in the canonical [`ProposalState`] lifecycle. The state is the
+    /// authority on which transitions are legal; `executed` is retained for
+    /// consumers that read it directly and always mirrors `Executed`.
+    pub state: ProposalState,
 }
 
 /// A governance modification awaiting the timelock. Each variant carries the
@@ -123,4 +136,14 @@ pub struct BatchCall {
     pub func: Symbol,
     /// Arguments passed to the target function.
     pub args: Vec<Val>,
+}
+
+/// One confirmation inside a batched approval (Issue #501): `signer` approves
+/// pending proposal `proposal_id`. A batch may mix signers and proposals; every
+/// distinct signer must authorize the call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchApproval {
+    pub signer: Address,
+    pub proposal_id: u64,
 }

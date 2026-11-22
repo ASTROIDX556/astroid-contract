@@ -9,7 +9,8 @@
 //!   `ReentrancyLock`) share one ledger entry and one TTL. It is extended
 //!   once per value-moving invocation, when the re-entrancy lock is taken
 //!   ([`acquire_lock`]); releasing the lock in the same invocation does not
-//!   extend it a second time.
+//!   extend it a second time. `Registry` and `Org` are also read by `upgrade`
+//!   to ask the registry whether the caller may swap this contract's Wasm.
 //! * **Persistent** entries (`Wallet`, `Balance`, `PolicyBypass`,
 //!   `VelocityLimit`/`VelocityUsage`, `RateLimit`/`RateLimitUsage`,
 //!   `AssetBudgetId`) each carry their own TTL, extended whenever the entry
@@ -26,7 +27,7 @@ use astroid_shared::constants::{
 use astroid_shared::ensure;
 use astroid_shared::errors::Error;
 use astroid_shared::types::WalletData;
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env, String};
 
 #[contracttype]
 #[derive(Clone)]
@@ -135,6 +136,16 @@ pub(crate) fn is_paused(env: &Env) -> bool {
         .instance()
         .get(&DataKey::Paused)
         .unwrap_or(false)
+}
+
+/// Registry contract wired for module resolution and upgrade authorization.
+pub(crate) fn registry(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::Registry)
+}
+
+/// Org slug used for registry module and upgrade-permission lookups.
+pub(crate) fn org(env: &Env) -> Option<String> {
+    env.storage().instance().get(&DataKey::Org)
 }
 
 /// Whether wallet `id` is excused from the policy gate.

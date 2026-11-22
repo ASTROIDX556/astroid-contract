@@ -137,6 +137,15 @@ fn token_balance(h: &Harness, who: &Address) -> i128 {
 }
 
 #[test]
+fn initialize_requires_admin_authorization() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, WalletContract);
+    let client = WalletContractClient::new(&env, &id);
+    assert!(client.try_initialize(&admin).is_err());
+}
+
+#[test]
 fn create_wallet_starts_active() {
     let h = setup();
     let owner = Address::generate(&h.env);

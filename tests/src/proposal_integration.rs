@@ -168,7 +168,7 @@ fn approved_by_head_count_but_under_weight_is_refused_with_threshold_not_met() {
     h.proposals.approve(&h.carol, &id);
     assert_eq!(h.proposals.state(&id), ProposalState::Approved);
 
-    assert_refused(&h, id, Error::ThresholdNotMet);
+    assert_refused(&h, id, Error::QUORUM_NOT_MET);
 
     // Topping the weight up clears the gate without re-creating anything.
     h.proposals.approve(&h.alice, &id);
@@ -193,7 +193,7 @@ fn threshold_raised_after_approval_is_enforced_at_execution() {
     assert_eq!(h.multisig.get_total_weight(), 6);
 
     // The live threshold applies: 5 < 6.
-    assert_refused(&h, id, Error::ThresholdNotMet);
+    assert_refused(&h, id, Error::QUORUM_NOT_MET);
 
     h.proposals.approve(&h.carol, &id);
     assert_executes(&h, id);

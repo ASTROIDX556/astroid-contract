@@ -119,6 +119,7 @@
 //! nothing else — no auth, no code swap — so a deployer can confirm a target
 //! advances the registry before asking for the swap.
 
+use astroid_interfaces::upgrade::UpgradeAuthorizationInterface;
 use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
@@ -821,6 +822,7 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
+        require_valid_wasm_hash(&env, &wasm_hash)?;
         // A pair is taken if either layout already holds it. The common case is
         // a single existence check; the legacy key is only consulted when the
         // consolidated one is free, so a fresh registration still pays one read.
@@ -938,6 +940,10 @@ impl RegistryContract {
         // kind fails rather than laundering a no-op through the flow.
         ensure!(version != 0, Error::InvalidInput);
         require_valid_wasm_hash(&env, &wasm_hash)?;
+        ensure!(
+            Self::is_contract_address(&address),
+            Error::InvalidUpgradeAddress
+        );
 
         // Downgrade protection: strictly newer versions only.
         let latest: u32 = env
@@ -1026,6 +1032,11 @@ impl RegistryContract {
         // Re-validate everything the proposal asserted at propose time; the
         // world may have moved underneath it while it was pending.
         require_valid_wasm_hash(&env, &proposal.wasm_hash)?;
+        ensure!(proposal.version != 0, Error::InvalidInput);
+        ensure!(
+            Self::is_contract_address(&proposal.address),
+            Error::InvalidUpgradeAddress
+        );
         let latest: u32 = env
             .storage()
             .persistent()
@@ -1963,6 +1974,7 @@ impl RegistryContract {
             // the code behind a module is known.
             BoundHash::Unbound => return Err(Error::InvalidInput),
         };
+        require_valid_wasm_hash(env, &hash)?;
         ensure!(
             Self::is_wasm_approved(env.clone(), kind, hash.clone()),
             Error::Unauthorized
@@ -2018,6 +2030,7 @@ impl RegistryContract {
         env: &Env,
         wasm_hash: &BytesN<32>,
     ) -> Result<RegistryUpgradePlan, Error> {
+        require_valid_wasm_hash(env, wasm_hash)?;
         let from_version: u32 = env
             .storage()
             .instance()
@@ -2322,6 +2335,19 @@ impl RegistryInterface for RegistryContract {
             modules.push_back(Self::read_module(&env, id.org, id.kind));
         }
         Ok(modules)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade authorization surface consumed by member contracts. The registry is
+// the authority on protocol admins, multisig governance and delegated org
+// roles; this is the same permission gate `upgrade_module` applies, exposed as
+// a read so a member can decide whether to accept a code-swap request.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeAuthorizationInterface for RegistryContract {
+    fn is_upgrade_authorized(env: Env, org: String, caller: Address, kind: ModuleKind) -> bool {
+        Self::can_manage_module(env, org, caller, kind)
     }
 }
 

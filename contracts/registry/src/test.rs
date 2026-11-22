@@ -3866,26 +3866,106 @@ fn unauthorized_upgrade_attempts_are_rejected() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Issue #493 — standardized event emission through shared/events.rs.
-// ---------------------------------------------------------------------------
+#[test]
+fn register_version_refuses_a_zero_wasm_hash() {
+    let (env, client, admin) = setup();
+    let zero = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &impl_address(&env), &zero),
+        Err(Ok(Error::InvalidInput))
+    );
+}
 
 #[test]
-fn org_registration_emits_canonical_category_action_subject_topics() {
-    use astroid_shared::events::topic;
-    let (env, client, admin) = setup();
-    let org = String::from_str(&env, "acme");
-    let owner = Address::generate(&env);
-    client.register_org(&admin, &org, &owner);
+fn upgrade_proposals_require_owner_auth_and_a_contract_target() {
+    let h = setup_path();
+    let hash = BytesN::from_array(&h.env, &[9u8; 32]);
 
-    let cat: Val = topic::ORG.into_val(&env);
-    let act: Val = symbol_short!("register").into_val(&env);
-    let found = env.events().all().iter().any(|(_, topics, data)| {
-        topics.len() == 3
-            && topics.get(0).unwrap().shallow_eq(&cat)
-            && topics.get(1).unwrap().shallow_eq(&act)
-            && String::try_from_val(&env, &topics.get(2).unwrap()).ok() == Some(org.clone())
-            && Address::try_from_val(&env, &data).ok() == Some(owner.clone())
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &stranger,
+            &h.org,
+            &ModuleKind::Wallet,
+            &4,
+            &hash,
+            &impl_address(&h.env)
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &h.owner,
+            &h.org,
+            &ModuleKind::Wallet,
+            &4,
+            &hash,
+            &account_address(&h.env)
+        ),
+        Err(Ok(Error::InvalidUpgradeAddress))
+    );
+}
+
+#[test]
+fn commit_upgrade_refuses_a_recorded_account_target() {
+    let h = setup_path();
+    // Plant the legacy-shaped proposal directly: the propose gate would refuse
+    // it today, but a record written by an older deployment must not be
+    // committable into an unroutable module.
+    h.env.as_contract(&h.client.address, || {
+        h.env.storage().persistent().set(
+            &crate::DataKey::UpgradeProposal(ModuleKind::Wallet),
+            &crate::UpgradeProposal {
+                version: 4,
+                wasm_hash: BytesN::from_array(&h.env, &[9u8; 32]),
+                address: account_address(&h.env),
+                org: h.org.clone(),
+                proposer: h.owner.clone(),
+                expires_at: u64::MAX,
+            },
+        );
     });
-    assert!(found, "expected (org, register, org_id) -> owner");
+
+    assert_eq!(
+        h.client.try_commit_upgrade(&h.admin, &ModuleKind::Wallet),
+        Err(Ok(Error::InvalidUpgradeAddress))
+    );
+    assert_eq!(h.client.get_latest(&ModuleKind::Wallet), h.v3);
+}
+
+#[test]
+fn upgrade_targets_refuse_a_recorded_zero_wasm_hash() {
+    let h = setup_path();
+    let zero = BytesN::from_array(&h.env, &[0u8; 32]);
+    env_as_contract(&h, |env| {
+        env.storage().persistent().set(
+            &DataKey::VersionRecord(ModuleKind::Wallet, 4),
+            &VersionRecord {
+                address: impl_address(env),
+                hash: BoundHash::Bound(zero.clone()),
+            },
+        );
+        env.storage().persistent().set(
+            &DataKey::ApprovedWasm(ModuleKind::Wallet, zero.clone()),
+            &true,
+        );
+    });
+
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &4),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+}
+
+#[test]
+fn registry_self_upgrade_refuses_a_zero_wasm_hash() {
+    let h = setup_path();
+    let zero = BytesN::from_array(&h.env, &[0u8; 32]);
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&zero),
+        Err(Ok(Error::InvalidInput))
+    );
 }

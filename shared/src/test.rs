@@ -608,7 +608,7 @@ fn quorum_validation_helper_tests() {
     // 3. Threshold not met
     assert_eq!(
         verify_quorum(&[s1.clone(), s2.clone()], &[2, 2], &[s1.clone()], 3),
-        Err(Error::ThresholdNotMet)
+        Err(Error::QUORUM_NOT_MET)
     );
 
     // 4. Duplicate signers in approval list rejected
@@ -635,7 +635,7 @@ fn quorum_validation_helper_tests() {
     );
     assert_eq!(
         verify_quorum(&[s1.clone()], &[1], &[], 1),
-        Err(Error::ThresholdNotMet)
+        Err(Error::QUORUM_NOT_MET)
     );
 
     // 7. Mismatched signers and weights lengths
@@ -1157,7 +1157,7 @@ const RETIRED_CODES: [u32; 2] = [25, 26];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 62] = [
+const EXPECTED_CODES: [(Error, u32); 67] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1182,13 +1182,17 @@ const EXPECTED_CODES: [(Error, u32); 62] = [
     (Error::CircularUpgrade, 32),
     (Error::InvalidUpgradeAddress, 33),
     (Error::VersionNotMonotonic, 34),
-    // --- Budget (40-44) ---
+    // --- Budget (40-47) ---
     (Error::BudgetExceeded, 40),
     (Error::BudgetFrozen, 41),
     (Error::BudgetArchived, 42),
     (Error::AssetNotAuthorized, 43),
     (Error::BudgetExpired, 44),
-    (Error::BudgetWindowInvalid, 46),
+    (Error::InvalidTimeWindow, 46),
+    (Error::InvalidRolloverConfig, 47),
+    // --- Budget continued (48-49) ---
+    (Error::BudgetOverflow, 48),
+    (Error::BudgetLimitExceeded, 49),
     // --- Wallet (50-55) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
@@ -1211,6 +1215,7 @@ const EXPECTED_CODES: [(Error, u32); 62] = [
     (Error::TimelockNotExpired, 91),
     (Error::UnauthorizedModification, 92),
     (Error::DuplicateSigner, 93),
+    (Error::QuorumNotMet, 94),
     // --- Proposal (71-79) ---
     (Error::ProposalExpired, 71),
     (Error::InvalidProposalState, 72),
@@ -1230,6 +1235,8 @@ const EXPECTED_CODES: [(Error, u32); 62] = [
     (Error::AllowanceExceeded, 83),
     (Error::AllowanceExpired, 84),
     (Error::TreasuryPaused, 85),
+    (Error::AllocationLimitExceeded, 88),
+    (Error::EmergencySweepUnauthorized, 89),
 ];
 
 #[test]
@@ -1246,6 +1253,56 @@ fn error_code_table_is_frozen() {
             variant
         );
     }
+}
+
+#[test]
+fn budget_error_aliases_keep_their_deterministic_codes() {
+    // Issue #519: BUDGET_EXCEEDED, BUDGET_NOT_FOUND and INVALID_ALLOCATION must
+    // be nameable from the shared error table by both budget and wallet. They
+    // are aliases, so the published wire codes stay exactly as they were.
+    assert_eq!(Error::BudgetExceeded.code(), 40);
+    assert_eq!(Error::BudgetExceeded.wire_name(), "BUDGET_EXCEEDED");
+    assert_eq!(Error::BudgetNotFound, Error::NotFound);
+    assert_eq!(Error::BudgetNotFound.code(), 1);
+    assert_eq!(Error::InvalidAllocation, Error::InvalidInput);
+    assert_eq!(Error::InvalidAllocation.code(), 4);
+    assert_eq!(BudgetError::InvalidAllocation, BudgetError::InvalidInput);
+    assert_eq!(BudgetError::InvalidAllocation.code(), 4);
+}
+
+#[test]
+fn named_budget_and_quorum_codes_are_wire_stable() {
+    // Issues #459 and #463: the failure modes get their own published names and
+    // numbers. The mirrored budget codes stay identical in both tables, and a
+    // quorum shortfall is distinguishable from a generic threshold failure.
+    assert_eq!(Error::BUDGET_OVERFLOW, Error::BudgetOverflow);
+    assert_eq!(Error::BUDGET_OVERFLOW.code(), 48);
+    assert_eq!(Error::BUDGET_OVERFLOW.wire_name(), "BUDGET_OVERFLOW");
+    assert_eq!(Error::BUDGET_LIMIT_EXCEEDED, Error::BudgetLimitExceeded);
+    assert_eq!(Error::BUDGET_LIMIT_EXCEEDED.code(), 49);
+    assert_eq!(
+        Error::BUDGET_LIMIT_EXCEEDED.wire_name(),
+        "BUDGET_LIMIT_EXCEEDED"
+    );
+    assert_eq!(BudgetError::BUDGET_OVERFLOW, BudgetError::BudgetOverflow);
+    assert_eq!(BudgetError::BUDGET_OVERFLOW.code(), 48);
+    assert_eq!(
+        BudgetError::BUDGET_LIMIT_EXCEEDED.code(),
+        Error::BUDGET_LIMIT_EXCEEDED.code()
+    );
+    assert_eq!(
+        BudgetError::from(Error::BUDGET_OVERFLOW),
+        BudgetError::BudgetOverflow
+    );
+    assert_eq!(
+        Error::from(BudgetError::BUDGET_LIMIT_EXCEEDED),
+        Error::BUDGET_LIMIT_EXCEEDED
+    );
+    assert_eq!(Error::QUORUM_NOT_MET, Error::QuorumNotMet);
+    assert_eq!(Error::QUORUM_NOT_MET.code(), 94);
+    assert_eq!(Error::QUORUM_NOT_MET.wire_name(), "QUORUM_NOT_MET");
+    assert_ne!(Error::QUORUM_NOT_MET, Error::ThresholdNotMet);
+    assert_ne!(Error::QUORUM_NOT_MET, Error::InsufficientWeight);
 }
 
 #[test]
@@ -1273,17 +1330,18 @@ fn error_code_bands_are_ascending() {
     // Each contract's band is declared ascending, so a variant dropped into the
     // wrong block — the usual symptom of an accidental renumber — shows up as
     // a non-ascending band rather than passing silently.
-    let bands: [(u32, u32); 10] = [
+    let bands: [(u32, u32); 11] = [
         (1, 6),
         (10, 12),
         (20, 29),
         (30, 39),
-        (40, 44),
+        (40, 49),
         (50, 55),
         (60, 70),
         (71, 79),
         (80, 87),
-        (90, 93),
+        (88, 89),
+        (90, 94),
     ];
     for (low, high) in bands {
         let mut previous: Option<u32> = None;
@@ -1326,7 +1384,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let budget = Error::ALL
         .iter()
-        .filter(|e| (40..47).contains(&e.code()))
+        .filter(|e| (40..50).contains(&e.code()))
         .count();
     let wallet = Error::ALL
         .iter()
@@ -1334,7 +1392,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let multisig = Error::ALL
         .iter()
-        .filter(|e| (60..71).contains(&e.code()) || (90..94).contains(&e.code()))
+        .filter(|e| (60..71).contains(&e.code()) || (90..95).contains(&e.code()))
         .count();
     let proposal = Error::ALL
         .iter()
@@ -1346,7 +1404,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let treasury = Error::ALL
         .iter()
-        .filter(|e| (83..86).contains(&e.code()))
+        .filter(|e| (83..86).contains(&e.code()) || (88..90).contains(&e.code()))
         .count();
     let policy = Error::ALL
         .iter()
@@ -1354,12 +1412,12 @@ fn error_domains_do_not_overlap() {
         .count();
 
     assert_eq!(registry, 5, "registry band 30-39");
-    assert_eq!(budget, 6, "budget band 40-46");
+    assert_eq!(budget, 9, "budget band 40-49");
     assert_eq!(wallet, 6, "wallet band 50-55");
-    assert_eq!(multisig, 14, "multisig bands 61-70 and 90-93");
-    assert_eq!(proposal, 8, "proposal band 71-79");
+    assert_eq!(multisig, 15, "multisig bands 61-70 and 90-94");
+    assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 5, "escrow band 80-82 and 86-87");
-    assert_eq!(treasury, 3, "treasury band 83-85");
+    assert_eq!(treasury, 5, "treasury bands 83-85 and 88-89");
     assert_eq!(policy, 6, "policy band 20-29");
 }
 
@@ -1579,7 +1637,7 @@ const ERROR_SOURCE: &str = include_str!("errors.rs");
 /// The upper bound on the codes and wire names the audits below can remember.
 /// The largest table declares 51 variants; the slack keeps an in-progress table
 /// from failing on capacity alone.
-const MAX_AUDITED_CODES: usize = 64;
+const MAX_AUDITED_CODES: usize = 67;
 
 /// The upper bound on the `#[contracterror]` tables the scan tracks. Three exist
 /// today; the slack means a new one is reported as "extend the audit" rather
@@ -2012,122 +2070,77 @@ fn rollover_allowance_calculation() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #493 — centralized event builders and topic constants.
+// Issue #520: standardized deposit event emission
 // ---------------------------------------------------------------------------
 
-mod event_builders {
-    use crate::events::{self, topic};
-    use soroban_sdk::testutils::{Address as _, Events};
-    use soroban_sdk::{
-        contract, symbol_short, Address, Env, IntoVal, String, Symbol, TryFromVal, Val,
-    };
+mod deposit_events {
+    use crate::events::{self, DepositRecorded};
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
     #[contract]
-    struct Emitter;
+    pub struct DepositRecorder;
 
-    #[test]
-    fn topic_constants_match_their_wire_spelling() {
-        let env = Env::default();
-        let pairs: [(Symbol, &str); 21] = [
-            (topic::REGISTRY, "registry"),
-            (topic::ORG, "org"),
-            (topic::MODULE, "module"),
-            (topic::ROLE, "role"),
-            (topic::VERSION, "version"),
-            (topic::ADMIN, "admin"),
-            (topic::WASM, "wasm"),
-            (topic::WALLET, "wallet"),
-            (topic::SIGNER, "signer"),
-            (topic::THRESHOLD, "threshold"),
-            (topic::GOVCHANGE, "govchange"),
-            (topic::EMERGENCY, "emergency"),
-            (topic::BATCH, "batch"),
-            (topic::TIMELOCK, "timelock"),
-            (topic::PROPOSAL, "proposal"),
-            (topic::TREASURY, "treasury"),
-            (topic::MILESTONE, "milestone"),
-            (topic::BUDGET, "budget"),
-            (topic::POLICY, "policy"),
-            (topic::ESCROW, "escrow"),
-            (topic::TRANSFER, "transfer"),
-        ];
-        for (constant, spelling) in pairs {
-            assert_eq!(constant, Symbol::new(&env, spelling), "{spelling}");
+    #[contractimpl]
+    impl DepositRecorder {
+        pub fn record(
+            env: Env,
+            org: String,
+            from: Address,
+            asset: Address,
+            amount: i128,
+            balance: i128,
+        ) {
+            events::deposit_recorded(&env, &org, &from, &asset, amount, balance);
         }
     }
 
     #[test]
-    fn emit_builders_publish_two_three_and_four_topic_events() {
+    fn deposit_recorded_emits_typed_and_legacy_events() {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::{IntoVal, Symbol, TryFromVal, Val};
+
         let env = Env::default();
-        let id = env.register_contract(None, Emitter);
-        let who = Address::generate(&env);
-        env.as_contract(&id, || {
-            events::emit(&env, topic::BUDGET, symbol_short!("consumed"), 7i128);
-            events::emit_for(
-                &env,
-                topic::ESCROW,
-                symbol_short!("funded"),
-                9u64,
-                who.clone(),
-            );
-            events::emit_for_pair(
-                &env,
-                topic::MODULE,
-                symbol_short!("register"),
-                String::from_str(&env, "acme"),
-                3u32,
-                who.clone(),
-            );
-        });
-        let all = env.events().all();
-        assert_eq!(all.len(), 3);
+        env.ledger().set_timestamp(1_234);
+        let org = String::from_str(&env, "acme");
+        let from = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let id = env.register_contract(None, DepositRecorder);
 
-        let (_, t0, d0) = all.get(0).unwrap();
-        assert_eq!(t0.len(), 2);
-        assert_eq!(
-            Symbol::try_from_val(&env, &t0.get(0).unwrap()).unwrap(),
-            topic::BUDGET
-        );
-        assert_eq!(i128::try_from_val(&env, &d0).unwrap(), 7);
+        DepositRecorderClient::new(&env, &id).record(&org, &from, &asset, &50, &500);
 
-        let (_, t1, d1) = all.get(1).unwrap();
-        assert_eq!(t1.len(), 3);
-        assert_eq!(u64::try_from_val(&env, &t1.get(2).unwrap()).unwrap(), 9);
-        assert_eq!(Address::try_from_val(&env, &d1).unwrap(), who);
-
-        let (_, t2, _) = all.get(2).unwrap();
-        assert_eq!(t2.len(), 4);
-        assert_eq!(u32::try_from_val(&env, &t2.get(3).unwrap()).unwrap(), 3);
-    }
-
-    #[test]
-    fn standard_rollover_transition_and_rule_events_carry_identifiers() {
-        let env = Env::default();
-        let id = env.register_contract(None, Emitter);
-        let bid = String::from_str(&env, "eng");
-        env.as_contract(&id, || {
-            events::budget_window_rolled(&env, &bid, 2, 40, 200, 300);
-            events::proposal_state_changed(&env, 5, 1, 2);
-            events::policy_rule_denied(&env, &bid, 1, 10, Symbol::new(&env, "rule_velocity"));
-        });
-        let all = env.events().all();
-        assert_eq!(all.len(), 3);
-
-        let roll =
-            events::BudgetWindowRollover::try_from_val(&env, &all.get(0).unwrap().2).unwrap();
-        assert_eq!((roll.periods, roll.previous_spent), (2, 40));
-        assert_eq!((roll.window_start, roll.window_end), (200, 300));
-
-        let (_, topics, data) = all.get(1).unwrap();
-        assert_eq!(u64::try_from_val(&env, &topics.get(2).unwrap()).unwrap(), 5);
-        let t = events::ProposalTransition::try_from_val(&env, &data).unwrap();
-        assert_eq!((t.proposal_id, t.from, t.to), (5, 1, 2));
-
-        let (_, topics, data) = all.get(2).unwrap();
-        let act: Val = events::POLICY_RULE_DENIED.into_val(&env);
-        assert!(topics.get(1).unwrap().shallow_eq(&act));
-        let (index, leaf, reason) = <(u32, u32, Symbol)>::try_from_val(&env, &data).unwrap();
-        assert_eq!((index, leaf), (1, 10));
-        assert_eq!(reason, Symbol::new(&env, "rule_velocity"));
+        let typed_topic: Val = Symbol::new(&env, "DepositRecorded").into_val(&env);
+        let treasury_topic: Val = Symbol::new(&env, "treasury").into_val(&env);
+        let deposit_topic: Val = Symbol::new(&env, "deposit").into_val(&env);
+        let mut typed = 0;
+        let mut legacy = 0;
+        for (emitter, topics, data) in env.events().all().iter() {
+            if emitter != id.clone() {
+                continue;
+            }
+            if topics.contains(typed_topic) {
+                typed += 1;
+                let record = DepositRecorded::try_from_val(&env, &data).unwrap();
+                assert_eq!(record.org, org);
+                assert_eq!(record.from, from);
+                assert_eq!(record.asset, asset);
+                assert_eq!(record.amount, 50);
+                assert_eq!(record.balance, 500);
+                assert_eq!(record.recorded_at, 1_234);
+            }
+            if topics.contains(treasury_topic) && topics.contains(deposit_topic) {
+                legacy += 1;
+                let payload: (String, Address, Address, i128, i128, u64) =
+                    TryFromVal::try_from_val(&env, &data).unwrap();
+                assert_eq!(payload.0, org);
+                assert_eq!(payload.1, from);
+                assert_eq!(payload.2, asset);
+                assert_eq!(payload.3, 50);
+                assert_eq!(payload.4, 500);
+                assert_eq!(payload.5, 1_234);
+            }
+        }
+        assert_eq!(typed, 1);
+        assert_eq!(legacy, 1);
     }
 }

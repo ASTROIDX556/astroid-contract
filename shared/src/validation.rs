@@ -86,7 +86,7 @@ pub fn require_within_amount_bounds(value: i128, min: i128, max: i128) -> Result
 /// - `approvals` contains no duplicate signers (`Error::AlreadySigned`).
 /// - Every address in `approvals` is present in `signers` (`Error::NotASigner`).
 /// - Accumulated weight summation does not overflow `u32::MAX` (`Error::Overflow`).
-/// - Total accumulated approval weight meets or exceeds `threshold` (`Error::ThresholdNotMet`).
+/// - Total accumulated approval weight meets or exceeds `threshold` (`Error::QUORUM_NOT_MET`).
 pub fn verify_quorum(
     signers: &[Address],
     weights: &[u32],
@@ -138,7 +138,7 @@ pub fn verify_quorum(
     }
 
     if total_weight < threshold as u64 {
-        return Err(Error::ThresholdNotMet);
+        return Err(Error::QUORUM_NOT_MET);
     }
 
     Ok(())
