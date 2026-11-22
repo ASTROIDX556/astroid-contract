@@ -554,6 +554,14 @@ impl Error {
     /// named alias of [`Error::BudgetExceeded`] (40); no code changed.
     #[allow(non_upper_case_globals)]
     pub const ExceededSpendLimit: Error = Error::BudgetExceeded;
+
+    /// INVALID_ALLOCATION (Issue #519): an allocation is malformed — a
+    /// non-positive amount, an unregistered destination, or a split that does
+    /// not add up. A named alias of [`Error::InvalidInput`] (4), so both budget
+    /// and wallet integrations can report the deterministic code the issue
+    /// names without adding a new variant to the 50-case error table.
+    #[allow(non_upper_case_globals)]
+    pub const InvalidAllocation: Error = Error::InvalidInput;
 }
 
 /// Budget spend errors, kept separate from the protocol-wide error enum so
@@ -680,6 +688,12 @@ impl BudgetError {
     /// [`BudgetError::BudgetExceeded`] (code 40) for the budget spend table.
     #[allow(non_upper_case_globals)]
     pub const ExceededSpendLimit: BudgetError = BudgetError::BudgetExceeded;
+
+    /// INVALID_ALLOCATION (Issue #519): named alias of
+    /// [`BudgetError::InvalidInput`] (code 4). Keeps the budget and wallet
+    /// error tables in step on the same wire code.
+    #[allow(non_upper_case_globals)]
+    pub const InvalidAllocation: BudgetError = BudgetError::InvalidInput;
 }
 
 /// Every code the budget-specific [`BudgetError`] table can report, in

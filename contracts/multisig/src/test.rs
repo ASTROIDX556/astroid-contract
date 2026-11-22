@@ -5,6 +5,7 @@ use crate::{
     quorum, BatchApproval, BatchCall, GovernanceChange, MultiSigContract, MultiSigContractClient,
     QuorumStatus, SignerWeight,
 };
+use astroid_interfaces::ProposalState;
 use astroid_shared::constants::{
     GOVERNANCE_GRACE_PERIOD, MAX_BATCH_CALLS, MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY,
     THRESHOLD_CHANGE_DELAY_LEDGERS,
@@ -2688,4 +2689,255 @@ fn verify_proposal_weight_rejects_short_and_accepts_exact_and_excess() {
     assert_eq!(status.total_weight, 10);
     assert_eq!(status.remaining, 0);
     assert!(status.met);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #517: proposal creation, voting and execution state machine
+// ---------------------------------------------------------------------------
+
+#[test]
+fn proposal_state_walks_pending_approved_executed() {
+    // Weights 2, 1, 1 with threshold 3: the proposer alone is short.
+    let h = setup(&[2, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Pending);
+    assert_eq!(h.client.get_proposal(&id).rejection_weight, 0);
+
+    // The approval that reaches the threshold moves Pending -> Approved.
+    assert_eq!(h.client.approve(&h.signers[1], &id), 3);
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Approved);
+    assert_count_event(&h.env, "proposal", "quorum", 1);
+
+    // Execution moves Approved -> Executed, and both gates are now terminal.
+    h.client.execute(&h.signers[2], &id);
+    let stored = h.client.get_proposal(&id);
+    assert!(stored.executed);
+    assert_eq!(stored.state, ProposalState::Executed);
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Executed);
+    assert_eq!(
+        h.client.try_approve(&h.signers[2], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.signers[2], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_count_event(&h.env, "proposal", "executed", 1);
+}
+
+/// Count events with the given `(category, action)` topic pair.
+fn assert_count_event(env: &Env, category: &str, action: &str, expected: u32) {
+    assert_eq!(count_events(env, category, action), expected);
+}
+
+#[test]
+fn rejection_threshold_rejects_the_proposal() {
+    // Weights 2, 2, 1 with threshold 3: two rejecters carry enough weight.
+    let h = setup(&[2, 2, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+
+    assert_eq!(h.client.reject(&h.signers[1], &id), 2);
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Pending);
+    // The batch path refuses a proposal that already has a rejection vote from
+    // this signer, so one ballot per signer holds across both entrypoints.
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[1], id)]),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.reject(&h.signers[2], &id), 3);
+
+    let stored = h.client.get_proposal(&id);
+    assert_eq!(stored.state, ProposalState::Rejected);
+    assert_eq!(stored.rejection_weight, 3);
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Rejected);
+    assert_count_event(&h.env, "proposal", "rejected", 2);
+
+    // Rejection is terminal: no further votes, batched votes or execution.
+    assert_eq!(
+        h.client.try_approve(&h.signers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.signers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[0], id)]),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert!(!h.client.get_proposal(&id).executed);
+}
+
+#[test]
+fn a_signer_gets_one_ballot_across_approval_and_rejection() {
+    let h = setup(&[1, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+
+    // The proposer auto-approved at creation, so it cannot also reject.
+    assert_eq!(
+        h.client.try_reject(&h.signers[0], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.reject(&h.signers[1], &id), 1);
+    assert_eq!(
+        h.client.try_approve(&h.signers[1], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.signers[1], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 1);
+    assert_eq!(h.client.get_proposal(&id).rejection_weight, 1);
+}
+
+#[test]
+fn only_signers_may_reject() {
+    let h = setup(&[1, 1, 1], 2);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_reject(&stranger, &id),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(h.client.get_proposal(&id).rejection_weight, 0);
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn rejection_tally_follows_the_live_signer_set() {
+    let h = setup(&[2, 2, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.reject(&h.signers[1], &id), 2);
+
+    // Removing that signer leaves the remaining total weight (3) at the
+    // threshold, so the removal itself is valid — but its rejection vote must
+    // stop counting just as a removed approval does.
+    h.client.remove_signer(&h.signers[0], &h.signers[1]);
+    assert_eq!(h.client.get_proposal(&id).rejection_weight, 2);
+    assert_eq!(h.client.reject(&h.signers[2], &id), 1);
+    assert_eq!(h.client.get_proposal(&id).rejection_weight, 1);
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn voting_deadline_closes_approvals_rejections_and_execution() {
+    let h = setup(&[1, 1, 1], 3);
+    h.env.ledger().set_timestamp(1_000);
+    let id = h.client.propose_with_deadline(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+        &2_000,
+    );
+    assert_eq!(h.client.get_proposal(&id).expires_at, 2_000);
+    assert_eq!(h.client.approve(&h.signers[1], &id), 2);
+    // Still short of the threshold, so expiry must beat the weight gate.
+    h.env.ledger().set_timestamp(2_000);
+
+    assert_eq!(
+        h.client.try_approve(&h.signers[2], &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.signers[2], &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(
+        h.client
+            .try_approve_batch(&vec![&h.env, ba(&h.signers[2], id)]),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    // The view reports the deadline without a settling transaction...
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Expired);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 2);
+
+    // ...and anyone may record the terminal state.
+    h.client.expire_proposal(&id);
+    assert_eq!(h.client.get_proposal_state(&id), ProposalState::Expired);
+    assert_eq!(
+        h.client.try_expire_proposal(&id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_count_event(&h.env, "proposal", "expired", 1);
+}
+
+#[test]
+fn expired_deadline_cannot_start_a_proposal_or_settle_an_open_one() {
+    let h = setup(&[1, 1, 1], 2);
+    h.env.ledger().set_timestamp(5_000);
+    assert_eq!(
+        h.client.try_propose_with_deadline(
+            &h.signers[0],
+            &symbol_short!("payment"),
+            &payload(&h.env),
+            &0,
+            &5_000,
+        ),
+        Err(Ok(Error::ProposalExpired))
+    );
+
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    // A proposal with no voting deadline has nothing to settle.
+    assert_eq!(
+        h.client.try_expire_proposal(&id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+
+    let with_deadline = h.client.propose_with_deadline(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+        &6_000,
+    );
+    assert_eq!(
+        h.client.try_expire_proposal(&with_deadline),
+        Err(Ok(Error::TimelockNotExpired))
+    );
 }
