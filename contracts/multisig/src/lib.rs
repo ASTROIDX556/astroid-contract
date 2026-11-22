@@ -95,7 +95,8 @@ mod quorum;
 mod storage;
 use storage::DataKey;
 pub use storage::{
-    BatchCall, GovernanceChange, MsProposal, PendingChange, PendingThresholdChange, SignerWeight,
+    BatchApproval, BatchCall, GovernanceChange, MsProposal, PendingChange, PendingThresholdChange,
+    SignerWeight,
 };
 
 pub use quorum::QuorumStatus;
@@ -540,6 +541,111 @@ impl MultiSigContract {
             quorum::publish_threshold_met(&env, symbol_short!("proposal"), proposal_id, &status);
         }
         Ok(proposal.approval_weight)
+    }
+
+    /// Collect many confirmations in one transaction (Issue #501).
+    ///
+    /// Each [`BatchApproval`] records `signer`'s approval of pending proposal
+    /// `proposal_id`; a batch may span several proposals and several signers.
+    /// Returns, per entry and in batch order, the proposal's approval weight
+    /// once the whole batch has been applied.
+    ///
+    /// Security guarantees match [`Self::approve`] exactly, and the batch is
+    /// all-or-nothing:
+    ///
+    /// * every distinct signer is authenticated with `require_auth` (once per
+    ///   signer, however many proposals they confirm);
+    /// * every signer must be in the **current** signer set
+    ///   ([`Error::NotASigner`]);
+    /// * a (signer, proposal) pair repeated within the batch is refused with
+    ///   [`Error::DuplicateSigner`], and one already recorded on-chain with
+    ///   [`Error::AlreadySigned`];
+    /// * an unknown proposal reports [`Error::NotFound`], an executed one
+    ///   [`Error::InvalidProposalState`];
+    /// * an empty batch, or one longer than `MAX_BATCH_CALLS`, is
+    ///   [`Error::InvalidInput`]; the emergency lock refuses the whole call.
+    ///
+    /// Every entry is validated before any approval flag is written, so a
+    /// single invalid item rejects the batch and records nothing. Tallies are
+    /// rebuilt from the live signer set with checked arithmetic
+    /// ([`quorum::add_weight`]), so a duplicate can never stack weight.
+    ///
+    /// Emits the per-proposal `("proposal", "approved")` event for each entry
+    /// (so existing indexers keep their running tallies), the
+    /// `("proposal", "quorum")` event for each proposal this batch pushes over
+    /// the threshold, and one concise `("proposal", "batch_apr")` summary.
+    pub fn approve_batch(env: Env, approvals: Vec<BatchApproval>) -> Result<Vec<u32>, Error> {
+        Self::require_not_locked(&env)?;
+        let len = approvals.len();
+        if len == 0 || len > MAX_BATCH_CALLS {
+            return Err(Error::InvalidInput);
+        }
+        let signers = Self::signers(&env)?;
+        let threshold = Self::threshold(&env)?;
+
+        // Phase 1 — authenticate and validate every entry; nothing is written.
+        let mut authenticated: Vec<Address> = Vec::new(&env);
+        let mut proposal_ids: Vec<u64> = Vec::new(&env);
+        for i in 0..len {
+            let entry = approvals.get_unchecked(i);
+            for j in 0..i {
+                let prior = approvals.get_unchecked(j);
+                if prior.signer == entry.signer && prior.proposal_id == entry.proposal_id {
+                    return Err(Error::DuplicateSigner);
+                }
+            }
+            // Signer validity / active status against the live signer set.
+            Self::weight_in(&signers, &entry.signer)?;
+            if !authenticated.contains(&entry.signer) {
+                entry.signer.require_auth();
+                authenticated.push_back(entry.signer.clone());
+            }
+            let proposal = Self::load_proposal(&env, entry.proposal_id)?;
+            if proposal.executed {
+                return Err(Error::InvalidProposalState);
+            }
+            let akey = DataKey::Approval(entry.proposal_id, entry.signer.clone());
+            if env.storage().persistent().get(&akey).unwrap_or(false) {
+                return Err(Error::AlreadySigned);
+            }
+            if !proposal_ids.contains(entry.proposal_id) {
+                proposal_ids.push_back(entry.proposal_id);
+            }
+        }
+
+        // Phase 2 — record every approval flag.
+        for entry in approvals.iter() {
+            env.storage().persistent().set(
+                &DataKey::Approval(entry.proposal_id, entry.signer.clone()),
+                &true,
+            );
+            Self::bump_approval(&env, entry.proposal_id, &entry.signer);
+        }
+
+        // Phase 3 — recompute each touched proposal's tally once, from the
+        // live signer set, and announce threshold transitions.
+        for id in proposal_ids.iter() {
+            let mut proposal = Self::load_proposal(&env, id)?;
+            let was_met = quorum::is_met(proposal.approval_weight, threshold);
+            let status = Self::quorum_status(&env, id)?;
+            proposal.approval_weight = status.approval_weight;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(id), &proposal);
+            Self::bump_proposal(&env, id);
+            if status.met && !was_met {
+                quorum::publish_threshold_met(&env, symbol_short!("proposal"), id, &status);
+            }
+        }
+
+        let mut weights: Vec<u32> = Vec::new(&env);
+        for entry in approvals.iter() {
+            let weight = Self::load_proposal(&env, entry.proposal_id)?.approval_weight;
+            events::proposal_approved(&env, entry.proposal_id, &entry.signer, weight);
+            weights.push_back(weight);
+        }
+        events::proposal_batch_approved(&env, len, proposal_ids);
+        Ok(weights)
     }
 
     /// Execute a proposal once the accumulated approval weight meets the
