@@ -725,7 +725,7 @@ fn execution_revalidates_against_live_state() {
     assert_eq!(
         h.client
             .try_execute_threshold_change(&h.signers[1], &removal),
-        Err(Ok(Error::InvalidThreshold))
+        Err(Ok(Error::ThresholdExceeded))
     );
     assert!(h.client.is_signer(&h.signers[0]));
 }
@@ -907,19 +907,40 @@ fn cannot_drop_total_weight_below_threshold() {
     let res = h
         .client
         .try_propose_signer_removal(&h.signers[1], &h.signers[0]);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    assert_eq!(res, Err(Ok(Error::ThresholdExceeded)));
 
     // Lowering signer[0] weight to 1 would drop total to 2 < 3 -> rejected.
     let res = h
         .client
         .try_propose_weight_change(&h.signers[1], &h.signers[0], &1);
-    assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
+    assert_eq!(res, Err(Ok(Error::ThresholdExceeded)));
 
     // Zero weights are never admissible.
     let res = h
         .client
         .try_propose_weight_change(&h.signers[1], &h.signers[0], &0);
     assert_eq!(res, Err(Ok(Error::InvalidSignerWeight)));
+}
+
+#[test]
+fn direct_signer_removal_rejects_threshold_exceeded() {
+    // Weights 2, 1 with threshold 3: removing the large signer leaves 1 < 3.
+    let h = setup(&[2, 1], 3);
+    assert_eq!(
+        h.client.try_remove_signer(&h.signers[1], &h.signers[0]),
+        Err(Ok(Error::ThresholdExceeded))
+    );
+    assert!(h.client.is_signer(&h.signers[0]));
+}
+
+#[test]
+fn adding_a_signer_keeps_an_exact_threshold_satisfiable() {
+    let h = setup(&[1, 1], 2);
+    let extra = Address::generate(&h.env);
+    h.client.add_signer(&h.signers[0], &extra, &1);
+    assert_eq!(h.client.get_threshold(), 2);
+    assert_eq!(h.client.get_total_weight(), 3);
+    assert!(h.client.is_signer(&extra));
 }
 
 #[test]

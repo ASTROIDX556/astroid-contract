@@ -969,7 +969,8 @@ impl TreasuryContract {
         // 2. Issue #308 — a contract caller must be the registry-recorded
         //    Multisig (governance) module for this organization; account
         //    callers pass through to the admin check above.
-        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+        let registry_verified =
+            Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
 
         // 3. Issue #321 — refuse to settle a high-value payout in the same
         //    transaction that requests it. Everything below this point moves
@@ -977,7 +978,7 @@ impl TreasuryContract {
         //    every external call.
         Self::require_not_time_locked(&env, amount)?;
 
-        Self::settle_withdrawal(&env, &t, &caller, &asset, &to, amount)
+        Self::settle_withdrawal(&env, &t, &caller, &asset, &to, amount, registry_verified)
     }
 
     /// The value-moving half of [`Self::withdraw`]: policy, budget, allowance,
@@ -994,6 +995,7 @@ impl TreasuryContract {
         asset: &Address,
         to: &Address,
         amount: i128,
+        registry_verified: bool,
     ) -> Result<(), Error> {
         // Issue #308 — engage the reentrancy lock before the first
         // external call (policy and budget are cross-contract invocations
@@ -1071,6 +1073,7 @@ impl TreasuryContract {
             },
         );
         Self::emit_withdrawn(env, t, to, asset, amount, balance);
+        Self::emit_withdrawal_audit(env, t, caller, to, asset, amount, registry_verified);
         Self::unlock(env);
         Ok(())
     }
@@ -1132,12 +1135,13 @@ impl TreasuryContract {
         // 3. Issue #308 — a contract caller must be the registry-recorded
         //    Multisig (governance) module for this organization; account
         //    callers pass through to the admin check above.
-        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+        let registry_verified =
+            Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
         // 4. Issue #321 — the aggregate payout, not the individual legs, decides
         //    whether the cooling-off period applies.
         Self::require_not_time_locked(&env, total)?;
 
-        Self::settle_batch(&env, &t, &caller, &asset, payments)
+        Self::settle_batch(&env, &t, &caller, &asset, payments, registry_verified)
     }
 
     /// The value-moving half of [`Self::batch_transfer`]: per-leg policy, the
@@ -1152,6 +1156,7 @@ impl TreasuryContract {
         caller: &Address,
         asset: &Address,
         payments: Vec<Payment>,
+        registry_verified: bool,
     ) -> Result<(), Error> {
         // Re-accumulate the total from the legs themselves rather than trusting
         // a stored figure, so the amount budget is debited is always exactly the
@@ -1229,6 +1234,17 @@ impl TreasuryContract {
             (symbol_short!("treasury"), symbol_short!("batchpay")),
             (asset.clone(), payments.len(), total),
         );
+        for payment in payments.iter() {
+            Self::emit_withdrawal_audit(
+                env,
+                t,
+                caller,
+                &payment.recipient,
+                asset,
+                payment.amount,
+                registry_verified,
+            );
+        }
 
         Self::unlock(env);
         Ok(())
@@ -1412,7 +1428,8 @@ impl TreasuryContract {
         // time: the asset may have been de-whitelisted, or the caller may have
         // stopped being the recorded module, during the waiting period.
         Self::require_approved_asset(&env, &p.asset)?;
-        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+        let registry_verified =
+            Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
 
         // Record the settlement before the payout. If the payout aborts, the
         // host reverts this write along with everything else, so the record
@@ -1427,9 +1444,24 @@ impl TreasuryContract {
         );
 
         if p.payments.is_empty() {
-            Self::settle_withdrawal(&env, &t, &caller, &p.asset, &p.to, p.amount)?;
+            Self::settle_withdrawal(
+                &env,
+                &t,
+                &caller,
+                &p.asset,
+                &p.to,
+                p.amount,
+                registry_verified,
+            )?;
         } else {
-            Self::settle_batch(&env, &t, &caller, &p.asset, p.payments.clone())?;
+            Self::settle_batch(
+                &env,
+                &t,
+                &caller,
+                &p.asset,
+                p.payments.clone(),
+                registry_verified,
+            )?;
         }
 
         env.events().publish(
@@ -1574,7 +1606,8 @@ impl TreasuryContract {
         let t = Self::require_admin(&env, &caller)?;
         Self::require_active(&t)?;
         // Issue #308 — verify the caller before the ledger is touched.
-        Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
+        let registry_verified =
+            Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
         // Take the same reentrancy guard the other two outflows take, before
         // the disbursement counter is advanced and the payout is made.
         Self::lock(&env)?;
@@ -1629,6 +1662,15 @@ impl TreasuryContract {
             (milestone_id, d.disbursed, amount),
         );
         Self::emit_withdrawn(&env, &t, &d.to, &d.asset, amount, holding.total_in);
+        Self::emit_withdrawal_audit(
+            &env,
+            &t,
+            &caller,
+            &d.to,
+            &d.asset,
+            amount,
+            registry_verified,
+        );
         Self::unlock(&env);
         Ok(())
     }
@@ -1953,6 +1995,32 @@ impl TreasuryContract {
         );
     }
 
+    /// Record who actually invoked a settled outflow and whether the registry
+    /// vouched for that caller. `registry_verified` is captured by the gate that
+    /// authorized the movement, so the audit event cannot disagree with it.
+    fn emit_withdrawal_audit(
+        env: &Env,
+        t: &Treasury,
+        caller: &Address,
+        to: &Address,
+        asset: &Address,
+        amount: i128,
+        registry_verified: bool,
+    ) {
+        events::publish(
+            env,
+            events::ContractEvent::TreasuryWithdrawalAudit {
+                org: t.org.clone(),
+                caller: caller.clone(),
+                to: to.clone(),
+                asset: asset.clone(),
+                amount,
+                registry_verified,
+                recorded_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
     /// Release the reentrancy guard at the end of a movement.
     fn unlock(env: &Env) {
         env.storage()
@@ -2089,25 +2157,30 @@ impl TreasuryContract {
     /// The refusal uses [`Error::Unauthorized`]: the canonical enum is at its
     /// XDR 50-variant cap, so a dedicated code cannot be added (see the note
     /// on `shared/src/errors.rs`).
+    /// Verify the caller and report whether the registry actually vouched for
+    /// it. The boolean is audit metadata: account callers and unset registries
+    /// keep their legacy passthrough (reported as `false`), while a successful
+    /// registry lookup is reported as `true`. A configured registry that cannot
+    /// vouch for a contract caller still fails closed with `Unauthorized`.
     fn require_verified_caller(
         env: &Env,
         t: &Treasury,
         caller: &Address,
         expected_kind: ModuleKind,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         if !Self::is_contract_address(caller) {
-            return Ok(());
+            return Ok(false);
         }
         let registry = match &t.registry {
             Some(addr) => RegistryClient::new(env, addr),
-            None => return Ok(()),
+            None => return Ok(false),
         };
         let verified = match registry.try_lookup(&t.org.clone(), &expected_kind) {
             Ok(Ok(recorded)) => recorded == *caller,
             Ok(Err(_)) | Err(_) => false,
         };
         if verified {
-            Ok(())
+            Ok(true)
         } else {
             Err(Error::Unauthorized)
         }

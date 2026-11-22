@@ -327,6 +327,71 @@ fn h_assert_refused<R: std::fmt::Debug>(res: R) {
     );
 }
 
+#[test]
+fn a_contract_caller_must_be_the_registered_multisig_to_withdraw() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = Address::generate(&env);
+    let governance = env.register_contract(None, RegistryContract);
+    let merchant = Address::generate(&env);
+    let org = String::from_str(&env, ORG);
+
+    let registry_id = env.register_contract(None, RegistryContract);
+    let registry = RegistryContractClient::new(&env, &registry_id);
+    registry.initialize(&owner);
+    registry.register_org(&owner, &org, &owner);
+
+    let treasury_id = env.register_contract(None, TreasuryContract);
+    let treasury = TreasuryContractClient::new(&env, &treasury_id);
+    treasury.initialize(&org, &governance);
+    treasury.set_registry(&governance, &Some(registry_id.clone()));
+    registry.register_module(&owner, &org, &ModuleKind::Treasury, &treasury_id);
+    registry.register_module(&owner, &org, &ModuleKind::Multisig, &governance);
+
+    let wallet = env.register_contract(None, RegistryContract);
+    registry.register_module(&owner, &org, &ModuleKind::Wallet, &wallet);
+
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    treasury.add_approved_asset(&governance, &asset);
+    token::StellarAssetClient::new(&env, &asset).mint(&wallet, &1_000);
+    treasury.deposit(&wallet, &asset, &1_000);
+
+    // While the contract is the recorded Multisig module, its signed withdrawal
+    // is the authorized governance path and value moves normally.
+    treasury.withdraw(&governance, &asset, &merchant, &100);
+    assert_eq!(
+        token::TokenClient::new(&env, &asset).balance(&merchant),
+        100
+    );
+
+    // Re-point the record at a different module kind: the same signed contract
+    // is no longer the org's Multisig and every withdrawal must be refused,
+    // even though its admin identity and signature are still valid.
+    registry.remove_module(&owner, &org, &ModuleKind::Multisig);
+    registry.register_module(&owner, &org, &ModuleKind::Proposal, &governance);
+
+    let before = (
+        token::TokenClient::new(&env, &asset).balance(&treasury.address),
+        treasury.holding(&asset).total_out,
+    );
+    assert_eq!(
+        treasury.try_withdraw(&governance, &asset, &merchant, &100),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        (
+            token::TokenClient::new(&env, &asset).balance(&treasury.address),
+            treasury.holding(&asset).total_out,
+        ),
+        before,
+        "a registry-verification refusal must move nothing"
+    );
+}
+
 // --- authorized signature, wrong identity ---------------------------------
 
 #[test]
