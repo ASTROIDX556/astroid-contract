@@ -227,7 +227,7 @@ fn proposal_waits_for_weight_threshold_and_checks_it_at_execution() {
     assert_eq!(h.client.get(&id).approval_weight, 3);
     assert_eq!(
         h.client.try_execute(&h.proposer, &id),
-        Err(Ok(Error::ThresholdNotMet))
+        Err(Ok(Error::QUORUM_NOT_MET))
     );
 
     h.client.approve(&h.approvers[2], &id);

@@ -376,7 +376,7 @@ fn multisig_batch_freezes_and_unfreezes_the_treasury() {
             &vec![&h.env, h.unfreeze_call()],
             &h.signers(&[&h.carol]),
         ),
-        Err(Ok(Error::ThresholdNotMet))
+        Err(Ok(Error::QUORUM_NOT_MET))
     );
     // ...and a failed batch does not burn its nonce.
     assert_eq!(h.multisig.get_last_batch_nonce(), 1);
@@ -435,7 +435,7 @@ fn batch_duplicate_signatories_count_once() {
             &vec![&h.env, h.allocate_call("dup", 1)],
             &h.signers(&[&h.alice, &h.alice]),
         ),
-        Err(Ok(Error::ThresholdNotMet))
+        Err(Ok(Error::QUORUM_NOT_MET))
     );
     assert_eq!(h.budget.try_get(&h.s("dup")), Err(Ok(Error::NotFound)));
 }
@@ -468,7 +468,7 @@ fn verify_threshold_checks_a_signature_set_without_executing() {
     assert_eq!(
         h.multisig
             .try_verify_threshold(&h.bob, &h.signers(&[&h.carol]), &payload),
-        Err(Ok(Error::ThresholdNotMet))
+        Err(Ok(Error::QUORUM_NOT_MET))
     );
     let outsider = Address::generate(&h.env);
     assert_eq!(

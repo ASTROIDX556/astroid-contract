@@ -1131,8 +1131,8 @@ impl ProposalContract {
     ///   would let any (even empty) approval set through, so it fails closed
     ///   with [`Error::InvalidThreshold`] instead of executing;
     /// * the verified approval weight must meet or exceed that threshold,
-    ///   otherwise [`Error::ThresholdNotMet`] (the protocol's
-    ///   insufficient-signers code).
+    ///   otherwise [`Error::QUORUM_NOT_MET`] (the dedicated weighted-quorum
+    ///   code introduced for issue #459).
     ///
     /// The threshold is read on every call, so a threshold raised (or a signer
     /// removed) after a proposal reached `Approved` is honoured at execution.
@@ -1147,7 +1147,7 @@ impl ProposalContract {
             return Err(Error::InvalidThreshold);
         }
         if approval_weight < multisig_threshold {
-            return Err(Error::ThresholdNotMet);
+            return Err(Error::QUORUM_NOT_MET);
         }
         Ok(())
     }
@@ -1171,7 +1171,8 @@ impl ProposalContract {
                 );
             }
             if approved && multisig_client.is_signer(&approver) {
-                approvals = checked_add(approvals as i128, 1)? as u32;
+                let next = checked_add(approvals as i128, 1)?;
+                approvals = u32::try_from(next).map_err(|_| Error::Overflow)?;
                 weight = checked_add(weight, multisig_client.get_signer_weight(&approver) as i128)?;
             }
         }

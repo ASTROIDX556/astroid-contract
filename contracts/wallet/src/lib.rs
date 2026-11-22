@@ -375,6 +375,7 @@ impl WalletContract {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         // The admin is its own guardian until a dedicated one is designated.
         env.storage().instance().set(&DataKey::Guardian, &admin);
@@ -842,24 +843,7 @@ impl WalletContract {
         // take effect without re-wiring the wallet. Each fallible step
         // unlocks before returning so a failed spend never leaves the
         // contract locked (even if the host commits storage on Err).
-        if let Err(e) = Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        if let Err(e) = Self::enforce_velocity(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Rate limiting counts both value and transactions, across every asset
-        // and outbound path, after the per-asset velocity ceiling.
-        if let Err(e) = Self::enforce_rate_limit(&env, wallet_id, amount, 1) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Allowance verification, debit and payout share one read of the
-        // tracked balance: the tracked ledger and the real SAC custody must
-        // each cover the amount before anything moves.
-        if let Err(e) = Self::settle_outbound(&env, wallet_id, &asset, amount, &to) {
+        if let Err(e) = Self::execute_spend(&env, wallet_id, &asset, &to, amount, &caller) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -885,26 +869,8 @@ impl WalletContract {
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active_for_transfer(&wallet)?;
         Self::lock(&env)?;
-        if let Err(e) =
-            Self::pre_execute_checks(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
+        if let Err(e) = Self::execute_spend(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
         {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        if let Err(e) = Self::enforce_velocity(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Rate limiting counts both value and transactions, across every asset
-        // and outbound path, after the per-asset velocity ceiling.
-        if let Err(e) = Self::enforce_rate_limit(&env, wallet_id, amount, 1) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Same single-read verification and debit as `transfer`: tracked
-        // balance and real SAC custody both cover the amount before any
-        // token call.
-        if let Err(e) = Self::settle_outbound(&env, wallet_id, &asset, amount, &wallet.owner) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -1086,15 +1052,6 @@ impl WalletContract {
                 }
             }
 
-            // The velocity ceiling is not opt-out per action: an agent cannot
-            // route around it by leaving `policy_id` empty. Actions accumulate
-            // against the same cached record, so a batch can never split a
-            // window's allowance across actions to slip past the ceiling.
-            if let Err(e) = velocity.enforce(&env, &action.asset, action.amount) {
-                Self::unlock(&env);
-                return Err(e);
-            }
-
             if !action.budget_id.is_empty() {
                 let budget_addr = match reg_budget.as_ref() {
                     Some(a) => a,
@@ -1118,6 +1075,15 @@ impl WalletContract {
                         return Err(Error::BudgetExceeded);
                     }
                 }
+            }
+
+            // The velocity ceiling is not opt-out per action: an agent cannot
+            // route around it by leaving `policy_id` empty. Actions accumulate
+            // against the same cached record, so a batch can never split a
+            // window's allowance across actions to slip past the ceiling.
+            if let Err(e) = velocity.enforce(&env, &action.asset, action.amount) {
+                Self::unlock(&env);
+                return Err(e);
             }
         }
 
@@ -1583,8 +1549,22 @@ impl WalletContract {
         }
     }
 
-    /// Atomic pre-execution hook: policy → budget → velocity, before any
-    /// debit. If registry is configured, addresses are resolved dynamically;
+    fn execute_spend(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+        caller: &Address,
+    ) -> Result<(), Error> {
+        Self::pre_execute_checks(env, wallet_id, asset, recipient, amount, caller)?;
+        Self::enforce_velocity(env, wallet_id, asset, amount)?;
+        Self::enforce_rate_limit(env, wallet_id, amount, 1)?;
+        Self::settle_outbound(env, wallet_id, asset, amount, recipient)
+    }
+
+    /// Atomic gate hook: policy evaluation immediately followed by budget
+    /// consumption, before any debit. If registry is configured, addresses are resolved dynamically;
     /// otherwise falls back to instance-wired addresses. A bypassed wallet
     /// skips the policy gate but never the budget or velocity gates.
     ///
