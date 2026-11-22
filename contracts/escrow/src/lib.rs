@@ -1603,6 +1603,58 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Refund an expired escrow to its original funder and remove its storage.
+    ///
+    /// Permissionless: any keeper may call this once the settlement window has
+    /// closed, but the funds always return to `escrow.sender`. The effective
+    /// expiration deadline is `deadline + grace_period`; before `deadline` the
+    /// call fails with [`Error::EscrowNotExpired`], during the grace window with
+    /// [`Error::GraceActive`], and after a configured `refund_window` closes with
+    /// [`Error::EscrowExpired`]. Settled escrows fail with
+    /// [`Error::EscrowAlreadySettled`].
+    ///
+    /// The escrow record (and any release-condition or milestone metadata) is
+    /// deleted before the token transfers are issued, so a repeated call or a
+    /// re-entrant call cannot refund the same funds twice.
+    pub fn refund_expired(env: Env, id: u64) -> Result<(), Error> {
+        let escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::EscrowAlreadySettled);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < escrow.deadline {
+            return Err(Error::EscrowNotExpired);
+        }
+        if now < Self::grace_end(&escrow)? {
+            return Err(Error::GraceActive);
+        }
+        Self::require_refund_window_open(&env, &escrow)?;
+
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        Self::cleanup_expired_escrow_storage(&env, id);
+        Self::transfer_all(&env, &escrow, &escrow.sender, remaining)?;
+
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
+        events::escrow_funds_refunded(&env, id, &escrow.sender, remaining);
+        env.events().publish(
+            (
+                Symbol::new(&env, "escrow"),
+                Symbol::new(&env, "refund_expired"),
+            ),
+            (id, escrow.sender.clone()),
+        );
+        Ok(())
+    }
+
     pub fn close(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
@@ -2135,6 +2187,24 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
         Ok(())
+    }
+
+    /// Remove every persistent entry belonging to an escrow after its funds
+    /// have been refunded. Approvals live under participant-keyed entries, so
+    /// they are cleaned up through the condition's participant list.
+    fn cleanup_expired_escrow_storage(env: &Env, id: u64) {
+        if let Some(condition) = load_release_condition(env, id) {
+            for participant in condition.participants.iter() {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::ReleaseApproval(id, participant));
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ReleaseCondition(id));
+        }
+        env.storage().persistent().remove(&DataKey::Milestones(id));
+        env.storage().persistent().remove(&DataKey::Escrow(id));
     }
 
     /// Timestamp the refund window closes at (`0` = never). Refunds open at
