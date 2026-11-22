@@ -1157,7 +1157,7 @@ const RETIRED_CODES: [u32; 2] = [25, 26];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 60] = [
+const EXPECTED_CODES: [(Error, u32); 63] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1188,6 +1188,7 @@ const EXPECTED_CODES: [(Error, u32); 60] = [
     (Error::BudgetArchived, 42),
     (Error::AssetNotAuthorized, 43),
     (Error::BudgetExpired, 44),
+    (Error::InvalidTimeWindow, 46),
     // --- Wallet (50-55) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
@@ -1228,6 +1229,8 @@ const EXPECTED_CODES: [(Error, u32); 60] = [
     (Error::AllowanceExceeded, 83),
     (Error::AllowanceExpired, 84),
     (Error::TreasuryPaused, 85),
+    (Error::AllocationLimitExceeded, 88),
+    (Error::EmergencySweepUnauthorized, 89),
 ];
 
 #[test]
@@ -1271,16 +1274,17 @@ fn error_code_bands_are_ascending() {
     // Each contract's band is declared ascending, so a variant dropped into the
     // wrong block — the usual symptom of an accidental renumber — shows up as
     // a non-ascending band rather than passing silently.
-    let bands: [(u32, u32); 10] = [
+    let bands: [(u32, u32); 11] = [
         (1, 6),
         (10, 12),
         (20, 29),
         (30, 39),
-        (40, 44),
+        (40, 49),
         (50, 55),
         (60, 70),
         (71, 79),
         (80, 87),
+        (88, 89),
         (90, 93),
     ];
     for (low, high) in bands {
@@ -1324,7 +1328,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let budget = Error::ALL
         .iter()
-        .filter(|e| (40..45).contains(&e.code()))
+        .filter(|e| (40..50).contains(&e.code()))
         .count();
     let wallet = Error::ALL
         .iter()
@@ -1344,7 +1348,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let treasury = Error::ALL
         .iter()
-        .filter(|e| (83..86).contains(&e.code()))
+        .filter(|e| (83..86).contains(&e.code()) || (88..90).contains(&e.code()))
         .count();
     let policy = Error::ALL
         .iter()
@@ -1352,12 +1356,12 @@ fn error_domains_do_not_overlap() {
         .count();
 
     assert_eq!(registry, 5, "registry band 30-39");
-    assert_eq!(budget, 5, "budget band 40-44");
+    assert_eq!(budget, 6, "budget band 40-49");
     assert_eq!(wallet, 6, "wallet band 50-55");
     assert_eq!(multisig, 14, "multisig bands 61-70 and 90-93");
     assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 5, "escrow band 80-82 and 86-87");
-    assert_eq!(treasury, 3, "treasury band 83-85");
+    assert_eq!(treasury, 5, "treasury bands 83-85 and 88-89");
     assert_eq!(policy, 6, "policy band 20-29");
 }
 

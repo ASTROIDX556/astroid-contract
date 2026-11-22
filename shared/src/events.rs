@@ -871,3 +871,152 @@ pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
     let topics = (symbol_short!("wallet"), symbol_short!("batch"));
     env.events().publish(topics, (wallet_id, call_count));
 }
+
+// ---------------------------------------------------------------------------
+// Wallet policy evaluation failures (Issue #504)
+// ---------------------------------------------------------------------------
+
+/// Typed payload of the standardized wallet policy-failure event (Issue #504).
+///
+/// Published by the wallet whenever its pre-execution policy gate refuses an
+/// outbound movement, so off-chain monitoring sees one concise, uniform record
+/// per refusal regardless of which rule fired:
+///
+/// * `agent` — the account that attempted the movement (the AI agent's key;
+///   also carried as the third topic so a subscriber can follow one agent
+///   without decoding payloads);
+/// * `wallet_id` — the wallet the movement would have debited;
+/// * `policy_id` — the policy envelope that was evaluated (`"active"` for the
+///   wallet's standing gate, or a batch action's own `policy_id`);
+/// * `reason` — the `UPPER_SNAKE_CASE` wire name of the refusal
+///   ([`crate::errors::Error::wire_name`]), e.g. `POLICY_DENIED`, or
+///   `POLICY_UNAVAILABLE` when the policy contract could not be invoked;
+/// * `code` — the numeric contract error code matching `reason`;
+/// * `timestamp` — the ledger timestamp, following the
+///   payload-ends-with-timestamp convention from Issue #222.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyViolationEvent {
+    pub agent: Address,
+    pub wallet_id: u64,
+    pub policy_id: String,
+    pub reason: Symbol,
+    pub code: u32,
+    pub timestamp: u64,
+}
+
+/// Topic category symbol of [`wallet_policy_violation`].
+pub const WALLET_TOPIC: Symbol = symbol_short!("wallet");
+/// Topic action symbol of [`wallet_policy_violation`].
+pub const POLICY_VIOLATION_ACTION: Symbol = symbol_short!("pol_viol");
+
+/// `WalletPolicyViolation` — topic `("wallet", "pol_viol", agent)`, data
+/// [`PolicyViolationEvent`].
+///
+/// Note on durability: Soroban rolls back every event of an invocation that
+/// returns an error. The wallet therefore publishes this both on its reverting
+/// spend paths (visible in simulation / diagnostic traces) and on the
+/// non-reverting `evaluate_policy` pre-flight entrypoint, whose event is
+/// committed on-chain.
+pub fn wallet_policy_violation(env: &Env, event: &PolicyViolationEvent) {
+    env.events().publish(
+        (WALLET_TOPIC, POLICY_VIOLATION_ACTION, event.agent.clone()),
+        event.clone(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multisig batch confirmations (Issue #501)
+// ---------------------------------------------------------------------------
+
+/// `ProposalBatchApproved` — topic `("proposal", "batch_apr")`, data
+/// `(approvals, proposal_ids, timestamp)`.
+///
+/// One concise event per batched confirmation call: `approvals` is the number
+/// of (signer, proposal) confirmations recorded and `proposal_ids` lists the
+/// proposals they touched, in batch order (duplicates collapsed). Per-proposal
+/// `("proposal", "approved")` events are still published so existing indexers
+/// keep their running tallies.
+pub fn proposal_batch_approved(env: &Env, approvals: u32, proposal_ids: Vec<u64>) {
+    let topics = (symbol_short!("proposal"), symbol_short!("batch_apr"));
+    env.events()
+        .publish(topics, (approvals, proposal_ids, env.ledger().timestamp()));
+}
+
+// ---------------------------------------------------------------------------
+// Treasury sub-allocations and emergency sweep (Issue #502)
+// ---------------------------------------------------------------------------
+
+/// `AllocationLimitSet` — topic `("treasury", "alloc_cap")`, data
+/// `(category, asset, max_amount, timestamp)`.
+pub fn treasury_allocation_limit_set(env: &Env, category: &Symbol, asset: &Address, max: i128) {
+    let topics = (symbol_short!("treasury"), symbol_short!("alloc_cap"));
+    env.events().publish(
+        topics,
+        (
+            category.clone(),
+            asset.clone(),
+            max,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// `AllocationChanged` — topic `("treasury", action)` where `action` is
+/// `alloc` (reserve) or `dealloc` (release), data
+/// `(category, asset, amount, reserved_after, timestamp)`.
+pub fn treasury_allocation_changed(
+    env: &Env,
+    action: Symbol,
+    category: &Symbol,
+    asset: &Address,
+    amount: i128,
+    reserved_after: i128,
+) {
+    let topics = (symbol_short!("treasury"), action);
+    env.events().publish(
+        topics,
+        (
+            category.clone(),
+            asset.clone(),
+            amount,
+            reserved_after,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// `RecoveryAddressSet` — topic `("treasury", "recov_set")`, data
+/// `(recovery, actor, timestamp)`.
+pub fn treasury_recovery_set(env: &Env, recovery: &Address, actor: &Address) {
+    let topics = (symbol_short!("treasury"), symbol_short!("recov_set"));
+    env.events().publish(
+        topics,
+        (recovery.clone(), actor.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// `EmergencySweep` — topic `("treasury", "em_sweep", asset)`, data
+/// `(actor, recovery, amount, timestamp)`. Published once per swept asset.
+pub fn treasury_emergency_sweep(
+    env: &Env,
+    actor: &Address,
+    recovery: &Address,
+    asset: &Address,
+    amount: i128,
+) {
+    let topics = (
+        symbol_short!("treasury"),
+        symbol_short!("em_sweep"),
+        asset.clone(),
+    );
+    env.events().publish(
+        topics,
+        (
+            actor.clone(),
+            recovery.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}

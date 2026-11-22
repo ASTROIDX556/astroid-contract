@@ -102,15 +102,22 @@
 //! Every handler validates its inputs before touching storage and fails with a
 //! stable code from the shared [`Error`] table rather than panicking:
 //!
-//! | Condition                                                   | Error                     |
-//! |-------------------------------------------------------------|---------------------------|
-//! | Spend / release / transfer amount `<= 0`                    | [`Error::InvalidAmount`]  |
-//! | Negative limit or rollover cap                              | [`Error::InvalidAmount`]  |
-//! | Limit below spent, expiry already passed, malformed period  | [`Error::InvalidInput`]   |
-//! | Spend would exceed the effective ceiling                    | [`Error::BudgetExceeded`] |
-//! | Checked arithmetic would overflow `i128`                    | [`Error::Overflow`]       |
-//! | Caller is not the budget owner                              | [`Error::Unauthorized`]   |
-//! | Budget is frozen / archived / expired                       | [`Error::BudgetFrozen`] / [`Error::BudgetArchived`] / [`Error::BudgetExpired`] |
+//! Issue #503 gives the four budget-domain failures explicit names. Two are
+//! named aliases that keep their published wire codes, so no consumer breaks:
+//!
+//! | Condition                                                   | Error                          | Code |
+//! |-------------------------------------------------------------|--------------------------------|------|
+//! | No budget exists for the id                                 | [`Error::BudgetNotFound`] (alias of `NotFound`) | 1 |
+//! | Spend would exceed the effective ceiling / per-asset limit  | [`Error::ExceededSpendLimit`] (alias of `BudgetExceeded`) | 40 |
+//! | Budget window has closed (`now >= expires_at`)              | [`Error::BudgetExpired`]       | 44 |
+//! | Budget has not started yet (`now < starts_at`)              | [`BudgetError::BudgetNotActive`] | 45 |
+//! | Expiry not after now/start, zero-length `Custom` interval, deficit on a non-recurring period | [`Error::InvalidTimeWindow`] | 46 |
+//! | Spend / release / transfer amount `<= 0`                    | [`Error::InvalidAmount`]       | 12 |
+//! | Negative limit or rollover cap                              | [`Error::InvalidAmount`]       | 12 |
+//! | Limit below spent, rollover bps out of range                | [`Error::InvalidInput`]        | 4  |
+//! | Checked arithmetic would overflow `i128`                    | [`Error::Overflow`]            | 11 |
+//! | Caller is not the budget owner                              | [`Error::Unauthorized`]        | 3  |
+//! | Budget is frozen / archived                                 | [`Error::BudgetFrozen`] / [`Error::BudgetArchived`] | 41 / 42 |
 
 use astroid_interfaces::{BudgetInterface, UpgradeableInterface};
 use astroid_shared::constants::{
@@ -436,7 +443,7 @@ impl BudgetContract {
         // A budget that is already expired at creation, or expires before it
         // starts, could never be spent.
         if expires_at != 0 && (expires_at <= now || expires_at <= start_at) {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidTimeWindow);
         }
         // Deficit carryforward only makes sense with a recurring period: the
         // overspend has to land in a *next* window to be repaid out of, and
@@ -457,7 +464,7 @@ impl BudgetContract {
         // `period_seconds: 0`, so the interval argument is 0 here by
         // construction.
         if allow_deficit && Self::window_of(period, 0).is_none() {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidTimeWindow);
         }
         let key = DataKey::Budget(budget_id.clone());
         if env.storage().persistent().has(&key) {
@@ -536,7 +543,7 @@ impl BudgetContract {
             return Err(Error::InvalidInput);
         }
         if period == Period::Custom && period_seconds == 0 {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidTimeWindow);
         }
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
@@ -836,7 +843,7 @@ impl BudgetContract {
         // Only the unspent portion of `from` may be reallocated.
         let available = checked_sub(from.limit, from.spent)?;
         if amount > available {
-            return Err(Error::BudgetExceeded);
+            return Err(Error::ExceededSpendLimit);
         }
         from.limit = checked_sub(from.limit, amount)?;
         to.limit = checked_add(to.limit, amount)?;
@@ -1045,7 +1052,7 @@ impl BudgetContract {
         let capacity = Self::asset_capacity(&asset_budget)?;
         let new_spent = checked_add(asset_budget.spent, amount)?;
         if new_spent > capacity {
-            return Err(BudgetError::BudgetExceeded);
+            return Err(BudgetError::ExceededSpendLimit);
         }
         asset_budget.spent = new_spent;
         env.storage().persistent().set(&key, &asset_budget);
@@ -1130,7 +1137,7 @@ impl BudgetContract {
             // the bare limit refused spends `check_and_record_spend` accepts.
             let new_spent = checked_add(asset_budget.spent, spend.amount)?;
             if new_spent > Self::asset_capacity(&asset_budget)? {
-                return Err(BudgetError::BudgetExceeded);
+                return Err(BudgetError::ExceededSpendLimit);
             }
             asset_budget.spent = new_spent;
             settled.push_back(asset_budget);
@@ -1238,7 +1245,7 @@ impl BudgetContract {
         env.storage()
             .persistent()
             .get(&DataKey::Budget(id.clone()))
-            .ok_or(Error::NotFound)
+            .ok_or(Error::BudgetNotFound)
     }
     fn store(env: &Env, id: &String, budget: &Budget) {
         env.storage()
@@ -1548,8 +1555,8 @@ impl BudgetContract {
             return Ok(());
         }
         let periods = outcome.periods as i128;
-        let window =
-            Self::window_of(budget.period, budget.period_seconds).ok_or(Error::InvalidInput)?;
+        let window = Self::window_of(budget.period, budget.period_seconds)
+            .ok_or(Error::InvalidTimeWindow)?;
         let capacity = checked_add(budget.limit, budget.rollover_credit)?;
         let spent = budget.spent;
         let went_into_deficit = budget.allow_deficit && spent > capacity;
@@ -1788,7 +1795,7 @@ impl BudgetInterface for BudgetContract {
             }
             let remaining = checked_sub(ceiling, budget.spent)?;
             events::budget_exceeded(&env, &budget_id, amount, remaining);
-            return Err(BudgetError::BudgetExceeded);
+            return Err(BudgetError::ExceededSpendLimit);
         }
         budget.spent = new_spent;
         Self::store(&env, &budget_id, &budget);
