@@ -393,7 +393,7 @@ fn agent_daily_limit_blocks_then_resets_next_day() {
     h.agent_pay(&h.merchant, 2_000).unwrap(); // exactly the daily limit.
 
     let before = h.snapshot();
-    assert_eq!(h.agent_pay(&h.merchant, 1), Err(Error::BudgetLimitReached));
+    assert_eq!(h.agent_pay(&h.merchant, 1), Err(Error::BudgetLimitExceeded));
     assert_eq!(h.snapshot(), before);
 
     // Next UTC day: the window resets automatically.
