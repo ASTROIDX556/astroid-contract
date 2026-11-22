@@ -17,6 +17,8 @@ pub mod e2e_agent_spending;
 #[cfg(test)]
 pub mod error_codes;
 #[cfg(test)]
+pub mod escrow_cleanup;
+#[cfg(test)]
 pub mod escrow_integration;
 #[cfg(test)]
 pub mod escrow_lifecycle;
