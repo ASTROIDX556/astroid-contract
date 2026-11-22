@@ -46,6 +46,21 @@ pub struct UpgradeAudit {
     pub recorded_at: u64,
 }
 
+/// Typed payload of [`ContractEvent::EscrowExpired`].
+///
+/// Published when an escrow reaches its expiration deadline or when a keeper
+/// reclaims an expired escrow's remaining custody. `amount` is the value still
+/// held for the sender at that instant; `expired_at` is the ledger timestamp
+/// that made the escrow expire.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowExpiration {
+    pub escrow_id: u64,
+    pub sender: Address,
+    pub amount: i128,
+    pub expired_at: u64,
+}
+
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
 /// Publish with `events::publish(env, ContractEvent::Variant { .. })`. Each
@@ -290,6 +305,10 @@ pub enum ContractEvent {
         sender: Address,
         assets: Vec<AssetAmount>,
     },
+    /// An escrow reached its expiration deadline, or an expired escrow's
+    /// remaining custody was reclaimed and its storage entries removed
+    /// (Issue #521). Carries [`EscrowExpiration`].
+    EscrowExpired { expiration: EscrowExpiration },
     /// Gas usage telemetry for a single operation execution.
     GasTelemetry {
         operation: Symbol,
@@ -622,6 +641,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (escrow_id, sender, assets),
             );
         }
+        ContractEvent::EscrowExpired { expiration } => {
+            env.events()
+                .publish((Symbol::new(env, "EscrowExpired"),), expiration);
+        }
         ContractEvent::GasTelemetry {
             operation,
             gas_used,
@@ -697,6 +720,25 @@ pub fn escrow_funds_released(env: &Env, escrow_id: u64, recipient: &Address, amo
 /// reclaim).
 pub fn escrow_funds_refunded(env: &Env, escrow_id: u64, recipient: &Address, amount: i128) {
     publish_escrow_settlement(env, ESCROW_FUNDS_REFUNDED, escrow_id, recipient, amount);
+}
+
+/// `EscrowExpired` — topic `("EscrowExpired",)`, data [`EscrowExpiration`].
+///
+/// Published by `escrow::expire` when a keeper marks a timed-out escrow and by
+/// `escrow::cleanup_expired` when the remaining custody is refunded and the
+/// escrow's ledger entries are removed (Issue #521).
+pub fn escrow_expired(env: &Env, escrow_id: u64, sender: &Address, amount: i128) {
+    publish(
+        env,
+        ContractEvent::EscrowExpired {
+            expiration: EscrowExpiration {
+                escrow_id,
+                sender: sender.clone(),
+                amount,
+                expired_at: env.ledger().timestamp(),
+            },
+        },
+    );
 }
 
 fn publish_escrow_settlement(
