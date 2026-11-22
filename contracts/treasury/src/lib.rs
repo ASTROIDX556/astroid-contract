@@ -1464,7 +1464,15 @@ impl TreasuryContract {
         //    whether the cooling-off period applies.
         Self::require_not_time_locked(&env, total)?;
 
-        Self::settle_batch(&env, &t, &caller, &asset, payments, registry_verified, holding)
+        Self::settle_batch(
+            &env,
+            &t,
+            &caller,
+            &asset,
+            payments,
+            registry_verified,
+            holding,
+        )
     }
 
     /// The value-moving half of [`Self::batch_transfer`]: per-leg policy, the

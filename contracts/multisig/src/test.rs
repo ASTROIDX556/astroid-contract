@@ -2035,9 +2035,7 @@ fn a_reweight_does_not_make_the_next_approval_a_false_quorum_transition() {
     h.client.execute_threshold_change(&h.signers[1], &reweigh);
 
     let added = Address::generate(&h.env);
-    let add = h
-        .client
-        .propose_signer_addition(&h.signers[0], &added, &1);
+    let add = h.client.propose_signer_addition(&h.signers[0], &added, &1);
     advance(&h, MIN_TIMELOCK_DELAY);
     h.client.execute_threshold_change(&h.signers[0], &add);
 

@@ -4638,17 +4638,16 @@ fn seeded_policy_verification_agrees_across_evaluation_paths() {
     let id = env.register_contract(None, PolicyContract);
     let client = PolicyContractClient::new(&env, &id);
     client.initialize();
-    client
-        .register_policy(
-            &owner,
-            &policy_id,
-            &BytesN::from_array(&env, &[9; 32]),
-            &1_000_000,
-            &Some(allowed.clone()),
-            &None,
-            &0,
-            &None,
-        );
+    client.register_policy(
+        &owner,
+        &policy_id,
+        &BytesN::from_array(&env, &[9; 32]),
+        &1_000_000,
+        &Some(allowed.clone()),
+        &None,
+        &0,
+        &None,
+    );
 
     let mut rng = DetRng::new(0xC0FF_EE00_1234_5678);
     for _ in 0..24 {

@@ -1697,31 +1697,21 @@ fn invalid_rollover_configurations_return_deterministic_error() {
     assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
 
     allocate(&h, "eng", 1_000, Period::Daily, true);
-    let res = h.client.try_set_rollover_config(&h.owner, &budget_id, &true, &10_001, &500);
+    let res = h
+        .client
+        .try_set_rollover_config(&h.owner, &budget_id, &true, &10_001, &500);
     assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
 
     let res = h.client.try_set_budget_limit_with_rollover(
-        &h.owner,
-        &budget_id,
-        &token,
-        &1_000,
-        &3_600,
-        &true,
-        &10_001,
-        &500,
+        &h.owner, &budget_id, &token, &1_000, &3_600, &true, &10_001, &500,
     );
     assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
 
     h.client
         .set_budget_limit(&h.owner, &budget_id, &token, &100, &3_600);
-    let res = h.client.try_set_asset_rollover_config(
-        &h.owner,
-        &budget_id,
-        &token,
-        &true,
-        &10_001,
-        &500,
-    );
+    let res = h
+        .client
+        .try_set_asset_rollover_config(&h.owner, &budget_id, &token, &true, &10_001, &500);
     assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
 
     assert_eq!(h.client.get(&budget_id).rollover_bps, 10_000);
@@ -4080,11 +4070,17 @@ fn seeded_rollover_calculations_keep_their_invariants() {
         };
 
         let outcome = BudgetContract::calculate_rollover(&budget, now).unwrap();
-        assert_eq!(outcome, BudgetContract::calculate_rollover(&budget, now).unwrap());
+        assert_eq!(
+            outcome,
+            BudgetContract::calculate_rollover(&budget, now).unwrap()
+        );
 
         if outcome.is_due {
             assert!(outcome.periods >= 1);
-            assert_eq!(outcome.periods as i128, (now - start) as i128 / window as i128);
+            assert_eq!(
+                outcome.periods as i128,
+                (now - start) as i128 / window as i128
+            );
             if !rollover_enabled {
                 assert_eq!(outcome.carry_over, 0);
             } else {
