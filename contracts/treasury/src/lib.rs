@@ -190,6 +190,15 @@
 //! `withdrawal_time_lock`, `queue_withdrawal`, `queue_batch_transfer`,
 //! `execute_withdrawal`, `cancel_withdrawal`, `pending_withdrawal`,
 //! `pending_withdrawal_count`.
+//!
+//! Sub-allocations and emergency sweep (Issue #502): `set_allocation_limit`,
+//! `allocate`, `release_allocation`, `allocation`, `reserved`,
+//! `set_recovery_address`, `recovery_address`, `emergency_sweep`. Category
+//! reserves are capped per (category, asset) and held back from ordinary
+//! payouts ([`Error::AllocationLimitExceeded`] on a breach); the sweep moves
+//! every remaining balance to the governance-designated recovery address and
+//! is refused for anyone but the multisig or owner
+//! ([`Error::EmergencySweepUnauthorized`]).
 
 use astroid_interfaces::{PolicyClient, RegistryClient, TreasuryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
@@ -202,7 +211,7 @@ use astroid_shared::events;
 use astroid_shared::math::{checked_add, checked_add_u64, checked_div, checked_mul, checked_sub};
 use astroid_shared::types::{ModuleKind, Payment, ResourceState};
 use astroid_shared::validation::{
-    require_non_empty, require_positive_amount, require_time_reached,
+    require_non_empty, require_non_negative_amount, require_positive_amount, require_time_reached,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
@@ -212,6 +221,35 @@ use soroban_sdk::{
 /// Bounds every per-asset iteration (e.g. [`TreasuryContract::portfolio`]).
 pub const MAX_TREASURY_ASSETS: u32 = 32;
 const MAX_BALANCE_ASSETS: u32 = MAX_TREASURY_ASSETS;
+
+/// Maximum number of sub-allocation categories configurable per asset
+/// (Issue #502). Bounds the per-asset iteration the emergency sweep performs
+/// when it clears every reservation.
+pub const MAX_ALLOCATION_CATEGORIES: u32 = 16;
+
+/// A capped sub-allocation (reserve) of one asset for one category
+/// (Issue #502). `allocated` is the amount currently reserved; it may never
+/// exceed `limit`, and the sum of every category's `allocated` for an asset is
+/// held back from ordinary withdrawals and batch payouts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryAllocation {
+    pub category: Symbol,
+    pub asset: Address,
+    /// Configured maximum that may be reserved for this category.
+    pub limit: i128,
+    /// Amount currently reserved for this category.
+    pub allocated: i128,
+}
+
+/// One asset's outcome in an [`TreasuryContract::emergency_sweep`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweptAsset {
+    pub asset: Address,
+    /// Custody balance moved to the recovery address.
+    pub amount: i128,
+}
 
 /// Stored treasury record.
 #[contracttype]
@@ -448,6 +486,17 @@ enum DataKey {
     PendingWithdrawal(u64),
     /// Id allocator for `PendingWithdrawal` (instance).
     PendingWithdrawalCount,
+    /// Issue #502 — capped sub-allocation for (category, asset) (persistent).
+    Allocation(Symbol, Address),
+    /// Issue #502 — categories configured for an asset, bounded by
+    /// [`MAX_ALLOCATION_CATEGORIES`] (persistent).
+    AllocationCategories(Address),
+    /// Issue #502 — sum of every category's reservation for an asset
+    /// (persistent).
+    Reserved(Address),
+    /// Issue #502 — designated secure recovery address paid by the
+    /// emergency sweep (instance).
+    RecoveryAddress,
 }
 
 #[contract]
@@ -935,6 +984,273 @@ impl TreasuryContract {
             .ok_or(Error::NotFound)
     }
 
+    // --- Issue #502: sub-allocation limits and emergency sweep ---
+
+    /// Configure (or re-configure) the maximum amount of `asset` that may be
+    /// reserved for `category` (admin only). A limit of `0` closes the
+    /// category to new reservations. Lowering a limit below what is already
+    /// reserved is refused with [`Error::AllocationLimitExceeded`] — release
+    /// first, then tighten.
+    pub fn set_allocation_limit(
+        env: Env,
+        caller: Address,
+        category: Symbol,
+        asset: Address,
+        max_amount: i128,
+    ) -> Result<(), Error> {
+        let _t = Self::require_admin(&env, &caller)?;
+        require_non_negative_amount(max_amount)?;
+        Self::require_approved_asset(&env, &asset)?;
+        let key = DataKey::Allocation(category.clone(), asset.clone());
+        let existing: Option<CategoryAllocation> = env.storage().persistent().get(&key);
+        let allocation = match existing {
+            Some(mut a) => {
+                if max_amount < a.allocated {
+                    return Err(Error::AllocationLimitExceeded);
+                }
+                a.limit = max_amount;
+                a
+            }
+            None => {
+                let ckey = DataKey::AllocationCategories(asset.clone());
+                let mut categories: Vec<Symbol> = env
+                    .storage()
+                    .persistent()
+                    .get(&ckey)
+                    .unwrap_or_else(|| Vec::new(&env));
+                if categories.len() >= MAX_ALLOCATION_CATEGORIES {
+                    return Err(Error::InvalidInput);
+                }
+                categories.push_back(category.clone());
+                env.storage().persistent().set(&ckey, &categories);
+                CategoryAllocation {
+                    category: category.clone(),
+                    asset: asset.clone(),
+                    limit: max_amount,
+                    allocated: 0,
+                }
+            }
+        };
+        env.storage().persistent().set(&key, &allocation);
+        events::treasury_allocation_limit_set(&env, &category, &asset, max_amount);
+        Ok(())
+    }
+
+    /// Reserve `amount` of `asset` for `category` (admin only). Returns the
+    /// category's reserved total afterwards.
+    ///
+    /// Refused with [`Error::AllocationLimitExceeded`] when the reservation
+    /// would push the category past its configured limit, or when the
+    /// treasury's unreserved recorded balance cannot back it. All arithmetic
+    /// is checked. Reserved value is held back from [`Self::withdraw`] and
+    /// [`Self::batch_transfer`] until released.
+    pub fn allocate(
+        env: Env,
+        caller: Address,
+        category: Symbol,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        require_positive_amount(amount)?;
+        let t = Self::require_admin(&env, &caller)?;
+        Self::require_active(&t)?;
+        Self::require_approved_asset(&env, &asset)?;
+        let key = DataKey::Allocation(category.clone(), asset.clone());
+        let mut allocation: CategoryAllocation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        let new_allocated = checked_add(allocation.allocated, amount)?;
+        if new_allocated > allocation.limit {
+            return Err(Error::AllocationLimitExceeded);
+        }
+        let reserved = Self::reserved_of(&env, &asset);
+        let new_reserved = checked_add(reserved, amount)?;
+        let holding = Self::load_holding(&env, &asset);
+        if new_reserved > holding.total_in {
+            return Err(Error::AllocationLimitExceeded);
+        }
+        allocation.allocated = new_allocated;
+        env.storage().persistent().set(&key, &allocation);
+        Self::store_reserved(&env, &asset, new_reserved);
+        events::treasury_allocation_changed(
+            &env,
+            symbol_short!("alloc"),
+            &category,
+            &asset,
+            amount,
+            new_allocated,
+        );
+        Ok(new_allocated)
+    }
+
+    /// Release `amount` of a category's reservation back to the treasury's
+    /// free balance (admin only). Returns the category's reserved total
+    /// afterwards. Releasing more than is reserved is refused with
+    /// [`Error::InsufficientFunds`].
+    pub fn release_allocation(
+        env: Env,
+        caller: Address,
+        category: Symbol,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        require_positive_amount(amount)?;
+        let _t = Self::require_admin(&env, &caller)?;
+        let key = DataKey::Allocation(category.clone(), asset.clone());
+        let mut allocation: CategoryAllocation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        if amount > allocation.allocated {
+            return Err(Error::InsufficientFunds);
+        }
+        allocation.allocated = checked_sub(allocation.allocated, amount)?;
+        env.storage().persistent().set(&key, &allocation);
+        let reserved = checked_sub(Self::reserved_of(&env, &asset), amount)?;
+        Self::store_reserved(&env, &asset, reserved);
+        events::treasury_allocation_changed(
+            &env,
+            symbol_short!("dealloc"),
+            &category,
+            &asset,
+            amount,
+            allocation.allocated,
+        );
+        Ok(allocation.allocated)
+    }
+
+    /// The sub-allocation configured for (`category`, `asset`), if any.
+    pub fn allocation(env: Env, category: Symbol, asset: Address) -> Option<CategoryAllocation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allocation(category, asset))
+    }
+
+    /// Total of `asset` currently reserved across every category.
+    pub fn reserved(env: Env, asset: Address) -> i128 {
+        Self::reserved_of(&env, &asset)
+    }
+
+    /// Designate the secure recovery address the emergency sweep pays.
+    ///
+    /// Once a multisig is wired, only the multisig may change it — so a
+    /// compromised admin key cannot redirect a sweep. Before that, the admin
+    /// (owner) sets it. Any other caller is refused with
+    /// [`Error::EmergencySweepUnauthorized`]. The treasury itself is not a
+    /// valid recovery address.
+    pub fn set_recovery_address(env: Env, caller: Address, recovery: Address) -> Result<(), Error> {
+        let t = Self::load(&env)?;
+        let authorized = match &t.multisig {
+            Some(multisig) => multisig == &caller,
+            None => t.admin == caller,
+        };
+        if !authorized {
+            return Err(Error::EmergencySweepUnauthorized);
+        }
+        caller.require_auth();
+        if recovery == env.current_contract_address() {
+            return Err(Error::InvalidInput);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RecoveryAddress, &recovery);
+        events::treasury_recovery_set(&env, &recovery, &caller);
+        Ok(())
+    }
+
+    /// The designated recovery address, if one has been set.
+    pub fn recovery_address(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::RecoveryAddress)
+    }
+
+    /// Emergency sweep: move the treasury's entire remaining custody balance
+    /// of each asset to the designated recovery address.
+    ///
+    /// * **Authorization** — the caller must be the organization's multisig or
+    ///   the treasury owner (admin), and must sign; anyone else is refused
+    ///   with [`Error::EmergencySweepUnauthorized`] before anything is read.
+    /// * **Scope** — `assets` lists the token contracts to sweep (each must be
+    ///   approved; duplicates are refused). An empty list sweeps every
+    ///   approved asset.
+    /// * **Emergency semantics** — deliberately runs while the treasury is
+    ///   paused or frozen and bypasses the policy, budget, allowance and
+    ///   time-lock gates: the destination is fixed in advance by governance,
+    ///   so the only thing a sweep can do is secure funds. Every category
+    ///   reservation of a swept asset is cleared.
+    ///
+    /// Emits one `("treasury", "em_sweep", asset)` audit event plus the
+    /// standard `TreasuryWithdrawn` event per asset moved. Returns what was
+    /// moved per asset (zero balances are reported, not transferred).
+    pub fn emergency_sweep(
+        env: Env,
+        caller: Address,
+        assets: Vec<Address>,
+    ) -> Result<Vec<SweptAsset>, Error> {
+        let t = Self::load(&env)?;
+        let is_multisig = matches!(&t.multisig, Some(multisig) if multisig == &caller);
+        if !is_multisig && t.admin != caller {
+            return Err(Error::EmergencySweepUnauthorized);
+        }
+        caller.require_auth();
+        let recovery: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecoveryAddress)
+            .ok_or(Error::InvalidState)?;
+
+        let targets = if assets.is_empty() {
+            Self::approved_list(&env)
+        } else {
+            if assets.len() > MAX_TREASURY_ASSETS {
+                return Err(Error::InvalidInput);
+            }
+            for i in 0..assets.len() {
+                let a = assets.get_unchecked(i);
+                for j in (i + 1)..assets.len() {
+                    if assets.get_unchecked(j) == a {
+                        return Err(Error::InvalidInput);
+                    }
+                }
+            }
+            assets
+        };
+
+        Self::lock(&env)?;
+        let custody = env.current_contract_address();
+        let mut report = Vec::new(&env);
+        for asset in targets.iter() {
+            if let Err(e) = Self::require_approved_asset(&env, &asset) {
+                Self::unlock(&env);
+                return Err(e);
+            }
+            let token_client = token::TokenClient::new(&env, &asset);
+            let amount = token_client.balance(&custody);
+            // Clear every reservation and zero the recorded balance: after a
+            // sweep nothing of this asset remains in custody to back them.
+            Self::clear_allocations(&env, &asset);
+            let mut holding = Self::load_holding(&env, &asset);
+            let booked = holding.total_in;
+            holding.total_in = 0;
+            holding.total_out = checked_add(holding.total_out, booked)?;
+            Self::store_holding(&env, &asset, &holding);
+            Self::store_asset_balance(&env, &asset, 0);
+            if amount > 0 {
+                token_client.transfer(&custody, &recovery, &amount);
+                events::treasury_emergency_sweep(&env, &caller, &recovery, &asset, amount);
+                Self::emit_withdrawn(&env, &t, &recovery, &asset, amount, 0);
+            }
+            report.push_back(SweptAsset {
+                asset: asset.clone(),
+                amount,
+            });
+        }
+        Self::unlock(&env);
+        Ok(report)
+    }
+
     /// Withdraw assets to a recipient. Only the admin may call, and the spend
     /// must clear policy and budget gates before the ledger is debited.
     ///
@@ -1051,6 +1367,11 @@ impl TreasuryContract {
         if holding.total_in < amount {
             Self::unlock(env);
             return Err(Error::InsufficientFunds);
+        }
+        // Issue #502 — category reserves are not spendable by a withdrawal.
+        if let Err(e) = Self::require_unreserved(env, asset, holding.total_in, amount) {
+            Self::unlock(env);
+            return Err(e);
         }
         holding.total_in = checked_sub(holding.total_in, amount)?;
         holding.total_out = checked_add(holding.total_out, amount)?;
@@ -1192,6 +1513,8 @@ impl TreasuryContract {
         if holding.total_in < total {
             return Err(Error::InsufficientFunds);
         }
+        // Issue #502 — category reserves are not spendable by a batch payout.
+        Self::require_unreserved(env, asset, holding.total_in, total)?;
         holding.total_in = checked_sub(holding.total_in, total)?;
         holding.total_out = checked_add(holding.total_out, total)?;
         Self::store_holding(env, asset, &holding);
@@ -2128,6 +2451,57 @@ impl TreasuryContract {
         }
         strkey.copy_into_slice(&mut buf);
         buf[0] == b'C'
+    }
+
+    /// Issue #502 — total of `asset` reserved across every category.
+    fn reserved_of(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Reserved(asset.clone()))
+            .unwrap_or(0)
+    }
+
+    fn store_reserved(env: &Env, asset: &Address, reserved: i128) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reserved(asset.clone()), &reserved);
+    }
+
+    /// Issue #502 — refuse an outflow that would dip into reserved value:
+    /// only `recorded - reserved` is spendable by ordinary payouts.
+    fn require_unreserved(
+        env: &Env,
+        asset: &Address,
+        recorded: i128,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let free = checked_sub(recorded, Self::reserved_of(env, asset))?;
+        if amount > free {
+            return Err(Error::InsufficientFunds);
+        }
+        Ok(())
+    }
+
+    /// Issue #502 — zero every category reservation of `asset` (used by the
+    /// emergency sweep). Bounded by [`MAX_ALLOCATION_CATEGORIES`].
+    fn clear_allocations(env: &Env, asset: &Address) {
+        let categories: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllocationCategories(asset.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        for category in categories.iter() {
+            let key = DataKey::Allocation(category, asset.clone());
+            if let Some(mut a) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, CategoryAllocation>(&key)
+            {
+                a.allocated = 0;
+                env.storage().persistent().set(&key, &a);
+            }
+        }
+        Self::store_reserved(env, asset, 0);
     }
 
     fn load_holding(env: &Env, asset: &Address) -> Holding {

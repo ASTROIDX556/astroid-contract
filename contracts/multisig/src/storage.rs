@@ -124,3 +124,13 @@ pub struct BatchCall {
     /// Arguments passed to the target function.
     pub args: Vec<Val>,
 }
+
+/// One confirmation inside a batched approval (Issue #501): `signer` approves
+/// pending proposal `proposal_id`. A batch may mix signers and proposals; every
+/// distinct signer must authorize the call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchApproval {
+    pub signer: Address,
+    pub proposal_id: u64,
+}
