@@ -789,6 +789,32 @@ impl MultiSigContract {
         Self::total_weight(&Self::signers(&env)?)
     }
 
+    /// Verify the current approval weight for `proposal_id` against the
+    /// configured threshold (Issue #522).
+    ///
+    /// Rebuilds the tally from the live signer set and each signer's recorded
+    /// approval through [`quorum::verify_weight`], so the sum is wrap-free and
+    /// a signer removed or re-weighted after approving is credited correctly.
+    /// Returns the full [`QuorumStatus`] when the quorum is met — an exact
+    /// match and any excess weight both pass — and
+    /// [`Error::InsufficientWeight`] when it falls short.
+    pub fn verify_proposal_weight(env: Env, proposal_id: u64) -> Result<QuorumStatus, Error> {
+        let signers = Self::signers(&env)?;
+        let threshold = Self::threshold(&env)?;
+        quorum::verify_weight(
+            &signers,
+            &|s| {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::Approval(proposal_id, s.address.clone()))
+                    .unwrap_or(false)
+            },
+            threshold,
+            Self::total_weight(&signers)?,
+            Error::InsufficientWeight,
+        )
+    }
+
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<MsProposal, Error> {
         Self::load_proposal(&env, proposal_id)
     }
@@ -922,20 +948,12 @@ impl MultiSigContract {
     /// [`quorum::narrow`], so an unrepresentable sum is refused rather than
     /// truncated.
     fn live_tally(env: &Env, proposal_id: u64) -> Result<(u32, u32), Error> {
-        let mut total: i128 = 0;
-        let mut approvers: u32 = 0;
-        for s in Self::signers(env)?.iter() {
-            let approved: bool = env
-                .storage()
+        quorum::accumulate_selected(&Self::signers(env)?, &|s| {
+            env.storage()
                 .persistent()
                 .get(&DataKey::Approval(proposal_id, s.address.clone()))
-                .unwrap_or(false);
-            if approved {
-                total = Self::add_weight(total, s.weight)?;
-                approvers = approvers.checked_add(1).ok_or(Error::Overflow)?;
-            }
-        }
-        Ok((Self::to_weight(total)?, approvers))
+                .unwrap_or(false)
+        })
     }
 
     /// The verified quorum tally for `proposal_id` against the current signer
@@ -1366,9 +1384,7 @@ impl MultisigInterface for MultiSigContract {
         let threshold = Self::threshold(&env)?;
         let args = vec![&env, payload.to_val()];
         let weight = Self::accumulate_weight(&env, &signers, &caller, &signatories, &args)?;
-        if weight < threshold {
-            return Err(Error::ThresholdNotMet);
-        }
+        Self::require_quorum(weight, threshold, Error::ThresholdNotMet)?;
         Ok(weight)
     }
 
