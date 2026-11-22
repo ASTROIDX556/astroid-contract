@@ -480,7 +480,8 @@ impl MultiSigContract {
             .instance()
             .get(&DataKey::ProposalCount)
             .ok_or(Error::NotInitialized)?;
-        count = checked_add(count as i128, 1)? as u64;
+        let next = checked_add(count as i128, 1)?;
+        count = u64::try_from(next).map_err(|_| Error::Overflow)?;
         let id = count;
 
         let delay = Self::timelock_delay(env);
@@ -560,11 +561,14 @@ impl MultiSigContract {
         {
             return Err(Error::AlreadySigned);
         }
+        // The tally *before* this approval is measured from the same live
+        // signer set as the tally after it. The cached `approval_weight` on the
+        // record may be stale after a re-weight or a signer removal, so using
+        // it here would announce a quorum twice (or suppress the announcement
+        // entirely) when the approval actually crosses the bar.
+        let was_met = Self::quorum_status(&env, proposal_id)?.met;
         env.storage().persistent().set(&akey, &true);
         Self::bump_approval(&env, proposal_id, &caller);
-        // The tally *before* this approval: whether the quorum was already
-        // reached decides if the new one is the transition or just an addition.
-        let was_met = quorum::is_met(proposal.approval_weight, Self::threshold(&env)?);
         let status = Self::quorum_status(&env, proposal_id)?;
         proposal.approval_weight = status.approval_weight;
         Self::approve_transition(&mut proposal)?;
@@ -700,11 +704,11 @@ impl MultiSigContract {
             return Err(Error::InvalidInput);
         }
         let signers = Self::signers(&env)?;
-        let threshold = Self::threshold(&env)?;
 
         // Phase 1 — authenticate and validate every entry; nothing is written.
         let mut authenticated: Vec<Address> = Vec::new(&env);
         let mut proposal_ids: Vec<u64> = Vec::new(&env);
+        let mut prior_met: Vec<bool> = Vec::new(&env);
         for i in 0..len {
             let entry = approvals.get_unchecked(i);
             for j in 0..i {
@@ -732,6 +736,11 @@ impl MultiSigContract {
                 return Err(Error::AlreadySigned);
             }
             if !proposal_ids.contains(entry.proposal_id) {
+                // Snapshot the quorum state before any approval flag is written.
+                // A cached tally may be stale after a re-weight or signer
+                // removal; measuring both sides of the batch against the live
+                // set keeps the threshold event a one-shot transition.
+                prior_met.push_back(Self::quorum_status(&env, entry.proposal_id)?.met);
                 proposal_ids.push_back(entry.proposal_id);
             }
         }
@@ -747,9 +756,10 @@ impl MultiSigContract {
 
         // Phase 3 — recompute each touched proposal's tally once, from the
         // live signer set, and announce threshold transitions.
-        for id in proposal_ids.iter() {
+        for i in 0..proposal_ids.len() {
+            let id = proposal_ids.get_unchecked(i);
+            let was_met = prior_met.get_unchecked(i);
             let mut proposal = Self::load_proposal(&env, id)?;
-            let was_met = quorum::is_met(proposal.approval_weight, threshold);
             let status = Self::quorum_status(&env, id)?;
             proposal.approval_weight = status.approval_weight;
             Self::approve_transition(&mut proposal)?;
@@ -875,19 +885,22 @@ impl MultiSigContract {
         // voting weight, accumulated with checked arithmetic and narrowed
         // without truncation.
         let payload = Self::batch_payload(&env, nonce, &calls);
-        let weight = Self::accumulate_weight(&env, &signers, &caller, &approvers, &payload)?;
+        let (weight, distinct_approvers) =
+            Self::accumulate_weight(&env, &signers, &caller, &approvers, &payload)?;
         // Same quorum verification helper as the proposal flow; batches report
         // their dedicated shortfall code.
         Self::require_quorum(weight, threshold, Error::ThresholdNotMet)?;
         // The signatures just verified met the threshold: announce the quorum
-        // with the tally behind it, distinct from `batch/executed`.
+        // with the tally behind it, distinct from `batch/executed`. The signer
+        // count comes from the same deduplicating pass that produced `weight`,
+        // so repeated approvers cannot inflate it.
         quorum::publish_threshold_met(
             &env,
             symbol_short!("batch"),
             nonce,
             &QuorumStatus::evaluate(
                 weight,
-                approvers.len() + 1,
+                distinct_approvers,
                 threshold,
                 Self::total_weight(&signers)?,
             ),
@@ -1243,10 +1256,11 @@ impl MultiSigContract {
         caller: &Address,
         signatories: &Vec<Address>,
         args: &Vec<Val>,
-    ) -> Result<u32, Error> {
+    ) -> Result<(u32, u32), Error> {
         let caller_weight = Self::weight_in(signers, caller)?;
         caller.require_auth_for_args(args.clone());
         let mut total: i128 = caller_weight as i128;
+        let mut distinct: u32 = 1;
         let mut seen = Vec::new(env);
         seen.push_back(caller.clone());
         for who in signatories.iter() {
@@ -1258,10 +1272,11 @@ impl MultiSigContract {
             }
             let weight = Self::weight_in(signers, &who)?;
             seen.push_back(who.clone());
+            distinct = distinct.checked_add(1).ok_or(Error::Overflow)?;
             who.require_auth_for_args(args.clone());
             total = Self::add_weight(total, weight)?;
         }
-        Self::to_weight(total)
+        Ok((Self::to_weight(total)?, distinct))
     }
 
     /// Invoke a single batch call inside a Soroban error-handling boundary so a
@@ -1302,7 +1317,8 @@ impl MultiSigContract {
             .instance()
             .get(&DataKey::ChangeCount)
             .unwrap_or(0);
-        count = checked_add(count as i128, 1)? as u64;
+        let next = checked_add(count as i128, 1)?;
+        count = u64::try_from(next).map_err(|_| Error::Overflow)?;
         let id = count;
 
         let now = env.ledger().timestamp();
@@ -1609,7 +1625,7 @@ impl MultisigInterface for MultiSigContract {
         let signers = Self::signers(&env)?;
         let threshold = Self::threshold(&env)?;
         let args = vec![&env, payload.to_val()];
-        let weight = Self::accumulate_weight(&env, &signers, &caller, &signatories, &args)?;
+        let (weight, _) = Self::accumulate_weight(&env, &signers, &caller, &signatories, &args)?;
         Self::require_quorum(weight, threshold, Error::ThresholdNotMet)?;
         Ok(weight)
     }

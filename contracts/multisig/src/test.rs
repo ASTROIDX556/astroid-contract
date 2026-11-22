@@ -1762,6 +1762,21 @@ fn count_events(env: &Env, category: &str, action: &str) -> u32 {
         .count() as u32
 }
 
+/// The tally carried by the most recent `batch/quorum` event.
+fn last_batch_quorum_status(env: &Env) -> QuorumStatus {
+    let category: Val = Symbol::new(env, "batch").into_val(env);
+    let action: Val = symbol_short!("quorum").into_val(env);
+    let (_, _, data) = env
+        .events()
+        .all()
+        .iter()
+        .rev()
+        .find(|(_, topics, _)| topics.contains(category) && topics.contains(action))
+        .expect("no batch quorum event");
+    let (_, status): (u64, QuorumStatus) = <(u64, QuorumStatus)>::try_from_val(env, &data).unwrap();
+    status
+}
+
 #[test]
 fn weight_accumulation_is_checked_and_narrowing_refuses_to_truncate() {
     // Ordinary accumulation, in the wide type it is computed in.
@@ -2000,6 +2015,40 @@ fn approval_tracking_follows_the_live_signer_set() {
 }
 
 #[test]
+fn a_reweight_does_not_make_the_next_approval_a_false_quorum_transition() {
+    // The cached tally records two approvals, but re-weighting the proposer
+    // makes the *live* tally already quorate before any new approval lands.
+    let h = setup(&[1, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 2);
+    assert_eq!(count_events(&h.env, "proposal", "quorum"), 0);
+
+    let reweigh = h
+        .client
+        .propose_weight_change(&h.signers[1], &h.signers[0], &5);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[1], &reweigh);
+
+    let added = Address::generate(&h.env);
+    let add = h.client.propose_signer_addition(&h.signers[0], &added, &1);
+    advance(&h, MIN_TIMELOCK_DELAY);
+    h.client.execute_threshold_change(&h.signers[0], &add);
+
+    // The live tally was 6 before this approval (5 + 1) and is 7 after it.
+    // Both sides of the transition are met, so no quorum event is announced.
+    h.client.approve(&added, &id);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 7);
+    assert_eq!(count_events(&h.env, "proposal", "quorum"), 0);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+#[test]
 fn a_batch_quorum_is_announced_with_its_verified_tally() {
     let h = setup_batch_weighted(&[4, 3, 3], 7);
     let calls = vec![&h.env, store_call(&h.env, &h.helper, 1, 7)];
@@ -2060,6 +2109,8 @@ fn batch_signature_weight_is_checked_and_duplicates_count_once() {
     );
     assert_eq!(h.helper_client.get(&3), 3);
     assert_eq!(count_events(&h.env, "batch", "quorum"), 1);
+    // The event reports one distinct signer, not the three list entries.
+    assert_eq!(last_batch_quorum_status(&h.env).approvers, 1);
 
     // Raise the bar past what one key can reach, and the same duplication is
     // still worth nothing: the batch is short, not quorate.

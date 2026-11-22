@@ -1271,11 +1271,12 @@ impl TreasuryContract {
         amount: i128,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
-        Self::require_not_paused(&env)?;
+        let t = Self::load(&env)?;
+        Self::require_not_paused_for(&t, &env)?;
         Self::check_frozen(&env)?;
         // Single audited authorization point for every outbound movement: the
         // caller must be the recorded admin and must sign for it.
-        let t = Self::require_admin(&env, &caller)?;
+        Self::require_admin_loaded(&t, &caller)?;
         Self::require_active(&t)?;
 
         // 1. Routing validation — refuse to invoke a token contract the
@@ -1432,11 +1433,12 @@ impl TreasuryContract {
         if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
             return Err(Error::InvalidInput);
         }
-        Self::require_not_paused(&env)?;
+        let t = Self::load(&env)?;
+        Self::require_not_paused_for(&t, &env)?;
         Self::check_frozen(&env)?;
         // Same single audited authorization point as `withdraw`: admin identity
         // plus the caller's own signature.
-        let t = Self::require_admin(&env, &caller)?;
+        Self::require_admin_loaded(&t, &caller)?;
         Self::require_active(&t)?;
 
         // 1. Validate every leg and accumulate the payout with checked math, so
@@ -1462,7 +1464,15 @@ impl TreasuryContract {
         //    whether the cooling-off period applies.
         Self::require_not_time_locked(&env, total)?;
 
-        Self::settle_batch(&env, &t, &caller, &asset, payments, registry_verified)
+        Self::settle_batch(
+            &env,
+            &t,
+            &caller,
+            &asset,
+            payments,
+            registry_verified,
+            holding,
+        )
     }
 
     /// The value-moving half of [`Self::batch_transfer`]: per-leg policy, the
@@ -1478,6 +1488,7 @@ impl TreasuryContract {
         asset: &Address,
         payments: Vec<Payment>,
         registry_verified: bool,
+        mut holding: Holding,
     ) -> Result<(), Error> {
         // Re-accumulate the total from the legs themselves rather than trusting
         // a stored figure, so the amount budget is debited is always exactly the
@@ -1502,8 +1513,8 @@ impl TreasuryContract {
         }
 
         // Budget consumption — one debit for the aggregate rather than one
-        // cross-contract call per recipient.
-        let mut holding = Self::load_holding(env, asset);
+        // cross-contract call per recipient. `holding` was loaded by the
+        // caller's pre-flight check and is re-checked below before debiting.
         if let (Some(budget_addr), Some(budget_id)) = (&t.budget, &holding.budget_id) {
             astroid_interfaces::BudgetClient::new(env, budget_addr)
                 .consume(caller, budget_id, &total);
@@ -1654,17 +1665,18 @@ impl TreasuryContract {
         amount: i128,
     ) -> Result<u64, Error> {
         require_positive_amount(amount)?;
-        Self::require_not_paused(&env)?;
+        let t = Self::load(&env)?;
+        Self::require_not_paused_for(&t, &env)?;
         Self::check_frozen(&env)?;
-        let t = Self::require_admin(&env, &caller)?;
+        Self::require_admin_loaded(&t, &caller)?;
         Self::require_active(&t)?;
         // Routing and caller verification are settled at request time, so a
         // request that could never have been paid is never parked.
         Self::require_approved_asset(&env, &asset)?;
         Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
-        Self::require_time_lock_applies(&env, amount)?;
+        let config = Self::require_time_lock_applies(&env, amount)?;
 
-        Self::open_pending(&env, &caller, asset, to, amount, Vec::new(&env))
+        Self::open_pending(&env, &caller, asset, to, amount, Vec::new(&env), &config)
     }
 
     /// Park a whole batch payout in its cooling-off period and return its id.
@@ -1683,9 +1695,10 @@ impl TreasuryContract {
         if payments.is_empty() || payments.len() > MAX_BATCH_PAYMENTS {
             return Err(Error::InvalidInput);
         }
-        Self::require_not_paused(&env)?;
+        let t = Self::load(&env)?;
+        Self::require_not_paused_for(&t, &env)?;
         Self::check_frozen(&env)?;
-        let t = Self::require_admin(&env, &caller)?;
+        Self::require_admin_loaded(&t, &caller)?;
         Self::require_active(&t)?;
 
         let mut total: i128 = 0;
@@ -1694,14 +1707,14 @@ impl TreasuryContract {
             total = checked_add(total, payment.amount)?;
         }
         Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
-        Self::require_time_lock_applies(&env, total)?;
+        let config = Self::require_time_lock_applies(&env, total)?;
 
         // `to` is not meaningful for a multi-recipient payout; the legs in
         // `payments` are the record. The first leg's recipient is carried so the
         // stored record is never self-contradictory for a reader that only
         // looks at the scalar fields.
         let to = payments.first().unwrap().recipient.clone();
-        Self::open_pending(&env, &caller, asset, to, total, payments)
+        Self::open_pending(&env, &caller, asset, to, total, payments, &config)
     }
 
     /// Settle a queued withdrawal once its cooling-off period has elapsed.
@@ -1722,9 +1735,10 @@ impl TreasuryContract {
     /// whole cooldown cannot be cashed in months later against a treasury whose
     /// balances have since changed entirely.
     pub fn execute_withdrawal(env: Env, caller: Address, id: u64) -> Result<(), Error> {
-        Self::require_not_paused(&env)?;
+        let t = Self::load(&env)?;
+        Self::require_not_paused_for(&t, &env)?;
         Self::check_frozen(&env)?;
-        let t = Self::require_admin(&env, &caller)?;
+        Self::require_admin_loaded(&t, &caller)?;
         Self::require_active(&t)?;
 
         let key = DataKey::PendingWithdrawal(id);
@@ -1777,6 +1791,7 @@ impl TreasuryContract {
                 registry_verified,
             )?;
         } else {
+            let holding = Self::load_holding(&env, &p.asset);
             Self::settle_batch(
                 &env,
                 &t,
@@ -1784,6 +1799,7 @@ impl TreasuryContract {
                 &p.asset,
                 p.payments.clone(),
                 registry_verified,
+                holding,
             )?;
         }
 
@@ -1921,12 +1937,13 @@ impl TreasuryContract {
         caller: Address,
         milestone_id: u64,
     ) -> Result<(), Error> {
-        Self::require_not_paused(&env)?;
+        let t = Self::load(&env)?;
+        Self::require_not_paused_for(&t, &env)?;
         // A frozen or deactivated treasury moves nothing: the milestone
         // payout is an outflow like `withdraw` and `batch_transfer`, which
         // both refuse here.
         Self::check_frozen(&env)?;
-        let t = Self::require_admin(&env, &caller)?;
+        Self::require_admin_loaded(&t, &caller)?;
         Self::require_active(&t)?;
         // Issue #308 — verify the caller before the ledger is touched.
         let registry_verified =
@@ -2068,12 +2085,17 @@ impl TreasuryContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
-        let t = Self::load(env)?;
+    fn require_admin_loaded(t: &Treasury, caller: &Address) -> Result<(), Error> {
         if t.admin != *caller {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
+        Ok(())
+    }
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<Treasury, Error> {
+        let t = Self::load(env)?;
+        Self::require_admin_loaded(&t, caller)?;
         Ok(t)
     }
 
@@ -2218,9 +2240,10 @@ impl TreasuryContract {
     /// Short-circuit an outbound value movement while the emergency circuit
     /// breaker is engaged, with the dedicated [`Error::TreasuryPaused`] code.
     ///
-    /// Reads the flag from instance storage on every call rather than caching
-    /// it, and is never called on inbound paths: deposits must keep working
-    /// during a pause so recovery funding can arrive.
+    /// Uses the treasury record the caller already loaded for authorization,
+    /// so an outflow reads instance storage once rather than once per gate, and
+    /// is never called on inbound paths: deposits must keep working during a
+    /// pause so recovery funding can arrive.
     ///
     /// The breaker also lapses here: once [`MAX_PAUSE_DURATION`] has passed
     /// since [`Treasury::paused_at`], a still-set flag no longer blocks
@@ -2228,8 +2251,8 @@ impl TreasuryContract {
     /// any external keeper to release it — if the guardian disappears mid
     /// incident, the treasury unblocks itself after the cap. A pause that
     /// must outlive the cap is the multisig-only [`Self::freeze`].
-    fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::pause_is_active(&Self::load(env)?, env) {
+    fn require_not_paused_for(t: &Treasury, env: &Env) -> Result<(), Error> {
+        if Self::pause_is_active(t, env) {
             return Err(Error::TreasuryPaused);
         }
         Ok(())
@@ -2388,9 +2411,10 @@ impl TreasuryContract {
     /// Refuse to park a payout the configured time-lock would not have
     /// captured, so queueing cannot be used to impose a cooldown governance
     /// never configured.
-    fn require_time_lock_applies(env: &Env, amount: i128) -> Result<(), Error> {
-        if Self::load_time_lock(env).applies(amount) {
-            Ok(())
+    fn require_time_lock_applies(env: &Env, amount: i128) -> Result<WithdrawalTimeLock, Error> {
+        let config = Self::load_time_lock(env);
+        if config.applies(amount) {
+            Ok(config)
         } else {
             Err(Error::InvalidInput)
         }
@@ -2415,8 +2439,8 @@ impl TreasuryContract {
         to: Address,
         amount: i128,
         payments: Vec<Payment>,
+        config: &WithdrawalTimeLock,
     ) -> Result<u64, Error> {
-        let config = Self::load_time_lock(env);
         let now = env.ledger().timestamp();
         let execute_after = checked_add_u64(now, config.delay)?;
         let expires_at = checked_add_u64(execute_after, GOVERNANCE_GRACE_PERIOD)?;

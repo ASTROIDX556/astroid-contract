@@ -114,7 +114,8 @@
 //! | Expiry not after now/start, zero-length `Custom` interval, deficit on a non-recurring period | [`Error::InvalidTimeWindow`] | 46 |
 //! | Spend / release / transfer amount `<= 0`                    | [`Error::InvalidAmount`]       | 12 |
 //! | Negative limit or rollover cap                              | [`Error::InvalidAmount`]       | 12 |
-//! | Limit below spent, rollover bps out of range                | [`Error::InvalidInput`]        | 4  |
+//! | Limit below spent                                            | [`Error::InvalidInput`]        | 4  |
+//! | Invalid rollover configuration                               | [`Error::InvalidRolloverConfig`] | 47 |
 //! | Checked arithmetic would overflow `i128`                    | [`Error::Overflow`]            | 11 |
 //! | Caller is not the budget owner                              | [`Error::Unauthorized`]        | 3  |
 //! | Budget is frozen / archived                                 | [`Error::BudgetFrozen`] / [`Error::BudgetArchived`] | 41 / 42 |
@@ -373,7 +374,7 @@ impl BudgetContract {
         Self::require_valid_limit(max_rollover_cap)?;
         Self::require_valid_limit(rollover_bps)?;
         if rollover_bps > BPS_DENOMINATOR {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidRolloverConfig);
         }
         let start_at = env.ledger().timestamp();
         Self::allocate_internal(
@@ -437,7 +438,7 @@ impl BudgetContract {
         Self::require_valid_limit(rollover_cap)?;
         Self::require_valid_limit(rollover_bps)?;
         if rollover_bps > BPS_DENOMINATOR {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidRolloverConfig);
         }
         let now = env.ledger().timestamp();
         // A budget that is already expired at creation, or expires before it
@@ -518,7 +519,7 @@ impl BudgetContract {
     /// `limit`, in basis points (0 = uncapped, 2_500 = 25%). It is a
     /// protocol-safety ceiling layered on top of the owner's absolute
     /// `rollover_cap`: the effective cap is the smaller of the two. A
-    /// percentage of 100% or more is rejected with [`Error::InvalidInput`] so
+    /// percentage of 100% or more is rejected with [`Error::InvalidRolloverConfig`] so
     /// the cap can never loosen a bounded rollover, and `Self::effective_rollover_cap`
     /// applies it through the shared checked arithmetic.
     ///
@@ -540,7 +541,7 @@ impl BudgetContract {
         Self::require_valid_limit(rollover_max_bps)?;
         // A percentage cap of 100% or more would not bound anything.
         if rollover_max_bps >= BPS_DENOMINATOR {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidRolloverConfig);
         }
         if period == Period::Custom && period_seconds == 0 {
             return Err(Error::InvalidTimeWindow);
@@ -617,7 +618,7 @@ impl BudgetContract {
         Self::require_valid_limit(max_rollover_cap)?;
         Self::require_valid_limit(rollover_bps)?;
         if rollover_bps > BPS_DENOMINATOR {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidRolloverConfig);
         }
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
@@ -933,7 +934,7 @@ impl BudgetContract {
         Self::require_valid_limit(max_rollover_cap)?;
         Self::require_valid_limit(rollover_bps)?;
         if rollover_bps > BPS_DENOMINATOR {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidRolloverConfig);
         }
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;
@@ -979,7 +980,7 @@ impl BudgetContract {
         Self::require_valid_limit(max_rollover_cap)?;
         Self::require_valid_limit(rollover_bps)?;
         if rollover_bps > BPS_DENOMINATOR {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidRolloverConfig);
         }
         let budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_active(&budget)?;

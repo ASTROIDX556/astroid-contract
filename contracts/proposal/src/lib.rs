@@ -296,19 +296,28 @@ impl VoteBars {
     /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
     /// checked arithmetic — never floating point, so every node derives the
     /// identical integer. `percent` is clamped to 100, so a misconfigured
-    /// percentage can never demand more than the whole allow-list.
+    /// percentage can never demand more than the whole allow-list. A result
+    /// wider than `u32` saturates to `u32::MAX` instead of trapping or
+    /// wrapping into a bar that could be met by a smaller tally.
     pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
-        let percent = percent.min(100);
-        let product = checked_mul_u64(eligible as u64, percent as u64)
-            .expect("quorum multiplication overflow");
-        product.div_ceil(100) as u32
+        let percent = u64::from(percent.min(100));
+        checked_mul_u64(u64::from(eligible), percent)
+            .map(|product| product.div_ceil(100))
+            .ok()
+            .and_then(|bar| u32::try_from(bar).ok())
+            .unwrap_or(u32::MAX)
     }
 
     /// Majority check helper: the smallest number of approvals that exceeds
     /// half the allow-list — a strict majority. An exact tie (exactly half)
-    /// never reaches it.
+    /// never reaches it. Computed in `u64` and capped at `u32::MAX` so an
+    /// allow-list near the type boundary cannot overflow into a false bar.
     pub fn majority_required(eligible: u32) -> u32 {
-        eligible / 2 + 1
+        u64::from(eligible)
+            .checked_div(2)
+            .and_then(|half| half.checked_add(1))
+            .and_then(|bar| u32::try_from(bar).ok())
+            .unwrap_or(u32::MAX)
     }
 
     /// Whether `approvals` forms a strict majority of the `eligible` voters.
@@ -453,7 +462,8 @@ impl ProposalContract {
             .instance()
             .get(&DataKey::ProposalCount)
             .ok_or(Error::NotInitialized)?;
-        count = checked_add(count as i128, 1)? as u64;
+        let next = checked_add(count as i128, 1)?;
+        count = u64::try_from(next).map_err(|_| Error::Overflow)?;
         let id = count;
 
         // Validate the declared prerequisites and collapse duplicates, so that
@@ -761,7 +771,7 @@ impl ProposalContract {
             let _ = Self::expire_if_due(&env, id, &mut proposal);
             if proposal.is_expired(&env) && proposal.state.deposit_settled() {
                 Self::purge_proposal(&env, id, &proposal);
-                pruned += 1;
+                pruned = pruned.checked_add(1).ok_or(Error::Overflow)?;
             }
         }
         if pruned > 0 {
@@ -792,7 +802,7 @@ impl ProposalContract {
             let _ = Self::expire_if_due(&env, id, &mut proposal);
             if proposal.is_expired(&env) && proposal.state.deposit_settled() {
                 Self::purge_proposal(&env, id, &proposal);
-                pruned += 1;
+                pruned = pruned.checked_add(1).ok_or(Error::Overflow)?;
             }
         }
         if pruned > 0 {

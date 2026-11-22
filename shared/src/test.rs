@@ -1157,7 +1157,7 @@ const RETIRED_CODES: [u32; 2] = [25, 26];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 63] = [
+const EXPECTED_CODES: [(Error, u32); 64] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1182,13 +1182,14 @@ const EXPECTED_CODES: [(Error, u32); 63] = [
     (Error::CircularUpgrade, 32),
     (Error::InvalidUpgradeAddress, 33),
     (Error::VersionNotMonotonic, 34),
-    // --- Budget (40-44) ---
+    // --- Budget (40-47) ---
     (Error::BudgetExceeded, 40),
     (Error::BudgetFrozen, 41),
     (Error::BudgetArchived, 42),
     (Error::AssetNotAuthorized, 43),
     (Error::BudgetExpired, 44),
     (Error::InvalidTimeWindow, 46),
+    (Error::InvalidRolloverConfig, 47),
     // --- Wallet (50-55) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
@@ -1371,7 +1372,7 @@ fn error_domains_do_not_overlap() {
         .count();
 
     assert_eq!(registry, 5, "registry band 30-39");
-    assert_eq!(budget, 6, "budget band 40-49");
+    assert_eq!(budget, 7, "budget band 40-49");
     assert_eq!(wallet, 6, "wallet band 50-55");
     assert_eq!(multisig, 14, "multisig bands 61-70 and 90-93");
     assert_eq!(proposal, 7, "proposal band 71-79");
