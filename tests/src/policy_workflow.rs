@@ -20,7 +20,7 @@
 //! spend recorded against the agent's daily total.
 //!
 //! For every blocked transaction the test asserts both the deterministic error
-//! code (`PolicyDenied` for rule violations, `BudgetExceeded` for exhausted
+//! code (`PolicyDenied` for rule violations, `BudgetLimitReached` for exhausted
 //! allowances) and that no balance, ledger, or counter moved.
 
 use astroid_budget::{BudgetContract, BudgetContractClient, Period};
@@ -393,7 +393,7 @@ fn agent_daily_limit_blocks_then_resets_next_day() {
     h.agent_pay(&h.merchant, 2_000).unwrap(); // exactly the daily limit.
 
     let before = h.snapshot();
-    assert_eq!(h.agent_pay(&h.merchant, 1), Err(Error::BudgetExceeded));
+    assert_eq!(h.agent_pay(&h.merchant, 1), Err(Error::BudgetLimitExceeded));
     assert_eq!(h.snapshot(), before);
 
     // Next UTC day: the window resets automatically.

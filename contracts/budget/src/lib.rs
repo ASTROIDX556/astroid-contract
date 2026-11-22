@@ -4,7 +4,7 @@
 //!
 //! Enforces spending limits (PRD Doc 7 §Budget). Every spend calls
 //! [`BudgetContract::consume`], which debits the remaining allocation and
-//! reverts with [`Error::BudgetExceeded`] when a spend would push spending past
+//! reverts with [`Error::BudgetLimitReached`] when a spend would push spending past
 //! the limit. Budgets support periodic auto-reset windows (daily / weekly /
 //! monthly), optional unspent-allowance rollover into the next period, an
 //! expiration timestamp after which consumption is rejected, freezing,
@@ -1089,7 +1089,7 @@ impl BudgetContract {
     /// tokens are rejected with [`Error::InvalidInput`] so a spend cannot be
     /// split into legs that individually fit but jointly breach the cap, and
     /// each leg's new spent total must stay within the token's current-window
-    /// limit ([`Error::BudgetExceeded`] otherwise). Only when every leg passes
+    /// limit ([`Error::BudgetLimitReached`] otherwise). Only when every leg passes
     /// are all new spent totals persisted — a single breach rejects the whole
     /// batch and leaves every ledger untouched. Time-based window resets,
     /// lifecycle state and the scheduled-start gate are checked exactly as
@@ -1615,6 +1615,18 @@ impl BudgetContract {
                     amount: checked_sub(capacity, spent)?,
                 },
             );
+            // Emit dedicated BudgetRollover event when rollover occurs
+            if budget.rollover_enabled && !went_into_deficit && outcome.carry_over != 0 {
+                events::publish(
+                    env,
+                    ContractEvent::BudgetRollover {
+                        budget_id: budget_id.clone(),
+                        periods_elapsed: outcome.periods,
+                        carry_over: outcome.carry_over,
+                        new_window_start: budget.window_start,
+                    },
+                );
+            }
             // The window re-armed: announce the headroom now spendable so a
             // consumer that saw `exhausted` knows the agent may spend again.
             // Informational only: a capacity beyond `i128::MAX` saturates
@@ -1760,7 +1772,7 @@ impl BudgetContract {
 impl BudgetInterface for BudgetContract {
     /// Debit `amount` from the budget. Applies any pending period transition
     /// first, then enforces `spent + amount <= limit + rollover_credit`, else
-    /// [`Error::BudgetExceeded`].
+    /// [`Error::BudgetLimitReached`].
     fn consume(
         env: Env,
         caller: Address,

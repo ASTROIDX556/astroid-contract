@@ -123,6 +123,12 @@ pub enum Error {
     /// ceiling. Nothing moves; the spend may succeed once older volume ages
     /// out of the window.
     VelocityLimitExceeded = 27,
+    /// A policy constraint was not satisfied: the transaction violates a
+    /// configured rule (e.g. recipient not whitelisted, asset not allowed,
+    /// category restricted, amount exceeds limit). This provides a more
+    /// specific error than [`Error::PolicyDenied`] for off-chain consumers
+    /// to distinguish policy constraint violations from a disabled/expired policy.
+    PolicyConstraintUnmet = 28,
 
     // --- Registry (30-39) ---
     /// The protocol registry is frozen: every mutating registry entrypoint
@@ -359,7 +365,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 67] = [
+    pub const ALL: [Error; 68] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -378,6 +384,7 @@ impl Error {
         Error::PolicyMerchantBlocked,
         Error::PolicyCategoryRestricted,
         Error::VelocityLimitExceeded,
+        Error::PolicyConstraintUnmet,
         // --- Registry (30-39) ---
         Error::RegistryFrozen,
         Error::ModuleDeprecated,
@@ -487,6 +494,7 @@ impl Error {
             Error::PolicyMerchantBlocked => "POLICY_MERCHANT_BLOCKED",
             Error::PolicyCategoryRestricted => "POLICY_CATEGORY_RESTRICTED",
             Error::VelocityLimitExceeded => "VELOCITY_LIMIT_EXCEEDED",
+            Error::PolicyConstraintUnmet => "POLICY_CONSTRAINT_UNMET",
             // --- Registry (30-39) ---
             Error::RegistryFrozen => "REGISTRY_FROZEN",
             Error::ModuleDeprecated => "MODULE_DEPRECATED",
@@ -819,7 +827,6 @@ impl From<BudgetError> for Error {
         }
     }
 }
-
 /// Milestone-approval errors, kept separate from the protocol-wide [`Error`]
 /// enum so the escrow's milestone state machine can report dedicated,
 /// deterministic codes without pushing the canonical table past Soroban's
