@@ -1250,6 +1250,21 @@ fn error_code_table_is_frozen() {
 }
 
 #[test]
+fn budget_error_aliases_keep_their_deterministic_codes() {
+    // Issue #519: BUDGET_EXCEEDED, BUDGET_NOT_FOUND and INVALID_ALLOCATION must
+    // be nameable from the shared error table by both budget and wallet. They
+    // are aliases, so the published wire codes stay exactly as they were.
+    assert_eq!(Error::BudgetExceeded.code(), 40);
+    assert_eq!(Error::BudgetExceeded.wire_name(), "BUDGET_EXCEEDED");
+    assert_eq!(Error::BudgetNotFound, Error::NotFound);
+    assert_eq!(Error::BudgetNotFound.code(), 1);
+    assert_eq!(Error::InvalidAllocation, Error::InvalidInput);
+    assert_eq!(Error::InvalidAllocation.code(), 4);
+    assert_eq!(BudgetError::InvalidAllocation, BudgetError::InvalidInput);
+    assert_eq!(BudgetError::InvalidAllocation.code(), 4);
+}
+
+#[test]
 fn error_codes_are_unique_and_never_overlap() {
     for (i, variant) in Error::ALL.iter().enumerate() {
         let code = variant.code();
@@ -2011,4 +2026,80 @@ fn rollover_allowance_calculation() {
         calculate_rollover_allowance(i128::MAX, 1_000, 5_000, 300),
         Err(Error::Overflow)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #520: standardized deposit event emission
+// ---------------------------------------------------------------------------
+
+mod deposit_events {
+    use crate::events::{self, DepositRecorded};
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{contract, contractimpl, Address, Env, String};
+
+    #[contract]
+    pub struct DepositRecorder;
+
+    #[contractimpl]
+    impl DepositRecorder {
+        pub fn record(
+            env: Env,
+            org: String,
+            from: Address,
+            asset: Address,
+            amount: i128,
+            balance: i128,
+        ) {
+            events::deposit_recorded(&env, &org, &from, &asset, amount, balance);
+        }
+    }
+
+    #[test]
+    fn deposit_recorded_emits_typed_and_legacy_events() {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::{IntoVal, Symbol, TryFromVal, Val};
+
+        let env = Env::default();
+        env.ledger().set_timestamp(1_234);
+        let org = String::from_str(&env, "acme");
+        let from = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let id = env.register_contract(None, DepositRecorder);
+
+        DepositRecorderClient::new(&env, &id).record(&org, &from, &asset, &50, &500);
+
+        let typed_topic: Val = Symbol::new(&env, "DepositRecorded").into_val(&env);
+        let treasury_topic: Val = Symbol::new(&env, "treasury").into_val(&env);
+        let deposit_topic: Val = Symbol::new(&env, "deposit").into_val(&env);
+        let mut typed = 0;
+        let mut legacy = 0;
+        for (emitter, topics, data) in env.events().all().iter() {
+            if emitter != id.clone() {
+                continue;
+            }
+            if topics.contains(typed_topic) {
+                typed += 1;
+                let record = DepositRecorded::try_from_val(&env, &data).unwrap();
+                assert_eq!(record.org, org);
+                assert_eq!(record.from, from);
+                assert_eq!(record.asset, asset);
+                assert_eq!(record.amount, 50);
+                assert_eq!(record.balance, 500);
+                assert_eq!(record.recorded_at, 1_234);
+            }
+            if topics.contains(treasury_topic) && topics.contains(deposit_topic) {
+                legacy += 1;
+                let payload: (String, Address, Address, i128, i128, u64) =
+                    TryFromVal::try_from_val(&env, &data).unwrap();
+                assert_eq!(payload.0, org);
+                assert_eq!(payload.1, from);
+                assert_eq!(payload.2, asset);
+                assert_eq!(payload.3, 50);
+                assert_eq!(payload.4, 500);
+                assert_eq!(payload.5, 1_234);
+            }
+        }
+        assert_eq!(typed, 1);
+        assert_eq!(legacy, 1);
+    }
 }

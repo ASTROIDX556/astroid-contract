@@ -61,6 +61,22 @@ pub struct EscrowExpiration {
     pub expired_at: u64,
 }
 
+/// Typed payload of [`ContractEvent::DepositRecorded`].
+///
+/// A compact, self-describing record of value entering protocol custody: who
+/// sent it, which asset and amount actually arrived, the custodian's recorded
+/// balance afterwards, and the ledger timestamp that made the deposit final.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositRecorded {
+    pub org: String,
+    pub from: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub balance: i128,
+    pub recorded_at: u64,
+}
+
 /// Canonical, structured event schema emitted by every Astroid contract.
 ///
 /// Publish with `events::publish(env, ContractEvent::Variant { .. })`. Each
@@ -252,6 +268,10 @@ pub enum ContractEvent {
         amount: i128,
         balance: i128,
     },
+    /// A deposit was recorded by any protocol custodian (treasury, wallet or
+    /// escrow). Carries [`DepositRecorded`], one stable schema across all of
+    /// them (Issue #520).
+    DepositRecorded { record: DepositRecorded },
     /// Value was withdrawn from a treasury. `balance` is the treasury's
     /// recorded balance of `asset` after the withdrawal.
     TreasuryWithdrawn {
@@ -574,6 +594,10 @@ pub fn publish(env: &Env, event: ContractEvent) {
                 (Symbol::new(env, "TreasuryDeposited"),),
                 (org, from, asset, amount, balance),
             );
+        }
+        ContractEvent::DepositRecorded { record } => {
+            env.events()
+                .publish((Symbol::new(env, "DepositRecorded"),), record);
         }
         ContractEvent::TreasuryWithdrawn {
             org,
@@ -1093,6 +1117,49 @@ pub fn treasury_emergency_sweep(
             recovery.clone(),
             amount,
             env.ledger().timestamp(),
+        ),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deposit tracking (Issue #520)
+// ---------------------------------------------------------------------------
+
+/// `DepositRecorded` — typed topic `("DepositRecorded",)` carrying a
+/// [`DepositRecorded`] payload, plus the legacy tuple topic
+/// `("treasury", "deposit")` with `(org, from, asset, amount, balance,
+/// timestamp)` for dashboards that predate the typed layer.
+///
+/// Both use the standard Soroban event encoding: topics are symbols, the data
+/// tuple is a single `contracttype`-compatible value, and the timestamp comes
+/// from the deterministic ledger clock rather than the caller.
+pub fn deposit_recorded(
+    env: &Env,
+    org: &String,
+    from: &Address,
+    asset: &Address,
+    amount: i128,
+    balance: i128,
+) {
+    let recorded_at = env.ledger().timestamp();
+    let record = DepositRecorded {
+        org: org.clone(),
+        from: from.clone(),
+        asset: asset.clone(),
+        amount,
+        balance,
+        recorded_at,
+    };
+    publish(env, ContractEvent::DepositRecorded { record });
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("deposit")),
+        (
+            org.clone(),
+            from.clone(),
+            asset.clone(),
+            amount,
+            balance,
+            recorded_at,
         ),
     );
 }
