@@ -1777,7 +1777,7 @@ impl PolicyContract {
     /// | `amount <= 0`                               | [`Error::InvalidAmount`]  |
     /// | unknown `policy_id`                         | [`Error::NotFound`]       |
     /// | `amount > per_tx_limit`                     | [`Error::PolicyDenied`]   |
-    /// | today's spend + `amount` > `daily_limit`    | [`Error::BudgetExceeded`] |
+    /// | today's spend + `amount` > `daily_limit`    | [`Error::BudgetLimitReached`] |
     /// | the running total would overflow `i128`     | [`Error::Overflow`]       |
     ///
     /// An agent without a configured limit is not restricted by this gate; the
@@ -2275,7 +2275,7 @@ impl PolicyContract {
             if limit.daily_limit > 0 {
                 if new_spent > limit.daily_limit {
                     events_policy_violation(env, policy_id, "daily_limit_exceeded");
-                    return Err(Error::BudgetExceeded);
+                    return Err(Error::BudgetLimitExceeded);
                 }
                 remaining = checked_sub(limit.daily_limit, new_spent)?;
             }

@@ -73,8 +73,9 @@ fn interface_table_compiles() {
 #[test]
 fn interface_version_is_pinned() {
     // Bumping the version is a deliberate act; this catches accidental edits.
-    // 3 added `EscrowInterface` (Issue #293).
-    assert_eq!(INTERFACE_VERSION, 3);
+    // 3 added `EscrowInterface` (Issue #293); 4 added the registry's upgrade
+    // authorization interface used by wallet upgrades (Issue #524).
+    assert_eq!(INTERFACE_VERSION, 4);
 }
 
 #[test]

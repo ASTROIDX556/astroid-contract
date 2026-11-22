@@ -96,8 +96,8 @@ impl QuorumStatus {
     }
 
     /// Refuse a tally short of the threshold, reporting the caller's own
-    /// shortfall code ([`Error::InsufficientWeight`] for proposal approvals,
-    /// [`Error::ThresholdNotMet`] for signature-verified batches), so every
+    /// shortfall code ([`Error::InsufficientWeight`] for approval progress,
+    /// [`Error::QUORUM_NOT_MET`] for signature-verified quorums), so every
     /// quorum decision reports failure in one place.
     pub fn ensure_met(&self, shortfall: Error) -> Result<(), Error> {
         if self.met {
@@ -123,7 +123,7 @@ pub fn add_weight(total: i128, weight: u32) -> Result<i128, Error> {
 /// rejected instead of being wrapped down into a smaller number that would
 /// wrongly fail a legitimate quorum.
 pub fn narrow(total: i128) -> Result<u32, Error> {
-    if total > u32::MAX as i128 {
+    if total < 0 || total > u32::MAX as i128 {
         return Err(Error::Overflow);
     }
     Ok(total as u32)
@@ -184,8 +184,8 @@ pub fn accumulate_selected(
 /// configured threshold in one fail-closed step (Issue #522).
 ///
 /// Returns the full [`QuorumStatus`] on success — including an exact match and
-/// any excess weight — or `shortfall` (`Error::InsufficientWeight` for proposal
-/// approvals, `Error::ThresholdNotMet` for signature-verified batches) when the
+/// any excess weight — or `shortfall` (`Error::InsufficientWeight` for approval
+/// progress, `Error::QUORUM_NOT_MET` for signature-verified quorums) when the
 /// aggregate falls below the threshold. A sum that cannot be represented as
 /// `u32` surfaces as [`Error::Overflow`] before any comparison is made.
 pub fn verify_weight(

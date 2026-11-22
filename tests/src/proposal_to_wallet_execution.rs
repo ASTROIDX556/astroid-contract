@@ -510,7 +510,7 @@ fn policy_violation_aborts_execution_path() {
         &h.asset,
         &(BUDGET_LIMIT - SPEND + 1),
     );
-    assert_eq!(res, Err(Ok(Error::BudgetExceeded)));
+    assert_eq!(res, Err(Ok(Error::BUDGET_LIMIT_EXCEEDED)));
     assert_eq!(token_balance(&h, &h.vendor), SPEND);
     assert_eq!(h.wallet.balance(&wallet_id, &h.asset), before - SPEND);
     assert_eq!(h.budget.get(&budget_id(&h)).spent, SPEND);

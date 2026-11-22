@@ -26,7 +26,7 @@
 use astroid_shared::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
-use soroban_sdk::{contractclient, contracttype, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{contractclient, contracttype, symbol_short, Address, BytesN, Env, String};
 
 /// The slice of the registry an upgrading contract needs: whether a Wasm hash is
 /// approved for a module kind.
@@ -38,6 +38,19 @@ use soroban_sdk::{contractclient, contracttype, symbol_short, Address, BytesN, E
 pub trait UpgradeRegistryInterface {
     /// Whether `wasm_hash` is an approved implementation for `kind`.
     fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool;
+}
+
+/// The registry's answer to "may this key roll `kind` forward for `org`?".
+///
+/// Kept separate from [`UpgradeRegistryInterface`] because that trait's
+/// entrypoint already exists on the registry; a contract can expose both
+/// surfaces without exporting the same symbol twice. The registry resolves
+/// protocol admins, their governance contract and delegated org roles, so a
+/// member asking this question never has to keep its own privileged-key list.
+#[contractclient(name = "UpgradeAuthorizationClient")]
+pub trait UpgradeAuthorizationInterface {
+    /// Whether `caller` may authorize an upgrade of `kind` for `org`.
+    fn is_upgrade_authorized(env: Env, org: String, caller: Address, kind: ModuleKind) -> bool;
 }
 
 /// Instance-storage key for the upgrade authority. Namespaced under its own

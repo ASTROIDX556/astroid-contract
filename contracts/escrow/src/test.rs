@@ -3814,15 +3814,15 @@ mod claim_refund_tests {
 
         // Check that the correct events were emitted
         let events = h.env.events().all();
-        let has_claim_refund = events
-            .iter()
-            .any(|(_, topics, _)| topics.contains(&symbol_short!("claim_rfd").into_val(&h.env)));
+        let topic: Val = symbol_short!("claim_rfd").into_val(&h.env);
+        let has_claim_refund = events.iter().any(|(_, topics, _)| topics.contains(topic));
         assert!(has_claim_refund, "claim_refund event should be emitted");
 
         // Check standard refunded event
-        let has_refunded = events.iter().any(|(_, topics, _)| {
-            topics.contains(&Symbol::new(&h.env, "EscrowRefunded").into_val(&h.env))
-        });
+        let refunded_topic: Val = Symbol::new(&h.env, "EscrowRefunded").into_val(&h.env);
+        let has_refunded = events
+            .iter()
+            .any(|(_, topics, _)| topics.contains(refunded_topic));
         assert!(has_refunded, "EscrowRefunded event should be emitted");
     }
 

@@ -4,7 +4,7 @@
 //!
 //! Enforces spending limits (PRD Doc 7 §Budget). Every spend calls
 //! [`BudgetContract::consume`], which debits the remaining allocation and
-//! reverts with [`Error::BudgetExceeded`] when a spend would push spending past
+//! reverts with [`Error::BudgetLimitReached`] when a spend would push spending past
 //! the limit. Budgets support periodic auto-reset windows (daily / weekly /
 //! monthly), optional unspent-allowance rollover into the next period, an
 //! expiration timestamp after which consumption is rejected, freezing,
@@ -116,7 +116,9 @@
 //! | Negative limit or rollover cap                              | [`Error::InvalidAmount`]       | 12 |
 //! | Limit below spent                                            | [`Error::InvalidInput`]        | 4  |
 //! | Invalid rollover configuration                               | [`Error::InvalidRolloverConfig`] | 47 |
-//! | Checked arithmetic would overflow `i128`                    | [`Error::Overflow`]            | 11 |
+//! | Checked arithmetic in a spend/fund/allocate path overflowed  | [`Error::BUDGET_OVERFLOW`]     | 48 |
+//! | Spend/consume would breach the effective ceiling            | [`Error::BUDGET_LIMIT_EXCEEDED`] | 49 |
+//! | Other checked arithmetic would overflow `i128`              | [`Error::Overflow`]            | 11 |
 //! | Caller is not the budget owner                              | [`Error::Unauthorized`]        | 3  |
 //! | Budget is frozen / archived                                 | [`Error::BudgetFrozen`] / [`Error::BudgetArchived`] | 41 / 42 |
 
@@ -735,7 +737,7 @@ impl BudgetContract {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_not_archived(&budget)?;
         Self::window_transition(&env, &mut budget, &budget_id, true)?;
-        budget.limit = checked_add(budget.limit, amount)?;
+        budget.limit = checked_add(budget.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &budget_id, &budget);
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("funded")),
@@ -842,12 +844,12 @@ impl BudgetContract {
         Self::require_not_expired(&env, &from)?;
         Self::require_not_expired(&env, &to)?;
         // Only the unspent portion of `from` may be reallocated.
-        let available = checked_sub(from.limit, from.spent)?;
+        let available = checked_sub(from.limit, from.spent).map_err(|_| Error::BUDGET_OVERFLOW)?;
         if amount > available {
-            return Err(Error::ExceededSpendLimit);
+            return Err(Error::BUDGET_LIMIT_EXCEEDED);
         }
-        from.limit = checked_sub(from.limit, amount)?;
-        to.limit = checked_add(to.limit, amount)?;
+        from.limit = checked_sub(from.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
+        to.limit = checked_add(to.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &from_id, &from);
         Self::store(&env, &to_id, &to);
         env.events().publish(
@@ -1051,9 +1053,10 @@ impl BudgetContract {
 
         // Check if within limit (accounting for any rollover credit)
         let capacity = Self::asset_capacity(&asset_budget)?;
-        let new_spent = checked_add(asset_budget.spent, amount)?;
+        let new_spent =
+            checked_add(asset_budget.spent, amount).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         if new_spent > capacity {
-            return Err(BudgetError::ExceededSpendLimit);
+            return Err(BudgetError::BUDGET_LIMIT_EXCEEDED);
         }
         asset_budget.spent = new_spent;
         env.storage().persistent().set(&key, &asset_budget);
@@ -1086,7 +1089,7 @@ impl BudgetContract {
     /// tokens are rejected with [`Error::InvalidInput`] so a spend cannot be
     /// split into legs that individually fit but jointly breach the cap, and
     /// each leg's new spent total must stay within the token's current-window
-    /// limit ([`Error::BudgetExceeded`] otherwise). Only when every leg passes
+    /// limit ([`Error::BudgetLimitReached`] otherwise). Only when every leg passes
     /// are all new spent totals persisted — a single breach rejects the whole
     /// batch and leaves every ledger untouched. Time-based window resets,
     /// lifecycle state and the scheduled-start gate are checked exactly as
@@ -1136,9 +1139,10 @@ impl BudgetContract {
             // Same ceiling as the single-leg path: the base limit plus any
             // rollover credit banked from earlier windows. Checking against
             // the bare limit refused spends `check_and_record_spend` accepts.
-            let new_spent = checked_add(asset_budget.spent, spend.amount)?;
+            let new_spent = checked_add(asset_budget.spent, spend.amount)
+                .map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
             if new_spent > Self::asset_capacity(&asset_budget)? {
-                return Err(BudgetError::ExceededSpendLimit);
+                return Err(BudgetError::BUDGET_LIMIT_EXCEEDED);
             }
             asset_budget.spent = new_spent;
             settled.push_back(asset_budget);
@@ -1611,6 +1615,18 @@ impl BudgetContract {
                     amount: checked_sub(capacity, spent)?,
                 },
             );
+            // Emit dedicated BudgetRollover event when rollover occurs
+            if budget.rollover_enabled && !went_into_deficit && outcome.carry_over != 0 {
+                events::publish(
+                    env,
+                    ContractEvent::BudgetRollover {
+                        budget_id: budget_id.clone(),
+                        periods_elapsed: outcome.periods,
+                        carry_over: outcome.carry_over,
+                        new_window_start: budget.window_start,
+                    },
+                );
+            }
             // The window re-armed: announce the headroom now spendable so a
             // consumer that saw `exhausted` knows the agent may spend again.
             // Informational only: a capacity beyond `i128::MAX` saturates
@@ -1736,6 +1752,7 @@ impl BudgetContract {
     fn asset_capacity(asset_budget: &AssetBudget) -> Result<i128, Error> {
         if asset_budget.rollover_enabled {
             checked_add(asset_budget.limit, asset_budget.rollover_credit)
+                .map_err(|_| Error::BUDGET_OVERFLOW)
         } else {
             Ok(asset_budget.limit)
         }
@@ -1755,7 +1772,7 @@ impl BudgetContract {
 impl BudgetInterface for BudgetContract {
     /// Debit `amount` from the budget. Applies any pending period transition
     /// first, then enforces `spent + amount <= limit + rollover_credit`, else
-    /// [`Error::BudgetExceeded`].
+    /// [`Error::BudgetLimitReached`].
     fn consume(
         env: Env,
         caller: Address,
@@ -1767,17 +1784,20 @@ impl BudgetInterface for BudgetContract {
         Self::require_active(&budget)?;
         Self::require_started(&env, &budget)?;
         Self::window_transition(&env, &mut budget, &budget_id, true)?;
-        let capacity = checked_add(budget.limit, budget.rollover_credit)?;
+        let capacity = checked_add(budget.limit, budget.rollover_credit)
+            .map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         // When a deficit exists from prior periods, the effective spending
         // ceiling is reduced.  When no deficit exists yet, `allow_deficit`
         // lets the current period overspend (the excess becomes next-period
         // deficit).
         let ceiling = if budget.allow_deficit && budget.deficit_amount > 0 {
-            checked_sub(capacity, budget.deficit_amount)?
+            checked_sub(capacity, budget.deficit_amount)
+                .map_err(|_| BudgetError::BUDGET_OVERFLOW)?
         } else {
             capacity
         };
-        let new_spent = checked_add(budget.spent, amount)?;
+        let new_spent =
+            checked_add(budget.spent, amount).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         if new_spent > ceiling {
             // With deficit allowed and no prior deficit, the first overspend is
             // permitted — it becomes the carried-forward deficit.
@@ -1786,7 +1806,8 @@ impl BudgetInterface for BudgetContract {
                 Self::store(&env, &budget_id, &budget);
                 // Checked: a genuine i128 overflow surfaces as [`Error::Overflow`]
                 // instead of a panic; a negative result (deficit) is expected.
-                let remaining = checked_sub(capacity, new_spent)?;
+                let remaining =
+                    checked_sub(capacity, new_spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
                 env.events().publish(
                     (symbol_short!("budget"), symbol_short!("consumed")),
                     (budget_id.clone(), amount, remaining),
@@ -1794,13 +1815,15 @@ impl BudgetInterface for BudgetContract {
                 events::budget_exhausted(&env, &budget_id, None, new_spent, capacity);
                 return Ok(remaining);
             }
-            let remaining = checked_sub(ceiling, budget.spent)?;
+            let remaining =
+                checked_sub(ceiling, budget.spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
             events::budget_exceeded(&env, &budget_id, amount, remaining);
-            return Err(BudgetError::ExceededSpendLimit);
+            return Err(BudgetError::BUDGET_LIMIT_EXCEEDED);
         }
         budget.spent = new_spent;
         Self::store(&env, &budget_id, &budget);
-        let remaining = checked_sub(ceiling, budget.spent)?;
+        let remaining =
+            checked_sub(ceiling, budget.spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         env.events().publish(
             (symbol_short!("budget"), symbol_short!("consumed")),
             (budget_id.clone(), amount, remaining),
@@ -1823,7 +1846,7 @@ impl BudgetInterface for BudgetContract {
         if amount > budget.spent {
             return Err(Error::InvalidAmount);
         }
-        budget.spent = checked_sub(budget.spent, amount)?;
+        budget.spent = checked_sub(budget.spent, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &budget_id, &budget);
         Self::effective_remaining(&budget)
     }
