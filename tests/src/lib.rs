@@ -54,3 +54,5 @@ pub mod treasury_withdrawal_time_lock;
 pub mod upgrade_validation;
 #[cfg(test)]
 pub mod wallet_policy_violation_events;
+#[cfg(test)]
+pub mod wallet_registry_upgrade;
