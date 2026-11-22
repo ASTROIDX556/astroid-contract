@@ -15,6 +15,31 @@ struct Harness {
     owner: Address,
 }
 
+struct DetRng(u64);
+
+impl DetRng {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 { 1 } else { seed })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+
+    fn range(&mut self, low: i128, high: i128) -> i128 {
+        low + (self.below((high - low + 1) as u64) as i128)
+    }
+}
+
 fn setup() -> Harness {
     let env = Env::default();
     env.mock_all_auths();
@@ -1638,7 +1663,7 @@ fn rollover_max_bps_of_100_or_more_is_rejected() {
         &0,
         &10_000,
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
     // Strictly greater is rejected too, and no state was written.
     let res = h.client.try_set_recurrence(
         &h.owner,
@@ -1649,8 +1674,58 @@ fn rollover_max_bps_of_100_or_more_is_rejected() {
         &0,
         &20_000,
     );
-    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+    assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
     assert_eq!(h.client.get(&id(&h.env, "eng")).rollover_max_bps, 0);
+}
+
+#[test]
+fn invalid_rollover_configurations_return_deterministic_error() {
+    let h = setup();
+    let budget_id = id(&h.env, "eng");
+    let token = Address::generate(&h.env);
+
+    let res = h.client.try_allocate_with_rollover(
+        &h.owner,
+        &id(&h.env, "bad-allocate"),
+        &1_000,
+        &Period::Daily,
+        &true,
+        &10_001,
+        &500,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
+
+    allocate(&h, "eng", 1_000, Period::Daily, true);
+    let res = h.client.try_set_rollover_config(&h.owner, &budget_id, &true, &10_001, &500);
+    assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
+
+    let res = h.client.try_set_budget_limit_with_rollover(
+        &h.owner,
+        &budget_id,
+        &token,
+        &1_000,
+        &3_600,
+        &true,
+        &10_001,
+        &500,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
+
+    h.client
+        .set_budget_limit(&h.owner, &budget_id, &token, &100, &3_600);
+    let res = h.client.try_set_asset_rollover_config(
+        &h.owner,
+        &budget_id,
+        &token,
+        &true,
+        &10_001,
+        &500,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidRolloverConfig)));
+
+    assert_eq!(h.client.get(&budget_id).rollover_bps, 10_000);
+    assert_eq!(h.client.get(&budget_id).rollover_max_bps, 0);
 }
 
 #[test]
@@ -3971,4 +4046,74 @@ fn malformed_windows_return_invalid_time_window() {
             Err(Ok(Error::BudgetNotFound))
         );
     }
+}
+
+#[test]
+fn seeded_rollover_calculations_keep_their_invariants() {
+    let env = Env::default();
+    let mut rng = DetRng::new(0x5EED_1234_5678_9ABC);
+
+    for _ in 0..128 {
+        let limit = rng.range(0, 1_000_000);
+        let credit = rng.range(0, limit / 2 + 1);
+        let spent = rng.range(0, limit + credit + 1);
+        let window = rng.range(1, 3_600) as u64;
+        let start = rng.below(1_000_000) as u64;
+        let now = start.saturating_add(rng.below(10_000) as u64);
+        let rollover_enabled = rng.below(2) == 1;
+        let budget = Budget {
+            owner: Address::generate(&env),
+            limit,
+            spent,
+            period: Period::Custom,
+            period_seconds: window,
+            window_start: start,
+            rollover_enabled,
+            rollover_credit: credit,
+            rollover_cap: rng.range(0, limit + 1),
+            rollover_max_bps: rng.range(0, 10_000),
+            rollover_bps: rng.range(0, 10_000),
+            allow_deficit: false,
+            deficit_amount: 0,
+            expires_at: 0,
+            state: ResourceState::Active,
+        };
+
+        let outcome = BudgetContract::calculate_rollover(&budget, now).unwrap();
+        assert_eq!(outcome, BudgetContract::calculate_rollover(&budget, now).unwrap());
+
+        if outcome.is_due {
+            assert!(outcome.periods >= 1);
+            assert_eq!(outcome.periods as i128, (now - start) as i128 / window as i128);
+            if !rollover_enabled {
+                assert_eq!(outcome.carry_over, 0);
+            } else {
+                assert!(outcome.carry_over >= 0);
+            }
+        } else {
+            assert_eq!(outcome.periods, 0);
+            assert_eq!(outcome.carry_over, credit);
+        }
+    }
+}
+
+#[test]
+fn seeded_percentage_of_limit_matches_exact_integer_math() {
+    let mut rng = DetRng::new(0xB000_1000_DEAD_BEEF);
+    let bound = i128::MAX / 10_000;
+
+    for _ in 0..128 {
+        let limit = rng.range(0, bound);
+        let bps = rng.range(0, 10_000);
+        assert_eq!(
+            BudgetContract::percentage_of_limit(limit, bps),
+            Ok(limit * bps / 10_000)
+        );
+    }
+
+    assert_eq!(BudgetContract::percentage_of_limit(i128::MAX, 0), Ok(0));
+    assert_eq!(
+        BudgetContract::percentage_of_limit(i128::MAX, 10_000),
+        Ok(i128::MAX)
+    );
 }

@@ -153,7 +153,7 @@ pub enum Error {
     /// same version.
     VersionNotMonotonic = 34,
 
-    // --- Budget (40-46) ---
+    // --- Budget (40-47) ---
     /// The spend would breach the budget: the per-asset limit for this token,
     /// or the aggregate ceiling for the period once rollover and any deficit
     /// carry-forward have been applied. Nothing is spent and the recorded
@@ -182,6 +182,10 @@ pub enum Error {
     /// period with a zero-second interval, or a deficit policy on a period that
     /// never recurs. Rejected before any budget state is written (Issue #503).
     InvalidTimeWindow = 46,
+    /// INVALID_ROLLOVER_CONFIG: a budget rollover setting is invalid — a
+    /// rollover percentage above 100%, or a recurring maximum that does not
+    /// bound rollover. Rejected before any budget state is written.
+    InvalidRolloverConfig = 47,
 
     // --- Wallet (50-55) ---
     /// The wallet is frozen by its guardian, so configuration changes are
@@ -341,7 +345,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 63] = [
+    pub const ALL: [Error; 64] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -366,13 +370,14 @@ impl Error {
         Error::CircularUpgrade,
         Error::InvalidUpgradeAddress,
         Error::VersionNotMonotonic,
-        // --- Budget (40-44) ---
+        // --- Budget (40-47) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
         Error::BudgetArchived,
         Error::AssetNotAuthorized,
         Error::BudgetExpired,
         Error::InvalidTimeWindow,
+        Error::InvalidRolloverConfig,
         // --- Wallet (50-55) ---
         Error::WalletFrozen,
         Error::WalletArchived,
@@ -470,13 +475,14 @@ impl Error {
             Error::CircularUpgrade => "CIRCULAR_UPGRADE",
             Error::InvalidUpgradeAddress => "INVALID_UPGRADE_ADDRESS",
             Error::VersionNotMonotonic => "VERSION_NOT_MONOTONIC",
-            // --- Budget (40-44) ---
+            // --- Budget (40-47) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
             Error::BudgetArchived => "BUDGET_ARCHIVED",
             Error::AssetNotAuthorized => "ASSET_NOT_AUTHORIZED",
             Error::BudgetExpired => "BUDGET_EXPIRED",
             Error::InvalidTimeWindow => "INVALID_TIME_WINDOW",
+            Error::InvalidRolloverConfig => "INVALID_ROLLOVER_CONFIG",
             // --- Wallet (50-55) ---
             Error::WalletFrozen => "WALLET_FROZEN",
             Error::WalletArchived => "WALLET_ARCHIVED",
@@ -629,6 +635,10 @@ pub enum BudgetError {
     /// after now/start, zero-length custom interval, or a deficit policy on a
     /// non-recurring period). Wire-compatible with [`Error::InvalidTimeWindow`].
     InvalidTimeWindow = 46,
+    /// INVALID_ROLLOVER_CONFIG: a rollover percentage is above 100% or a
+    /// recurring maximum does not bound rollover. Wire-compatible with
+    /// [`Error::InvalidRolloverConfig`].
+    InvalidRolloverConfig = 47,
 }
 
 impl BudgetError {
@@ -636,7 +646,7 @@ impl BudgetError {
     /// declares them. The audit walks this list, so a variant added to (or
     /// removed from) the enum without a matching entry fails
     /// `budget_error_table_is_frozen`.
-    pub const ALL: [BudgetError; 12] = [
+    pub const ALL: [BudgetError; 13] = [
         BudgetError::NotFound,
         BudgetError::Unauthorized,
         BudgetError::InvalidInput,
@@ -649,6 +659,7 @@ impl BudgetError {
         BudgetError::BudgetExpired,
         BudgetError::BudgetNotActive,
         BudgetError::InvalidTimeWindow,
+        BudgetError::InvalidRolloverConfig,
     ];
 
     /// The `u32` code this variant carries on the wire, identical to the value
@@ -676,6 +687,7 @@ impl BudgetError {
             BudgetError::BudgetExpired => "BUDGET_EXPIRED",
             BudgetError::BudgetNotActive => "BUDGET_NOT_ACTIVE",
             BudgetError::InvalidTimeWindow => "INVALID_TIME_WINDOW",
+            BudgetError::InvalidRolloverConfig => "INVALID_ROLLOVER_CONFIG",
         }
     }
 
@@ -700,7 +712,7 @@ impl BudgetError {
 /// declaration order. Kept as a literal so a renumber or a reissued slot is
 /// caught by `budget_error_codes_are_frozen_and_unique` rather than passing
 /// silently.
-pub const BUDGET_ERROR_CODES: [u32; 12] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46];
+pub const BUDGET_ERROR_CODES: [u32; 13] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46, 47];
 
 impl From<Error> for BudgetError {
     fn from(error: Error) -> Self {
@@ -716,6 +728,7 @@ impl From<Error> for BudgetError {
             Error::AssetNotAuthorized => Self::AssetNotAuthorized,
             Error::BudgetExpired => Self::BudgetExpired,
             Error::InvalidTimeWindow => Self::InvalidTimeWindow,
+            Error::InvalidRolloverConfig => Self::InvalidRolloverConfig,
             Error::InvalidState => Self::InvalidInput,
             _ => Self::InvalidInput,
         }
@@ -736,6 +749,7 @@ impl From<BudgetError> for Error {
             BudgetError::AssetNotAuthorized => Self::AssetNotAuthorized,
             BudgetError::BudgetExpired | BudgetError::BudgetNotActive => Self::BudgetExpired,
             BudgetError::InvalidTimeWindow => Self::InvalidTimeWindow,
+            BudgetError::InvalidRolloverConfig => Self::InvalidRolloverConfig,
         }
     }
 }
