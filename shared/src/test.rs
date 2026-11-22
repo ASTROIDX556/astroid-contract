@@ -608,7 +608,7 @@ fn quorum_validation_helper_tests() {
     // 3. Threshold not met
     assert_eq!(
         verify_quorum(&[s1.clone(), s2.clone()], &[2, 2], &[s1.clone()], 3),
-        Err(Error::ThresholdNotMet)
+        Err(Error::QUORUM_NOT_MET)
     );
 
     // 4. Duplicate signers in approval list rejected
@@ -635,7 +635,7 @@ fn quorum_validation_helper_tests() {
     );
     assert_eq!(
         verify_quorum(&[s1.clone()], &[1], &[], 1),
-        Err(Error::ThresholdNotMet)
+        Err(Error::QUORUM_NOT_MET)
     );
 
     // 7. Mismatched signers and weights lengths
@@ -1157,7 +1157,7 @@ const RETIRED_CODES: [u32; 2] = [25, 26];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 64] = [
+const EXPECTED_CODES: [(Error, u32); 67] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1191,6 +1191,9 @@ const EXPECTED_CODES: [(Error, u32); 64] = [
     (Error::BudgetExpired, 44),
     (Error::InvalidTimeWindow, 46),
     (Error::InvalidRolloverConfig, 47),
+    // --- Budget continued (48-49) ---
+    (Error::BudgetOverflow, 48),
+    (Error::BudgetLimitExceeded, 49),
     // --- Wallet (50-55) ---
     (Error::WalletFrozen, 50),
     (Error::WalletArchived, 51),
@@ -1213,6 +1216,7 @@ const EXPECTED_CODES: [(Error, u32); 64] = [
     (Error::TimelockNotExpired, 91),
     (Error::UnauthorizedModification, 92),
     (Error::DuplicateSigner, 93),
+    (Error::QuorumNotMet, 94),
     // --- Proposal (71-79) ---
     (Error::ProposalExpired, 71),
     (Error::InvalidProposalState, 72),
@@ -1267,6 +1271,41 @@ fn budget_error_aliases_keep_their_deterministic_codes() {
 }
 
 #[test]
+fn named_budget_and_quorum_codes_are_wire_stable() {
+    // Issues #459 and #463: the failure modes get their own published names and
+    // numbers. The mirrored budget codes stay identical in both tables, and a
+    // quorum shortfall is distinguishable from a generic threshold failure.
+    assert_eq!(Error::BUDGET_OVERFLOW, Error::BudgetOverflow);
+    assert_eq!(Error::BUDGET_OVERFLOW.code(), 48);
+    assert_eq!(Error::BUDGET_OVERFLOW.wire_name(), "BUDGET_OVERFLOW");
+    assert_eq!(Error::BUDGET_LIMIT_EXCEEDED, Error::BudgetLimitExceeded);
+    assert_eq!(Error::BUDGET_LIMIT_EXCEEDED.code(), 49);
+    assert_eq!(
+        Error::BUDGET_LIMIT_EXCEEDED.wire_name(),
+        "BUDGET_LIMIT_EXCEEDED"
+    );
+    assert_eq!(BudgetError::BUDGET_OVERFLOW, BudgetError::BudgetOverflow);
+    assert_eq!(BudgetError::BUDGET_OVERFLOW.code(), 48);
+    assert_eq!(
+        BudgetError::BUDGET_LIMIT_EXCEEDED.code(),
+        Error::BUDGET_LIMIT_EXCEEDED.code()
+    );
+    assert_eq!(
+        BudgetError::from(Error::BUDGET_OVERFLOW),
+        BudgetError::BudgetOverflow
+    );
+    assert_eq!(
+        Error::from(BudgetError::BUDGET_LIMIT_EXCEEDED),
+        Error::BUDGET_LIMIT_EXCEEDED
+    );
+    assert_eq!(Error::QUORUM_NOT_MET, Error::QuorumNotMet);
+    assert_eq!(Error::QUORUM_NOT_MET.code(), 94);
+    assert_eq!(Error::QUORUM_NOT_MET.wire_name(), "QUORUM_NOT_MET");
+    assert_ne!(Error::QUORUM_NOT_MET, Error::ThresholdNotMet);
+    assert_ne!(Error::QUORUM_NOT_MET, Error::InsufficientWeight);
+}
+
+#[test]
 fn error_codes_are_unique_and_never_overlap() {
     for (i, variant) in Error::ALL.iter().enumerate() {
         let code = variant.code();
@@ -1302,7 +1341,7 @@ fn error_code_bands_are_ascending() {
         (71, 79),
         (80, 87),
         (88, 89),
-        (90, 93),
+        (90, 94),
     ];
     for (low, high) in bands {
         let mut previous: Option<u32> = None;
@@ -1353,7 +1392,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let multisig = Error::ALL
         .iter()
-        .filter(|e| (60..71).contains(&e.code()) || (90..94).contains(&e.code()))
+        .filter(|e| (60..71).contains(&e.code()) || (90..95).contains(&e.code()))
         .count();
     let proposal = Error::ALL
         .iter()
@@ -1373,9 +1412,9 @@ fn error_domains_do_not_overlap() {
         .count();
 
     assert_eq!(registry, 5, "registry band 30-39");
-    assert_eq!(budget, 7, "budget band 40-49");
+    assert_eq!(budget, 9, "budget band 40-49");
     assert_eq!(wallet, 6, "wallet band 50-55");
-    assert_eq!(multisig, 14, "multisig bands 61-70 and 90-93");
+    assert_eq!(multisig, 15, "multisig bands 61-70 and 90-94");
     assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 5, "escrow band 80-82 and 86-87");
     assert_eq!(treasury, 5, "treasury bands 83-85 and 88-89");
@@ -1607,7 +1646,7 @@ const ERROR_SOURCE: &str = include_str!("errors.rs");
 /// The upper bound on the codes and wire names the audits below can remember.
 /// The largest table declares 51 variants; the slack keeps an in-progress table
 /// from failing on capacity alone.
-const MAX_AUDITED_CODES: usize = 64;
+const MAX_AUDITED_CODES: usize = 67;
 
 /// The upper bound on the `#[contracterror]` tables the scan tracks. Three exist
 /// today; the slack means a new one is reported as "extend the audit" rather

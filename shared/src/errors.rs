@@ -159,7 +159,7 @@ pub enum Error {
     /// same version.
     VersionNotMonotonic = 34,
 
-    // --- Budget (40-47) ---
+    // --- Budget (40-49) ---
     /// The spend would breach the budget: the per-asset limit for this token,
     /// or the aggregate ceiling for the period once rollover and any deficit
     /// carry-forward have been applied. Nothing is spent and the recorded
@@ -192,6 +192,14 @@ pub enum Error {
     /// rollover percentage above 100%, or a recurring maximum that does not
     /// bound rollover. Rejected before any budget state is written.
     InvalidRolloverConfig = 47,
+    /// BUDGET_OVERFLOW: checked arithmetic while funding, allocating, rolling
+    /// over or consuming a budget left the representable `i128` range. No
+    /// budget state is written and no value moves (Issue #463).
+    BudgetOverflow = 48,
+    /// BUDGET_LIMIT_EXCEEDED: a spend, transfer or consumption would breach the
+    /// budget's effective ceiling (base limit plus rollover credit, minus any
+    /// carried deficit). The whole spend is refused atomically (Issue #463).
+    BudgetLimitExceeded = 49,
 
     // --- Wallet (50-55) ---
     /// The wallet is frozen by its guardian, so configuration changes are
@@ -221,7 +229,7 @@ pub enum Error {
     /// indicates the caller did not authenticate at all (missing `require_auth`).
     UnauthorizedWalletAccess = 55,
 
-    // --- Multisig / approvals (61-69, 70, 90-93) ---
+    // --- Multisig / approvals (61-69, 70, 90-94) ---
     /// The accumulated approvals are below the configured threshold: too few
     /// distinct signers, a tally that has not reached the required quorum or
     /// majority, or a vote that has not yet collected enough weight for the
@@ -273,6 +281,12 @@ pub enum Error {
     /// DUPLICATE_SIGNER: an attempt was made to add a signer that already
     /// exists in the signer set. Each address may appear only once.
     DuplicateSigner = 93,
+    /// QUORUM_NOT_MET: the distinct, currently registered signers behind a
+    /// vote carry less than the configured approval weight. Distinct from
+    /// [`Error::ThresholdNotMet`] (an approval-count bar) and
+    /// [`Error::InsufficientWeight`] (a cached-weight shortfall): this is the
+    /// dedicated code for a verified quorum tally that fell short (Issue #459).
+    QuorumNotMet = 94,
 
     // --- Proposal (71-79) ---
     /// The proposal's deadline has passed, so it can no longer be approved,
@@ -351,7 +365,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 64] = [
+    pub const ALL: [Error; 67] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -385,6 +399,9 @@ impl Error {
         Error::BudgetExpired,
         Error::InvalidTimeWindow,
         Error::InvalidRolloverConfig,
+        // --- Budget continued (48-49) ---
+        Error::BudgetOverflow,
+        Error::BudgetLimitExceeded,
         // --- Wallet (50-55) ---
         Error::WalletFrozen,
         Error::WalletArchived,
@@ -392,7 +409,7 @@ impl Error {
         Error::InvalidState,
         Error::RateLimitExceeded,
         Error::UnauthorizedWalletAccess,
-        // --- Multisig / approvals (61-69, 70, 90-93) ---
+        // --- Multisig / approvals (61-69, 70, 90-94) ---
         Error::ThresholdNotMet,
         Error::AlreadySigned,
         Error::NotASigner,
@@ -407,6 +424,7 @@ impl Error {
         Error::TimelockNotExpired,
         Error::UnauthorizedModification,
         Error::DuplicateSigner,
+        Error::QuorumNotMet,
         // --- Proposal (71-79) ---
         Error::ProposalExpired,
         Error::InvalidProposalState,
@@ -491,6 +509,9 @@ impl Error {
             Error::BudgetExpired => "BUDGET_EXPIRED",
             Error::InvalidTimeWindow => "INVALID_TIME_WINDOW",
             Error::InvalidRolloverConfig => "INVALID_ROLLOVER_CONFIG",
+            // --- Budget continued (48-49) ---
+            Error::BudgetOverflow => "BUDGET_OVERFLOW",
+            Error::BudgetLimitExceeded => "BUDGET_LIMIT_EXCEEDED",
             // --- Wallet (50-55) ---
             Error::WalletFrozen => "WALLET_FROZEN",
             Error::WalletArchived => "WALLET_ARCHIVED",
@@ -498,7 +519,7 @@ impl Error {
             Error::InvalidState => "INVALID_STATE",
             Error::RateLimitExceeded => "RATE_LIMIT_EXCEEDED",
             Error::UnauthorizedWalletAccess => "UNAUTHORIZED_WALLET_ACCESS",
-            // --- Multisig / approvals (61-69, 70, 90-93) ---
+            // --- Multisig / approvals (61-69, 70, 90-94) ---
             Error::ThresholdNotMet => "THRESHOLD_NOT_MET",
             Error::AlreadySigned => "ALREADY_SIGNED",
             Error::NotASigner => "NOT_A_SIGNER",
@@ -513,6 +534,7 @@ impl Error {
             Error::TimelockNotExpired => "TIMELOCK_NOT_EXPIRED",
             Error::UnauthorizedModification => "UNAUTHORIZED_MODIFICATION",
             Error::DuplicateSigner => "DUPLICATE_SIGNER",
+            Error::QuorumNotMet => "QUORUM_NOT_MET",
             // --- Proposal (71-79) ---
             Error::ProposalExpired => "PROPOSAL_EXPIRED",
             Error::InvalidProposalState => "INVALID_PROPOSAL_STATE",
@@ -576,6 +598,27 @@ impl Error {
     /// names without adding a new variant to the 50-case error table.
     #[allow(non_upper_case_globals)]
     pub const InvalidAllocation: Error = Error::InvalidInput;
+
+    /// BUDGET_OVERFLOW (Issue #463): the budget contract's name for checked
+    /// arithmetic leaving the representable range. Published as the canonical
+    /// [`Error::BudgetOverflow`] (48) so both `BudgetError` and `Error` callers
+    /// decode the same explicit code.
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_OVERFLOW: Error = Error::BudgetOverflow;
+
+    /// BUDGET_LIMIT_EXCEEDED (Issue #463): the budget contract's name for an
+    /// effective-ceiling breach. The same code as [`Error::BudgetLimitExceeded`]
+    /// (49); it is not an alias of the older generic `BudgetExceeded` (40), so a
+    /// consumer can tell a dedicated limit failure from a generic budget refusal.
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_LIMIT_EXCEEDED: Error = Error::BudgetLimitExceeded;
+
+    /// QUORUM_NOT_MET (Issue #459): the multisig's name for a verified quorum
+    /// tally below the configured weight threshold. The explicit code is
+    /// [`Error::QuorumNotMet`] (94), distinct from `THRESHOLD_NOT_MET` (61) and
+    /// `INSUFFICIENT_WEIGHT` (90).
+    #[allow(non_upper_case_globals)]
+    pub const QUORUM_NOT_MET: Error = Error::QuorumNotMet;
 }
 
 /// Budget spend errors, kept separate from the protocol-wide error enum so
@@ -653,6 +696,12 @@ pub enum BudgetError {
     /// recurring maximum does not bound rollover. Wire-compatible with
     /// [`Error::InvalidRolloverConfig`].
     InvalidRolloverConfig = 47,
+    /// BUDGET_OVERFLOW: checked budget arithmetic left the `i128` range. Mirrors
+    /// [`Error::BudgetOverflow`] (48) exactly (Issue #463).
+    BudgetOverflow = 48,
+    /// BUDGET_LIMIT_EXCEEDED: the spend would breach the effective ceiling.
+    /// Mirrors [`Error::BudgetLimitExceeded`] (49) exactly (Issue #463).
+    BudgetLimitExceeded = 49,
 }
 
 impl BudgetError {
@@ -660,7 +709,7 @@ impl BudgetError {
     /// declares them. The audit walks this list, so a variant added to (or
     /// removed from) the enum without a matching entry fails
     /// `budget_error_table_is_frozen`.
-    pub const ALL: [BudgetError; 13] = [
+    pub const ALL: [BudgetError; 15] = [
         BudgetError::NotFound,
         BudgetError::Unauthorized,
         BudgetError::InvalidInput,
@@ -674,6 +723,8 @@ impl BudgetError {
         BudgetError::BudgetNotActive,
         BudgetError::InvalidTimeWindow,
         BudgetError::InvalidRolloverConfig,
+        BudgetError::BudgetOverflow,
+        BudgetError::BudgetLimitExceeded,
     ];
 
     /// The `u32` code this variant carries on the wire, identical to the value
@@ -702,6 +753,8 @@ impl BudgetError {
             BudgetError::BudgetNotActive => "BUDGET_NOT_ACTIVE",
             BudgetError::InvalidTimeWindow => "INVALID_TIME_WINDOW",
             BudgetError::InvalidRolloverConfig => "INVALID_ROLLOVER_CONFIG",
+            BudgetError::BudgetOverflow => "BUDGET_OVERFLOW",
+            BudgetError::BudgetLimitExceeded => "BUDGET_LIMIT_EXCEEDED",
         }
     }
 
@@ -720,13 +773,22 @@ impl BudgetError {
     /// error tables in step on the same wire code.
     #[allow(non_upper_case_globals)]
     pub const InvalidAllocation: BudgetError = BudgetError::InvalidInput;
+
+    /// BUDGET_OVERFLOW (Issue #463): explicit name for [`BudgetError::BudgetOverflow`].
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_OVERFLOW: BudgetError = BudgetError::BudgetOverflow;
+
+    /// BUDGET_LIMIT_EXCEEDED (Issue #463): explicit name for
+    /// [`BudgetError::BudgetLimitExceeded`].
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_LIMIT_EXCEEDED: BudgetError = BudgetError::BudgetLimitExceeded;
 }
 
 /// Every code the budget-specific [`BudgetError`] table can report, in
 /// declaration order. Kept as a literal so a renumber or a reissued slot is
 /// caught by `budget_error_codes_are_frozen_and_unique` rather than passing
 /// silently.
-pub const BUDGET_ERROR_CODES: [u32; 13] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46, 47];
+pub const BUDGET_ERROR_CODES: [u32; 15] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49];
 
 impl From<Error> for BudgetError {
     fn from(error: Error) -> Self {
@@ -743,6 +805,8 @@ impl From<Error> for BudgetError {
             Error::BudgetExpired => Self::BudgetExpired,
             Error::InvalidTimeWindow => Self::InvalidTimeWindow,
             Error::InvalidRolloverConfig => Self::InvalidRolloverConfig,
+            Error::BudgetOverflow => Self::BudgetOverflow,
+            Error::BudgetLimitExceeded => Self::BudgetLimitExceeded,
             Error::InvalidState => Self::InvalidInput,
             _ => Self::InvalidInput,
         }
@@ -764,6 +828,8 @@ impl From<BudgetError> for Error {
             BudgetError::BudgetExpired | BudgetError::BudgetNotActive => Self::BudgetExpired,
             BudgetError::InvalidTimeWindow => Self::InvalidTimeWindow,
             BudgetError::InvalidRolloverConfig => Self::InvalidRolloverConfig,
+            BudgetError::BudgetOverflow => Self::BudgetOverflow,
+            BudgetError::BudgetLimitExceeded => Self::BudgetLimitExceeded,
         }
     }
 }

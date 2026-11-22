@@ -409,7 +409,7 @@ fn treasury_budget_exhaustion_is_budget_exceeded_even_when_policy_allows() {
     h.fund_wallet(POLICY_CAP).unwrap();
     // 100_000 of 120_000 spent; 30_000 passes the policy cap but not the budget.
     let before = h.snapshot();
-    assert_eq!(h.fund_wallet(30_000), Err(Error::BudgetLimitReached));
+    assert_eq!(h.fund_wallet(30_000), Err(Error::BUDGET_LIMIT_EXCEEDED));
     assert_eq!(h.snapshot(), before);
     h.fund_wallet(20_000).unwrap();
     assert_eq!(h.budget.get(&h.s(BUDGET_ID)).spent, DAILY_BUDGET);

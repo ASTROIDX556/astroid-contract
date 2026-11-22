@@ -496,6 +496,97 @@ fn wallet_policy_denial_blocks_forwarded_batch_calls() {
     assert_eq!(token_balance(&h, &recipient), 0);
 }
 
+fn batch_transfer_call(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> ContractCall {
+    let mut args: Vec<Val> = Vec::new(env);
+    args.push_back(from.clone().into_val(env));
+    args.push_back(to.clone().into_val(env));
+    args.push_back(amount.into_val(env));
+    ContractCall {
+        contract_addr: token.clone(),
+        fn_name: Symbol::new(env, "transfer"),
+        args,
+    }
+}
+
+#[test]
+fn batch_budget_exhaustion_mid_flow_reverts_every_leg() {
+    let h = setup();
+    let wallet_id = fund_agent_wallet(&h, 10_000);
+    h.wallet.set_policy(&h.admin, &h.policy.address);
+    h.wallet.set_budget(&h.admin, &h.budget.address);
+    h.wallet
+        .set_default_budget_id(&h.admin, &string(&h, BUDGET_ID));
+    register_active_policy(&h, 1_000, false);
+    h.budget.allocate(
+        &h.agent,
+        &string(&h, BUDGET_ID),
+        &1_500,
+        &Period::None,
+        &false,
+        &0,
+    );
+
+    let second_recipient = h.org_owner.clone();
+    let mut actions: Vec<BatchAction> = Vec::new(&h.env);
+    actions.push_back(BatchAction {
+        call: batch_transfer_call(&h.env, &h.asset, &h.wallet.address, &h.recipient, 1_000),
+        policy_id: string(&h, POLICY_ID),
+        budget_id: string(&h, BUDGET_ID),
+        asset: h.asset.clone(),
+        recipient: h.recipient.clone(),
+        amount: 1_000,
+    });
+    actions.push_back(BatchAction {
+        call: batch_transfer_call(&h.env, &h.asset, &h.wallet.address, &second_recipient, 600),
+        policy_id: string(&h, POLICY_ID),
+        budget_id: string(&h, BUDGET_ID),
+        asset: h.asset.clone(),
+        recipient: second_recipient.clone(),
+        amount: 600,
+    });
+
+    let balance_before = h.wallet.balance(&wallet_id, &h.asset);
+    let res = h
+        .wallet
+        .try_batch_execute_validated(&h.agent, &wallet_id, &actions);
+    assert_eq!(res, Err(Ok(Error::BUDGET_LIMIT_EXCEEDED)));
+    assert_eq!(h.wallet.balance(&wallet_id, &h.asset), balance_before);
+    assert_eq!(token_balance(&h, &h.recipient), 0);
+    assert_eq!(token_balance(&h, &second_recipient), 0);
+    assert_eq!(h.budget.get(&string(&h, BUDGET_ID)).spent, 0);
+
+    let mut compliant: Vec<BatchAction> = Vec::new(&h.env);
+    compliant.push_back(BatchAction {
+        call: batch_transfer_call(&h.env, &h.asset, &h.wallet.address, &h.recipient, 900),
+        policy_id: string(&h, POLICY_ID),
+        budget_id: string(&h, BUDGET_ID),
+        asset: h.asset.clone(),
+        recipient: h.recipient.clone(),
+        amount: 900,
+    });
+    compliant.push_back(BatchAction {
+        call: batch_transfer_call(&h.env, &h.asset, &h.wallet.address, &second_recipient, 600),
+        policy_id: string(&h, POLICY_ID),
+        budget_id: string(&h, BUDGET_ID),
+        asset: h.asset.clone(),
+        recipient: second_recipient.clone(),
+        amount: 600,
+    });
+    let receipt = h
+        .wallet
+        .batch_execute_validated(&h.agent, &wallet_id, &compliant);
+    assert_eq!(receipt.executed, 2);
+    assert_eq!(h.budget.get(&string(&h, BUDGET_ID)).spent, 1_500);
+    assert_eq!(token_balance(&h, &h.recipient), 900);
+    assert_eq!(token_balance(&h, &second_recipient), 600);
+}
+
 /// A configured contract that cannot answer `check_transfer` fails closed.
 #[test]
 fn wallet_policy_invocation_failure_maps_to_policy_denied() {
@@ -544,7 +635,7 @@ fn budget_exhaustion_blocks_treasury_withdrawal() {
     let res = h
         .treasury
         .try_withdraw(&h.admin, &h.asset, &h.recipient, &1_000);
-    assert_eq!(res, Err(Ok(Error::BudgetLimitReached)));
+    assert_eq!(res, Err(Ok(Error::BUDGET_LIMIT_EXCEEDED)));
     assert_eq!(h.treasury.holding(&h.asset).total_out, 0);
     assert_eq!(token_balance(&h, &h.recipient), 0);
 }

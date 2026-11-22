@@ -119,6 +119,7 @@
 //! nothing else — no auth, no code swap — so a deployer can confirm a target
 //! advances the registry before asking for the swap.
 
+use astroid_interfaces::upgrade::UpgradeAuthorizationInterface;
 use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
@@ -2308,6 +2309,19 @@ impl RegistryInterface for RegistryContract {
             modules.push_back(Self::read_module(&env, id.org, id.kind));
         }
         Ok(modules)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade authorization surface consumed by member contracts. The registry is
+// the authority on protocol admins, multisig governance and delegated org
+// roles; this is the same permission gate `upgrade_module` applies, exposed as
+// a read so a member can decide whether to accept a code-swap request.
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl UpgradeAuthorizationInterface for RegistryContract {
+    fn is_upgrade_authorized(env: Env, org: String, caller: Address, kind: ModuleKind) -> bool {
+        Self::can_manage_module(env, org, caller, kind)
     }
 }
 
