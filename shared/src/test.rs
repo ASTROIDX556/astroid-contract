@@ -1157,7 +1157,7 @@ const RETIRED_CODES: [u32; 2] = [25, 26];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 67] = [
+const EXPECTED_CODES: [(Error, u32); 68] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1418,7 +1418,7 @@ fn error_domains_do_not_overlap() {
     assert_eq!(proposal, 7, "proposal band 71-79");
     assert_eq!(escrow, 5, "escrow band 80-82 and 86-87");
     assert_eq!(treasury, 5, "treasury bands 83-85 and 88-89");
-    assert_eq!(policy, 6, "policy band 20-29");
+    assert_eq!(policy, 7, "policy band 20-29");
 }
 
 #[test]
@@ -1555,11 +1555,17 @@ fn budget_error_codes_are_frozen_and_unique() {
             BudgetError::BudgetNotActive => {
                 assert_eq!(canonical, Error::BudgetExpired);
             }
-            BudgetError::BudgetLimitReached => {
-                assert_eq!(canonical, Error::BudgetLimitReached);
+            BudgetError::BudgetLimitExceeded => {
+                assert_eq!(canonical, Error::BudgetLimitExceeded);
             }
-            BudgetError::BudgetPeriodExpired => {
-                assert_eq!(canonical, Error::BudgetPeriodExpired);
+            BudgetError::InvalidTimeWindow => {
+                assert_eq!(canonical, Error::InvalidTimeWindow);
+            }
+            BudgetError::InvalidRolloverConfig => {
+                assert_eq!(canonical, Error::InvalidRolloverConfig);
+            }
+            BudgetError::BudgetOverflow => {
+                assert_eq!(canonical, Error::BudgetOverflow);
             }
             _ => {
                 assert_eq!(
@@ -1646,7 +1652,7 @@ const ERROR_SOURCE: &str = include_str!("errors.rs");
 /// The upper bound on the codes and wire names the audits below can remember.
 /// The largest table declares 51 variants; the slack keeps an in-progress table
 /// from failing on capacity alone.
-const MAX_AUDITED_CODES: usize = 67;
+const MAX_AUDITED_CODES: usize = 100;
 
 /// The upper bound on the `#[contracterror]` tables the scan tracks. Three exist
 /// today; the slack means a new one is reported as "extend the audit" rather

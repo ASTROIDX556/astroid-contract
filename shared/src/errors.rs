@@ -365,7 +365,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 67] = [
+    pub const ALL: [Error; 68] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -674,12 +674,6 @@ pub enum BudgetError {
     /// The budget's window has closed: the ledger timestamp is at or past
     /// `expires_at`. Wire-compatible with [`Error::BudgetExpired`].
     BudgetExpired = 44,
-    /// The budget's spending limit for the current period has been reached.
-    /// Wire-compatible with [`Error::BudgetLimitReached`].
-    BudgetLimitReached = 46,
-    /// The budget's active period has ended and a new period has begun.
-    /// Wire-compatible with [`Error::BudgetPeriodExpired`].
-    BudgetPeriodExpired = 47,
     /// BUDGET_NOT_ACTIVE: the budget has not started yet — the ledger timestamp
     /// is before `starts_at` — so nothing may be spent. The "not yet begun"
     /// counterpart to [`BudgetError::BudgetExpired`] ("already over"), and the

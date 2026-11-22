@@ -2275,7 +2275,7 @@ impl PolicyContract {
             if limit.daily_limit > 0 {
                 if new_spent > limit.daily_limit {
                     events_policy_violation(env, policy_id, "daily_limit_exceeded");
-                    return Err(Error::BudgetLimitReached);
+                    return Err(Error::BudgetLimitExceeded);
                 }
                 remaining = checked_sub(limit.daily_limit, new_spent)?;
             }
