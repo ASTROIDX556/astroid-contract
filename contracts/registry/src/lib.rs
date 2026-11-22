@@ -567,6 +567,11 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
+        // Reject zero addresses (all bytes zero) — an invalid contract principal
+        // cannot serve as a module and must be caught before storage is written.
+        if !Self::is_contract_address(&address) {
+            return Err(Error::InvalidUpgradeAddress);
+        }
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
@@ -805,6 +810,7 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
+        require_valid_wasm_hash(&env, &wasm_hash)?;
         // A pair is taken if either layout already holds it. The common case is
         // a single existence check; the legacy key is only consulted when the
         // consolidated one is free, so a fresh registration still pays one read.
@@ -923,6 +929,10 @@ impl RegistryContract {
         // kind fails rather than laundering a no-op through the flow.
         ensure!(version != 0, Error::InvalidInput);
         require_valid_wasm_hash(&env, &wasm_hash)?;
+        ensure!(
+            Self::is_contract_address(&address),
+            Error::InvalidUpgradeAddress
+        );
 
         // Downgrade protection: strictly newer versions only.
         let latest: u32 = env
@@ -1011,6 +1021,11 @@ impl RegistryContract {
         // Re-validate everything the proposal asserted at propose time; the
         // world may have moved underneath it while it was pending.
         require_valid_wasm_hash(&env, &proposal.wasm_hash)?;
+        ensure!(proposal.version != 0, Error::InvalidInput);
+        ensure!(
+            Self::is_contract_address(&proposal.address),
+            Error::InvalidUpgradeAddress
+        );
         let latest: u32 = env
             .storage()
             .persistent()
@@ -1913,13 +1928,14 @@ impl RegistryContract {
         // that makes an upgrade path acyclic: a module can never re-enter a
         // version it has already left, and never move backwards onto one. An
         // unpinned module (0) is at the start of its path, so any version is
-        // forward of it.
+        // forward of it. Use VERSION_NOT_MONOTONIC to distinguish a backwards
+        // jump from a cycle onto the same version (CircularUpgrade).
         let from_version: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::ModuleVersion(org.clone(), kind))
             .unwrap_or(0);
-        ensure!(target_version > from_version, Error::CircularUpgrade);
+        ensure!(target_version > from_version, Error::VersionNotMonotonic);
 
         // Existence, then integrity: the target must be a published version of
         // *this* kind, bound to code that is still approved for it.
@@ -1931,16 +1947,18 @@ impl RegistryContract {
             // the code behind a module is known.
             BoundHash::Unbound => return Err(Error::InvalidInput),
         };
+        require_valid_wasm_hash(env, &hash)?;
         ensure!(
             Self::is_wasm_approved(env.clone(), kind, hash.clone()),
             Error::Unauthorized
         );
         // A module must be routable, and only a contract can be called. Without
         // this, a version record naming an account would leave the module
-        // permanently unroutable.
+        // permanently unroutable. Use INVALID_UPGRADE_ADDRESS for an invalid
+        // contract principal.
         ensure!(
             Self::is_contract_address(&record.address),
-            Error::InvalidInput
+            Error::InvalidUpgradeAddress
         );
         // A "move" onto the contract the module already runs is the degenerate
         // cycle: it changes no code and no routing, so it is refused rather than
@@ -1985,6 +2003,7 @@ impl RegistryContract {
         env: &Env,
         wasm_hash: &BytesN<32>,
     ) -> Result<RegistryUpgradePlan, Error> {
+        require_valid_wasm_hash(env, wasm_hash)?;
         let from_version: u32 = env
             .storage()
             .instance()

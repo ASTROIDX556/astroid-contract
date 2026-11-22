@@ -11,7 +11,7 @@
 //! entrypoints decode correctly across crates.
 
 use astroid_interfaces::upgrade::UpgradeAuthority;
-use astroid_registry::{RegistryContractClient, RegistryRole, UpgradeProposal};
+use astroid_registry::{RegistryContractClient, RegistryRole};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;
 use soroban_sdk::testutils::Address as _;
@@ -204,6 +204,44 @@ fn member_contracts_still_route_upgrades_through_the_registry_gate() {
     assert!(h.registry.is_wasm_approved(&ModuleKind::Wallet, &v1));
     assert!(!h.registry.is_wasm_approved(&ModuleKind::Treasury, &v1));
     assert_eq!(h.registry.get_version(&ModuleKind::Wallet, &1), v1_addr);
+}
+
+#[test]
+fn admin_only_commit_and_invalid_targets_are_refused_across_contract_boundaries() {
+    let h = setup();
+    let hash = wasm_hash(&h.env, 1);
+    let target = Address::generate(&h.env);
+    h.registry
+        .propose_upgrade(&h.owner, &h.org, &ModuleKind::Wallet, &1, &hash, &target);
+
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.registry
+            .try_commit_upgrade(&stranger, &ModuleKind::Wallet),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    h.registry.reject_upgrade(&h.owner, &ModuleKind::Wallet);
+    let account = Address::from_string(&String::from_str(
+        &h.env,
+        "GAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSH7S",
+    ));
+    assert_eq!(
+        h.registry
+            .try_propose_upgrade(&h.owner, &h.org, &ModuleKind::Wallet, &1, &hash, &account),
+        Err(Ok(Error::InvalidUpgradeAddress))
+    );
+
+    let zero = BytesN::from_array(&h.env, &[0u8; 32]);
+    assert_eq!(
+        h.registry
+            .try_propose_upgrade(&h.owner, &h.org, &ModuleKind::Wallet, &1, &zero, &target),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        h.registry.try_validate_registry_upgrade(&zero),
+        Err(Ok(Error::InvalidInput))
+    );
 }
 
 #[test]

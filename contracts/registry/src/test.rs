@@ -2635,7 +2635,7 @@ fn a_target_that_is_not_a_contract_is_refused() {
     assert_eq!(
         h.client
             .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &5),
-        Err(Ok(Error::InvalidInput))
+        Err(Ok(Error::InvalidUpgradeAddress))
     );
     assert_eq!(pointed_at(&h), h.v1);
     assert_eq!(pin(&h), 0);
@@ -2651,7 +2651,7 @@ fn an_upgrade_cannot_repeat_the_version_it_already_runs() {
     assert_eq!(
         h.client
             .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
     assert_eq!(pointed_at(&h), h.v2);
     assert_eq!(pin(&h), 2);
@@ -2665,17 +2665,17 @@ fn an_upgrade_cannot_walk_back_to_an_earlier_version() {
     assert_eq!(pointed_at(&h), h.v3);
 
     // v2 is published, approved and perfectly valid — it is simply behind the
-    // module now, so returning to it would close the loop v1 → v3 → v2 → v3.
+    // module now, so returning to it would violate monotonicity.
     for behind in [1u32, 2] {
         assert_eq!(
             h.client
                 .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &behind),
-            Err(Ok(Error::CircularUpgrade))
+            Err(Ok(Error::VersionNotMonotonic))
         );
         assert_eq!(
             h.client
                 .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &behind),
-            Err(Ok(Error::CircularUpgrade))
+            Err(Ok(Error::VersionNotMonotonic))
         );
     }
     assert_eq!(pointed_at(&h), h.v3);
@@ -2848,8 +2848,8 @@ fn validation_predicts_every_refusal_of_the_write_path() {
     let cases = [
         (0u32, Error::InvalidInput),
         (99, Error::NotFound),
-        (2, Error::CircularUpgrade),
-        (1, Error::CircularUpgrade),
+        (2, Error::VersionNotMonotonic),
+        (1, Error::VersionNotMonotonic),
     ];
     for (version, expected) in cases {
         assert_eq!(
@@ -3230,35 +3230,38 @@ fn versioned_registration_moves_an_existing_module_forward() {
     );
 }
 
+/// Equal version: the degenerate cycle both validated paths refuse. Now fails
+/// with VERSION_NOT_MONOTONIC (target_version must be strictly greater than
+/// from_version).
 #[test]
 fn versioned_registration_refuses_the_version_the_module_already_runs() {
     let h = setup_path();
     h.client
         .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
 
-    // Equal version: the degenerate cycle both validated paths refuse.
     assert_eq!(
         h.client
             .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
     assert_eq!(pointed_at(&h), h.v2);
     assert_eq!(pin(&h), 2);
 }
 
+/// Older version: refused, and nothing is written, so the module cannot be
+/// rolled back through the registration path. Now fails with
+/// VERSION_NOT_MONOTONIC.
 #[test]
 fn versioned_registration_cannot_walk_backwards() {
     let h = setup_path();
     h.client
         .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
 
-    // Older version: refused, and nothing is written, so the module cannot be
-    // rolled back through the registration path.
     let before = h.env.events().all().len();
     assert_eq!(
         h.client
             .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
     assert_eq!(pointed_at(&h), h.v3);
     assert_eq!(pin(&h), 3);
@@ -3370,10 +3373,12 @@ fn versioned_registration_agrees_with_the_upgrade_validation() {
             .register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
         2
     );
+    // After registering v2, validating an upgrade to v2 again fails with
+    // VERSION_NOT_MONOTONIC (target_version must be strictly greater than from_version).
     assert_eq!(
         h.client
             .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::CircularUpgrade))
+        Err(Ok(Error::VersionNotMonotonic))
     );
 }
 
@@ -3857,5 +3862,109 @@ fn unauthorized_upgrade_attempts_are_rejected() {
     assert_eq!(
         h.client.try_remove_module(&upgrader, &h.org, &k),
         Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn register_version_refuses_a_zero_wasm_hash() {
+    let (env, client, admin) = setup();
+    let zero = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Wallet, &1, &impl_address(&env), &zero),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn upgrade_proposals_require_owner_auth_and_a_contract_target() {
+    let h = setup_path();
+    let hash = BytesN::from_array(&h.env, &[9u8; 32]);
+
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &stranger,
+            &h.org,
+            &ModuleKind::Wallet,
+            &4,
+            &hash,
+            &impl_address(&h.env)
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    assert_eq!(
+        h.client.try_propose_upgrade(
+            &h.owner,
+            &h.org,
+            &ModuleKind::Wallet,
+            &4,
+            &hash,
+            &account_address(&h.env)
+        ),
+        Err(Ok(Error::InvalidUpgradeAddress))
+    );
+}
+
+#[test]
+fn commit_upgrade_refuses_a_recorded_account_target() {
+    let h = setup_path();
+    // Plant the legacy-shaped proposal directly: the propose gate would refuse
+    // it today, but a record written by an older deployment must not be
+    // committable into an unroutable module.
+    h.env.as_contract(&h.client.address, || {
+        h.env.storage().persistent().set(
+            &crate::DataKey::UpgradeProposal(ModuleKind::Wallet),
+            &crate::UpgradeProposal {
+                version: 4,
+                wasm_hash: BytesN::from_array(&h.env, &[9u8; 32]),
+                address: account_address(&h.env),
+                org: h.org.clone(),
+                proposer: h.owner.clone(),
+                expires_at: u64::MAX,
+            },
+        );
+    });
+
+    assert_eq!(
+        h.client.try_commit_upgrade(&h.admin, &ModuleKind::Wallet),
+        Err(Ok(Error::InvalidUpgradeAddress))
+    );
+    assert_eq!(h.client.get_latest(&ModuleKind::Wallet), h.v3);
+}
+
+#[test]
+fn upgrade_targets_refuse_a_recorded_zero_wasm_hash() {
+    let h = setup_path();
+    let zero = BytesN::from_array(&h.env, &[0u8; 32]);
+    env_as_contract(&h, |env| {
+        env.storage().persistent().set(
+            &DataKey::VersionRecord(ModuleKind::Wallet, 4),
+            &VersionRecord {
+                address: impl_address(env),
+                hash: BoundHash::Bound(zero.clone()),
+            },
+        );
+        env.storage().persistent().set(
+            &DataKey::ApprovedWasm(ModuleKind::Wallet, zero.clone()),
+            &true,
+        );
+    });
+
+    assert_eq!(
+        h.client
+            .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &4),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(pointed_at(&h), h.v1);
+}
+
+#[test]
+fn registry_self_upgrade_refuses_a_zero_wasm_hash() {
+    let h = setup_path();
+    let zero = BytesN::from_array(&h.env, &[0u8; 32]);
+    assert_eq!(
+        h.client.try_validate_registry_upgrade(&zero),
+        Err(Ok(Error::InvalidInput))
     );
 }

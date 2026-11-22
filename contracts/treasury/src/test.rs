@@ -61,6 +61,35 @@ fn treasury_flow_payload(
     found
 }
 
+/// Decode the most recent `TreasuryWithdrawalAudit` event as
+/// `(org, caller, to, asset, amount, registry_verified, recorded_at)`.
+fn treasury_audit_payload(
+    env: &Env,
+    variant: &str,
+) -> Option<(String, Address, Address, Address, i128, bool, u64)> {
+    let topic: Val = Symbol::new(env, variant).into_val(env);
+    let mut found = None;
+    for (_emitter, topics, data) in env.events().all().iter() {
+        if !topics.contains(topic) {
+            continue;
+        }
+        let fields = match Vec::<Val>::try_from_val(env, &data) {
+            Ok(fields) if fields.len() == 7 => fields,
+            _ => continue,
+        };
+        found = Some((
+            String::try_from_val(env, &fields.get(0).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(1).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(2).unwrap()).unwrap(),
+            Address::try_from_val(env, &fields.get(3).unwrap()).unwrap(),
+            i128::try_from_val(env, &fields.get(4).unwrap()).unwrap(),
+            bool::try_from_val(env, &fields.get(5).unwrap()).unwrap(),
+            u64::try_from_val(env, &fields.get(6).unwrap()).unwrap(),
+        ));
+    }
+    found
+}
+
 struct Harness<'a> {
     env: Env,
     client: TreasuryContractClient<'a>,
@@ -481,7 +510,7 @@ fn balance_reports_actual_custody_across_assets() {
     assert_eq!(h.client.balance(&second), 250);
 
     let assets: Vec<Address> = vec![&h.env, second.clone(), h.asset.clone()];
-    let report = h.client.balances(&assets);
+    let report = h.client.get_balances(&assets);
     assert_eq!(report.len(), 2);
     assert_eq!(report.get(0).unwrap().asset, second);
     assert_eq!(report.get(0).unwrap().balance, 250);
@@ -500,7 +529,7 @@ fn balance_queries_require_approved_assets() {
     );
     let assets: Vec<Address> = vec![&h.env, rogue];
     assert_eq!(
-        h.client.try_balances(&assets),
+        h.client.try_get_balances(&assets),
         Err(Ok(Error::AssetNotAuthorized))
     );
 }
@@ -510,7 +539,10 @@ fn balance_report_rejects_duplicate_assets() {
     let h = setup("vault", 0);
     let assets: Vec<Address> = vec![&h.env, h.asset.clone(), h.asset.clone()];
 
-    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        h.client.try_get_balances(&assets),
+        Err(Ok(Error::InvalidInput))
+    );
 }
 
 #[test]
@@ -521,7 +553,10 @@ fn balance_report_rejects_oversized_asset_lists() {
         assets.push_back(Address::generate(&h.env));
     }
 
-    assert_eq!(h.client.try_balances(&assets), Err(Ok(Error::InvalidInput)));
+    assert_eq!(
+        h.client.try_get_balances(&assets),
+        Err(Ok(Error::InvalidInput))
+    );
 }
 
 #[test]
@@ -529,7 +564,7 @@ fn balance_report_is_empty_for_no_assets() {
     let h = setup("vault", 0);
     let assets: Vec<Address> = Vec::new(&h.env);
 
-    assert!(h.client.balances(&assets).is_empty());
+    assert!(h.client.get_balances(&assets).is_empty());
 }
 
 #[test]
@@ -1075,6 +1110,64 @@ fn setup_gated(funded: i128) -> GatedHarness<'static> {
     }
 }
 
+/// Harness whose treasury admin is itself a contract, so a successful registry
+/// lookup can be observed on an outbound withdrawal rather than only on a
+/// deposit. The admin contract is recorded as the org's Multisig module.
+struct ContractGatedHarness<'a> {
+    env: Env,
+    registry: RegistryContractClient<'a>,
+    client: TreasuryContractClient<'a>,
+    /// Account that owns the org and bootstraps the registry.
+    owner: Address,
+    /// Contract admin of the treasury and org-recorded Multisig module.
+    admin: Address,
+    asset: Address,
+    org: String,
+}
+
+fn setup_contract_gated(funded: i128) -> ContractGatedHarness<'static> {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = account_address(&env);
+    let admin = env.register_contract(None, RegistryContract);
+    let org = String::from_str(&env, GATED_ORG);
+
+    let registry_id = env.register_contract(None, RegistryContract);
+    let registry = RegistryContractClient::new(&env, &registry_id);
+    registry.initialize(&owner);
+    registry.register_org(&owner, &org.clone(), &owner);
+
+    let treasury_id = env.register_contract(None, TreasuryContract);
+    let client = TreasuryContractClient::new(&env, &treasury_id);
+    client.initialize(&org.clone(), &admin);
+    client.set_registry(&admin, &Some(registry_id.clone()));
+    registry.register_module(&owner, &org.clone(), &ModuleKind::Treasury, &treasury_id);
+    registry.register_module(&owner, &org.clone(), &ModuleKind::Multisig, &admin);
+
+    let funder = env.register_contract(None, RegistryContract);
+    registry.register_module(&owner, &org.clone(), &ModuleKind::Wallet, &funder);
+
+    let token_admin = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.add_approved_asset(&admin, &asset);
+    if funded > 0 {
+        token::StellarAssetClient::new(&env, &asset).mint(&funder, &funded);
+        client.deposit(&funder, &asset, &funded);
+    }
+
+    ContractGatedHarness {
+        env,
+        registry,
+        client,
+        owner,
+        admin,
+        asset,
+        org,
+    }
+}
+
 /// A hostile, unregistered contract cannot deposit into the treasury: the
 /// deposit gate verifies a contract depositor against the org's Wallet
 /// module record and refuses everything else with `Unauthorized`.
@@ -1151,6 +1244,67 @@ fn account_callers_bypass_the_registry_gate() {
     h.client
         .withdraw(&h.admin, &h.asset, &Address::generate(&h.env), &100);
     assert_eq!(h.client.holding(&h.asset).total_out, 100);
+}
+
+#[test]
+fn account_withdrawal_emits_audit_event() {
+    let h = setup_gated(2_000);
+    h.client.deposit(&h.funder, &h.asset, &1_000);
+    let to = Address::generate(&h.env);
+    h.env.ledger().set_timestamp(1_700_000_100);
+
+    h.client.withdraw(&h.admin, &h.asset, &to, &100);
+
+    let (org, caller, recipient, asset, amount, verified, recorded_at) =
+        treasury_audit_payload(&h.env, "TreasuryWithdrawalAudit").unwrap();
+    assert_eq!(org, h.org);
+    assert_eq!(caller, h.admin);
+    assert_eq!(recipient, to);
+    assert_eq!(asset, h.asset);
+    assert_eq!(amount, 100);
+    assert!(!verified, "an account caller has no registry vouch");
+    assert_eq!(recorded_at, 1_700_000_100);
+}
+
+#[test]
+fn registry_verified_withdrawal_emits_audit_event() {
+    let h = setup_contract_gated(1_000);
+    let to = Address::generate(&h.env);
+    h.env.ledger().set_timestamp(1_700_000_200);
+
+    h.client.withdraw(&h.admin, &h.asset, &to, &100);
+
+    let (org, caller, recipient, asset, amount, verified, recorded_at) =
+        treasury_audit_payload(&h.env, "TreasuryWithdrawalAudit").unwrap();
+    assert_eq!(org, h.org);
+    assert_eq!(caller, h.admin);
+    assert_eq!(recipient, to);
+    assert_eq!(asset, h.asset);
+    assert_eq!(amount, 100);
+    assert!(
+        verified,
+        "the admin contract is the recorded Multisig module"
+    );
+    assert_eq!(recorded_at, 1_700_000_200);
+}
+
+#[test]
+fn contract_admin_recorded_under_the_wrong_module_cannot_withdraw() {
+    let h = setup_contract_gated(1_000);
+    // The admin contract is legitimate under a different module kind, but the
+    // outbound gate resolves (org, Multisig) and must not accept it.
+    h.registry
+        .remove_module(&h.owner, &h.org.clone(), &ModuleKind::Multisig);
+    h.registry
+        .register_module(&h.owner, &h.org.clone(), &ModuleKind::Proposal, &h.admin);
+
+    let to = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &to, &100),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.holding(&h.asset).total_out, 0);
+    assert!(treasury_audit_payload(&h.env, "TreasuryWithdrawalAudit").is_none());
 }
 
 /// Clearing the registry (admin-gated) restores the pre-registry behaviour:
@@ -2865,5 +3019,250 @@ fn frozen_treasury_blocks_milestone_disbursement_and_release_emits_withdrawn() {
     assert_eq!(
         treasury_flow_payload(&h.env, "TreasuryWithdrawn").map(|p| (p.1, p.3, p.4)),
         Some((to.clone(), 500, 500))
+    );
+}
+
+// --- Issue #502: sub-allocation limits and emergency sweep ---
+
+fn cat(env: &Env, name: &str) -> Symbol {
+    Symbol::new(env, name)
+}
+
+#[test]
+fn allocation_is_capped_per_category() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let ops = cat(&h.env, "ops");
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &300);
+
+    assert_eq!(h.client.allocate(&h.admin, &ops, &h.asset, &200), 200);
+    assert_eq!(h.client.allocate(&h.admin, &ops, &h.asset, &100), 300);
+    // One unit past the cap is refused and nothing more is reserved.
+    let res = h.client.try_allocate(&h.admin, &ops, &h.asset, &1);
+    assert_eq!(res, Err(Ok(Error::AllocationLimitExceeded)));
+    let a = h.client.allocation(&ops, &h.asset).unwrap();
+    assert_eq!((a.limit, a.allocated), (300, 300));
+    assert_eq!(h.client.reserved(&h.asset), 300);
+}
+
+#[test]
+fn categories_are_capped_independently() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let ops = cat(&h.env, "ops");
+    let payroll = cat(&h.env, "payroll");
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &100);
+    h.client
+        .set_allocation_limit(&h.admin, &payroll, &h.asset, &500);
+    h.client.allocate(&h.admin, &ops, &h.asset, &100);
+    h.client.allocate(&h.admin, &payroll, &h.asset, &500);
+    assert_eq!(
+        h.client.try_allocate(&h.admin, &ops, &h.asset, &1),
+        Err(Ok(Error::AllocationLimitExceeded))
+    );
+    assert_eq!(h.client.reserved(&h.asset), 600);
+}
+
+#[test]
+fn allocation_cannot_exceed_unreserved_balance() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &400);
+    let ops = cat(&h.env, "ops");
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &10_000);
+    assert_eq!(
+        h.client.try_allocate(&h.admin, &ops, &h.asset, &401),
+        Err(Ok(Error::AllocationLimitExceeded))
+    );
+    h.client.allocate(&h.admin, &ops, &h.asset, &400);
+}
+
+#[test]
+fn unconfigured_category_and_non_admin_are_refused() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let ops = cat(&h.env, "ops");
+    assert_eq!(
+        h.client.try_allocate(&h.admin, &ops, &h.asset, &1),
+        Err(Ok(Error::NotFound))
+    );
+    let intruder = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_set_allocation_limit(&intruder, &ops, &h.asset, &100),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn limit_cannot_drop_below_reserved_amount() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let ops = cat(&h.env, "ops");
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &300);
+    h.client.allocate(&h.admin, &ops, &h.asset, &250);
+    assert_eq!(
+        h.client
+            .try_set_allocation_limit(&h.admin, &ops, &h.asset, &200),
+        Err(Ok(Error::AllocationLimitExceeded))
+    );
+    h.client.release_allocation(&h.admin, &ops, &h.asset, &100);
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &200);
+    assert_eq!(h.client.reserved(&h.asset), 150);
+}
+
+#[test]
+fn reserved_funds_are_held_back_from_withdrawals() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let ops = cat(&h.env, "ops");
+    let recipient = Address::generate(&h.env);
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &700);
+    h.client.allocate(&h.admin, &ops, &h.asset, &700);
+
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &h.asset, &recipient, &301),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    let payments = vec![&h.env, payment(&recipient, 301)];
+    assert_eq!(
+        h.client.try_batch_transfer(&h.admin, &h.asset, &payments),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &300);
+    assert_eq!(token_balance(&h, &recipient), 300);
+
+    // Releasing the reserve makes it spendable again.
+    h.client.release_allocation(&h.admin, &ops, &h.asset, &700);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &700);
+    assert_eq!(token_balance(&h, &recipient), 1_000);
+}
+
+#[test]
+fn over_release_is_refused() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let ops = cat(&h.env, "ops");
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &100);
+    h.client.allocate(&h.admin, &ops, &h.asset, &50);
+    assert_eq!(
+        h.client
+            .try_release_allocation(&h.admin, &ops, &h.asset, &51),
+        Err(Ok(Error::InsufficientFunds))
+    );
+}
+
+#[test]
+fn emergency_sweep_moves_every_balance_to_recovery() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let ops = cat(&h.env, "ops");
+    h.client
+        .set_allocation_limit(&h.admin, &ops, &h.asset, &400);
+    h.client.allocate(&h.admin, &ops, &h.asset, &400);
+
+    let vault = Address::generate(&h.env);
+    h.client.set_recovery_address(&h.multisig, &vault);
+    assert_eq!(h.client.recovery_address(), Some(vault.clone()));
+
+    let swept = h.client.emergency_sweep(&h.multisig, &Vec::new(&h.env));
+    assert_eq!(swept.len(), 1);
+    assert_eq!(swept.get(0).unwrap().amount, 1_000);
+    assert_eq!(token_balance(&h, &vault), 1_000);
+    assert_eq!(token_balance(&h, &h.client.address), 0);
+    // Books and reservations are cleared.
+    let holding = h.client.holding(&h.asset);
+    assert_eq!((holding.total_in, holding.total_out), (0, 1_000));
+    assert_eq!(h.client.reserved(&h.asset), 0);
+    assert_eq!(h.client.allocation(&ops, &h.asset).unwrap().allocated, 0);
+
+    // Audit event: ("treasury", "em_sweep", asset).
+    let want: Vec<Val> = (
+        Symbol::new(&h.env, "treasury"),
+        Symbol::new(&h.env, "em_sweep"),
+        h.asset.clone(),
+    )
+        .into_val(&h.env);
+    assert!(h
+        .env
+        .events()
+        .all()
+        .iter()
+        .any(|(id, topics, _)| id == h.client.address && topics == want));
+}
+
+#[test]
+fn owner_can_sweep_even_while_frozen_and_paused() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let vault = Address::generate(&h.env);
+    h.client.set_recovery_address(&h.multisig, &vault);
+    h.client.freeze(&h.multisig);
+    h.client.pause(&h.admin);
+
+    let assets = vec![&h.env, h.asset.clone()];
+    h.client.emergency_sweep(&h.admin, &assets);
+    assert_eq!(token_balance(&h, &vault), 1_000);
+}
+
+#[test]
+fn unauthorized_sweep_is_rejected_with_its_code() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let vault = Address::generate(&h.env);
+    h.client.set_recovery_address(&h.multisig, &vault);
+
+    let intruder = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_emergency_sweep(&intruder, &Vec::new(&h.env)),
+        Err(Ok(Error::EmergencySweepUnauthorized))
+    );
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+    assert_eq!(token_balance(&h, &vault), 0);
+}
+
+#[test]
+fn recovery_address_is_governed_by_the_multisig() {
+    let h = setup("vault", 1_000);
+    let vault = Address::generate(&h.env);
+    // A multisig is wired, so the admin alone may not redirect the sweep.
+    assert_eq!(
+        h.client.try_set_recovery_address(&h.admin, &vault),
+        Err(Ok(Error::EmergencySweepUnauthorized))
+    );
+    // The treasury itself is not a valid destination.
+    assert_eq!(
+        h.client
+            .try_set_recovery_address(&h.multisig, &h.client.address),
+        Err(Ok(Error::InvalidInput))
+    );
+    h.client.set_recovery_address(&h.multisig, &vault);
+}
+
+#[test]
+fn sweep_without_recovery_address_or_with_duplicates_is_refused() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    assert_eq!(
+        h.client.try_emergency_sweep(&h.admin, &Vec::new(&h.env)),
+        Err(Ok(Error::InvalidState))
+    );
+    let vault = Address::generate(&h.env);
+    h.client.set_recovery_address(&h.multisig, &vault);
+    let dup = vec![&h.env, h.asset.clone(), h.asset.clone()];
+    assert_eq!(
+        h.client.try_emergency_sweep(&h.admin, &dup),
+        Err(Ok(Error::InvalidInput))
+    );
+    let unapproved = vec![&h.env, Address::generate(&h.env)];
+    assert_eq!(
+        h.client.try_emergency_sweep(&h.admin, &unapproved),
+        Err(Ok(Error::AssetNotAuthorized))
     );
 }
