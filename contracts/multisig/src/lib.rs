@@ -32,7 +32,7 @@
 //! [`MultiSigContract::verify_threshold`] exposes that same signature check on
 //! its own, without executing anything: it verifies a set of signatures over an
 //! exact payload, accumulates the weight of the distinct registered signers
-//! behind them, and returns the total or [`Error::ThresholdNotMet`]. Duplicated
+//! behind them, and returns the total or [`Error::QUORUM_NOT_MET`]. Duplicated
 //! signatories are counted once, so a single key can never reach the threshold
 //! alone however often it is listed.
 //!
@@ -571,7 +571,9 @@ impl MultiSigContract {
         Self::bump_approval(&env, proposal_id, &caller);
         let status = Self::quorum_status(&env, proposal_id)?;
         proposal.approval_weight = status.approval_weight;
-        Self::approve_transition(&mut proposal)?;
+        if status.met {
+            Self::approve_transition(&mut proposal)?;
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -586,6 +588,31 @@ impl MultiSigContract {
             quorum::publish_threshold_met(&env, symbol_short!("proposal"), proposal_id, &status);
         }
         Ok(proposal.approval_weight)
+    }
+
+    pub fn revoke_approval(env: Env, caller: Address, proposal_id: u64) -> Result<u32, Error> {
+        Self::require_not_locked(&env)?;
+        Self::require_signer_weight(&env, &caller)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
+        if proposal.state != ProposalState::Pending {
+            return Err(Error::InvalidProposalState);
+        }
+        let akey = DataKey::Approval(proposal_id, caller.clone());
+        if !env.storage().persistent().get(&akey).unwrap_or(false) {
+            return Err(Error::NotFound);
+        }
+        env.storage().persistent().remove(&akey);
+        let status = Self::quorum_status(&env, proposal_id)?;
+        proposal.approval_weight = status.approval_weight;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_proposal(&env, proposal_id);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("revoked")),
+            (proposal_id, caller, status.approval_weight),
+        );
+        Ok(status.approval_weight)
     }
 
     /// Reject a proposal. Only current signers may reject, once each, and a
@@ -889,7 +916,7 @@ impl MultiSigContract {
             Self::accumulate_weight(&env, &signers, &caller, &approvers, &payload)?;
         // Same quorum verification helper as the proposal flow; batches report
         // their dedicated shortfall code.
-        Self::require_quorum(weight, threshold, Error::ThresholdNotMet)?;
+        Self::require_quorum(weight, threshold, Error::QUORUM_NOT_MET)?;
         // The signatures just verified met the threshold: announce the quorum
         // with the tally behind it, distinct from `batch/executed`. The signer
         // count comes from the same deduplicating pass that produced `weight`,
@@ -1082,7 +1109,7 @@ impl MultiSigContract {
     /// [`Self::add_weight`] (i.e. it is wrap-free by construction), a sum below
     /// `threshold` is rejected with `shortfall`, the caller's own shortfall code
     /// ([`Error::InsufficientWeight`] for proposal approvals,
-    /// [`Error::ThresholdNotMet`] for batches), so every quorum decision in the
+    /// [`Error::QUORUM_NOT_MET`] for signature-verified batches), so every quorum decision in the
     /// contract is taken in exactly one place.
     ///
     /// Named distinctly from the public
@@ -1608,7 +1635,7 @@ impl MultisigInterface for MultiSigContract {
     /// the multisig to execute anything.
     ///
     /// Returns the accumulated weight on success, [`Error::NotASigner`] when an
-    /// unregistered address is presented, and [`Error::ThresholdNotMet`] when
+    /// unregistered address is presented, and [`Error::QUORUM_NOT_MET`] when
     /// the verified weight falls short.
     fn verify_threshold(
         env: Env,
@@ -1626,7 +1653,7 @@ impl MultisigInterface for MultiSigContract {
         let threshold = Self::threshold(&env)?;
         let args = vec![&env, payload.to_val()];
         let (weight, _) = Self::accumulate_weight(&env, &signers, &caller, &signatories, &args)?;
-        Self::require_quorum(weight, threshold, Error::ThresholdNotMet)?;
+        Self::require_quorum(weight, threshold, Error::QUORUM_NOT_MET)?;
         Ok(weight)
     }
 

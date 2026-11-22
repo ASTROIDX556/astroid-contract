@@ -226,6 +226,28 @@ fn rejected_transfer_reports_policy_denied_and_moves_nothing() {
 }
 
 #[test]
+fn unauthorized_signer_cannot_bypass_policy_constraints() {
+    let h = setup();
+    let rogue = Address::generate(&h.env);
+    let owner = h.wallet.get_wallet(&h.wallet_id).owner;
+    h.wallet
+        .grant_role(&owner, &h.wallet_id, &rogue, &Role::Agent);
+    h.policy
+        .add_blacklist(&h.admin, &String::from_str(&h.env, POLICY_ID), &h.merchant);
+
+    let before = h.wallet.balance(&h.wallet_id, &h.asset);
+    let res = h
+        .wallet
+        .try_transfer(&rogue, &h.wallet_id, &h.merchant, &h.asset, &1);
+    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
+    assert_eq!(h.wallet.balance(&h.wallet_id, &h.asset), before);
+    assert_eq!(
+        token::TokenClient::new(&h.env, &h.asset).balance(&h.merchant),
+        0
+    );
+}
+
+#[test]
 fn rejected_batch_action_reports_its_own_policy_id() {
     let h = setup();
     let action = BatchAction {

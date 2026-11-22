@@ -29,7 +29,6 @@ const AMOUNT: i128 = 8_000;
 struct Harness<'a> {
     env: Env,
     escrow: EscrowContractClient<'a>,
-    admin: Address,
     sender: Address,
     recipient: Address,
     arbiter: Address,
@@ -59,7 +58,6 @@ fn setup() -> Harness<'static> {
     Harness {
         env,
         escrow,
-        admin,
         sender,
         recipient,
         arbiter,

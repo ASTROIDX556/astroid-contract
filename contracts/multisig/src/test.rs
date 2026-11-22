@@ -1101,7 +1101,7 @@ fn batch_below_threshold_rejected() {
         &calls,
         &approvers(&h.env, &h.signers, &[]),
     );
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET)));
     // Nothing was executed and the nonce was not consumed.
     assert_eq!(h.helper_client.get(&1), 0);
     assert_eq!(h.client.get_last_batch_nonce(), 0);
@@ -1124,7 +1124,7 @@ fn batch_duplicate_approvers_do_not_stack_weight() {
     // The caller listed as approver too must still count once: 1 < threshold 2.
     let app = vec![&h.env, h.signers[0].clone()];
     let res = h.client.try_execute_batch(&h.signers[0], &1, &calls, &app);
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET)));
 }
 
 #[test]
@@ -1138,7 +1138,7 @@ fn batch_unanimous_quorum_requires_every_signer() {
         &calls,
         &approvers(&h.env, &h.signers, &[1]),
     );
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET)));
     assert_eq!(h.helper_client.get(&1), 0);
 
     // Caller plus every remaining signer meets the threshold exactly.
@@ -1320,7 +1320,7 @@ fn batch_execution_uses_signer_weights() {
         &calls,
         &approvers(&h.env, &h.signers, &[2]),
     );
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET)));
 }
 
 // --- standalone threshold verification ---
@@ -1367,7 +1367,7 @@ fn verify_threshold_below_threshold_is_refused() {
         &approvers(&h.env, &h.signers, &[2]),
         &payload(&h.env),
     );
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET)));
 }
 
 #[test]
@@ -1379,7 +1379,7 @@ fn verify_threshold_counts_a_repeated_signatory_once() {
         &approvers(&h.env, &h.signers, &[0]),
         &payload(&h.env),
     );
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet)));
+    assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET)));
 }
 
 #[test]
@@ -1793,6 +1793,8 @@ fn weight_accumulation_is_checked_and_narrowing_refuses_to_truncate() {
     assert_eq!(quorum::narrow(u32::MAX as i128), Ok(u32::MAX));
     assert_eq!(quorum::narrow(u32::MAX as i128 + 1), Err(Error::Overflow));
     assert_eq!(quorum::narrow(i128::MAX), Err(Error::Overflow));
+    assert_eq!(quorum::narrow(-1), Err(Error::Overflow));
+    assert_eq!(quorum::narrow(i128::MIN), Err(Error::Overflow));
 }
 
 #[test]
@@ -2076,7 +2078,7 @@ fn a_batch_below_the_threshold_never_announces_a_quorum() {
             &calls,
             &approvers(&h.env, &h.signers, &[1])
         ),
-        Err(Ok(Error::ThresholdNotMet))
+        Err(Ok(Error::QUORUM_NOT_MET))
     );
     assert_eq!(h.helper_client.get(&2), 0);
     assert_eq!(count_events(&h.env, "batch", "quorum"), 0);
@@ -2123,7 +2125,7 @@ fn batch_signature_weight_is_checked_and_duplicates_count_once() {
             &calls,
             &approvers(&strict.env, &strict.signers, &[0, 0, 0]),
         ),
-        Err(Ok(Error::ThresholdNotMet))
+        Err(Ok(Error::QUORUM_NOT_MET))
     );
     assert_eq!(strict.helper_client.get(&4), 0);
     assert_eq!(count_events(&strict.env, "batch", "quorum"), 0);
@@ -2366,7 +2368,7 @@ fn verify_threshold_duplicate_signatories_count_once() {
     let res = h
         .client
         .try_verify_threshold(&h.signers[0], &signatories, &payload);
-    assert_eq!(res, Err(Ok(Error::ThresholdNotMet))); // 3 < 4
+    assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET))); // 3 < 4
 
     // caller (3) + distinct signer (2) = 5 >= 4
     let signatories2 = vec![&h.env, h.signers[1].clone()];
@@ -2990,5 +2992,95 @@ fn expired_deadline_cannot_start_a_proposal_or_settle_an_open_one() {
     assert_eq!(
         h.client.try_expire_proposal(&with_deadline),
         Err(Ok(Error::TimelockNotExpired))
+    );
+}
+
+#[test]
+fn revoking_an_approval_recomputes_the_live_tally() {
+    let h = setup(&[1, 1, 1], 3);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &id), 2);
+    assert_eq!(h.client.get_proposal(&id).state, ProposalState::Pending);
+
+    assert_eq!(h.client.revoke_approval(&h.signers[1], &id), 1);
+    assert_eq!(h.client.get_proposal(&id).approval_weight, 1);
+    assert_eq!(
+        h.client.try_execute(&h.signers[0], &id),
+        Err(Ok(Error::InsufficientWeight))
+    );
+
+    assert_eq!(h.client.approve(&h.signers[2], &id), 2);
+    assert_eq!(h.client.revoke_approval(&h.signers[2], &id), 1);
+    assert_eq!(h.client.approve(&h.signers[1], &id), 2);
+    assert_eq!(h.client.approve(&h.signers[2], &id), 3);
+    assert_eq!(h.client.get_proposal(&id).state, ProposalState::Approved);
+    h.client.execute(&h.signers[0], &id);
+    assert!(h.client.get_proposal(&id).executed);
+}
+
+#[test]
+fn revoke_approval_is_limited_to_a_live_pending_ballot() {
+    let h = setup(&[1, 1, 1], 2);
+    let id = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_revoke_approval(&stranger, &id),
+        Err(Ok(Error::NotASigner))
+    );
+    assert_eq!(
+        h.client.try_revoke_approval(&h.signers[1], &id),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(h.client.revoke_approval(&h.signers[0], &id), 0);
+    assert_eq!(
+        h.client.try_revoke_approval(&h.signers[0], &id),
+        Err(Ok(Error::NotFound))
+    );
+
+    let approved = h.client.propose(
+        &h.signers[0],
+        &symbol_short!("payment"),
+        &payload(&h.env),
+        &0,
+    );
+    assert_eq!(h.client.approve(&h.signers[1], &approved), 2);
+    assert_eq!(
+        h.client.get_proposal(&approved).state,
+        ProposalState::Approved
+    );
+    assert_eq!(
+        h.client.try_revoke_approval(&h.signers[1], &approved),
+        Err(Ok(Error::InvalidProposalState))
+    );
+}
+
+#[test]
+fn quorum_shortfall_has_a_dedicated_error_code() {
+    let h = setup(&[3, 1], 4);
+    assert_eq!(
+        h.client.try_verify_threshold(
+            &h.signers[1],
+            &vec![&h.env, h.signers[1].clone()],
+            &payload(&h.env),
+        ),
+        Err(Ok(Error::QUORUM_NOT_MET))
+    );
+    assert_eq!(
+        h.client.verify_threshold(
+            &h.signers[0],
+            &vec![&h.env, h.signers[1].clone()],
+            &payload(&h.env),
+        ),
+        4
     );
 }
