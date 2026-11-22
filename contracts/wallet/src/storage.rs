@@ -73,6 +73,8 @@ pub(crate) enum DataKey {
     DefaultBudgetId,
     /// Per-asset budget envelope id: asset -> budget_id (persistent).
     AssetBudgetId(Address),
+    /// Scheduled execution timelock: wallet id -> timestamp (persistent).
+    Timelock(u64),
 }
 
 /// Extend the shared instance TTL.
@@ -168,4 +170,19 @@ pub(crate) fn release_lock(env: &Env) {
     env.storage()
         .instance()
         .set(&DataKey::ReentrancyLock, &false);
+}
+
+pub(crate) fn read_timelock(env: &Env, id: u64) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Timelock(id))
+        .unwrap_or(0)
+}
+
+pub(crate) fn set_timelock(env: &Env, id: u64, unlock_time: u64) {
+    set_persistent(env, &DataKey::Timelock(id), &unlock_time);
+}
+
+pub(crate) fn clear_timelock(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Timelock(id));
 }

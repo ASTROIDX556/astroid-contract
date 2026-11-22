@@ -40,6 +40,18 @@ pub trait UpgradeRegistryInterface {
     fn is_wasm_approved(env: Env, kind: ModuleKind, wasm_hash: BytesN<32>) -> bool;
 }
 
+/// Wallet module upgrade hook interface.
+///
+/// Implemented by contracts that validate wallet module upgrades or act as
+/// upgrade hooks before a wallet module is registered or upgraded in the registry.
+#[contractclient(name = "WalletModuleUpgradeHookClient")]
+pub trait WalletModuleUpgradeHookInterface {
+    /// Validate the proposed wallet module address.
+    ///
+    /// Return `true` if valid, `false` or error if incompatible/malformed.
+    fn validate_upgrade_hook(env: Env, module: Address) -> Result<bool, Error>;
+}
+
 /// Instance-storage key for the upgrade authority. Namespaced under its own
 /// type so it can never collide with a contract's own `DataKey`.
 #[contracttype]

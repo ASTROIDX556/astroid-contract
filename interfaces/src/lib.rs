@@ -39,6 +39,7 @@ pub mod proposal;
 pub mod upgrade;
 
 pub use proposal::{ProposalClient, ProposalInterface, ProposalState};
+pub use upgrade::{WalletModuleUpgradeHookClient, WalletModuleUpgradeHookInterface};
 
 #[cfg(test)]
 mod test;
