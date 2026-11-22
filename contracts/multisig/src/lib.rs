@@ -77,7 +77,7 @@
 //! [`Error::TimelockNotExpired`]; governance calls from a non-signer with
 //! [`Error::UnauthorizedModification`].
 
-use astroid_interfaces::{MultisigInterface, UpgradeableInterface};
+use astroid_interfaces::{MultisigInterface, ProposalState, UpgradeableInterface};
 use astroid_shared::constants::{
     GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_CALLS,
     MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_THRESHOLD, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
@@ -430,7 +430,8 @@ impl MultiSigContract {
 
     /// Create a proposal. Only a signer may propose. `unlock_at` sets an optional
     /// time lock (0 = immediately executable once threshold met). The proposer's
-    /// weight is counted automatically.
+    /// weight is counted automatically and the proposal starts in
+    /// [`ProposalState::Pending`], with no voting deadline.
     pub fn propose(
         env: Env,
         proposer: Address,
@@ -438,10 +439,41 @@ impl MultiSigContract {
         payload: Bytes,
         unlock_at: u64,
     ) -> Result<u64, Error> {
-        Self::require_not_locked(&env)?;
+        Self::propose_inner(&env, &proposer, action, payload, unlock_at, 0)
+    }
+
+    /// Create a proposal with an explicit voting deadline, after which no signer
+    /// may approve or reject it. `expires_at` is a unix timestamp; `0` means the
+    /// voting window never closes (the behaviour of [`Self::propose`]). A
+    /// deadline already reached at creation time is refused. Only a signer may
+    /// propose, and the proposer's own approval is recorded automatically.
+    pub fn propose_with_deadline(
+        env: Env,
+        proposer: Address,
+        action: Symbol,
+        payload: Bytes,
+        unlock_at: u64,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        Self::propose_inner(&env, &proposer, action, payload, unlock_at, expires_at)
+    }
+
+    fn propose_inner(
+        env: &Env,
+        proposer: &Address,
+        action: Symbol,
+        payload: Bytes,
+        unlock_at: u64,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        Self::require_not_locked(env)?;
         // Authorization and the proposer's voting weight come from one read of
         // the signer set (`require_signer` + `weight_of` read it twice before).
-        let proposer_weight = Self::require_signer_weight(&env, &proposer)?;
+        let proposer_weight = Self::require_signer_weight(env, proposer)?;
+        let now = env.ledger().timestamp();
+        if expires_at != 0 && expires_at <= now {
+            return Err(Error::ProposalExpired);
+        }
 
         let mut count: u64 = env
             .storage()
@@ -451,8 +483,7 @@ impl MultiSigContract {
         count = checked_add(count as i128, 1)? as u64;
         let id = count;
 
-        let now = env.ledger().timestamp();
-        let delay = Self::timelock_delay(&env);
+        let delay = Self::timelock_delay(env);
         let min_unlock = now.saturating_add(delay);
 
         let effective_unlock_at = if Self::is_quorum_or_weight_action(&action) {
@@ -470,8 +501,11 @@ impl MultiSigContract {
             action,
             payload,
             approval_weight: proposer_weight,
+            rejection_weight: 0,
             executed: false,
             unlock_at: effective_unlock_at,
+            expires_at,
+            state: ProposalState::Pending,
         };
         env.storage()
             .persistent()
@@ -479,20 +513,21 @@ impl MultiSigContract {
         env.storage()
             .persistent()
             .set(&DataKey::Approval(id, proposer.clone()), &true);
-        Self::bump_approval(&env, id, &proposer);
-        Self::bump_proposal(&env, id);
+        Self::bump_approval(env, id, proposer);
+        Self::bump_proposal(env, id);
         env.storage()
             .instance()
             .set(&DataKey::ProposalCount, &count);
-        Self::bump_instance(&env);
+        Self::bump_instance(env);
 
-        events::proposal_created(&env, id, &proposer);
+        events::proposal_created(env, id, proposer);
         // The proposer's own weight counts toward the threshold, so a heavy
         // signer can satisfy it alone at creation time — announce that once,
         // with the same verified tally every later approval is measured against.
-        let status = Self::quorum_status(&env, id)?;
+        let status = Self::quorum_status(env, id)?;
         if status.met {
-            quorum::publish_threshold_met(&env, symbol_short!("proposal"), id, &status);
+            Self::mark_approved(env, id, &status)?;
+            quorum::publish_threshold_met(env, symbol_short!("proposal"), id, &status);
         }
         Ok(id)
     }
@@ -510,15 +545,19 @@ impl MultiSigContract {
         // signer is credited at their current weight.
         Self::require_signer_weight(&env, &caller)?;
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
-        if proposal.executed {
-            return Err(Error::InvalidProposalState);
-        }
-        // Reject duplicate signers: an approval is recorded once per
-        // (proposal, signer) pair and the flag is only written once every
-        // check below has passed, so a repeated approval can never stack its
-        // weight twice.
+        Self::require_open_for_voting(&env, &proposal)?;
+        // One ballot per signer: an approval is recorded once per
+        // (proposal, signer) pair and a signer who already rejected cannot
+        // approve afterwards. The flag is written only after every check below
+        // has passed, so a repeated vote can never stack its weight twice.
         let akey = DataKey::Approval(proposal_id, caller.clone());
-        if env.storage().persistent().get(&akey).unwrap_or(false) {
+        if env.storage().persistent().get(&akey).unwrap_or(false)
+            || env
+                .storage()
+                .persistent()
+                .get(&DataKey::Rejection(proposal_id, caller.clone()))
+                .unwrap_or(false)
+        {
             return Err(Error::AlreadySigned);
         }
         env.storage().persistent().set(&akey, &true);
@@ -528,6 +567,7 @@ impl MultiSigContract {
         let was_met = quorum::is_met(proposal.approval_weight, Self::threshold(&env)?);
         let status = Self::quorum_status(&env, proposal_id)?;
         proposal.approval_weight = status.approval_weight;
+        Self::approve_transition(&mut proposal)?;
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -542,6 +582,84 @@ impl MultiSigContract {
             quorum::publish_threshold_met(&env, symbol_short!("proposal"), proposal_id, &status);
         }
         Ok(proposal.approval_weight)
+    }
+
+    /// Reject a proposal. Only current signers may reject, once each, and a
+    /// signer who has already approved cannot also reject. Rejection weight is
+    /// rebuilt from the *live* signer set exactly like approval weight, so a
+    /// removed signer's vote stops counting and a re-weighted signer counts at
+    /// their current weight. Once the accumulated rejection weight reaches the
+    /// configured threshold the proposal moves to [`ProposalState::Rejected`],
+    /// a terminal state: no further votes or execution are accepted.
+    ///
+    /// Returns the running rejection weight.
+    pub fn reject(env: Env, caller: Address, proposal_id: u64) -> Result<u32, Error> {
+        Self::require_not_locked(&env)?;
+        Self::require_signer_weight(&env, &caller)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
+        Self::require_open_for_voting(&env, &proposal)?;
+        let rejection_key = DataKey::Rejection(proposal_id, caller.clone());
+        if env
+            .storage()
+            .persistent()
+            .get(&rejection_key)
+            .unwrap_or(false)
+            || env
+                .storage()
+                .persistent()
+                .get(&DataKey::Approval(proposal_id, caller.clone()))
+                .unwrap_or(false)
+        {
+            return Err(Error::AlreadySigned);
+        }
+        env.storage().persistent().set(&rejection_key, &true);
+        Self::bump_rejection(&env, proposal_id, &caller);
+
+        let status = Self::rejection_status(&env, proposal_id)?;
+        proposal.rejection_weight = status.approval_weight;
+        let threshold_met = status.met;
+        if threshold_met {
+            Self::require_transition(&mut proposal, ProposalState::Rejected)?;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_proposal(&env, proposal_id);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("rejected")),
+            (proposal_id, caller, proposal.rejection_weight),
+        );
+        if threshold_met {
+            quorum::publish_threshold_met(&env, symbol_short!("rejection"), proposal_id, &status);
+        }
+        Ok(proposal.rejection_weight)
+    }
+
+    /// Settle a proposal whose voting deadline has passed. Permissionless: the
+    /// deadline is deterministic, so anyone may record the transition. A
+    /// proposal with no deadline, one that is not past its deadline, or one
+    /// already in a terminal state is refused.
+    pub fn expire_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
+        if !proposal.state.is_live() || proposal.executed {
+            return Err(Error::InvalidProposalState);
+        }
+        if proposal.expires_at == 0 {
+            return Err(Error::InvalidProposalState);
+        }
+        if env.ledger().timestamp() < proposal.expires_at {
+            return Err(Error::TimelockNotExpired);
+        }
+        Self::require_transition(&mut proposal, ProposalState::Expired)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_proposal(&env, proposal_id);
+        env.events().publish(
+            (symbol_short!("proposal"), symbol_short!("expired")),
+            proposal_id,
+        );
+        Ok(())
     }
 
     /// Collect many confirmations in one transaction (Issue #501).
@@ -602,11 +720,15 @@ impl MultiSigContract {
                 authenticated.push_back(entry.signer.clone());
             }
             let proposal = Self::load_proposal(&env, entry.proposal_id)?;
-            if proposal.executed {
-                return Err(Error::InvalidProposalState);
-            }
+            Self::require_open_for_voting(&env, &proposal)?;
             let akey = DataKey::Approval(entry.proposal_id, entry.signer.clone());
-            if env.storage().persistent().get(&akey).unwrap_or(false) {
+            if env.storage().persistent().get(&akey).unwrap_or(false)
+                || env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Rejection(entry.proposal_id, entry.signer.clone()))
+                    .unwrap_or(false)
+            {
                 return Err(Error::AlreadySigned);
             }
             if !proposal_ids.contains(entry.proposal_id) {
@@ -630,6 +752,7 @@ impl MultiSigContract {
             let was_met = quorum::is_met(proposal.approval_weight, threshold);
             let status = Self::quorum_status(&env, id)?;
             proposal.approval_weight = status.approval_weight;
+            Self::approve_transition(&mut proposal)?;
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(id), &proposal);
@@ -662,8 +785,11 @@ impl MultiSigContract {
         Self::require_not_locked(&env)?;
         Self::require_signer(&env, &caller)?;
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
-        if proposal.executed {
+        if !proposal.state.is_live() || proposal.executed {
             return Err(Error::InvalidProposalState);
+        }
+        if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
+            return Err(Error::ProposalExpired);
         }
         // Same quorum verification helper as the batch flow, over the tally
         // rebuilt from the live signer set; the proposal flow reports its own
@@ -671,9 +797,11 @@ impl MultiSigContract {
         let status = Self::quorum_status(&env, proposal_id)?;
         proposal.approval_weight = status.approval_weight;
         status.ensure_met(Error::InsufficientWeight)?;
+        Self::approve_transition(&mut proposal)?;
         if proposal.unlock_at != 0 {
             require_time_reached(&env, proposal.unlock_at)?;
         }
+        Self::require_transition(&mut proposal, ProposalState::Executed)?;
         proposal.executed = true;
         env.storage()
             .persistent()
@@ -791,6 +919,22 @@ impl MultiSigContract {
 
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<MsProposal, Error> {
         Self::load_proposal(&env, proposal_id)
+    }
+
+    /// Canonical lifecycle state of a multisig proposal.
+    ///
+    /// Read-only view: a live proposal past its voting deadline is reported as
+    /// [`ProposalState::Expired`] without mutating storage, so the answer
+    /// reflects the ledger clock even before `expire_proposal` is called.
+    pub fn get_proposal_state(env: Env, proposal_id: u64) -> Result<ProposalState, Error> {
+        let proposal = Self::load_proposal(&env, proposal_id)?;
+        if proposal.state.is_live()
+            && proposal.expires_at != 0
+            && env.ledger().timestamp() >= proposal.expires_at
+        {
+            return Ok(ProposalState::Expired);
+        }
+        Ok(proposal.state)
     }
 
     /// Last used batch nonce. The next `execute_batch` call must pass a strictly
@@ -963,6 +1107,78 @@ impl MultiSigContract {
             .persistent()
             .get(&DataKey::Proposal(id))
             .ok_or(Error::NotFound)
+    }
+
+    /// Gate every voting action on the proposal's state and deadline. A
+    /// deadline is checked first so a stale proposal reports `ProposalExpired`
+    /// even if it has not been settled by `expire_proposal` yet; executed,
+    /// rejected and expired proposals all refuse further votes.
+    fn require_open_for_voting(env: &Env, proposal: &MsProposal) -> Result<(), Error> {
+        if proposal.expires_at != 0 && env.ledger().timestamp() >= proposal.expires_at {
+            return Err(Error::ProposalExpired);
+        }
+        if !proposal.state.is_live() || proposal.executed {
+            return Err(Error::InvalidProposalState);
+        }
+        Ok(())
+    }
+
+    /// Move a pending proposal to `Approved` once its approval weight meets the
+    /// threshold. Already-approved proposals are left alone, so a late approval
+    /// cannot replay a transition.
+    fn approve_transition(proposal: &mut MsProposal) -> Result<(), Error> {
+        if proposal.state == ProposalState::Pending {
+            Self::require_transition(proposal, ProposalState::Approved)?;
+        }
+        Ok(())
+    }
+
+    fn mark_approved(env: &Env, id: u64, status: &QuorumStatus) -> Result<(), Error> {
+        let mut proposal = Self::load_proposal(env, id)?;
+        Self::approve_transition(&mut proposal)?;
+        proposal.approval_weight = status.approval_weight;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), &proposal);
+        Self::bump_proposal(env, id);
+        Ok(())
+    }
+
+    /// The single state-transition gate: every change goes through the
+    /// canonical [`ProposalState::may_transition`] table, so no entrypoint can
+    /// revive a terminal proposal or skip a state.
+    fn require_transition(proposal: &mut MsProposal, next: ProposalState) -> Result<(), Error> {
+        if !proposal.state.may_transition(next) {
+            return Err(Error::InvalidProposalState);
+        }
+        proposal.state = next;
+        Ok(())
+    }
+
+    /// Rejection tally, rebuilt from the live signer set exactly like the
+    /// approval tally in [`Self::live_tally`], and evaluated through the same
+    /// [`QuorumStatus`] so rejection and approval use one comparison rule.
+    fn rejection_status(env: &Env, id: u64) -> Result<QuorumStatus, Error> {
+        let signers = Self::signers(env)?;
+        let mut total: i128 = 0;
+        let mut rejecters: u32 = 0;
+        for s in signers.iter() {
+            if env
+                .storage()
+                .persistent()
+                .get(&DataKey::Rejection(id, s.address.clone()))
+                .unwrap_or(false)
+            {
+                total = Self::add_weight(total, s.weight)?;
+                rejecters = rejecters.checked_add(1).ok_or(Error::Overflow)?;
+            }
+        }
+        Ok(QuorumStatus::evaluate(
+            Self::to_weight(total)?,
+            rejecters,
+            Self::threshold(env)?,
+            Self::total_weight(&signers)?,
+        ))
     }
 
     fn require_signer(env: &Env, caller: &Address) -> Result<(), Error> {
@@ -1315,6 +1531,16 @@ impl MultiSigContract {
     fn bump_approval(env: &Env, id: u64, who: &Address) {
         env.storage().persistent().extend_ttl(
             &DataKey::Approval(id, who.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Rejections are re-read when a proposal is settled, so they live at
+    /// least as long as the proposal record itself.
+    fn bump_rejection(env: &Env, id: u64, who: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Rejection(id, who.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
