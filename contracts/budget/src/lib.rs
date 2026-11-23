@@ -130,7 +130,7 @@ use astroid_shared::constants::{
 use astroid_shared::errors::{BudgetError, Error};
 use astroid_shared::events::ContractEvent;
 use astroid_shared::math::{
-    calculate_budget_rollover, checked_add, checked_div, checked_mul, checked_rem, checked_sub,
+    calculate_budget_rollover, safe_add, safe_mul, safe_percentage, safe_sub,
 };
 use astroid_shared::types::ResourceState;
 use astroid_shared::validation::{
@@ -728,7 +728,7 @@ impl BudgetContract {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_not_archived(&budget)?;
         Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
-        budget.limit = checked_add(budget.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
+        budget.limit = safe_add(budget.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &budget_id, &budget);
         events::budget_updated(
             &env,
@@ -815,12 +815,12 @@ impl BudgetContract {
         Self::require_not_expired(&env, &from)?;
         Self::require_not_expired(&env, &to)?;
         // Only the unspent portion of `from` may be reallocated.
-        let available = checked_sub(from.limit, from.spent).map_err(|_| Error::BUDGET_OVERFLOW)?;
+        let available = safe_sub(from.limit, from.spent).map_err(|_| Error::BUDGET_OVERFLOW)?;
         if amount > available {
             return Err(Error::BUDGET_LIMIT_EXCEEDED);
         }
-        from.limit = checked_sub(from.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
-        to.limit = checked_add(to.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
+        from.limit = safe_sub(from.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
+        to.limit = safe_add(to.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &from_id, &from);
         Self::store(&env, &to_id, &to);
         events::budget_updated(
@@ -1005,7 +1005,7 @@ impl BudgetContract {
         // Check if within limit (accounting for any rollover credit)
         let capacity = Self::asset_capacity(&asset_budget)?;
         let new_spent =
-            checked_add(asset_budget.spent, amount).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
+            safe_add(asset_budget.spent, amount).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         if new_spent > capacity {
             return Err(BudgetError::BUDGET_LIMIT_EXCEEDED);
         }
@@ -1085,7 +1085,7 @@ impl BudgetContract {
             // Same ceiling as the single-leg path: the base limit plus any
             // rollover credit banked from earlier windows. Checking against
             // the bare limit refused spends `check_and_record_spend` accepts.
-            let new_spent = checked_add(asset_budget.spent, spend.amount)
+            let new_spent = safe_add(asset_budget.spent, spend.amount)
                 .map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
             if new_spent > Self::asset_capacity(&asset_budget)? {
                 return Err(BudgetError::BUDGET_LIMIT_EXCEEDED);
@@ -1152,11 +1152,11 @@ impl BudgetContract {
             return Ok(0);
         }
         let capacity = if asset_budget.rollover_enabled {
-            checked_add(asset_budget.limit, asset_budget.rollover_credit)?
+            safe_add(asset_budget.limit, asset_budget.rollover_credit)?
         } else {
             asset_budget.limit
         };
-        checked_sub(capacity, asset_budget.spent)
+        safe_sub(capacity, asset_budget.spent)
     }
 
     /// Settle a budget's spending window against the ledger clock
@@ -1272,12 +1272,12 @@ impl BudgetContract {
     /// Remaining allowance in the current period: base limit plus rollover
     /// credit, less any carried-forward deficit and what has been spent.
     fn effective_remaining(budget: &Budget) -> Result<i128, Error> {
-        let capacity = checked_add(budget.limit, budget.rollover_credit)?;
+        let capacity = safe_add(budget.limit, budget.rollover_credit)?;
         if budget.allow_deficit && budget.deficit_amount > 0 {
-            let net = checked_sub(capacity, budget.deficit_amount)?;
-            checked_sub(net, budget.spent)
+            let net = safe_sub(capacity, budget.deficit_amount)?;
+            safe_sub(net, budget.spent)
         } else {
-            checked_sub(capacity, budget.spent)
+            safe_sub(capacity, budget.spent)
         }
     }
     fn require_active(budget: &Budget) -> Result<(), Error> {
@@ -1419,8 +1419,8 @@ impl BudgetContract {
         // already accounts for any credit carried into this window because
         // the period's capacity is `limit + rollover_credit`. Re-adding the
         // old credit would count it a second time.
-        let capacity = checked_add(budget.limit, budget.rollover_credit)?;
-        let leftover = checked_sub(capacity, budget.spent)?;
+        let capacity = safe_add(budget.limit, budget.rollover_credit)?;
+        let leftover = safe_sub(capacity, budget.spent)?;
 
         let carry = if budget.allow_deficit && budget.spent > capacity {
             // Deficit: spent exceeded capacity (base limit + rollover
@@ -1428,7 +1428,7 @@ impl BudgetContract {
             // into next period's reduced effective limit, and no surplus is
             // banked. `spent > capacity` with `!allow_deficit` cannot happen
             // — consume rejects it — so it is handled defensively below.
-            checked_sub(capacity, budget.spent)?
+            safe_sub(capacity, budget.spent)?
         } else if budget.rollover_enabled {
             // A negative closing balance (`spent` above `capacity`, reachable
             // when the owner tightens the cap mid-period through
@@ -1443,7 +1443,7 @@ impl BudgetContract {
             // shared calculation (mirroring `window_transition`).
             let mut credit = calculate_budget_rollover(unspent, budget.rollover_bps, cap)?;
             if periods > 1 {
-                let idle = checked_sub(periods, 1)?;
+                let idle = safe_sub(periods, 1)?;
                 credit = Self::accrue_idle_periods(credit, budget, idle)?;
                 credit = Self::apply_cap(credit, cap);
             }
@@ -1475,11 +1475,7 @@ impl BudgetContract {
         if bps == 0 {
             return Ok(0);
         }
-        let q = checked_div(limit, BPS_DENOMINATOR)?;
-        let r = checked_rem(limit, BPS_DENOMINATOR)?;
-        let whole = checked_mul(q, bps)?;
-        let part = checked_div(checked_mul(r, bps)?, BPS_DENOMINATOR)?;
-        checked_add(whole, part)
+        safe_percentage(limit, bps)
     }
 
     /// Whether the budget's current window has lapsed.
@@ -1618,7 +1614,7 @@ impl BudgetContract {
         let periods = outcome.periods as i128;
         let window = Self::window_of(budget.period, budget.period_seconds)
             .ok_or(Error::InvalidTimeWindow)?;
-        let capacity = checked_add(budget.limit, budget.rollover_credit)?;
+        let capacity = safe_add(budget.limit, budget.rollover_credit)?;
         let spent = budget.spent;
         let went_into_deficit = budget.allow_deficit && spent > capacity;
 
@@ -1632,8 +1628,8 @@ impl BudgetContract {
             outcome.carry_over
         };
         if went_into_deficit {
-            let deficit = checked_sub(spent, capacity)?;
-            budget.deficit_amount = checked_add(budget.deficit_amount, deficit)?;
+            let deficit = safe_sub(spent, capacity)?;
+            budget.deficit_amount = safe_add(budget.deficit_amount, deficit)?;
         }
         budget.spent = 0;
         // Re-anchor to the period boundary, not to `now`, so windows never
@@ -1650,9 +1646,9 @@ impl BudgetContract {
                 symbol_short!("reset")
             };
             let amount = if went_into_deficit {
-                checked_sub(spent, capacity)?
+                safe_sub(spent, capacity)?
             } else {
-                checked_sub(capacity, spent)?
+                safe_sub(capacity, spent)?
             };
             // The canonical amount is the unspent remainder that drove the
             // transition — what `calculate_rollover` started from as its carry
@@ -1662,7 +1658,7 @@ impl BudgetContract {
                 env,
                 budget_id,
                 action,
-                checked_sub(capacity, spent)?,
+                safe_sub(capacity, spent)?,
                 (budget_id.clone(), amount),
             );
             // Emit dedicated BudgetRollover event when rollover occurs
@@ -1709,7 +1705,7 @@ impl BudgetContract {
         if budget.rollover_cap != 0 {
             return Ok(credit.saturating_add(budget.limit.saturating_mul(idle)));
         }
-        checked_add(credit, checked_mul(budget.limit, idle)?)
+        safe_add(credit, safe_mul(budget.limit, idle)?)
     }
 
     /// Per-asset counterpart of [`Self::window_transition`].
@@ -1731,7 +1727,7 @@ impl BudgetContract {
         }
         let periods = elapsed / asset_budget.window_seconds;
         if asset_budget.rollover_enabled {
-            let capacity = match checked_add(asset_budget.limit, asset_budget.rollover_credit) {
+            let capacity = match safe_add(asset_budget.limit, asset_budget.rollover_credit) {
                 Ok(c) => c,
                 Err(_) => asset_budget.limit,
             };
@@ -1799,7 +1795,7 @@ impl BudgetContract {
     /// the single and batch spend paths so they can never disagree.
     fn asset_capacity(asset_budget: &AssetBudget) -> Result<i128, Error> {
         if asset_budget.rollover_enabled {
-            checked_add(asset_budget.limit, asset_budget.rollover_credit)
+            safe_add(asset_budget.limit, asset_budget.rollover_credit)
                 .map_err(|_| Error::BUDGET_OVERFLOW)
         } else {
             Ok(asset_budget.limit)
@@ -1832,20 +1828,18 @@ impl BudgetInterface for BudgetContract {
         Self::require_active(&budget)?;
         Self::require_started(&env, &budget)?;
         Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
-        let capacity = checked_add(budget.limit, budget.rollover_credit)
+        let capacity = safe_add(budget.limit, budget.rollover_credit)
             .map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         // When a deficit exists from prior periods, the effective spending
         // ceiling is reduced.  When no deficit exists yet, `allow_deficit`
         // lets the current period overspend (the excess becomes next-period
         // deficit).
         let ceiling = if budget.allow_deficit && budget.deficit_amount > 0 {
-            checked_sub(capacity, budget.deficit_amount)
-                .map_err(|_| BudgetError::BUDGET_OVERFLOW)?
+            safe_sub(capacity, budget.deficit_amount).map_err(|_| BudgetError::BUDGET_OVERFLOW)?
         } else {
             capacity
         };
-        let new_spent =
-            checked_add(budget.spent, amount).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
+        let new_spent = safe_add(budget.spent, amount).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         if new_spent > ceiling {
             // With deficit allowed and no prior deficit, the first overspend is
             // permitted — it becomes the carried-forward deficit.
@@ -1855,20 +1849,20 @@ impl BudgetInterface for BudgetContract {
                 // Checked: a genuine i128 overflow surfaces as [`Error::Overflow`]
                 // instead of a panic; a negative result (deficit) is expected.
                 let remaining =
-                    checked_sub(capacity, new_spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
+                    safe_sub(capacity, new_spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
                 events::budget_consumed(&env, &budget_id, amount, remaining);
                 events::budget_exhausted(&env, &budget_id, None, new_spent, capacity);
                 return Ok(remaining);
             }
             let remaining =
-                checked_sub(ceiling, budget.spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
+                safe_sub(ceiling, budget.spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
             events::budget_exceeded(&env, &budget_id, amount, remaining);
             return Err(BudgetError::BUDGET_LIMIT_EXCEEDED);
         }
         budget.spent = new_spent;
         Self::store(&env, &budget_id, &budget);
         let remaining =
-            checked_sub(ceiling, budget.spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
+            safe_sub(ceiling, budget.spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
         events::budget_consumed(&env, &budget_id, amount, remaining);
         if remaining <= 0 {
             events::budget_exhausted(&env, &budget_id, None, budget.spent, ceiling);
@@ -1888,7 +1882,7 @@ impl BudgetInterface for BudgetContract {
         if amount > budget.spent {
             return Err(Error::InvalidAmount);
         }
-        budget.spent = checked_sub(budget.spent, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
+        budget.spent = safe_sub(budget.spent, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &budget_id, &budget);
         Self::effective_remaining(&budget)
     }

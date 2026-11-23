@@ -142,22 +142,71 @@ impl SafeDiv for u128 {
     }
 }
 
-// Keep the old functions for backwards compatibility in other contracts,
-// but delegate to the traits
+// ---------------------------------------------------------------------------
+// Canonical `i128` value math (Issue #530)
+// ---------------------------------------------------------------------------
+//
+// These free functions are the canonical entry points for token-amount
+// arithmetic. They are the free-function counterparts of the `Safe*` traits
+// above, returning the shared deterministic [`Error`] on overflow, underflow
+// and division by zero, so contracts never need primitive `checked_*` operators
+// or ad-hoc `ok_or` mappings.
+
+/// Checked `i128` addition. Returns [`Error::Overflow`] on overflow.
+pub fn safe_add(a: i128, b: i128) -> Result<i128, Error> {
+    a.checked_add(b).or_overflow()
+}
+
+/// Checked `i128` subtraction. Returns [`Error::Overflow`] on underflow.
+pub fn safe_sub(a: i128, b: i128) -> Result<i128, Error> {
+    a.checked_sub(b).or_overflow()
+}
+
+/// Checked `i128` multiplication. Returns [`Error::Overflow`] on overflow.
+pub fn safe_mul(a: i128, b: i128) -> Result<i128, Error> {
+    a.checked_mul(b).or_overflow()
+}
+
+/// Checked `i128` division. Returns [`Error::InvalidInput`] on a zero divisor
+/// and [`Error::Overflow`] for `i128::MIN / -1`.
+pub fn safe_div(a: i128, b: i128) -> Result<i128, Error> {
+    if b == 0 {
+        return Err(Error::InvalidInput);
+    }
+    a.checked_div(b).or_overflow()
+}
+
+/// Percentage of `amount` expressed in basis points (10_000 = 100%).
+///
+/// Computes `amount * bps / 10_000` without ever materializing the full
+/// product: the quotient and remainder are scaled separately so intermediate
+/// values stay inside `i128`. Returns [`Error::Overflow`] when the scaled
+/// result cannot be represented.
+pub fn safe_percentage(amount: i128, bps: i128) -> Result<i128, Error> {
+    let denom = crate::constants::BPS_DENOMINATOR;
+    let whole = safe_mul(safe_div(amount, denom)?, bps)?;
+    let remainder = amount.checked_rem(denom).ok_or(Error::Overflow)?;
+    let part = safe_div(safe_mul(remainder, bps)?, denom)?;
+    safe_add(whole, part)
+}
+
+// Legacy names retained for callers outside this workspace; they now route
+// through the canonical safe helpers so every arithmetic failure maps to the
+// same error code.
 pub fn checked_add(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_add(b)
+    safe_add(a, b)
 }
 
 pub fn checked_sub(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_sub(b)
+    safe_sub(a, b)
 }
 
 pub fn checked_mul(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_mul(b)
+    safe_mul(a, b)
 }
 
 pub fn checked_div(a: i128, b: i128) -> Result<i128, Error> {
-    a.safe_div(b)
+    safe_div(a, b)
 }
 
 /// Checked remainder. Returns [`Error::InvalidInput`] on divide-by-zero.
@@ -712,13 +761,9 @@ pub fn calculate_budget_rollover(
         return Ok(0);
     }
 
-    // Split unspent into quotient and remainder with BPS_DENOMINATOR (10_000)
-    // to guarantee no i128 intermediate overflow even if unspent == i128::MAX.
-    let q = unspent.safe_div(crate::constants::BPS_DENOMINATOR)?;
-    let r = checked_rem(unspent, crate::constants::BPS_DENOMINATOR)?;
-    let whole = q.safe_mul(rollover_bps)?;
-    let part = (r.safe_mul(rollover_bps)?).safe_div(crate::constants::BPS_DENOMINATOR)?;
-    let credit = whole.safe_add(part)?;
+    // `safe_percentage` splits the product into quotient/remainder steps so no
+    // i128 intermediate overflows, even when unspent == i128::MAX.
+    let credit = safe_percentage(unspent, rollover_bps)?;
 
     if max_rollover_cap > 0 && credit > max_rollover_cap {
         Ok(max_rollover_cap)
@@ -755,6 +800,55 @@ pub fn calculate_rollover_allowance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_add_reports_overflow_at_the_i128_boundary() {
+        assert_eq!(safe_add(1_000, 2_000), Ok(3_000));
+        assert_eq!(safe_add(0, i128::MAX), Ok(i128::MAX));
+        assert_eq!(safe_add(i128::MAX, 1), Err(Error::Overflow));
+        assert_eq!(safe_add(i128::MIN, -1), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn safe_sub_reports_underflow_at_the_i128_boundary() {
+        assert_eq!(safe_sub(2_000, 1_000), Ok(1_000));
+        assert_eq!(safe_sub(i128::MIN, 1), Err(Error::Overflow));
+        assert_eq!(safe_sub(i128::MAX, -1), Err(Error::Overflow));
+        assert_eq!(safe_sub(0, i128::MIN), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn safe_mul_reports_overflow() {
+        assert_eq!(safe_mul(12, 3), Ok(36));
+        assert_eq!(safe_mul(0, i128::MAX), Ok(0));
+        assert_eq!(safe_mul(i128::MAX, 2), Err(Error::Overflow));
+        assert_eq!(safe_mul(i128::MIN, -1), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn safe_div_reports_zero_divisor_and_overflow() {
+        assert_eq!(safe_div(9, 3), Ok(3));
+        assert_eq!(safe_div(1, 0), Err(Error::InvalidInput));
+        assert_eq!(safe_div(i128::MIN, -1), Err(Error::Overflow));
+        assert_eq!(checked_div(1, 0), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn safe_percentage_scales_basis_points_without_overflow() {
+        assert_eq!(safe_percentage(1_000, 2_500), Ok(250));
+        assert_eq!(safe_percentage(1_000, 0), Ok(0));
+        assert_eq!(safe_percentage(1_000, 10_000), Ok(1_000));
+        // The full product would overflow; the split keeps it representable.
+        assert_eq!(safe_percentage(i128::MAX, 10_000), Ok(i128::MAX));
+        assert_eq!(safe_percentage(i128::MAX, 10_001), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn legacy_checked_helpers_share_the_safe_semantics() {
+        assert_eq!(checked_add(i128::MAX, 1), Err(Error::Overflow));
+        assert_eq!(checked_sub(i128::MIN, 1), Err(Error::Overflow));
+        assert_eq!(checked_mul(i128::MAX, 2), Err(Error::Overflow));
+    }
 
     #[test]
     fn batch_allowance_single_limit_happy_path() {
