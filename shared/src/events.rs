@@ -953,12 +953,7 @@ pub fn proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
 
 /// `ProposalApproved` — topic `("proposal", "approved")`.
 pub fn proposal_approved(env: &Env, proposal_id: u64, approver: &Address, approvals: u32) {
-    emit(
-        env,
-        topic::PROPOSAL,
-        symbol_short!("approved"),
-        (proposal_id, approver.clone(), approvals),
-    );
+    proposal_cast(env, proposal_id, approver, approvals);
 }
 
 /// `ProposalExecuted` — topic `("proposal", "executed")`.
@@ -1010,12 +1005,7 @@ pub fn budget_exhausted(
 /// headroom the budget (or per-asset limit, when `token` is `Some`) holds
 /// immediately afterwards.
 pub fn budget_replenished(env: &Env, budget_id: &String, token: Option<Address>, available: i128) {
-    emit(
-        env,
-        topic::BUDGET,
-        symbol_short!("replenish"),
-        (budget_id.clone(), token, available),
-    );
+    budget_refilled(env, budget_id, token, available);
 }
 
 /// `PolicyViolation` — topic `("policy", "violation")`.
@@ -1476,4 +1466,574 @@ pub fn deposit_recorded(
             recorded_at,
         ),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Core protocol action builders (Issue #529)
+// ---------------------------------------------------------------------------
+//
+// Every core state transition in wallet, budget and proposal goes through one
+// of the builders below. They are the single place that fixes an action's
+// topic spelling and its payload field order, so an indexer sees the same
+// schema regardless of which contract emitted the event. All helpers are thin
+// wrappers around [`emit`] / [`emit_for`] / [`publish`]: they add no runtime
+// work, perform no storage lookups, and emit exactly the wire events the
+// contracts emitted before, keeping payloads as small as they were.
+
+/// Topic action of [`budget_refilled`] — the canonical refill spelling.
+pub const BUDGET_REPLENISHED: Symbol = symbol_short!("replenish");
+/// Topic action of [`proposal_cast`] / [`proposal_approved`].
+pub const PROPOSAL_APPROVED: Symbol = symbol_short!("approved");
+/// Topic action of [`wallet_org_set`].
+pub const WALLET_ORG_SET: Symbol = symbol_short!("org");
+
+// -- Wallet ----------------------------------------------------------------
+
+/// `WalletCreated` — canonical single-topic builder for wallet creation.
+pub fn wallet_created(env: &Env, wallet_id: u64, owner: &Address) {
+    publish(
+        env,
+        ContractEvent::WalletCreated {
+            wallet_id,
+            owner: owner.clone(),
+        },
+    );
+}
+
+/// `WalletStateChanged` — canonical single-topic builder for a lifecycle move.
+pub fn wallet_state_changed(env: &Env, wallet_id: u64, state: Symbol) {
+    publish(env, ContractEvent::WalletStateChanged { wallet_id, state });
+}
+
+/// `WalletPaused` — canonical builder for tripping the circuit breaker.
+pub fn wallet_paused(env: &Env, by: &Address) {
+    publish(env, ContractEvent::WalletPaused { by: by.clone() });
+}
+
+/// `WalletUnpaused` — canonical builder for resetting the circuit breaker.
+pub fn wallet_unpaused(env: &Env, by: &Address) {
+    publish(env, ContractEvent::WalletUnpaused { by: by.clone() });
+}
+
+/// `WalletGuardianChanged` — canonical builder for guardian designation.
+pub fn wallet_guardian_changed(env: &Env, guardian: &Address) {
+    publish(
+        env,
+        ContractEvent::WalletGuardianChanged {
+            guardian: guardian.clone(),
+        },
+    );
+}
+
+/// One builder for both wallet policy-gate modifications.
+///
+/// `Some(policy)` publishes `WalletPolicyConfigured`, `None` publishes
+/// `WalletPolicyCleared`. Callers never pick the variant themselves, so the
+/// "wire vs unwired" fact cannot be encoded under two different schemas.
+pub fn wallet_policy_modified(env: &Env, policy: Option<&Address>) {
+    match policy {
+        Some(policy) => publish(
+            env,
+            ContractEvent::WalletPolicyConfigured {
+                policy: policy.clone(),
+            },
+        ),
+        None => publish(env, ContractEvent::WalletPolicyCleared),
+    }
+}
+
+/// `WalletPolicyBypassChanged` — canonical builder for exemption flips.
+pub fn wallet_policy_bypass_changed(env: &Env, wallet_id: u64, bypass: bool) {
+    publish(
+        env,
+        ContractEvent::WalletPolicyBypassChanged { wallet_id, bypass },
+    );
+}
+
+/// `WalletFunded` — canonical builder for value credited to a wallet.
+pub fn wallet_funded(env: &Env, wallet_id: u64, from: &Address, asset: &Address, amount: i128) {
+    publish(
+        env,
+        ContractEvent::WalletFunded {
+            wallet_id,
+            from: from.clone(),
+            asset: asset.clone(),
+            amount,
+        },
+    );
+}
+
+/// `WalletWithdrawn` — canonical builder for value leaving a wallet.
+pub fn wallet_withdrawn(env: &Env, wallet_id: u64, to: &Address, asset: &Address, amount: i128) {
+    publish(
+        env,
+        ContractEvent::WalletWithdrawn {
+            wallet_id,
+            to: to.clone(),
+            asset: asset.clone(),
+            amount,
+        },
+    );
+}
+
+/// `WalletPolicyChecked` — canonical builder for a passing policy gate.
+pub fn wallet_policy_checked(env: &Env, wallet_id: u64, asset: &Address, amount: i128) {
+    publish(
+        env,
+        ContractEvent::WalletPolicyChecked {
+            wallet_id,
+            asset: asset.clone(),
+            amount,
+        },
+    );
+}
+
+/// `WalletBatchValidated` — one canonical builder per validated batch.
+pub fn wallet_batch_validated(
+    env: &Env,
+    wallet_id: u64,
+    executed: u32,
+    total_amount: i128,
+    budget_remaining: i128,
+) {
+    publish(
+        env,
+        ContractEvent::WalletBatchValidated {
+            wallet_id,
+            executed,
+            total_amount,
+            budget_remaining,
+        },
+    );
+}
+
+/// `WalletModuleWired` — canonical builder for supporting-module wiring.
+pub fn wallet_module_wired(env: &Env, module: Symbol, address: &Address) {
+    publish(
+        env,
+        ContractEvent::WalletModuleWired {
+            module,
+            address: address.clone(),
+        },
+    );
+}
+
+/// `WalletAssetBudgetSet` — canonical builder for per-asset budget binding.
+pub fn wallet_asset_budget_set(env: &Env, asset: &Address, budget_id: &String) {
+    publish(
+        env,
+        ContractEvent::WalletAssetBudgetSet {
+            asset: asset.clone(),
+            budget_id: budget_id.clone(),
+        },
+    );
+}
+
+/// `WalletRoleChanged` — canonical builder for grants and revocations.
+pub fn wallet_role_changed(
+    env: &Env,
+    wallet_id: u64,
+    account: &Address,
+    role: Option<Symbol>,
+    action: Symbol,
+) {
+    publish(
+        env,
+        ContractEvent::WalletRoleChanged {
+            wallet_id,
+            account: account.clone(),
+            role,
+            action,
+        },
+    );
+}
+
+/// `WalletVelocityLimitSet` — canonical builder for velocity ceilings.
+pub fn wallet_velocity_limit_set(
+    env: &Env,
+    wallet_id: u64,
+    asset: &Address,
+    max_amount: i128,
+    window_seconds: u64,
+) {
+    publish(
+        env,
+        ContractEvent::WalletVelocityLimitSet {
+            wallet_id,
+            asset: asset.clone(),
+            max_amount,
+            window_seconds,
+        },
+    );
+}
+
+/// `WalletVelocityLimitCleared` — canonical builder for ceiling removal.
+pub fn wallet_velocity_limit_cleared(env: &Env, wallet_id: u64, asset: &Address) {
+    publish(
+        env,
+        ContractEvent::WalletVelocityLimitCleared {
+            wallet_id,
+            asset: asset.clone(),
+        },
+    );
+}
+
+/// `WalletRateLimitSet` — canonical builder for rate-limit configuration.
+pub fn wallet_rate_limit_set(
+    env: &Env,
+    wallet_id: u64,
+    max_volume: i128,
+    max_count: u32,
+    window_seconds: u64,
+) {
+    publish(
+        env,
+        ContractEvent::WalletRateLimitSet {
+            wallet_id,
+            max_volume,
+            max_count,
+            window_seconds,
+        },
+    );
+}
+
+/// `WalletRateLimitCleared` — canonical builder for rate-limit removal.
+pub fn wallet_rate_limit_cleared(env: &Env, wallet_id: u64) {
+    publish(env, ContractEvent::WalletRateLimitCleared { wallet_id });
+}
+
+/// `("wallet", "org")` — the registry-org binding of a wallet.
+///
+/// Kept on its historical tuple topic (rather than a canonical variant) so a
+/// dashboard filtering on `topic[0] == "wallet"` keeps working; the topic is
+/// spelled through [`WALLET_ORG_SET`] instead of an inline literal.
+pub fn wallet_org_set(env: &Env, org: &String) {
+    emit(env, topic::WALLET, WALLET_ORG_SET, org.clone());
+}
+
+// -- Budget ----------------------------------------------------------------
+
+/// One builder for every budget state/configuration change.
+///
+/// Emits the documented `("budget", action)` tuple event with `detail` and the
+/// canonical `BudgetUpdated` event with `(budget_id, action, amount)` — the
+/// same two events call sites published by hand, now in one fixed field order.
+/// `detail` stays a compact tuple so no event grows on the wire.
+pub fn budget_updated<D>(env: &Env, budget_id: &String, action: Symbol, amount: i128, detail: D)
+where
+    D: IntoVal<Env, Val>,
+{
+    emit(env, topic::BUDGET, action.clone(), detail);
+    publish(
+        env,
+        ContractEvent::BudgetUpdated {
+            budget_id: budget_id.clone(),
+            action,
+            amount,
+        },
+    );
+}
+
+/// Canonical `BudgetRollover` builder for period-boundary accounting.
+pub fn budget_rollover(
+    env: &Env,
+    budget_id: &String,
+    periods_elapsed: u64,
+    carry_over: i128,
+    new_window_start: u64,
+) {
+    publish(
+        env,
+        ContractEvent::BudgetRollover {
+            budget_id: budget_id.clone(),
+            periods_elapsed,
+            carry_over,
+            new_window_start,
+        },
+    );
+}
+
+/// `("budget", "consumed")` — a successful spend and its remaining headroom.
+pub fn budget_consumed(env: &Env, budget_id: &String, amount: i128, remaining: i128) {
+    emit(
+        env,
+        topic::BUDGET,
+        symbol_short!("consumed"),
+        (budget_id.clone(), amount, remaining),
+    );
+}
+
+/// `("budget", "expired")` — a budget rejected at its expiry deadline.
+pub fn budget_expired(env: &Env, budget_id: &String) {
+    emit(
+        env,
+        topic::BUDGET,
+        symbol_short!("expired"),
+        budget_id.clone(),
+    );
+}
+
+/// `("budget", "replenish")` — the canonical "fresh allowance is spendable"
+/// event used by explicit top-ups and by window rollovers alike.
+///
+/// [`budget_replenished`] is retained as a compatibility alias; new call sites
+/// use this name so the refill action has one spelling across the contract.
+pub fn budget_refilled(env: &Env, budget_id: &String, token: Option<Address>, available: i128) {
+    emit(
+        env,
+        topic::BUDGET,
+        BUDGET_REPLENISHED,
+        (budget_id.clone(), token, available),
+    );
+}
+
+/// Per-asset window reset, the one budget event whose legacy tuple action
+/// (`ast_reset`) and canonical action (`asset_reset`) intentionally differ.
+pub fn asset_budget_reset(env: &Env, budget_id: &String, token: &Address, limit: i128) {
+    emit(
+        env,
+        topic::BUDGET,
+        symbol_short!("ast_reset"),
+        (budget_id.clone(), token.clone(), limit),
+    );
+    publish(
+        env,
+        ContractEvent::BudgetUpdated {
+            budget_id: budget_id.clone(),
+            action: Symbol::new(env, "asset_reset"),
+            amount: limit,
+        },
+    );
+}
+
+// -- Proposal --------------------------------------------------------------
+
+/// `("proposal", "approved")` — canonical builder for casting a vote.
+///
+/// Every accepted approval publishes this event; the topic and payload are
+/// unchanged from [`proposal_approved`], which now delegates here.
+pub fn proposal_cast(env: &Env, proposal_id: u64, voter: &Address, weight: u32) {
+    emit(
+        env,
+        topic::PROPOSAL,
+        PROPOSAL_APPROVED,
+        (proposal_id, voter.clone(), weight),
+    );
+}
+
+/// `("proposal", "rejected")` — a vote that refused the proposal.
+pub fn proposal_rejected(env: &Env, proposal_id: u64, rejecter: &Address) {
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("rejected"),
+        (proposal_id, rejecter.clone()),
+    );
+}
+
+/// `("proposal", "cancelled")` — a cancelled proposal.
+pub fn proposal_cancelled(env: &Env, proposal_id: u64) {
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("cancelled"),
+        proposal_id,
+    );
+}
+
+/// `("proposal", "failed")` — a proposal whose execution failed.
+pub fn proposal_failed(env: &Env, proposal_id: u64) {
+    emit(env, topic::PROPOSAL, symbol_short!("failed"), proposal_id);
+}
+
+/// `("proposal", "closed")` — a closed proposal.
+pub fn proposal_closed(env: &Env, proposal_id: u64) {
+    emit(env, topic::PROPOSAL, symbol_short!("closed"), proposal_id);
+}
+
+/// `("proposal", "defeated")` — a proposal that could no longer pass.
+pub fn proposal_defeated(env: &Env, proposal_id: u64, approvals: u32, required: u32) {
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("defeated"),
+        (proposal_id, approvals, required),
+    );
+}
+
+/// `("proposal", "expired")` — a proposal settled by its deadline.
+pub fn proposal_expired(env: &Env, proposal_id: u64) {
+    emit(env, topic::PROPOSAL, symbol_short!("expired"), proposal_id);
+}
+
+/// `("proposal", "weightok")` — the vote that crossed the approval threshold.
+pub fn proposal_weight_threshold_crossed(
+    env: &Env,
+    proposal_id: u64,
+    voter: &Address,
+    weight: u32,
+) {
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("weightok"),
+        (proposal_id, voter.clone(), weight),
+    );
+}
+
+/// `("proposal", "dep_fail")` — an unmet proposal dependency.
+pub fn proposal_dependency_failed(env: &Env, proposal_id: u64, dependency: u64) {
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("dep_fail"),
+        (proposal_id, dependency),
+    );
+}
+
+/// `("proposal", "dep_ok")` — a proposal whose dependencies are all met.
+pub fn proposal_dependency_satisfied(env: &Env, proposal_id: u64, dependencies: Vec<u64>) {
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("dep_ok"),
+        (proposal_id, dependencies),
+    );
+}
+
+/// `("proposal", "pruned")` — a pruned proposal record.
+pub fn proposal_pruned(env: &Env, proposal_id: u64) {
+    emit(env, topic::PROPOSAL, symbol_short!("pruned"), proposal_id);
+}
+
+/// `("proposal", "cleaned")` — a cleaned-up proposal record.
+pub fn proposal_cleaned(env: &Env, proposal_id: u64) {
+    emit(env, topic::PROPOSAL, symbol_short!("cleaned"), proposal_id);
+}
+
+/// `("proposal", "pruned_b")` — batched prune summary.
+pub fn proposal_pruned_batch(env: &Env, count: u32) {
+    emit(env, topic::PROPOSAL, symbol_short!("pruned_b"), count);
+}
+
+/// `("proposal", "pruned_r")` — range prune summary.
+pub fn proposal_pruned_range(env: &Env, count: u32) {
+    emit(env, topic::PROPOSAL, symbol_short!("pruned_r"), count);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::{contract, contractimpl, TryFromVal};
+
+    #[contract]
+    struct Emitter;
+
+    #[contractimpl]
+    impl Emitter {
+        pub fn wallet(env: Env, account: Address) {
+            wallet_created(&env, 7, &account);
+            wallet_policy_modified(&env, Some(&account));
+            wallet_policy_modified(&env, None);
+        }
+
+        pub fn budget(env: Env) {
+            let id = String::from_str(&env, "ops");
+            budget_refilled(&env, &id, None, 500);
+            budget_updated(&env, &id, symbol_short!("reset"), 0, id.clone());
+        }
+
+        pub fn proposal(env: Env, voter: Address) {
+            proposal_cast(&env, 3, &voter, 40);
+            proposal_weight_threshold_crossed(&env, 3, &voter, 40);
+        }
+    }
+
+    fn count_topic(env: &Env, topic: Symbol) -> usize {
+        let want: Val = topic.into_val(env);
+        env.events()
+            .all()
+            .iter()
+            .filter(|(_, topics, _)| topics.contains(want))
+            .count()
+    }
+
+    fn canonical_data(env: &Env, topic: Symbol) -> Val {
+        let want: Val = topic.into_val(env);
+        env.events()
+            .all()
+            .iter()
+            .find(|(_, topics, _)| topics.len() == 1 && topics.contains(want))
+            .map(|(_, _, data)| data)
+            .expect("canonical event not found")
+    }
+
+    fn tuple_data(env: &Env, category: Symbol, action: Symbol) -> Val {
+        let cat: Val = category.into_val(env);
+        let act: Val = action.into_val(env);
+        env.events()
+            .all()
+            .iter()
+            .find(|(_, topics, _)| {
+                topics.len() == 2 && topics.contains(cat) && topics.contains(act)
+            })
+            .map(|(_, _, data)| data)
+            .expect("tuple event not found")
+    }
+
+    #[test]
+    fn wallet_creation_uses_one_canonical_topic() {
+        let env = Env::default();
+        let account = Address::generate(&env);
+        EmitterClient::new(&env, &env.register_contract(None, Emitter)).wallet(&account);
+        let created = Symbol::new(&env, "WalletCreated");
+        assert_eq!(count_topic(&env, created.clone()), 1);
+        assert_eq!(count_topic(&env, topic::WALLET), 0);
+        let got: (u64, Address) =
+            TryFromVal::try_from_val(&env, &canonical_data(&env, created)).unwrap();
+        assert_eq!(got, (7, account));
+    }
+
+    #[test]
+    fn policy_modification_has_one_shape_for_both_directions() {
+        let env = Env::default();
+        let account = Address::generate(&env);
+        EmitterClient::new(&env, &env.register_contract(None, Emitter)).wallet(&account);
+        let wired = canonical_data(&env, Symbol::new(&env, "WalletPolicyConfigured"));
+        let got: (Address,) = TryFromVal::try_from_val(&env, &wired).unwrap();
+        assert_eq!(got, (account,));
+        assert_eq!(
+            count_topic(&env, Symbol::new(&env, "WalletPolicyCleared")),
+            1
+        );
+    }
+
+    #[test]
+    fn budget_refill_and_update_keep_their_topic_payloads() {
+        let env = Env::default();
+        EmitterClient::new(&env, &env.register_contract(None, Emitter)).budget();
+        let data = tuple_data(&env, topic::BUDGET, BUDGET_REPLENISHED);
+        let got: (String, Option<Address>, i128) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(got, (String::from_str(&env, "ops"), None, 500));
+
+        assert_eq!(count_topic(&env, Symbol::new(&env, "BudgetUpdated")), 1);
+        let canonical = canonical_data(&env, Symbol::new(&env, "BudgetUpdated"));
+        let got: (String, Symbol, i128) = TryFromVal::try_from_val(&env, &canonical).unwrap();
+        assert_eq!(
+            got,
+            (String::from_str(&env, "ops"), symbol_short!("reset"), 0)
+        );
+    }
+
+    #[test]
+    fn proposal_cast_and_vote_threshold_keep_distinct_topics() {
+        let env = Env::default();
+        let voter = Address::generate(&env);
+        EmitterClient::new(&env, &env.register_contract(None, Emitter)).proposal(&voter);
+        let data = tuple_data(&env, topic::PROPOSAL, PROPOSAL_APPROVED);
+        let got: (u64, Address, u32) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(got, (3, voter, 40));
+        assert_eq!(count_topic(&env, symbol_short!("weightok")), 1);
+    }
 }

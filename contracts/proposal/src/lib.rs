@@ -183,8 +183,7 @@ use astroid_shared::math::{checked_add, checked_add_u64, checked_mul_u64};
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::require_non_empty;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, String,
-    Vec,
+    contract, contractimpl, contracttype, token::TokenClient, Address, Env, String, Vec,
 };
 
 /// Stored proposal record. `approvers` is the allow-list of addresses eligible
@@ -644,14 +643,9 @@ impl ProposalContract {
         }
         Self::store(&env, id, &proposal);
         if crossed_multisig_threshold {
-            events::emit(
-                &env,
-                events::topic::PROPOSAL,
-                symbol_short!("weightok"),
-                (id, caller.clone(), approval_weight),
-            );
+            events::proposal_weight_threshold_crossed(&env, id, &caller, approval_weight);
         }
-        events::proposal_approved(&env, id, &caller, proposal.approvals);
+        events::proposal_cast(&env, id, &caller, proposal.approvals);
         Ok(proposal.approvals)
     }
 
@@ -683,12 +677,7 @@ impl ProposalContract {
             );
         }
         Self::store(&env, id, &proposal);
-        events::emit(
-            &env,
-            events::topic::PROPOSAL,
-            symbol_short!("rejected"),
-            (id, caller),
-        );
+        events::proposal_rejected(&env, id, &caller);
         Ok(())
     }
 
@@ -741,12 +730,7 @@ impl ProposalContract {
             );
         }
         Self::store(&env, id, &proposal);
-        events::emit(
-            &env,
-            events::topic::PROPOSAL,
-            symbol_short!("cancelled"),
-            id,
-        );
+        events::proposal_cancelled(&env, id);
         Ok(())
     }
 
@@ -827,12 +811,7 @@ impl ProposalContract {
             }
         }
         if pruned > 0 {
-            events::emit(
-                &env,
-                events::topic::PROPOSAL,
-                symbol_short!("pruned_b"),
-                pruned,
-            );
+            events::proposal_pruned_batch(&env, pruned);
         }
         Ok(pruned)
     }
@@ -860,12 +839,7 @@ impl ProposalContract {
             }
         }
         if pruned > 0 {
-            events::emit(
-                &env,
-                events::topic::PROPOSAL,
-                symbol_short!("pruned_r"),
-                pruned,
-            );
+            events::proposal_pruned_range(&env, pruned);
         }
         Ok(pruned)
     }
@@ -969,7 +943,7 @@ impl ProposalContract {
         // Issue #329 — every transition passes the canonical state machine.
         Self::transition(&env, id, &mut proposal, ProposalState::Failed)?;
         Self::store(&env, id, &proposal);
-        events::emit(&env, events::topic::PROPOSAL, symbol_short!("failed"), id);
+        events::proposal_failed(&env, id);
         Ok(())
     }
 
@@ -995,7 +969,7 @@ impl ProposalContract {
         // Issue #329 — every transition passes the canonical state machine.
         Self::transition(&env, id, &mut proposal, ProposalState::Closed)?;
         Self::store(&env, id, &proposal);
-        events::emit(&env, events::topic::PROPOSAL, symbol_short!("closed"), id);
+        events::proposal_closed(&env, id);
         Ok(())
     }
 
@@ -1028,12 +1002,7 @@ impl ProposalContract {
         Self::transition(&env, id, &mut proposal, ProposalState::Defeated)?;
         Self::refund_deposit(&env, &proposal);
         Self::store(&env, id, &proposal);
-        events::emit(
-            &env,
-            events::topic::PROPOSAL,
-            symbol_short!("defeated"),
-            (id, tally.approvals, tally.bars.required()),
-        );
+        events::proposal_defeated(&env, id, tally.approvals, tally.bars.required());
         Ok(proposal.state)
     }
 
@@ -1142,7 +1111,7 @@ impl ProposalContract {
             );
         }
         Self::store(env, id, proposal);
-        events::emit(env, events::topic::PROPOSAL, symbol_short!("expired"), id);
+        events::proposal_expired(env, id);
         Ok(true)
     }
 
@@ -1359,21 +1328,11 @@ impl ProposalContract {
         for dep in proposal.dependencies.iter() {
             let prerequisite = Self::load(env, dep)?;
             if !prerequisite.state.has_executed() {
-                events::emit(
-                    env,
-                    events::topic::PROPOSAL,
-                    symbol_short!("dep_fail"),
-                    (id, dep),
-                );
+                events::proposal_dependency_failed(env, id, dep);
                 return Err(Error::PrerequisiteNotMet);
             }
         }
-        events::emit(
-            env,
-            events::topic::PROPOSAL,
-            symbol_short!("dep_ok"),
-            (id, proposal.dependencies.clone()),
-        );
+        events::proposal_dependency_satisfied(env, id, proposal.dependencies.clone());
         Ok(())
     }
 
@@ -1392,8 +1351,8 @@ impl ProposalContract {
                 .persistent()
                 .remove(&DataKey::Approval(id, approver));
         }
-        events::emit(env, events::topic::PROPOSAL, symbol_short!("pruned"), id);
-        events::emit(env, events::topic::PROPOSAL, symbol_short!("cleaned"), id);
+        events::proposal_pruned(env, id);
+        events::proposal_cleaned(env, id);
     }
 }
 
