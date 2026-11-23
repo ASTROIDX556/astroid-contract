@@ -688,6 +688,13 @@ impl BudgetContract {
     pub fn rollover(env: Env, caller: Address, budget_id: String) -> Result<(), Error> {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         Self::require_not_archived(&budget)?;
+        if budget.period == Period::None {
+            return Err(Error::INVALID_PERIOD);
+        }
+        let now = env.ledger().timestamp();
+        if !Self::is_window_expired(&budget, now)? {
+            return Err(Error::PERIOD_NOT_ELAPSED);
+        }
         Self::window_transition(&env, &mut budget, &budget_id, true)?;
         Self::store(&env, &budget_id, &budget);
         Ok(())

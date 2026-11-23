@@ -815,11 +815,8 @@ impl PolicyContract {
         new_hash: BytesN<32>,
         new_max: i128,
     ) -> Result<(), Error> {
-        caller.require_auth();
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let mut policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
         policy.config_hash = new_hash;
         policy.max_amount = new_max;
         env.storage()
@@ -839,11 +836,8 @@ impl PolicyContract {
         policy_id: String,
         enabled: bool,
     ) -> Result<(), Error> {
-        caller.require_auth();
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let mut policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
         policy.enabled = enabled;
         env.storage()
             .persistent()
@@ -866,11 +860,8 @@ impl PolicyContract {
         policy_id: String,
         strategy: PolicyCombinationStrategy,
     ) -> Result<(), Error> {
-        caller.require_auth();
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let mut policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
         policy.rule_combination_strategy = strategy;
         env.storage()
             .persistent()
@@ -956,11 +947,7 @@ impl PolicyContract {
         policy_id: String,
         asset: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::AssetWhitelist(policy_id.clone(), asset.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
@@ -980,11 +967,7 @@ impl PolicyContract {
         policy_id: String,
         asset: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::AssetWhitelist(policy_id.clone(), asset.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -1055,11 +1038,7 @@ impl PolicyContract {
         policy_id: String,
         enabled: bool,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::AssetWhitelistEnabled(policy_id.clone());
         env.storage().persistent().set(&key, &enabled);
         // Issue #222 — same schema as `set_recipient_whitelist_enabled`'s
@@ -1146,11 +1125,7 @@ impl PolicyContract {
         policy_id: String,
         merchant_address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::MerchantBlacklist(merchant_address.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
@@ -1170,11 +1145,7 @@ impl PolicyContract {
         policy_id: String,
         merchant_address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::MerchantBlacklist(merchant_address.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -1194,11 +1165,7 @@ impl PolicyContract {
         policy_id: String,
         category: String,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         require_non_empty(&category)?;
         let key = DataKey::CategoryBlacklist(category.clone());
         if env.storage().persistent().has(&key) {
@@ -1219,11 +1186,7 @@ impl PolicyContract {
         policy_id: String,
         category: String,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::CategoryBlacklist(category.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -1245,11 +1208,7 @@ impl PolicyContract {
         policy_id: String,
         address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::Blacklist(address.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyExists);
@@ -1269,11 +1228,7 @@ impl PolicyContract {
         policy_id: String,
         address: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::Blacklist(address.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -1597,11 +1552,7 @@ impl PolicyContract {
         policy_id: String,
         asset: Address,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::Allowance(policy_id.clone(), asset.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -1914,11 +1865,7 @@ impl PolicyContract {
         policy_id: String,
         rule_tree: RuleTree,
     ) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         validate_rule_tree(&rule_tree)?;
         let key = DataKey::CompositeRule(policy_id.clone());
         env.storage().persistent().set(&key, &rule_tree);
@@ -1931,11 +1878,7 @@ impl PolicyContract {
 
     /// Remove the composite rule tree for a policy (owner only).
     pub fn clear_composite_rule(env: Env, caller: Address, policy_id: String) -> Result<(), Error> {
-        caller.require_auth();
-        let policy = Self::load(&env, &policy_id)?;
-        if policy.owner != caller {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
         let key = DataKey::CompositeRule(policy_id.clone());
         if !env.storage().persistent().has(&key) {
             return Err(Error::NotFound);
@@ -2183,7 +2126,7 @@ impl PolicyContract {
     fn require_policy_owner(env: &Env, caller: &Address, policy_id: &String) -> Result<(), Error> {
         caller.require_auth();
         if Self::load(env, policy_id)?.owner != *caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::UNAUTHORIZED_PRINCIPAL);
         }
         Ok(())
     }

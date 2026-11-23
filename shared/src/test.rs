@@ -2090,8 +2090,8 @@ fn rollover_allowance_calculation() {
 
 mod deposit_events {
     use crate::events::{self, DepositRecorded};
-    use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::{contract, contractimpl, Address, Env, String};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::{contract, contractimpl, Address, Env, IntoVal, String, TryFromVal};
 
     #[contract]
     pub struct DepositRecorder;
@@ -2157,5 +2157,83 @@ mod deposit_events {
         }
         assert_eq!(typed, 1);
         assert_eq!(legacy, 1);
+    }
+
+    #[contract]
+    pub struct EventTester;
+
+    #[contractimpl]
+    impl EventTester {
+        pub fn emit_all(env: Env, from: Address, to: Address, asset: Address) {
+            events::emit_deposit(&env, &from, &asset, 100, 500);
+            events::emit_withdraw(&env, &to, &asset, 50, 450);
+            events::emit_release(&env, 1, &to, 200);
+            events::emit_refund(&env, 1, &from, 300);
+        }
+    }
+
+    #[test]
+    fn test_standardized_event_helpers() {
+        let env = Env::default();
+        let from = Address::generate(&env);
+        let to = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let id = env.register_contract(None, EventTester);
+
+        EventTesterClient::new(&env, &id).emit_all(&from, &to, &asset);
+
+        let deposit_topic: soroban_sdk::Val =
+            soroban_sdk::symbol_short!("deposit").into_val(&env);
+        let withdraw_topic: soroban_sdk::Val =
+            soroban_sdk::symbol_short!("withdraw").into_val(&env);
+        let release_topic: soroban_sdk::Val =
+            soroban_sdk::symbol_short!("release").into_val(&env);
+        let refund_topic: soroban_sdk::Val =
+            soroban_sdk::symbol_short!("refund").into_val(&env);
+
+        let mut dep_count = 0;
+        let mut with_count = 0;
+        let mut rel_count = 0;
+        let mut ref_count = 0;
+
+        for (emitter, topics, data) in env.events().all().iter() {
+            if emitter != id.clone() {
+                continue;
+            }
+            if topics.contains(deposit_topic) {
+                dep_count += 1;
+                let ev = events::StandardDepositEvent::try_from_val(&env, &data).unwrap();
+                assert_eq!(ev.from, from);
+                assert_eq!(ev.asset, asset);
+                assert_eq!(ev.amount, 100);
+                assert_eq!(ev.balance, 500);
+            }
+            if topics.contains(withdraw_topic) {
+                with_count += 1;
+                let ev = events::StandardWithdrawEvent::try_from_val(&env, &data).unwrap();
+                assert_eq!(ev.to, to);
+                assert_eq!(ev.asset, asset);
+                assert_eq!(ev.amount, 50);
+                assert_eq!(ev.balance, 450);
+            }
+            if topics.contains(release_topic) {
+                rel_count += 1;
+                let ev = events::StandardReleaseEvent::try_from_val(&env, &data).unwrap();
+                assert_eq!(ev.id, 1);
+                assert_eq!(ev.recipient, to);
+                assert_eq!(ev.amount, 200);
+            }
+            if topics.contains(refund_topic) {
+                ref_count += 1;
+                let ev = events::StandardRefundEvent::try_from_val(&env, &data).unwrap();
+                assert_eq!(ev.id, 1);
+                assert_eq!(ev.recipient, from);
+                assert_eq!(ev.amount, 300);
+            }
+        }
+        assert_eq!(dep_count, 1);
+        assert_eq!(with_count, 1);
+        assert_eq!(rel_count, 1);
+        assert_eq!(ref_count, 1);
     }
 }

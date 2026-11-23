@@ -4126,3 +4126,38 @@ fn seeded_percentage_of_limit_matches_exact_integer_math() {
         Ok(i128::MAX)
     );
 }
+
+#[test]
+fn rollover_guards_enforce_valid_period_and_elapsed_window() {
+    let h = setup();
+    let bid_none = id(&h.env, "budget_none");
+    h.client
+        .allocate(&h.owner, &bid_none, &1_000, &Period::None, &false, &0);
+
+    // Period::None rejects rollover with INVALID_PERIOD
+    let res_none = h.client.try_rollover(&h.owner, &bid_none);
+    assert_eq!(res_none, Err(Ok(Error::INVALID_PERIOD)));
+
+    // Recurring budget before window elapses rejects rollover with PERIOD_NOT_ELAPSED
+    let bid_daily = id(&h.env, "budget_daily");
+    h.client
+        .allocate(&h.owner, &bid_daily, &1_000, &Period::Daily, &true, &0);
+    let res_early = h.client.try_rollover(&h.owner, &bid_daily);
+    assert_eq!(res_early, Err(Ok(Error::PERIOD_NOT_ELAPSED)));
+
+    // After window elapses, rollover succeeds
+    h.env.ledger().set_timestamp(1_000 + DAY);
+    let res_ok = h.client.try_rollover(&h.owner, &bid_daily);
+    assert_eq!(res_ok, Ok(Ok(())));
+}
+
+#[test]
+fn consume_exceeding_budget_limit_returns_budget_exceeded() {
+    let h = setup();
+    let bid = id(&h.env, "budget_limit");
+    h.client
+        .allocate(&h.owner, &bid, &500, &Period::Daily, &false, &0);
+
+    let res = h.client.try_consume(&h.owner, &bid, &600);
+    assert_eq!(res, Err(Ok(BudgetError::BUDGET_EXCEEDED)));
+}

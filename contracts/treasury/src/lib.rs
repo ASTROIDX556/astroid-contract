@@ -847,6 +847,7 @@ impl TreasuryContract {
         // path that mutates either.
         let balance = h.total_in;
         Self::store_asset_balance(&env, &asset, balance);
+        events::emit_deposit(&env, &from, &asset, received, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposited")),
             (asset.clone(), received),
@@ -2325,6 +2326,7 @@ impl TreasuryContract {
         amount: i128,
         balance: i128,
     ) {
+        events::emit_withdraw(env, to, asset, amount, balance);
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("withdrawn")),
             (asset.clone(), to.clone(), amount),
