@@ -1117,14 +1117,27 @@ fn narrowly_missing_the_quorum_blocks_execution() {
     );
     assert_eq!(h.client.state(&id), ProposalState::Approved);
 
-    // The tally cannot be topped up either (the state gate owns approvals
-    // now), so the proposer's escape hatch is to fail the proposal.
+    // Issue #497 — a passed-but-under-quorate tally keeps accepting votes
+    // until every bar is cleared, so the third approval tops it up and the
+    // proposal becomes executable instead of being stranded.
+    assert_eq!(h.client.approve(&h.approvers[2], &id), 3);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn passed_proposal_stops_accepting_votes_once_every_bar_is_cleared() {
+    let h = setup(5);
+    let id = create(&h, 3, 5_000);
+    for i in 0..3 {
+        h.client.approve(&h.approvers[i], &id);
+    }
+    assert!(h.client.tally(&id).passed);
+    // Nothing more to gain: further votes are refused.
     assert_eq!(
-        h.client.try_approve(&h.approvers[2], &id),
+        h.client.try_approve(&h.approvers[3], &id),
         Err(Ok(Error::InvalidProposalState))
     );
-    h.client.fail(&h.proposer, &id);
-    assert_eq!(h.client.state(&id), ProposalState::Failed);
 }
 
 #[test]
@@ -1971,10 +1984,12 @@ fn state_machine_admits_exactly_the_documented_edges() {
         (PS::Pending, PS::Rejected),
         (PS::Pending, PS::Cancelled),
         (PS::Pending, PS::Expired),
+        (PS::Pending, PS::Defeated),
         (PS::Approved, PS::Executed),
         (PS::Approved, PS::Failed),
         (PS::Approved, PS::Cancelled),
         (PS::Approved, PS::Expired),
+        (PS::Approved, PS::Defeated),
         (PS::Executed, PS::Closed),
     ];
     for (from, to) in legal {
@@ -1998,6 +2013,7 @@ fn state_machine_admits_exactly_the_documented_edges() {
         PS::Cancelled,
         PS::Expired,
         PS::Failed,
+        PS::Defeated,
     ];
     for from in states {
         for to in states {
@@ -2027,6 +2043,7 @@ fn terminal_states_have_no_outgoing_transitions() {
         PS::Cancelled,
         PS::Expired,
         PS::Failed,
+        PS::Defeated,
     ];
 
     // Fully frozen terminals: no outgoing edge at all.
@@ -2036,6 +2053,7 @@ fn terminal_states_have_no_outgoing_transitions() {
         PS::Cancelled,
         PS::Expired,
         PS::Failed,
+        PS::Defeated,
     ] {
         assert!(terminal.is_terminal());
         for next in all {
@@ -2538,4 +2556,265 @@ fn execution_refused_while_multisig_is_locked() {
     multisig.set_emergency_lock(&h.approvers[0], &false);
     h.client.execute(&h.proposer, &id);
     assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #497 — execution threshold, quorum verification and strict
+// Active → Passed / Defeated → Executed transitions.
+// ---------------------------------------------------------------------------
+
+use astroid_shared::events::ProposalTransition;
+use soroban_sdk::TryFromVal;
+
+/// Every decoded `("proposal", "state", id)` transition published so far.
+fn transitions(env: &Env) -> std::vec::Vec<ProposalTransition> {
+    let cat: Val = Symbol::new(env, "proposal").into_val(env);
+    let act: Val = Symbol::new(env, "state").into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| topics.len() == 3 && topics.contains(cat) && topics.contains(act))
+        .map(|(_, _, data)| ProposalTransition::try_from_val(env, &data).unwrap())
+        .collect()
+}
+
+fn remove_signers(h: &Harness, signers: &[usize]) {
+    let ms = MultiSigContractClient::new(&h.env, &h.multisig);
+    for &i in signers {
+        ms.remove_signer(&h.approvers[0], &h.approvers[i]);
+    }
+}
+
+#[test]
+fn checked_quorum_is_panic_free_and_rounds_up() {
+    assert_eq!(VoteBars::checked_quorum_required(0, 50), Ok(0));
+    assert_eq!(VoteBars::checked_quorum_required(1, 50), Ok(1));
+    assert_eq!(VoteBars::checked_quorum_required(4, 50), Ok(2));
+    assert_eq!(VoteBars::checked_quorum_required(5, 50), Ok(3));
+    // Percent is clamped, so the bar never exceeds the allow-list.
+    assert_eq!(VoteBars::checked_quorum_required(7, 250), Ok(7));
+    assert_eq!(
+        VoteBars::checked_quorum_required(u32::MAX, 100),
+        Ok(u32::MAX)
+    );
+    assert_eq!(VoteBars::quorum_required(u32::MAX, 100), u32::MAX);
+}
+
+#[test]
+fn tie_vote_reaches_quorum_but_not_majority_and_cannot_execute() {
+    // 4 approvers: quorum ceil(4 * 50%) = 2, majority 3.
+    let h = setup(4);
+    let id = create(&h, 2, 0);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    // The configured threshold moved it to Passed (Approved)...
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    let t = h.client.tally(&id);
+    assert_eq!(t.approvals, 2);
+    assert!(t.threshold_reached);
+    assert!(t.quorum_reached);
+    // ...but 2 of 4 is a tie, not a majority.
+    assert!(!t.majority_reached);
+    assert!(!t.passed);
+    assert!(
+        !t.defeated,
+        "two outstanding voters can still break the tie"
+    );
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert!(!h.client.can_execute(&id));
+
+    // Breaking the tie clears every bar.
+    h.client.approve(&h.approvers[2], &id);
+    assert!(h.client.tally(&id).passed);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn exact_threshold_boundary_executes_and_one_short_does_not() {
+    // 5 approvers: quorum ceil(2.5) = 3, majority 3, threshold 3.
+    let h = setup(5);
+    let id = create(&h, 3, 0);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    let short = h.client.tally(&id);
+    assert_eq!(short.bars.required(), 3);
+    assert!(!short.passed);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalNotApproved))
+    );
+
+    h.client.approve(&h.approvers[2], &id);
+    let exact = h.client.tally(&id);
+    assert_eq!(exact.approvals, 3);
+    assert!(exact.quorum_reached && exact.majority_reached && exact.threshold_reached);
+    assert!(exact.passed);
+    h.client.execute(&h.proposer, &id);
+    assert_eq!(h.client.state(&id), ProposalState::Executed);
+}
+
+#[test]
+fn double_voting_is_rejected_and_does_not_inflate_the_tally() {
+    let h = setup(3);
+    let id = create(&h, 3, 0);
+    h.client.approve(&h.approvers[0], &id);
+    assert_eq!(
+        h.client.try_approve(&h.approvers[0], &id),
+        Err(Ok(Error::AlreadySigned))
+    );
+    assert_eq!(h.client.tally(&id).approvals, 1);
+}
+
+#[test]
+fn expired_proposal_execution_is_refused_then_settled_as_expired() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+
+    // The deadline is inclusive: at `expires_at` execution is refused.
+    h.env.ledger().set_timestamp(5_000);
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+    assert_eq!(h.client.finalize(&id), ProposalState::Expired);
+    let last = transitions(&h.env);
+    let t = last.last().unwrap();
+    assert_eq!(t.proposal_id, id);
+    assert_eq!(t.from, ProposalState::Approved as u32);
+    assert_eq!(t.to, ProposalState::Expired as u32);
+    // Expired is terminal: execution stays refused.
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalExpired))
+    );
+}
+
+#[test]
+fn proposal_that_can_no_longer_pass_is_defeated() {
+    // 4 approvers, threshold 3: required = max(3, quorum 2, majority 3) = 3.
+    let h = setup(4);
+    let id = create(&h, 3, 0);
+    h.client.approve(&h.approvers[0], &id);
+    // Still reachable: 1 vote + 3 outstanding.
+    assert_eq!(h.client.finalize(&id), ProposalState::Pending);
+
+    // Two approvers leave the signer set: at most 1 + 1 = 2 < 3 votes.
+    remove_signers(&h, &[2, 3]);
+    let t = h.client.tally(&id);
+    assert_eq!(t.outstanding, 1);
+    assert!(t.defeated);
+
+    assert_eq!(h.client.finalize(&id), ProposalState::Defeated);
+    assert_eq!(h.client.state(&id), ProposalState::Defeated);
+    assert!(emitted(&h.env, "defeated"));
+    let t = transitions(&h.env);
+    let last = t.last().unwrap();
+    assert_eq!(last.from, ProposalState::Pending as u32);
+    assert_eq!(last.to, ProposalState::Defeated as u32);
+}
+
+#[test]
+fn passed_proposal_that_loses_its_support_is_defeated() {
+    let h = setup(4);
+    let id = create(&h, 2, 0);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+    // Majority of 4 is 3; with two signers gone only 2 votes remain possible.
+    remove_signers(&h, &[2, 3]);
+    assert_eq!(h.client.finalize(&id), ProposalState::Defeated);
+}
+
+#[test]
+fn defeated_is_terminal_and_rejects_every_action() {
+    let h = setup(4);
+    let id = create(&h, 3, 0);
+    h.client.approve(&h.approvers[0], &id);
+    remove_signers(&h, &[2, 3]);
+    h.client.finalize(&id);
+
+    assert_eq!(
+        h.client.try_approve(&h.approvers[1], &id),
+        Err(Ok(Error::ProposalDefeated))
+    );
+    assert_eq!(
+        h.client.try_execute(&h.proposer, &id),
+        Err(Ok(Error::ProposalDefeated))
+    );
+    assert_eq!(
+        h.client.try_cancel(&h.proposer, &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_reject(&h.approvers[1], &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    assert_eq!(
+        h.client.try_fail(&h.proposer, &id),
+        Err(Ok(Error::ProposalNotApproved))
+    );
+    assert_eq!(
+        h.client.try_close(&h.proposer, &id),
+        Err(Ok(Error::InvalidProposalState))
+    );
+    // Finalizing again is a no-op.
+    assert_eq!(h.client.finalize(&id), ProposalState::Defeated);
+}
+
+#[test]
+fn finalize_leaves_terminal_and_passing_proposals_alone() {
+    let h = setup(3);
+    let id = create(&h, 2, 0);
+    approve_and_execute(&h, id);
+    assert_eq!(h.client.finalize(&id), ProposalState::Executed);
+
+    let live = create(&h, 2, 0);
+    h.client.approve(&h.approvers[0], &live);
+    h.client.approve(&h.approvers[1], &live);
+    assert_eq!(h.client.finalize(&live), ProposalState::Approved);
+    assert_eq!(h.client.try_finalize(&999), Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn every_lifecycle_transition_publishes_a_standard_state_event() {
+    let h = setup(3);
+    let id = create(&h, 2, 0);
+    h.client.approve(&h.approvers[0], &id);
+    h.client.approve(&h.approvers[1], &id);
+    let to_passed = transitions(&h.env);
+    let t = to_passed.last().unwrap();
+    assert_eq!(
+        (t.proposal_id, t.from, t.to),
+        (
+            id,
+            ProposalState::Pending as u32,
+            ProposalState::Approved as u32
+        )
+    );
+    assert_eq!(t.timestamp, 1_000);
+
+    h.client.execute(&h.proposer, &id);
+    let t = transitions(&h.env).last().unwrap().clone();
+    assert_eq!(
+        (t.from, t.to),
+        (
+            ProposalState::Approved as u32,
+            ProposalState::Executed as u32
+        )
+    );
+
+    h.client.close(&h.proposer, &id);
+    let t = transitions(&h.env).last().unwrap().clone();
+    assert_eq!(
+        (t.from, t.to),
+        (ProposalState::Executed as u32, ProposalState::Closed as u32)
+    );
 }

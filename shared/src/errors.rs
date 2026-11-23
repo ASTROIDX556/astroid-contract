@@ -187,6 +187,9 @@ pub enum Error {
     /// or before the current ledger timestamp or before the start, a `Custom`
     /// period with a zero-second interval, or a deficit policy on a period that
     /// never recurs. Rejected before any budget state is written (Issue #503).
+    /// Also reported when a spending-window record cannot be rolled over
+    /// deterministically — a window end not representable as a ledger
+    /// timestamp, or a negative window counter (Issue #495).
     InvalidTimeWindow = 46,
     /// INVALID_ROLLOVER_CONFIG: a budget rollover setting is invalid — a
     /// rollover percentage above 100%, or a recurring maximum that does not
@@ -307,6 +310,10 @@ pub enum Error {
     /// The proposer attempted to cancel after the cancellation window (grace
     /// period) closed. Only the executor or governance may proceed from here.
     CancellationWindowClosed = 75,
+    /// The proposal was defeated: its tally can no longer clear the quorum,
+    /// majority and threshold bars, so it may not be approved or executed
+    /// (Issue #497).
+    ProposalDefeated = 76,
     /// A prerequisite proposal has not executed, so the dependent proposal may
     /// not execute yet.
     PrerequisiteNotMet = 78,
@@ -365,7 +372,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 68] = [
+    pub const ALL: [Error; 69] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -431,6 +438,7 @@ impl Error {
         Error::ProposalNotApproved,
         Error::NotAnApprover,
         Error::CancellationWindowClosed,
+        Error::ProposalDefeated,
         Error::PrerequisiteNotMet,
         Error::CircularDependencyDetected,
         // --- Escrow (80-82) ---
@@ -543,6 +551,7 @@ impl Error {
             Error::CancellationWindowClosed => "CANCELLATION_WINDOW_CLOSED",
             Error::PrerequisiteNotMet => "PREREQUISITE_NOT_MET",
             Error::CircularDependencyDetected => "CIRCULAR_DEPENDENCY_DETECTED",
+            Error::ProposalDefeated => "PROPOSAL_DEFEATED",
             // --- Escrow (80-82, 86-87) ---
             Error::EscrowExpired => "ESCROW_EXPIRED",
             Error::TimeLockActive => "TIME_LOCK_ACTIVE",

@@ -3078,3 +3078,41 @@ mod unauthorized_access_tests {
         assert_eq!(res, Err(Ok(Error::Unauthorized)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #493 — standardized event emission through shared/events.rs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wallet_events_use_canonical_builders() {
+    use astroid_shared::events::topic;
+    let h = setup();
+    let org = String::from_str(&h.env, "acme");
+    h.client.set_org(&h.admin, &org);
+    let cat: Val = topic::WALLET.into_val(&h.env);
+    let act: Val = symbol_short!("org").into_val(&h.env);
+    let found = h.env.events().all().iter().any(|(_, topics, data)| {
+        topics.len() == 2
+            && topics.get(0).unwrap().shallow_eq(&cat)
+            && topics.get(1).unwrap().shallow_eq(&act)
+            && String::try_from_val(&h.env, &data).ok() == Some(org.clone())
+    });
+    assert!(found, "expected (wallet, org) -> org");
+
+    // The circuit breaker now publishes through `ContractEvent`, with the
+    // same single-topic wire shape as before.
+    h.client.emergency_pause(&h.admin);
+    let paused = Symbol::new(&h.env, "WalletPaused");
+    let by = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 1
+                && Symbol::try_from_val(&h.env, &topics.get(0).unwrap()).ok()
+                    == Some(paused.clone())
+        })
+        .map(|(_, _, data)| Address::try_from_val(&h.env, &data).unwrap());
+    assert_eq!(by, Some(h.admin.clone()));
+}

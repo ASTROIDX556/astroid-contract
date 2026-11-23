@@ -11,7 +11,7 @@ use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, Env, IntoVal, TryFromVal, Val, Vec};
 
 /// The full lifecycle, in discriminant order, so every test can sweep it.
-const ALL_STATES: [ProposalState; 9] = [
+const ALL_STATES: [ProposalState; 10] = [
     ProposalState::Created,
     ProposalState::Pending,
     ProposalState::Approved,
@@ -21,6 +21,7 @@ const ALL_STATES: [ProposalState; 9] = [
     ProposalState::Cancelled,
     ProposalState::Expired,
     ProposalState::Failed,
+    ProposalState::Defeated,
 ];
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ fn discriminants_are_stable() {
     assert_eq!(ProposalState::Cancelled as u32, 6);
     assert_eq!(ProposalState::Expired as u32, 7);
     assert_eq!(ProposalState::Failed as u32, 8);
+    assert_eq!(ProposalState::Defeated as u32, 9);
 }
 
 #[test]
@@ -83,9 +85,9 @@ fn encoded_value_is_the_u32_discriminant() {
 #[test]
 fn unknown_discriminant_is_rejected() {
     let env = Env::default();
-    // Nothing in the table above sits at 9, so decoding it must fail rather
-    // than silently inventing a tenth state.
-    let unknown: Val = 9u32.into_val(&env);
+    // Nothing in the table above sits at 10, so decoding it must fail rather
+    // than silently inventing an eleventh state.
+    let unknown: Val = 10u32.into_val(&env);
     assert!(ProposalState::try_from_val(&env, &unknown).is_err());
 
     let far_out: Val = u32::MAX.into_val(&env);
@@ -146,6 +148,7 @@ fn deposit_settled_covers_refund_and_completion_states() {
                 | ProposalState::Cancelled
                 | ProposalState::Executed
                 | ProposalState::Closed
+                | ProposalState::Defeated
         );
         assert_eq!((*state).deposit_settled(), expected);
     }
