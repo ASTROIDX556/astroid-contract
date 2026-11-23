@@ -137,9 +137,7 @@ use astroid_shared::validation::{
     require_non_empty, require_non_negative_amount, require_positive_amount,
 };
 use astroid_shared::{constants, events};
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 
 /// Reset period for a recurring budget. `None` means one-shot (no auto-reset).
 ///
@@ -512,19 +510,12 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &budget);
         Self::bump(&env, &budget_id);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("allocated"),
+            limit,
             (budget_id.clone(), owner, limit),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("allocated"),
-                amount: limit,
-            },
         );
         Ok(())
     }
@@ -613,19 +604,12 @@ impl BudgetContract {
             budget.window_start = now;
         }
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("recurring"),
+            rollover_cap,
             (budget_id.clone(), period, period_seconds, rollover_cap),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("recurring"),
-                amount: rollover_cap,
-            },
         );
         Ok(())
     }
@@ -662,19 +646,12 @@ impl BudgetContract {
             );
         }
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("rollover"),
+            max_rollover_cap,
             (budget_id.clone(), rollover_bps, max_rollover_cap),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("rollover"),
-                amount: max_rollover_cap,
-            },
         );
         Ok(())
     }
@@ -690,19 +667,12 @@ impl BudgetContract {
         budget.rollover_credit = 0;
         budget.window_start = env.ledger().timestamp();
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("reset"),
+            0,
             budget_id.clone(),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("reset"),
-                amount: 0,
-            },
         );
         Ok(())
     }
@@ -735,19 +705,12 @@ impl BudgetContract {
         }
         budget.limit = new_limit;
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("setlimit"),
+            new_limit,
             (budget_id.clone(), new_limit),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("setlimit"),
-                amount: new_limit,
-            },
         );
         Ok(())
     }
@@ -767,24 +730,17 @@ impl BudgetContract {
         Self::check_and_rollover_window(&env, &budget_id, &mut budget)?;
         budget.limit = checked_add(budget.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("funded"),
+            amount,
             (budget_id.clone(), amount, budget.limit),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("funded"),
-                amount,
-            },
         );
         let available = Self::effective_remaining(&budget)
             .unwrap_or(i128::MAX)
             .max(0);
-        events::budget_replenished(&env, &budget_id, None, available);
+        events::budget_refilled(&env, &budget_id, None, available);
         Ok(budget.limit)
     }
     /// Freeze a budget (owner-gated). Frozen budgets reject consumption.
@@ -795,19 +751,12 @@ impl BudgetContract {
         }
         budget.state = ResourceState::Frozen;
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("frozen"),
+            0,
             budget_id.clone(),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("frozen"),
-                amount: 0,
-            },
         );
         Ok(())
     }
@@ -819,19 +768,12 @@ impl BudgetContract {
         }
         budget.state = ResourceState::Active;
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("unfrozen"),
+            0,
             budget_id.clone(),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("unfrozen"),
-                amount: 0,
-            },
         );
         Ok(())
     }
@@ -840,19 +782,12 @@ impl BudgetContract {
         let mut budget = Self::require_owner(&env, &budget_id, &caller)?;
         budget.state = ResourceState::Archived;
         Self::store(&env, &budget_id, &budget);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("archived"),
+            0,
             budget_id.clone(),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("archived"),
-                amount: 0,
-            },
         );
         Ok(())
     }
@@ -888,19 +823,12 @@ impl BudgetContract {
         to.limit = checked_add(to.limit, amount).map_err(|_| Error::BUDGET_OVERFLOW)?;
         Self::store(&env, &from_id, &from);
         Self::store(&env, &to_id, &to);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &from_id,
             symbol_short!("realloc"),
+            amount,
             (from_id.clone(), to_id.clone(), amount),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: from_id.clone(),
-                action: symbol_short!("realloc"),
-                amount,
-            },
         );
         events::publish(
             &env,
@@ -943,19 +871,12 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("set_ast"),
+            limit,
             (budget_id.clone(), token.clone(), limit),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("set_ast"),
-                amount: limit,
-            },
         );
         Ok(())
     }
@@ -994,19 +915,12 @@ impl BudgetContract {
         };
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("set_ast"),
+            limit,
             (budget_id.clone(), token.clone(), limit),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("set_ast"),
-                amount: limit,
-            },
         );
         Ok(())
     }
@@ -1047,24 +961,17 @@ impl BudgetContract {
         }
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("ast_roll"),
+            max_rollover_cap,
             (
                 budget_id.clone(),
                 token.clone(),
                 rollover_bps,
                 max_rollover_cap,
             ),
-        );
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("ast_roll"),
-                amount: max_rollover_cap,
-            },
         );
         Ok(())
     }
@@ -1105,23 +1012,16 @@ impl BudgetContract {
         asset_budget.spent = new_spent;
         env.storage().persistent().set(&key, &asset_budget);
         Self::bump_asset(&env, &budget_id, &token);
-        events::emit(
+        events::budget_updated(
             &env,
-            events::topic::BUDGET,
+            &budget_id,
             symbol_short!("ast_spend"),
+            amount,
             (budget_id.clone(), token.clone(), amount),
         );
         if new_spent >= capacity {
             events::budget_exhausted(&env, &budget_id, Some(token.clone()), new_spent, capacity);
         }
-        events::publish(
-            &env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: symbol_short!("ast_spend"),
-                amount,
-            },
-        );
         Ok(())
     }
 
@@ -1202,10 +1102,11 @@ impl BudgetContract {
                 &settled.get(i).unwrap(),
             );
             Self::bump_asset(&env, &budget_id, &spend.token);
-            events::emit(
+            events::budget_updated(
                 &env,
-                events::topic::BUDGET,
+                &budget_id,
                 symbol_short!("ast_spend"),
+                spend.amount,
                 (budget_id.clone(), spend.token.clone(), spend.amount),
             );
             let leg = settled.get(i).unwrap();
@@ -1219,14 +1120,6 @@ impl BudgetContract {
                     capacity,
                 );
             }
-            events::publish(
-                &env,
-                ContractEvent::BudgetUpdated {
-                    budget_id: budget_id.clone(),
-                    action: symbol_short!("ast_spend"),
-                    amount: spend.amount,
-                },
-            );
         }
         Ok(())
     }
@@ -1714,12 +1607,7 @@ impl BudgetContract {
         let now = env.ledger().timestamp();
         if budget.expires_at != 0 && now >= budget.expires_at {
             if publish {
-                events::emit(
-                    env,
-                    events::topic::BUDGET,
-                    symbol_short!("expired"),
-                    budget_id.clone(),
-                );
+                events::budget_expired(env, budget_id);
             }
             return Err(Error::BudgetExpired);
         }
@@ -1766,35 +1654,25 @@ impl BudgetContract {
             } else {
                 checked_sub(capacity, spent)?
             };
-            events::emit(
+            // The canonical amount is the unspent remainder that drove the
+            // transition — what `calculate_rollover` started from as its carry
+            // base. (A deficit transition over-drew, so this is negative; the
+            // `deficit` event carries the positive over-spend.)
+            events::budget_updated(
                 env,
-                events::topic::BUDGET,
-                action.clone(),
+                budget_id,
+                action,
+                checked_sub(capacity, spent)?,
                 (budget_id.clone(), amount),
-            );
-            events::publish(
-                env,
-                ContractEvent::BudgetUpdated {
-                    budget_id: budget_id.clone(),
-                    action,
-                    // The unspent remainder that drove the transition —
-                    // what `calculate_rollover` started from as its carry
-                    // base. (A deficit transition over-drew, so this is
-                    // negative; the `deficit` event above carries the
-                    // positive over-spend.)
-                    amount: checked_sub(capacity, spent)?,
-                },
             );
             // Emit dedicated BudgetRollover event when rollover occurs
             if budget.rollover_enabled && !went_into_deficit && outcome.carry_over != 0 {
-                events::publish(
+                events::budget_rollover(
                     env,
-                    ContractEvent::BudgetRollover {
-                        budget_id: budget_id.clone(),
-                        periods_elapsed: outcome.periods,
-                        carry_over: outcome.carry_over,
-                        new_window_start: budget.window_start,
-                    },
+                    budget_id,
+                    outcome.periods,
+                    outcome.carry_over,
+                    budget.window_start,
                 );
             }
             // The window re-armed: announce the headroom now spendable so a
@@ -1805,7 +1683,7 @@ impl BudgetContract {
             let available = Self::effective_remaining(budget)
                 .unwrap_or(i128::MAX)
                 .max(0);
-            events::budget_replenished(env, budget_id, None, available);
+            events::budget_refilled(env, budget_id, None, available);
             // Issue #495 — the standard window-rollover event: how many
             // windows were settled, the closed window's spend, and the new
             // active window.
@@ -1886,25 +1764,12 @@ impl BudgetContract {
                 asset_budget.limit
             };
             Self::emit_asset_reset(env, budget_id, token, amount);
-            events::budget_replenished(env, budget_id, Some(token.clone()), amount);
+            events::budget_refilled(env, budget_id, Some(token.clone()), amount);
         }
     }
 
     fn emit_asset_reset(env: &Env, budget_id: &String, token: &Address, limit: i128) {
-        events::emit(
-            env,
-            events::topic::BUDGET,
-            symbol_short!("ast_reset"),
-            (budget_id.clone(), token.clone(), limit),
-        );
-        events::publish(
-            env,
-            ContractEvent::BudgetUpdated {
-                budget_id: budget_id.clone(),
-                action: Symbol::new(env, "asset_reset"),
-                amount: limit,
-            },
-        );
+        events::asset_budget_reset(env, budget_id, token, limit);
     }
 
     /// Guard that rejects an expired budget.
@@ -1991,12 +1856,7 @@ impl BudgetInterface for BudgetContract {
                 // instead of a panic; a negative result (deficit) is expected.
                 let remaining =
                     checked_sub(capacity, new_spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
-                events::emit(
-                    &env,
-                    events::topic::BUDGET,
-                    symbol_short!("consumed"),
-                    (budget_id.clone(), amount, remaining),
-                );
+                events::budget_consumed(&env, &budget_id, amount, remaining);
                 events::budget_exhausted(&env, &budget_id, None, new_spent, capacity);
                 return Ok(remaining);
             }
@@ -2009,12 +1869,7 @@ impl BudgetInterface for BudgetContract {
         Self::store(&env, &budget_id, &budget);
         let remaining =
             checked_sub(ceiling, budget.spent).map_err(|_| BudgetError::BUDGET_OVERFLOW)?;
-        events::emit(
-            &env,
-            events::topic::BUDGET,
-            symbol_short!("consumed"),
-            (budget_id.clone(), amount, remaining),
-        );
+        events::budget_consumed(&env, &budget_id, amount, remaining);
         if remaining <= 0 {
             events::budget_exhausted(&env, &budget_id, None, budget.spent, ceiling);
         }
