@@ -208,7 +208,7 @@ use astroid_shared::constants::{
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
-use astroid_shared::math::{checked_add, checked_add_u64, checked_div, checked_mul, checked_sub};
+use astroid_shared::math::{checked_add_u64, safe_add, safe_div, safe_mul, safe_sub};
 use astroid_shared::types::{ModuleKind, Payment, ResourceState};
 use astroid_shared::validation::{
     require_non_empty, require_non_negative_amount, require_positive_amount, require_time_reached,
@@ -621,7 +621,7 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        let count = checked_add(Self::approved_count(&env) as i128, 1)? as u32;
+        let count = safe_add(Self::approved_count(&env) as i128, 1)? as u32;
         Self::store_approved_count(&env, count);
         Self::emit_asset_change(&env, &t, &asset, symbol_short!("asset_add"));
         Ok(())
@@ -821,7 +821,7 @@ impl TreasuryContract {
         let custody = env.current_contract_address();
         let before = token_client.balance(&custody);
         token_client.transfer(&from, &custody, &amount);
-        let received = checked_sub(token_client.balance(&custody), before)?;
+        let received = safe_sub(token_client.balance(&custody), before)?;
         if received <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -829,7 +829,7 @@ impl TreasuryContract {
             return Err(Error::InvalidState);
         }
         let mut h = Self::load_holding(&env, &asset);
-        h.total_in = checked_add(h.total_in, received)?;
+        h.total_in = safe_add(h.total_in, received)?;
         Self::store_holding(&env, &asset, &h);
         // The recorded balance mirrors the ledger itself rather than being
         // credited with the *requested* amount: on a fee-on-transfer token the
@@ -1056,12 +1056,12 @@ impl TreasuryContract {
             .persistent()
             .get(&key)
             .ok_or(Error::NotFound)?;
-        let new_allocated = checked_add(allocation.allocated, amount)?;
+        let new_allocated = safe_add(allocation.allocated, amount)?;
         if new_allocated > allocation.limit {
             return Err(Error::AllocationLimitExceeded);
         }
         let reserved = Self::reserved_of(&env, &asset);
-        let new_reserved = checked_add(reserved, amount)?;
+        let new_reserved = safe_add(reserved, amount)?;
         let holding = Self::load_holding(&env, &asset);
         if new_reserved > holding.total_in {
             return Err(Error::AllocationLimitExceeded);
@@ -1102,9 +1102,9 @@ impl TreasuryContract {
         if amount > allocation.allocated {
             return Err(Error::InsufficientFunds);
         }
-        allocation.allocated = checked_sub(allocation.allocated, amount)?;
+        allocation.allocated = safe_sub(allocation.allocated, amount)?;
         env.storage().persistent().set(&key, &allocation);
-        let reserved = checked_sub(Self::reserved_of(&env, &asset), amount)?;
+        let reserved = safe_sub(Self::reserved_of(&env, &asset), amount)?;
         Self::store_reserved(&env, &asset, reserved);
         events::treasury_allocation_changed(
             &env,
@@ -1229,7 +1229,7 @@ impl TreasuryContract {
             let mut holding = Self::load_holding(&env, &asset);
             let booked = holding.total_in;
             holding.total_in = 0;
-            holding.total_out = checked_add(holding.total_out, booked)?;
+            holding.total_out = safe_add(holding.total_out, booked)?;
             Self::store_holding(&env, &asset, &holding);
             Self::store_asset_balance(&env, &asset, 0);
             if amount > 0 {
@@ -1347,12 +1347,12 @@ impl TreasuryContract {
                 Self::unlock(env);
                 return Err(Error::AllowanceExpired);
             }
-            let remaining = checked_sub(al.limit, al.spent)?;
+            let remaining = safe_sub(al.limit, al.spent)?;
             if amount > remaining {
                 Self::unlock(env);
                 return Err(Error::AllowanceExceeded);
             }
-            al.spent = checked_add(al.spent, amount)?;
+            al.spent = safe_add(al.spent, amount)?;
             env.storage()
                 .persistent()
                 .set(&DataKey::Allowance(allowance_id), &al);
@@ -1371,8 +1371,8 @@ impl TreasuryContract {
             Self::unlock(env);
             return Err(e);
         }
-        holding.total_in = checked_sub(holding.total_in, amount)?;
-        holding.total_out = checked_add(holding.total_out, amount)?;
+        holding.total_in = safe_sub(holding.total_in, amount)?;
+        holding.total_out = safe_add(holding.total_out, amount)?;
         Self::store_holding(env, asset, &holding);
         // Mirror the debited ledger exactly (see `Self::deposit`): the recorded
         // balance is the holding itself, so it cannot drift from the books
@@ -1441,7 +1441,7 @@ impl TreasuryContract {
         let mut total: i128 = 0;
         for payment in payments.iter() {
             require_positive_amount(payment.amount)?;
-            total = checked_add(total, payment.amount)?;
+            total = safe_add(total, payment.amount)?;
         }
 
         // 2. Cumulative balance check against the recorded holding.
@@ -1490,7 +1490,7 @@ impl TreasuryContract {
         // amount actually paid out.
         let mut total: i128 = 0;
         for payment in payments.iter() {
-            total = checked_add(total, payment.amount)?;
+            total = safe_add(total, payment.amount)?;
         }
 
         // Issue #308 — engage the reentrancy lock before the first external
@@ -1526,8 +1526,8 @@ impl TreasuryContract {
         }
         // Issue #502 — category reserves are not spendable by a batch payout.
         Self::require_unreserved(env, asset, holding.total_in, total)?;
-        holding.total_in = checked_sub(holding.total_in, total)?;
-        holding.total_out = checked_add(holding.total_out, total)?;
+        holding.total_in = safe_sub(holding.total_in, total)?;
+        holding.total_out = safe_add(holding.total_out, total)?;
         Self::store_holding(env, asset, &holding);
         // Keep the recorded event balance in lockstep with the ledger this
         // batch just debited (Issue #218): a later deposit/withdrawal event
@@ -1544,7 +1544,7 @@ impl TreasuryContract {
             token_client.transfer(&custody, &payment.recipient, &payment.amount);
         }
         // The token must have debited exactly the batch total from custody.
-        if checked_sub(before, token_client.balance(&custody))? != total {
+        if safe_sub(before, token_client.balance(&custody))? != total {
             return Err(Error::InvalidState);
         }
 
@@ -1703,7 +1703,7 @@ impl TreasuryContract {
         let mut total: i128 = 0;
         for payment in payments.iter() {
             require_positive_amount(payment.amount)?;
-            total = checked_add(total, payment.amount)?;
+            total = safe_add(total, payment.amount)?;
         }
         Self::require_verified_caller(&env, &t, &caller, ModuleKind::Multisig)?;
         let config = Self::require_time_lock_applies(&env, total)?;
@@ -1891,7 +1891,7 @@ impl TreasuryContract {
             return Err(Error::InvalidInput);
         }
 
-        let amount_per_milestone = checked_div(total_amount, milestones as i128)?;
+        let amount_per_milestone = safe_div(total_amount, milestones as i128)?;
         // Fewer base units than milestones would schedule zero-value payouts.
         if amount_per_milestone == 0 {
             return Err(Error::InvalidAmount);
@@ -1970,8 +1970,8 @@ impl TreasuryContract {
         let last = d.milestones - 1; // milestones > 0, checked at init
         if d.disbursed == last {
             // The final payout absorbs the rounding remainder.
-            let disbursed_so_far = checked_mul(d.amount_per_milestone, last as i128)?;
-            amount = checked_sub(d.total_amount, disbursed_so_far)?;
+            let disbursed_so_far = safe_mul(d.amount_per_milestone, last as i128)?;
+            amount = safe_sub(d.total_amount, disbursed_so_far)?;
         }
 
         d.disbursed = d.disbursed.checked_add(1).ok_or(Error::Overflow)?;
@@ -1992,8 +1992,8 @@ impl TreasuryContract {
         if holding.total_in < amount {
             return Err(Error::InsufficientFunds);
         }
-        holding.total_in = checked_sub(holding.total_in, amount)?;
-        holding.total_out = checked_add(holding.total_out, amount)?;
+        holding.total_in = safe_sub(holding.total_in, amount)?;
+        holding.total_out = safe_add(holding.total_out, amount)?;
         Self::store_holding(&env, &d.asset, &holding);
         // Same recorded-balance sync as every other outflow (Issue #218).
         Self::store_asset_balance(&env, &d.asset, holding.total_in);
@@ -2143,7 +2143,7 @@ impl TreasuryContract {
             return Err(Error::InsufficientFunds);
         }
         token_client.transfer(&custody, to, &amount);
-        if checked_sub(before, token_client.balance(&custody))? != amount {
+        if safe_sub(before, token_client.balance(&custody))? != amount {
             return Err(Error::InvalidState);
         }
         Ok(())
@@ -2579,7 +2579,7 @@ impl TreasuryContract {
         recorded: i128,
         amount: i128,
     ) -> Result<(), Error> {
-        let free = checked_sub(recorded, Self::reserved_of(env, asset))?;
+        let free = safe_sub(recorded, Self::reserved_of(env, asset))?;
         if amount > free {
             return Err(Error::InsufficientFunds);
         }
