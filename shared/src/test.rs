@@ -2,6 +2,10 @@
 #![allow(clippy::cloned_ref_to_slice_refs)]
 //! Unit tests for the shared math, validation and constant helpers.
 
+use crate::auth::{
+    accumulate_selected, add_weight, meets_threshold, narrow_weight, remaining_weight,
+    require_threshold, tally_approvals, verify_approvals, verify_selected, WeightedSigner,
+};
 use crate::constants::{INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_SIGNERS};
 use crate::errors::{
     BudgetError, Error, MilestoneError, BUDGET_ERROR_CODES, MILESTONE_ERROR_CODES,
@@ -664,6 +668,177 @@ fn quorum_validation_helper_tests() {
             &[s1.clone(), s2.clone()],
             u32::MAX
         ),
+        Err(Error::Overflow)
+    );
+}
+
+/// Minimal `WeightedSigner` for the shared helper's tests. `contracttype`
+/// gives it the conversion traits a Soroban `Vec` element needs.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestSigner {
+    address: Address,
+    weight: u32,
+}
+
+impl WeightedSigner for TestSigner {
+    fn weight(&self) -> u32 {
+        self.weight
+    }
+}
+
+#[test]
+fn auth_weight_arithmetic_is_checked() {
+    assert_eq!(add_weight(0, 0), Ok(0));
+    assert_eq!(add_weight(0, 5), Ok(5));
+    assert_eq!(add_weight(5, 3), Ok(8));
+
+    assert_eq!(narrow_weight(0), Ok(0));
+    assert_eq!(narrow_weight(u32::MAX as i128), Ok(u32::MAX));
+    assert_eq!(narrow_weight(u32::MAX as i128 + 1), Err(Error::Overflow));
+    assert_eq!(narrow_weight(-1), Err(Error::Overflow));
+
+    assert!(!meets_threshold(9, 10));
+    assert!(meets_threshold(10, 10));
+    assert!(meets_threshold(11, 10));
+    assert_eq!(remaining_weight(9, 10), 1);
+    assert_eq!(remaining_weight(11, 10), 0);
+
+    assert_eq!(
+        require_threshold(9, 10, Error::QUORUM_NOT_MET),
+        Err(Error::QUORUM_NOT_MET)
+    );
+    assert_eq!(require_threshold(10, 10, Error::QUORUM_NOT_MET), Ok(()));
+}
+
+#[test]
+fn auth_accumulates_selected_weights() {
+    let env = Env::default();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    let signers = soroban_sdk::vec![
+        &env,
+        TestSigner {
+            address: a.clone(),
+            weight: 3,
+        },
+        TestSigner {
+            address: b.clone(),
+            weight: 2,
+        },
+        TestSigner {
+            address: c.clone(),
+            weight: 0,
+        },
+    ];
+
+    // Exact threshold: 3 + 2 == 5.
+    assert_eq!(
+        verify_selected(&signers, &|_| true, 5, Error::InsufficientWeight),
+        Ok((5, 2))
+    );
+    // Exceeding it is fine.
+    assert_eq!(
+        verify_selected(&signers, &|_| true, 4, Error::InsufficientWeight),
+        Ok((5, 2))
+    );
+    // Below threshold.
+    assert_eq!(
+        verify_selected(&signers, &|_| true, 6, Error::InsufficientWeight),
+        Err(Error::InsufficientWeight)
+    );
+
+    // A zero-weight signer contributes nothing and is not counted as an
+    // approver, even though it is selected.
+    let (weight, approvers) = accumulate_selected(&signers, &|s| s.address == c).unwrap();
+    assert_eq!((weight, approvers), (0, 0));
+
+    // Selection is exact: only `a` is selected here.
+    assert_eq!(
+        verify_selected(&signers, &|s| s.address == a, 3, Error::QUORUM_NOT_MET),
+        Ok((3, 1))
+    );
+    assert_eq!(
+        verify_selected(&signers, &|s| s.address == a, 4, Error::QUORUM_NOT_MET),
+        Err(Error::QUORUM_NOT_MET)
+    );
+}
+
+#[test]
+fn auth_tallies_approvals_with_edge_cases() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+    let signers = [s1.clone(), s2.clone(), s3.clone()];
+    let weights = [2u32, 3, 0];
+
+    // Exact threshold (2 + 3 == 5).
+    assert_eq!(
+        verify_approvals(
+            &signers,
+            &weights,
+            &[s1.clone(), s2.clone()],
+            5,
+            Error::QUORUM_NOT_MET
+        ),
+        Ok(5)
+    );
+
+    // Below threshold.
+    assert_eq!(
+        verify_approvals(&signers, &weights, &[s1.clone()], 3, Error::QUORUM_NOT_MET),
+        Err(Error::QUORUM_NOT_MET)
+    );
+
+    // Empty approvals can never clear a positive threshold.
+    assert_eq!(
+        verify_approvals(&signers, &weights, &[], 1, Error::QUORUM_NOT_MET),
+        Err(Error::QUORUM_NOT_MET)
+    );
+
+    // A duplicate approver is rejected rather than double-counted.
+    assert_eq!(
+        tally_approvals(&signers, &weights, &[s1.clone(), s1.clone()]),
+        Err(Error::AlreadySigned)
+    );
+
+    // A duplicate signer in the set is malformed input.
+    assert_eq!(
+        tally_approvals(&[s1.clone(), s1.clone()], &[1, 1], &[s1.clone()]),
+        Err(Error::InvalidInput)
+    );
+
+    // Non-signers cannot contribute weight.
+    let outsider = Address::generate(&env);
+    assert_eq!(
+        tally_approvals(&signers, &weights, &[outsider]),
+        Err(Error::NotASigner)
+    );
+
+    // A zero-weight signer is accepted but adds nothing.
+    assert_eq!(
+        verify_approvals(&signers, &weights, &[s3.clone()], 1, Error::QUORUM_NOT_MET),
+        Err(Error::QUORUM_NOT_MET)
+    );
+
+    // Mismatched signer/weight lengths and empty sets are invalid input.
+    assert_eq!(
+        tally_approvals(&signers, &[2, 3], &[s1.clone()]),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(tally_approvals(&[], &[], &[]), Err(Error::InvalidInput));
+
+    // A zero threshold is refused before any tally is taken.
+    assert_eq!(
+        verify_approvals(&signers, &weights, &[s1.clone()], 0, Error::QUORUM_NOT_MET),
+        Err(Error::InvalidThreshold)
+    );
+
+    // An unrepresentable weight sum fails closed.
+    assert_eq!(
+        tally_approvals(&signers, &[u32::MAX, 1, 0], &[s1.clone(), s2.clone()]),
         Err(Error::Overflow)
     );
 }
