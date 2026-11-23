@@ -235,7 +235,7 @@ fn rule_stack_composes_with_the_scalar_policy_gates() {
     // Scalar cap denies before the rule stack is even consulted.
     assert_eq!(
         iface.try_check_transfer(&pid(&env), &asset, &vendor, &1_001),
-        Err(Ok(Error::PolicyLimitExceeded))
+        Err(Ok(Error::PolicyConstraintUnmet))
     );
     // Rule stack denies the unlisted recipient under the scalar cap.
     assert_eq!(

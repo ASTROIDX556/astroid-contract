@@ -326,7 +326,7 @@ fn treasury_withdrawal_over_policy_cap_is_policy_denied_before_budget() {
     let before = h.snapshot();
     assert_eq!(
         h.fund_wallet(POLICY_CAP + 1),
-        Err(Error::PolicyLimitExceeded)
+        Err(Error::PolicyConstraintUnmet)
     );
     // The budget was never debited and no tokens left the treasury.
     assert_eq!(h.snapshot(), before);

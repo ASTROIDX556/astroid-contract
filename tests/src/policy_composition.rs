@@ -174,7 +174,7 @@ fn allowlist_and_ceiling_authorize_only_the_intersection() {
     );
     assert_eq!(
         iface.try_check_transfer(&policy_id(&env), &asset, &vendor, &501),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::PolicyConstraintUnmet))
     );
     assert_eq!(
         iface.try_check_transfer(&policy_id(&env), &asset, &stranger, &100),
@@ -682,7 +682,7 @@ fn expired_policy_denies_before_allowlists_and_ceiling() {
     env.ledger().with_mut(|l| l.timestamp = 2_000);
     assert_eq!(
         iface.try_check_transfer(&policy_id(&env), &asset, &vendor, &100),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::PolicyExpired))
     );
     assert_eq!(
         decision(&managed, &env, &asset, &vendor, 100).reason(),

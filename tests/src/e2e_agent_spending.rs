@@ -1013,7 +1013,7 @@ fn treasury_batch_payout_is_policy_gated_and_atomic() {
         },
     ];
     let res = h.treasury.try_batch_transfer(&h.admin, &h.asset, &too_big);
-    assert_eq!(res, Err(Ok(Error::PolicyLimitExceeded)));
+    assert_eq!(res, Err(Ok(Error::PolicyConstraintUnmet)));
     // The accepted legs did not partially pay out.
     assert_eq!(token_balance(&h, &too_big.get(0).unwrap().recipient), 0);
     assert_eq!(token_balance(&h, &too_big.get(1).unwrap().recipient), 0);

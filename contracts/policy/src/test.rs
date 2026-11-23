@@ -2050,7 +2050,7 @@ fn duplicate_entries_cannot_split_past_the_per_transfer_max() {
             &recip,
             &vec![&env, entry(&asset, 600_000), entry(&asset, 400_001)]
         ),
-        Err(Ok(Error::PolicyLimitExceeded))
+        Err(Ok(Error::PolicyConstraintUnmet))
     );
     assert_eq!(
         p.try_check_multi_asset_transfer(
@@ -3421,7 +3421,7 @@ fn whitelist_and_scalar_gates_are_conjunctive() {
     // Listed but over the cap: still denied by the scalar gate.
     assert_eq!(
         p.try_check_transfer(&pid, &asset, &vendor, &101),
-        Err(Ok(Error::PolicyLimitExceeded))
+        Err(Ok(Error::PolicyConstraintUnmet))
     );
     // Within the cap but unlisted: denied by the whitelist gate.
     assert_eq!(
@@ -3898,7 +3898,7 @@ fn evaluate_policy_names_the_single_transaction_ceiling_rule() {
     // The limit breach now maps to its own error code.
     assert_eq!(
         decision.reason().unwrap().to_error(),
-        Error::PolicyLimitExceeded
+        Error::PolicyConstraintUnmet
     );
 }
 
@@ -4090,7 +4090,7 @@ fn evaluate_policy_reports_each_rule_exactly_once() {
     let before = env.events().all().len();
     assert_eq!(
         p.try_check_transfer(&policy_id, &asset, &recipient, &1_000_001),
-        Err(Ok(Error::PolicyLimitExceeded))
+        Err(Ok(Error::PolicyConstraintUnmet))
     );
     let enforced = env.events().all().len() - before;
     assert_eq!(
@@ -4596,7 +4596,7 @@ fn validate_agent_spending_request_agrees_with_check_transfer_and_emits_one_even
     let over = transfer_payload(&asset, &recipient, 1_000_001);
     assert_eq!(
         p.try_check_transfer(&policy_id, &asset, &recipient, &over.amount),
-        Err(Ok(Error::PolicyDenied))
+        Err(Ok(Error::PolicyConstraintUnmet))
     );
     assert_eq!(event_count(&env, "policy", "violation"), 1);
     assert_eq!(
