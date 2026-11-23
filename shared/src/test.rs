@@ -1157,7 +1157,7 @@ const RETIRED_CODES: [u32; 2] = [25, 26];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 71] = [
+const EXPECTED_CODES: [(Error, u32); 69] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1225,6 +1225,7 @@ const EXPECTED_CODES: [(Error, u32); 71] = [
     (Error::ProposalNotApproved, 73),
     (Error::NotAnApprover, 74),
     (Error::CancellationWindowClosed, 75),
+    (Error::ProposalDefeated, 76),
     (Error::PrerequisiteNotMet, 78),
     (Error::CircularDependencyDetected, 79),
     // --- Escrow (80-82, 86-87) ---
@@ -1417,7 +1418,7 @@ fn error_domains_do_not_overlap() {
     assert_eq!(budget, 9, "budget band 40-49");
     assert_eq!(wallet, 6, "wallet band 50-55");
     assert_eq!(multisig, 15, "multisig bands 61-70 and 90-94");
-    assert_eq!(proposal, 7, "proposal band 71-79");
+    assert_eq!(proposal, 8, "proposal band 71-79");
     assert_eq!(escrow, 5, "escrow band 80-82 and 86-87");
     assert_eq!(treasury, 5, "treasury bands 83-85 and 88-89");
     assert_eq!(policy, 7, "policy band 20-29");
@@ -2159,5 +2160,126 @@ mod deposit_events {
         }
         assert_eq!(typed, 1);
         assert_eq!(legacy, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #493 — centralized event builders and topic constants.
+// ---------------------------------------------------------------------------
+
+mod event_builders {
+    use crate::events::{self, topic};
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::{
+        contract, symbol_short, Address, Env, IntoVal, String, Symbol, TryFromVal, Val,
+    };
+
+    #[contract]
+    struct Emitter;
+
+    #[test]
+    fn topic_constants_match_their_wire_spelling() {
+        let env = Env::default();
+        let pairs: [(Symbol, &str); 21] = [
+            (topic::REGISTRY, "registry"),
+            (topic::ORG, "org"),
+            (topic::MODULE, "module"),
+            (topic::ROLE, "role"),
+            (topic::VERSION, "version"),
+            (topic::ADMIN, "admin"),
+            (topic::WASM, "wasm"),
+            (topic::WALLET, "wallet"),
+            (topic::SIGNER, "signer"),
+            (topic::THRESHOLD, "threshold"),
+            (topic::GOVCHANGE, "govchange"),
+            (topic::EMERGENCY, "emergency"),
+            (topic::BATCH, "batch"),
+            (topic::TIMELOCK, "timelock"),
+            (topic::PROPOSAL, "proposal"),
+            (topic::TREASURY, "treasury"),
+            (topic::MILESTONE, "milestone"),
+            (topic::BUDGET, "budget"),
+            (topic::POLICY, "policy"),
+            (topic::ESCROW, "escrow"),
+            (topic::TRANSFER, "transfer"),
+        ];
+        for (constant, spelling) in pairs {
+            assert_eq!(constant, Symbol::new(&env, spelling), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn emit_builders_publish_two_three_and_four_topic_events() {
+        let env = Env::default();
+        let id = env.register_contract(None, Emitter);
+        let who = Address::generate(&env);
+        env.as_contract(&id, || {
+            events::emit(&env, topic::BUDGET, symbol_short!("consumed"), 7i128);
+            events::emit_for(
+                &env,
+                topic::ESCROW,
+                symbol_short!("funded"),
+                9u64,
+                who.clone(),
+            );
+            events::emit_for_pair(
+                &env,
+                topic::MODULE,
+                symbol_short!("register"),
+                String::from_str(&env, "acme"),
+                3u32,
+                who.clone(),
+            );
+        });
+        let all = env.events().all();
+        assert_eq!(all.len(), 3);
+
+        let (_, t0, d0) = all.get(0).unwrap();
+        assert_eq!(t0.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &t0.get(0).unwrap()).unwrap(),
+            topic::BUDGET
+        );
+        assert_eq!(i128::try_from_val(&env, &d0).unwrap(), 7);
+
+        let (_, t1, d1) = all.get(1).unwrap();
+        assert_eq!(t1.len(), 3);
+        assert_eq!(u64::try_from_val(&env, &t1.get(2).unwrap()).unwrap(), 9);
+        assert_eq!(Address::try_from_val(&env, &d1).unwrap(), who);
+
+        let (_, t2, _) = all.get(2).unwrap();
+        assert_eq!(t2.len(), 4);
+        assert_eq!(u32::try_from_val(&env, &t2.get(3).unwrap()).unwrap(), 3);
+    }
+
+    #[test]
+    fn standard_rollover_transition_and_rule_events_carry_identifiers() {
+        let env = Env::default();
+        let id = env.register_contract(None, Emitter);
+        let bid = String::from_str(&env, "eng");
+        env.as_contract(&id, || {
+            events::budget_window_rolled(&env, &bid, 2, 40, 200, 300);
+            events::proposal_state_changed(&env, 5, 1, 2);
+            events::policy_rule_denied(&env, &bid, 1, 10, Symbol::new(&env, "rule_velocity"));
+        });
+        let all = env.events().all();
+        assert_eq!(all.len(), 3);
+
+        let roll =
+            events::BudgetWindowRollover::try_from_val(&env, &all.get(0).unwrap().2).unwrap();
+        assert_eq!((roll.periods, roll.previous_spent), (2, 40));
+        assert_eq!((roll.window_start, roll.window_end), (200, 300));
+
+        let (_, topics, data) = all.get(1).unwrap();
+        assert_eq!(u64::try_from_val(&env, &topics.get(2).unwrap()).unwrap(), 5);
+        let t = events::ProposalTransition::try_from_val(&env, &data).unwrap();
+        assert_eq!((t.proposal_id, t.from, t.to), (5, 1, 2));
+
+        let (_, topics, data) = all.get(2).unwrap();
+        let act: Val = events::POLICY_RULE_DENIED.into_val(&env);
+        assert!(topics.get(1).unwrap().shallow_eq(&act));
+        let (index, leaf, reason) = <(u32, u32, Symbol)>::try_from_val(&env, &data).unwrap();
+        assert_eq!((index, leaf), (1, 10));
+        assert_eq!(reason, Symbol::new(&env, "rule_velocity"));
     }
 }

@@ -478,8 +478,7 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("init")), admin);
+        events::emit(&env, events::topic::REGISTRY, symbol_short!("init"), admin);
         Ok(())
     }
 
@@ -499,8 +498,11 @@ impl RegistryContract {
         }
         env.storage().persistent().set(&key, &owner);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("register"), org.clone()),
+        events::emit_for(
+            &env,
+            events::topic::ORG,
+            symbol_short!("register"),
+            org.clone(),
             owner,
         );
         Ok(())
@@ -534,8 +536,11 @@ impl RegistryContract {
                 new_owner: new_owner.clone(),
             },
         );
-        env.events().publish(
-            (symbol_short!("org"), symbol_short!("owner"), org.clone()),
+        events::emit_for(
+            &env,
+            events::topic::ORG,
+            symbol_short!("owner"),
+            org.clone(),
             new_owner,
         );
         Ok(())
@@ -593,13 +598,12 @@ impl RegistryContract {
                 address: address.clone(),
             },
         );
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("register"),
-                org.clone(),
-                kind,
-            ),
+        events::emit_for_pair(
+            &env,
+            events::topic::MODULE,
+            symbol_short!("register"),
+            org.clone(),
+            kind,
             address,
         );
         Ok(())
@@ -624,8 +628,10 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &true);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("deprecate")),
+        events::emit(
+            &env,
+            events::topic::MODULE,
+            symbol_short!("deprecate"),
             (org, kind),
         );
         Ok(())
@@ -647,8 +653,10 @@ impl RegistryContract {
         let dkey = DataKey::ModuleDeprecated(org.clone(), kind);
         env.storage().persistent().set(&dkey, &false);
         Self::bump(&env, &dkey);
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("restore")),
+        events::emit(
+            &env,
+            events::topic::MODULE,
+            symbol_short!("restore"),
             (org, kind),
         );
         Ok(())
@@ -696,13 +704,12 @@ impl RegistryContract {
             env.storage().persistent().remove(&dkey);
         }
         Self::clear_module_version(&env, &org, kind);
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("remove"),
-                org.clone(),
-                kind,
-            ),
+        events::emit_for_pair(
+            &env,
+            events::topic::MODULE,
+            symbol_short!("remove"),
+            org.clone(),
+            kind,
             (),
         );
         Ok(())
@@ -732,8 +739,10 @@ impl RegistryContract {
         let key = DataKey::OrgRole(org.clone(), account.clone());
         env.storage().persistent().set(&key, &role);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("granted")),
+        events::emit(
+            &env,
+            events::topic::ROLE,
+            symbol_short!("granted"),
             (org, account, role),
         );
         Ok(())
@@ -758,8 +767,10 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("role"), symbol_short!("revoked")),
+        events::emit(
+            &env,
+            events::topic::ROLE,
+            symbol_short!("revoked"),
             (org, account),
         );
         Ok(())
@@ -856,13 +867,12 @@ impl RegistryContract {
                 wasm_hash,
             },
         );
-        env.events().publish(
-            (
-                symbol_short!("version"),
-                symbol_short!("register"),
-                kind,
-                version,
-            ),
+        events::emit_for_pair(
+            &env,
+            events::topic::VERSION,
+            symbol_short!("register"),
+            kind,
+            version,
             address,
         );
         Ok(())
@@ -1069,13 +1079,12 @@ impl RegistryContract {
         );
         // Same payload as the canonical event, keeping the legacy
         // ("version", "register") topic consumers working.
-        env.events().publish(
-            (
-                symbol_short!("version"),
-                symbol_short!("register"),
-                kind,
-                version,
-            ),
+        events::emit_for_pair(
+            &env,
+            events::topic::VERSION,
+            symbol_short!("register"),
+            kind,
+            version,
             address.clone(),
         );
         Ok((version, address))
@@ -1274,8 +1283,10 @@ impl RegistryContract {
                 wasm_hash: plan.hash.clone(),
             },
         );
-        env.events().publish(
-            (symbol_short!("module"), symbol_short!("upgrade")),
+        events::emit(
+            &env,
+            events::topic::MODULE,
+            symbol_short!("upgrade"),
             (org, kind, plan.to_version),
         );
         Ok(plan.to_version)
@@ -1350,13 +1361,12 @@ impl RegistryContract {
                 address: plan.address.clone(),
             },
         );
-        env.events().publish(
-            (
-                symbol_short!("module"),
-                symbol_short!("register"),
-                org.clone(),
-                kind,
-            ),
+        events::emit_for_pair(
+            &env,
+            events::topic::MODULE,
+            symbol_short!("register"),
+            org.clone(),
+            kind,
             plan.address.clone(),
         );
         // A repoint moves an existing module, so it is reported as an upgrade
@@ -1374,8 +1384,10 @@ impl RegistryContract {
                     wasm_hash: plan.hash.clone(),
                 },
             );
-            env.events().publish(
-                (symbol_short!("module"), symbol_short!("upgrade")),
+            events::emit(
+                &env,
+                events::topic::MODULE,
+                symbol_short!("upgrade"),
                 (org, kind, plan.to_version),
             );
         }
@@ -1603,8 +1615,10 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events().publish(
-            (symbol_short!("registry"), symbol_short!("setadmin")),
+        events::emit(
+            &env,
+            events::topic::REGISTRY,
+            symbol_short!("setadmin"),
             new_admin,
         );
         Ok(())
@@ -1631,8 +1645,12 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events()
-            .publish((symbol_short!("admin"), symbol_short!("added")), new_admin);
+        events::emit(
+            &env,
+            events::topic::ADMIN,
+            symbol_short!("added"),
+            new_admin,
+        );
         Ok(())
     }
 
@@ -1673,8 +1691,7 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events()
-            .publish((symbol_short!("admin"), symbol_short!("removed")), admin);
+        events::emit(&env, events::topic::ADMIN, symbol_short!("removed"), admin);
         Ok(())
     }
 
@@ -1704,8 +1721,10 @@ impl RegistryContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.events().publish(
-            (symbol_short!("admin"), symbol_short!("multisig")),
+        events::emit(
+            &env,
+            events::topic::ADMIN,
+            symbol_short!("multisig"),
             multisig,
         );
         Ok(())
@@ -1752,8 +1771,7 @@ impl RegistryContract {
                 frozen: true,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("frozen")), org);
+        events::emit(&env, events::topic::REGISTRY, symbol_short!("frozen"), org);
         Ok(())
     }
 
@@ -1778,8 +1796,12 @@ impl RegistryContract {
                 frozen: false,
             },
         );
-        env.events()
-            .publish((symbol_short!("registry"), symbol_short!("unfrozen")), org);
+        events::emit(
+            &env,
+            events::topic::REGISTRY,
+            symbol_short!("unfrozen"),
+            org,
+        );
         Ok(())
     }
 
@@ -1805,8 +1827,10 @@ impl RegistryContract {
         let key = DataKey::ApprovedWasm(kind, wasm_hash.clone());
         env.storage().persistent().set(&key, &true);
         Self::bump(&env, &key);
-        env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("approved")),
+        events::emit(
+            &env,
+            events::topic::WASM,
+            symbol_short!("approved"),
             (kind, wasm_hash),
         );
         Ok(())
@@ -1825,8 +1849,10 @@ impl RegistryContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("wasm"), symbol_short!("removed")),
+        events::emit(
+            &env,
+            events::topic::WASM,
+            symbol_short!("removed"),
             (kind, wasm_hash),
         );
         Ok(())

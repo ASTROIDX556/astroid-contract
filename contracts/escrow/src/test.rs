@@ -4217,3 +4217,29 @@ mod cleanup_expired_tests {
         assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #493 — standardized event emission through shared/events.rs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn token_approval_emits_canonical_topics() {
+    use astroid_shared::events::topic;
+    use soroban_sdk::TryFromVal;
+    let h = setup_unapproved(0, 0);
+    h.client.approve_token(&h.admin, &h.asset_a);
+    let cat: Val = topic::ESCROW.into_val(&h.env);
+    let act: Val = symbol_short!("tok_add").into_val(&h.env);
+    let token = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && topics.get(0).unwrap().shallow_eq(&cat)
+                && topics.get(1).unwrap().shallow_eq(&act)
+        })
+        .map(|(_, _, data)| Address::try_from_val(&h.env, &data).unwrap());
+    assert_eq!(token, Some(h.asset_a.clone()));
+}
