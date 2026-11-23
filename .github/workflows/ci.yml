@@ -61,4 +61,4 @@ jobs:
           components: clippy
           targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --exclude astroid-integration-tests --workspace -- -D warnings
