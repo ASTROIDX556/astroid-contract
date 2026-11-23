@@ -42,9 +42,17 @@
 //!   full verified tally as [`QuorumStatus`].
 
 use crate::storage::SignerWeight;
+use astroid_shared::auth::{self, WeightedSigner};
 use astroid_shared::errors::Error;
-use astroid_shared::math::checked_add;
 use soroban_sdk::{contracttype, symbol_short, Env, Symbol, Vec};
+
+/// Expose the contract's signer record to the shared threshold helper, so the
+/// weight aggregation below is the *same* code the proposal contract runs.
+impl WeightedSigner for SignerWeight {
+    fn weight(&self) -> u32 {
+        self.weight
+    }
+}
 
 /// The verified tally for a proposal or batch against the current signer set.
 ///
@@ -114,7 +122,7 @@ impl QuorumStatus {
 /// overflowing weight sum surfaces as [`Error::Overflow`] rather than
 /// truncating into a value that could wrongly satisfy (or fail) the threshold.
 pub fn add_weight(total: i128, weight: u32) -> Result<i128, Error> {
-    checked_add(total, weight as i128)
+    auth::add_weight(total, weight)
 }
 
 /// Narrow an accumulated `i128` weight back to `u32`, refusing to truncate.
@@ -123,10 +131,7 @@ pub fn add_weight(total: i128, weight: u32) -> Result<i128, Error> {
 /// rejected instead of being wrapped down into a smaller number that would
 /// wrongly fail a legitimate quorum.
 pub fn narrow(total: i128) -> Result<u32, Error> {
-    if total < 0 || total > u32::MAX as i128 {
-        return Err(Error::Overflow);
-    }
-    Ok(total as u32)
+    auth::narrow_weight(total)
 }
 
 /// Whether a tally has met or exceeded the configured threshold.
@@ -134,13 +139,13 @@ pub fn narrow(total: i128) -> Result<u32, Error> {
 /// The single threshold predicate in the contract: `>=`, so an exact match is
 /// sufficient and exceeding the threshold is never a failure.
 pub fn is_met(weight: u32, threshold: u32) -> bool {
-    weight >= threshold
+    auth::meets_threshold(weight, threshold)
 }
 
 /// Weight still required before the threshold is met. Saturating at `0`, so a
 /// tally that exceeds the threshold reports nothing outstanding.
 pub fn remaining(weight: u32, threshold: u32) -> u32 {
-    threshold.saturating_sub(weight)
+    auth::remaining_weight(weight, threshold)
 }
 
 /// Quorum verification helper: validate a signer weight sum against the
@@ -149,11 +154,7 @@ pub fn remaining(weight: u32, threshold: u32) -> u32 {
 /// `sum` is built exclusively through [`add_weight`] and [`narrow`], i.e. it
 /// is wrap-free by construction.
 pub fn require(sum: u32, threshold: u32, shortfall: Error) -> Result<(), Error> {
-    if is_met(sum, threshold) {
-        Ok(())
-    } else {
-        Err(shortfall)
-    }
+    auth::require_threshold(sum, threshold, shortfall)
 }
 
 /// Accumulate the weights of the signers selected by `is_selected` and count
@@ -169,15 +170,7 @@ pub fn accumulate_selected(
     signers: &Vec<SignerWeight>,
     is_selected: &dyn Fn(&SignerWeight) -> bool,
 ) -> Result<(u32, u32), Error> {
-    let mut total: i128 = 0;
-    let mut approvers: u32 = 0;
-    for s in signers.iter() {
-        if is_selected(&s) {
-            total = add_weight(total, s.weight)?;
-            approvers = approvers.checked_add(1).ok_or(Error::Overflow)?;
-        }
-    }
-    Ok((narrow(total)?, approvers))
+    auth::accumulate_selected(signers, is_selected)
 }
 
 /// Accumulate the selected signers' weights and verify the total against the

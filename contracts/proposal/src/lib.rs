@@ -171,6 +171,7 @@ use astroid_interfaces::{MultisigClient, ProposalInterface, UpgradeableInterface
 // contract consumes the shared definition and re-exports it under its old name,
 // so existing callers keep working against a single source of truth.
 pub use astroid_interfaces::proposal::ProposalState;
+use astroid_shared::auth;
 use astroid_shared::constants::{
     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_APPROVERS, MAX_DEPENDENCIES,
     MAX_PRUNE_BATCH, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
@@ -1297,10 +1298,10 @@ impl ProposalContract {
         if multisig_threshold == 0 {
             return Err(Error::InvalidThreshold);
         }
-        if approval_weight < multisig_threshold {
-            return Err(Error::QUORUM_NOT_MET);
-        }
-        Ok(())
+        // Shared threshold verification (Issue #450): the same checked
+        // comparison the multisig itself runs, so the proposal can never
+        // disagree with governance about whether a tally is quorate.
+        auth::require_threshold(approval_weight, multisig_threshold, Error::QUORUM_NOT_MET)
     }
 
     fn live_approval_tally(env: &Env, id: u64, proposal: &Proposal) -> Result<(u32, u32), Error> {
@@ -1324,10 +1325,13 @@ impl ProposalContract {
             if approved && multisig_client.is_signer(&approver) {
                 let next = checked_add(approvals as i128, 1)?;
                 approvals = u32::try_from(next).map_err(|_| Error::Overflow)?;
-                weight = checked_add(weight, multisig_client.get_signer_weight(&approver) as i128)?;
+                // Shared weight accumulation (Issue #450): checked, and
+                // narrowed back to `u32` in one place so an unrepresentable
+                // tally fails closed instead of truncating.
+                weight = auth::add_weight(weight, multisig_client.get_signer_weight(&approver))?;
             }
         }
-        let approval_weight = u32::try_from(weight).map_err(|_| Error::Overflow)?;
+        let approval_weight = auth::narrow_weight(weight)?;
         Ok((approvals, approval_weight))
     }
 
