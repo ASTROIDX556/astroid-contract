@@ -442,7 +442,7 @@ impl PolicyDenialReason {
             PolicyDenialReason::AssetNotWhitelisted => Error::AssetNotAuthorized,
             PolicyDenialReason::AllowanceExceeded => Error::AllowanceExceeded,
             PolicyDenialReason::AllowanceExpired => Error::AllowanceExpired,
-            PolicyDenialReason::AboveMaxTransactionLimit => Error::PolicyLimitExceeded,
+            PolicyDenialReason::AboveMaxTransactionLimit => Error::PolicyConstraintUnmet,
         }
     }
 
