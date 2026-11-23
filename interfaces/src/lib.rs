@@ -51,7 +51,7 @@ use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env, String, Vec};
 /// trait gains, loses or changes a method — or a new trait is declared, as
 /// [`EscrowInterface`] was (Issue #293) — so off-chain clients built against an
 /// older definition can detect the drift.
-pub const INTERFACE_VERSION: u32 = 3;
+pub const INTERFACE_VERSION: u32 = 4;
 
 /// Wallet operations and views available to cross-contract callers.
 #[contractclient(name = "WalletClient")]

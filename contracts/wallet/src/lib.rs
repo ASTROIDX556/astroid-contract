@@ -33,7 +33,7 @@
 //! Functions: `create_wallet`, `deposit`, `transfer`, `withdraw`, `freeze`,
 //! `unfreeze`, `pause`, `unpause`, `archive`, `emergency_pause`,
 //! `emergency_unpause`, `set_guardian`, `set_policy`, `clear_policy`,
-//! `set_policy_bypass`, `batch_execute_validated`, `set_budget`,
+//! `set_policy_bypass`, `evaluate_policy`, `batch_execute_validated`, `set_budget`,
 //! `set_rate_limit`, `clear_rate_limit`, `custody_balance`.
 //!
 //! ## Multi-token custody verification
@@ -123,6 +123,7 @@
 //! plus wallet-scoped state-change and role-administration events.
 
 use crate::access::Role;
+use astroid_interfaces::upgrade::{UpgradeAuthorizationClient, UpgradeRegistryClient};
 use astroid_interfaces::{BudgetClient, PolicyClient, RegistryClient, UpgradeableInterface};
 use astroid_shared::constants;
 use astroid_shared::ensure;
@@ -134,8 +135,8 @@ pub use astroid_shared::types::WalletData;
 use astroid_shared::types::{ModuleId, ModuleKind, ResourceState};
 use astroid_shared::validation::{require_non_empty, require_positive_amount};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Val,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, String,
+    Symbol, Val, Vec,
 };
 
 pub mod access;
@@ -375,6 +376,7 @@ impl WalletContract {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         // The admin is its own guardian until a dedicated one is designated.
         env.storage().instance().set(&DataKey::Guardian, &admin);
@@ -523,6 +525,51 @@ impl WalletContract {
     /// Whether a wallet is excused from the policy gate.
     pub fn get_policy_bypass(env: Env, wallet_id: u64) -> bool {
         storage::policy_bypass(&env, wallet_id)
+    }
+
+    /// Non-reverting policy pre-flight for an agent spend (Issue #504).
+    ///
+    /// Evaluates a would-be `transfer` of `amount` of `asset` to `to` against
+    /// the wallet's policy gate exactly as the spend path does — same
+    /// `"active"` policy id, same bypass rule — without moving value or
+    /// touching budgets, velocity or rate limits. Requires [`Role::Agent`] on
+    /// the wallet (an admin also qualifies).
+    ///
+    /// Returns `Ok(true)` when the policy permits the spend (or no policy gate
+    /// applies) and `Ok(false)` when it refuses. A refusal publishes the
+    /// standardized [`events::PolicyViolationEvent`] under
+    /// `("wallet", "pol_viol", agent)`; because this call succeeds, that event
+    /// is committed on-chain, giving off-chain monitoring a durable record of
+    /// every policy evaluation failure an agent triggers.
+    pub fn evaluate_policy(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<bool, Error> {
+        require_positive_amount(amount)?;
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
+        let (policy_addr, _) = Self::resolve_gates(&env)?;
+        let policy_addr = match policy_addr {
+            Some(addr) => addr,
+            None => return Ok(true),
+        };
+        if storage::policy_bypass(&env, wallet_id) {
+            return Ok(true);
+        }
+        let violation = Self::evaluate_policy_gate(
+            &env,
+            wallet_id,
+            &caller,
+            &policy_addr,
+            &String::from_str(&env, "active"),
+            &asset,
+            &to,
+            amount,
+        );
+        Ok(violation.is_none())
     }
 
     /// Set the velocity ceiling for `asset` on a wallet ([`Role::Admin`]):
@@ -795,24 +842,7 @@ impl WalletContract {
         // take effect without re-wiring the wallet. Each fallible step
         // unlocks before returning so a failed spend never leaves the
         // contract locked (even if the host commits storage on Err).
-        if let Err(e) = Self::pre_execute_checks(&env, wallet_id, &asset, &to, amount, &caller) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        if let Err(e) = Self::enforce_velocity(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Rate limiting counts both value and transactions, across every asset
-        // and outbound path, after the per-asset velocity ceiling.
-        if let Err(e) = Self::enforce_rate_limit(&env, wallet_id, amount, 1) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Allowance verification, debit and payout share one read of the
-        // tracked balance: the tracked ledger and the real SAC custody must
-        // each cover the amount before anything moves.
-        if let Err(e) = Self::settle_outbound(&env, wallet_id, &asset, amount, &to) {
+        if let Err(e) = Self::execute_spend(&env, wallet_id, &asset, &to, amount, &caller) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -838,26 +868,8 @@ impl WalletContract {
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
         Self::require_active_for_transfer(&wallet)?;
         Self::lock(&env)?;
-        if let Err(e) =
-            Self::pre_execute_checks(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
+        if let Err(e) = Self::execute_spend(&env, wallet_id, &asset, &wallet.owner, amount, &caller)
         {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        if let Err(e) = Self::enforce_velocity(&env, wallet_id, &asset, amount) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Rate limiting counts both value and transactions, across every asset
-        // and outbound path, after the per-asset velocity ceiling.
-        if let Err(e) = Self::enforce_rate_limit(&env, wallet_id, amount, 1) {
-            Self::unlock(&env);
-            return Err(e);
-        }
-        // Same single-read verification and debit as `transfer`: tracked
-        // balance and real SAC custody both cover the amount before any
-        // token call.
-        if let Err(e) = Self::settle_outbound(&env, wallet_id, &asset, amount, &wallet.owner) {
             Self::unlock(&env);
             return Err(e);
         }
@@ -1027,6 +1039,7 @@ impl WalletContract {
                 if let Err(e) = Self::require_policy_check(
                     &env,
                     wallet_id,
+                    &caller,
                     policy_addr,
                     &action.policy_id,
                     &action.asset,
@@ -1036,15 +1049,6 @@ impl WalletContract {
                     Self::unlock(&env);
                     return Err(e);
                 }
-            }
-
-            // The velocity ceiling is not opt-out per action: an agent cannot
-            // route around it by leaving `policy_id` empty. Actions accumulate
-            // against the same cached record, so a batch can never split a
-            // window's allowance across actions to slip past the ceiling.
-            if let Err(e) = velocity.enforce(&env, &action.asset, action.amount) {
-                Self::unlock(&env);
-                return Err(e);
             }
 
             if !action.budget_id.is_empty() {
@@ -1070,6 +1074,15 @@ impl WalletContract {
                         return Err(Error::BudgetExceeded);
                     }
                 }
+            }
+
+            // The velocity ceiling is not opt-out per action: an agent cannot
+            // route around it by leaving `policy_id` empty. Actions accumulate
+            // against the same cached record, so a batch can never split a
+            // window's allowance across actions to slip past the ceiling.
+            if let Err(e) = velocity.enforce(&env, &action.asset, action.amount) {
+                Self::unlock(&env);
+                return Err(e);
             }
         }
 
@@ -1150,7 +1163,7 @@ impl WalletContract {
 
     /// Read the configured registry, if any.
     pub fn get_registry(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Registry)
+        storage::registry(&env)
     }
 
     /// Set the organization slug used for registry lookups (admin only).
@@ -1170,7 +1183,7 @@ impl WalletContract {
 
     /// Read the configured org slug, if any.
     pub fn get_org(env: Env) -> Option<String> {
-        env.storage().instance().get(&DataKey::Org)
+        storage::org(&env)
     }
 
     /// Set the default budget envelope id consumed by single transfers (admin only).
@@ -1375,20 +1388,53 @@ impl WalletContract {
     /// wallet-facing error. Only a successful policy response authorizes spend.
     ///
     /// Records a [`events::ContractEvent::WalletPolicyChecked`] on the passing
-    /// path. No event is published for a denial: the invocation is about to
-    /// revert, which discards anything already published, and the policy module
-    /// emits its own [`events::ContractEvent::PolicyViolation`] for the reason
-    /// - duplicating it here would double-count every refusal.
+    /// path. On a refusal it publishes the standardized
+    /// [`events::PolicyViolationEvent`] (Issue #504) carrying the agent, the
+    /// wallet, the evaluated policy id and the refusal's reason/code before
+    /// returning [`Error::PolicyDenied`]. On the reverting spend paths the host
+    /// discards that event with the rest of the invocation (it remains visible
+    /// in simulation and diagnostics); [`WalletContract::evaluate_policy`] is
+    /// the non-reverting path whose event is committed on-chain.
     fn require_policy_check(
         env: &Env,
         wallet_id: u64,
+        agent: &Address,
         policy_addr: &Address,
         policy_id: &String,
         asset: &Address,
         recipient: &Address,
         amount: i128,
     ) -> Result<(), Error> {
-        match PolicyClient::new(env, policy_addr)
+        match Self::evaluate_policy_gate(
+            env,
+            wallet_id,
+            agent,
+            policy_addr,
+            policy_id,
+            asset,
+            recipient,
+            amount,
+        ) {
+            None => Ok(()),
+            Some(_) => Err(Error::PolicyDenied),
+        }
+    }
+
+    /// Consult the policy contract once. Returns `None` when the spend is
+    /// permitted (publishing `WalletPolicyChecked`), or `Some(event)` after
+    /// publishing the [`events::PolicyViolationEvent`] for a refusal. Never
+    /// returns an error itself, so callers decide whether a refusal reverts.
+    fn evaluate_policy_gate(
+        env: &Env,
+        wallet_id: u64,
+        agent: &Address,
+        policy_addr: &Address,
+        policy_id: &String,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Option<events::PolicyViolationEvent> {
+        let (reason, code) = match PolicyClient::new(env, policy_addr)
             .try_check_transfer(policy_id, asset, recipient, &amount)
         {
             Ok(Ok(())) => {
@@ -1400,10 +1446,26 @@ impl WalletContract {
                         amount,
                     },
                 );
-                Ok(())
+                return None;
             }
-            Ok(Err(_)) | Err(_) => Err(Error::PolicyDenied),
-        }
+            // The policy contract refused with a deterministic contract error:
+            // report its own wire name and code so monitoring can tell a cap
+            // breach from a blocked recipient or an unapproved asset.
+            Err(Ok(e)) => (e.wire_name(), e.code()),
+            // The call itself failed (missing contract, trap, undecodable
+            // response): fail closed and say so.
+            Ok(Err(_)) | Err(Err(_)) => ("POLICY_UNAVAILABLE", Error::PolicyDenied.code()),
+        };
+        let event = events::PolicyViolationEvent {
+            agent: agent.clone(),
+            wallet_id,
+            policy_id: policy_id.clone(),
+            reason: events::reason(env, reason),
+            code,
+            timestamp: env.ledger().timestamp(),
+        };
+        events::wallet_policy_violation(env, &event);
+        Some(event)
     }
 
     /// Re-entrancy guard: refuse if a wallet entrypoint is already on the stack.
@@ -1421,8 +1483,8 @@ impl WalletContract {
     /// `Registry` + `Org` are configured. Uses a single `get_modules_batch`
     /// call to fetch both in one cross-contract invocation for gas savings.
     fn resolve_gates(env: &Env) -> Result<(Option<Address>, Option<Address>), Error> {
-        let reg: Option<Address> = env.storage().instance().get(&DataKey::Registry);
-        let org: Option<String> = env.storage().instance().get(&DataKey::Org);
+        let reg = storage::registry(env);
+        let org = storage::org(env);
         if let (Some(reg), Some(org)) = (reg, org) {
             let mut ids = Vec::new(env);
             ids.push_back(ModuleId {
@@ -1490,8 +1552,22 @@ impl WalletContract {
         }
     }
 
-    /// Atomic pre-execution hook: policy → budget → velocity, before any
-    /// debit. If registry is configured, addresses are resolved dynamically;
+    fn execute_spend(
+        env: &Env,
+        wallet_id: u64,
+        asset: &Address,
+        recipient: &Address,
+        amount: i128,
+        caller: &Address,
+    ) -> Result<(), Error> {
+        Self::pre_execute_checks(env, wallet_id, asset, recipient, amount, caller)?;
+        Self::enforce_velocity(env, wallet_id, asset, amount)?;
+        Self::enforce_rate_limit(env, wallet_id, amount, 1)?;
+        Self::settle_outbound(env, wallet_id, asset, amount, recipient)
+    }
+
+    /// Atomic gate hook: policy evaluation immediately followed by budget
+    /// consumption, before any debit. If registry is configured, addresses are resolved dynamically;
     /// otherwise falls back to instance-wired addresses. A bypassed wallet
     /// skips the policy gate but never the budget or velocity gates.
     ///
@@ -1512,6 +1588,7 @@ impl WalletContract {
                 Self::require_policy_check(
                     env,
                     wallet_id,
+                    caller,
                     policy_addr,
                     &String::from_str(env, "active"),
                     asset,
@@ -1889,6 +1966,54 @@ impl WalletContract {
         storage::bump_wallet(env, id);
     }
 
+    /// Registry that authorizes a code swap: the instance `Registry` entry
+    /// first, then the legacy upgrade-authority registry for deployments wired
+    /// before this entrypoint became registry-sourced. Either way the registry,
+    /// not a locally stored admin, is the authority consulted.
+    fn upgrade_registry(env: &Env) -> Result<Address, Error> {
+        storage::registry(env)
+            .or_else(|| {
+                astroid_interfaces::upgrade::get_authority(env)
+                    .ok()
+                    .map(|authority| authority.registry)
+            })
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Ask the registry whether `caller` may roll wallet code forward. The
+    /// protocol admins, their multisig governance and the org's delegated
+    /// maintainers all answer through `is_upgrade_authorized`; a refusal, a
+    /// registry error or an undecodable answer fail closed.
+    fn require_registry_upgrader(
+        env: &Env,
+        registry: &Address,
+        caller: &Address,
+    ) -> Result<(), Error> {
+        let org = storage::org(env).unwrap_or_else(|| String::from_str(env, ""));
+        match UpgradeAuthorizationClient::new(env, registry).try_is_upgrade_authorized(
+            &org,
+            caller,
+            &ModuleKind::Wallet,
+        ) {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(Error::Unauthorized),
+        }
+    }
+
+    /// Confirm the registry still approves `wasm_hash` for wallet code.
+    fn require_approved_wasm(
+        env: &Env,
+        registry: &Address,
+        wasm_hash: &BytesN<32>,
+    ) -> Result<(), Error> {
+        match UpgradeRegistryClient::new(env, registry)
+            .try_is_wasm_approved(&ModuleKind::Wallet, wasm_hash)
+        {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(Error::Unauthorized),
+        }
+    }
+
     fn bump_instance(env: &Env) {
         storage::bump_instance(env);
     }
@@ -1899,9 +2024,11 @@ impl WalletContract {
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl UpgradeableInterface for WalletContract {
-    /// Record (or rotate) who may upgrade this contract and which registry
-    /// authorizes the new code. Bootstrapped by the deployer alongside
-    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    /// Record (or rotate) the legacy upgrade authority. The shared interface
+    /// keeps this bootstrapping surface; the wallet's `upgrade` sources its
+    /// registry from the instance `Registry` entry (falling back to the one
+    /// recorded here) and asks that registry who may upgrade, so a local admin
+    /// record alone never authorizes a code swap.
     fn set_upgrade_authority(
         env: Env,
         caller: Address,
@@ -1911,7 +2038,7 @@ impl UpgradeableInterface for WalletContract {
         astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
     }
 
-    /// Read the recorded upgrade authority.
+    /// Read the recorded legacy upgrade authority.
     fn get_upgrade_authority(
         env: Env,
     ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, Error> {
@@ -1920,16 +2047,19 @@ impl UpgradeableInterface for WalletContract {
 
     /// Replace this contract's code with `wasm_hash`.
     ///
-    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
-    /// `wasm_hash` must be approved for `ModuleKind::Wallet` in the registry.
-    /// Any other outcome leaves the contract running its current code.
-    fn upgrade(env: Env, caller: Address, wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
-        astroid_interfaces::upgrade::perform(
-            &env,
-            &caller,
-            astroid_shared::types::ModuleKind::Wallet,
-            wasm_hash,
-        )
+    /// Both questions are put to the registry wired in instance storage:
+    /// `is_upgrade_authorized` must recognize `caller` as a protocol maintainer
+    /// or DAO governance for the org, and `is_wasm_approved` must still approve
+    /// the hash for [`ModuleKind::Wallet`]. A missing registry is
+    /// [`Error::NotInitialized`]; every refusal or failed cross-call is the
+    /// deterministic [`Error::Unauthorized`]. No code is swapped unless both
+    /// answers come back positive.
+    fn upgrade(env: Env, caller: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
+        caller.require_auth();
+        let registry = Self::upgrade_registry(&env)?;
+        Self::require_registry_upgrader(&env, &registry, &caller)?;
+        Self::require_approved_wasm(&env, &registry, &wasm_hash)?;
+        astroid_interfaces::upgrade::apply(&env, ModuleKind::Wallet, wasm_hash)
     }
 }
 

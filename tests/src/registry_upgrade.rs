@@ -59,6 +59,7 @@ fn setup() -> Harness<'static> {
     let wallet_id = env.register_contract(None, WalletContract);
     let wallet = WalletContractClient::new(&env, &wallet_id);
     wallet.initialize(&admin);
+    wallet.set_registry(&admin, &registry_id);
     wallet.set_upgrade_authority(&admin, &admin, &registry_id);
 
     let planner_id = env.register_contract(None, UpgradePlanner);

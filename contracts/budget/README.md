@@ -115,7 +115,7 @@ All errors use the shared [`Error`] enum from `astroid-shared` (re-exported as `
 | Budget not yet active (scheduled) | `BudgetNotActive` (45) — `BudgetError` only |
 | Token not registered for per-asset spend | `AssetNotAuthorized` (43) |
 | Duplicate token in batch spend | `InvalidInput` (4) |
-| Window record cannot be rolled over deterministically (unrepresentable window end, negative counter) | `BudgetWindowInvalid` (46) |
+| Window record cannot be rolled over deterministically (unrepresentable window end, negative counter) | `InvalidTimeWindow` (46) |
 
 Budget-specific codes (`BudgetError`) mirror the shared codes where applicable. `BudgetNotActive` (45) is unique to `BudgetError`; it folds to `BudgetExpired` when converted to the shared `Error`.
 

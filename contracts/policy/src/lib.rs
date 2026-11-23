@@ -2009,7 +2009,7 @@ impl PolicyContract {
     /// | `amount <= 0`                               | [`Error::InvalidAmount`]  |
     /// | unknown `policy_id`                         | [`Error::NotFound`]       |
     /// | `amount > per_tx_limit`                     | [`Error::PolicyDenied`]   |
-    /// | today's spend + `amount` > `daily_limit`    | [`Error::BudgetExceeded`] |
+    /// | today's spend + `amount` > `daily_limit`    | [`Error::BudgetLimitReached`] |
     /// | the running total would overflow `i128`     | [`Error::Overflow`]       |
     ///
     /// An agent without a configured limit is not restricted by this gate; the
@@ -2632,7 +2632,7 @@ impl PolicyContract {
             if limit.daily_limit > 0 {
                 if new_spent > limit.daily_limit {
                     events_policy_violation(env, policy_id, "daily_limit_exceeded");
-                    return Err(Error::BudgetExceeded);
+                    return Err(Error::BudgetLimitExceeded);
                 }
                 remaining = checked_sub(limit.daily_limit, new_spent)?;
             }
@@ -2916,6 +2916,30 @@ impl PolicyContract {
                 Err(reason.to_error())
             }
         }
+    }
+
+    /// Validate an incoming agent spending request against the policy's
+    /// recipient whitelist and per-transaction maximum amount (Issue #523).
+    ///
+    /// This is the deterministic pre-flight hook for the Wallet → Policy →
+    /// Execution flow. It walks the same rules as `check_transfer`, so the two
+    /// entrypoints can never disagree on whether a payload is in policy, but
+    /// collapses every refusal to [`Error::PolicyDenied`] while still emitting
+    /// the single `PolicyViolation` event that names the rule that refused it.
+    /// A non-positive amount is malformed input ([`Error::InvalidAmount`]) and
+    /// an unknown policy is [`Error::NotFound`]; neither is a policy refusal.
+    pub fn validate_agent_spending_request(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<(), Error> {
+        require_positive_amount(payload.amount)?;
+        let decision = Self::evaluate_policy_decision(&env, &policy_id, &payload)?;
+        if let Some(reason) = decision.reason() {
+            Self::report_denial(&env, &policy_id, reason);
+            return Err(Error::PolicyDenied);
+        }
+        Ok(())
     }
 }
 

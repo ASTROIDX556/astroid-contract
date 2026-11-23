@@ -297,7 +297,9 @@ impl VoteBars {
     /// Integer scaling only — `ceil(eligible * percent / 100)` computed with
     /// checked arithmetic — never floating point, so every node derives the
     /// identical integer. `percent` is clamped to 100, so a misconfigured
-    /// percentage can never demand more than the whole allow-list.
+    /// percentage can never demand more than the whole allow-list. A result
+    /// wider than `u32` saturates to `u32::MAX` instead of trapping or
+    /// wrapping into a bar that could be met by a smaller tally.
     pub fn quorum_required(eligible: u32, percent: u32) -> u32 {
         // With `percent <= 100` the result never exceeds `eligible`, so the
         // checked path cannot fail; should it ever, fail closed by demanding
@@ -318,9 +320,14 @@ impl VoteBars {
 
     /// Majority check helper: the smallest number of approvals that exceeds
     /// half the allow-list — a strict majority. An exact tie (exactly half)
-    /// never reaches it.
+    /// never reaches it. Computed in `u64` and capped at `u32::MAX` so an
+    /// allow-list near the type boundary cannot overflow into a false bar.
     pub fn majority_required(eligible: u32) -> u32 {
-        eligible / 2 + 1
+        u64::from(eligible)
+            .checked_div(2)
+            .and_then(|half| half.checked_add(1))
+            .and_then(|bar| u32::try_from(bar).ok())
+            .unwrap_or(u32::MAX)
     }
 
     /// Whether `approvals` forms a strict majority of the `eligible` voters.
@@ -502,7 +509,8 @@ impl ProposalContract {
             .instance()
             .get(&DataKey::ProposalCount)
             .ok_or(Error::NotInitialized)?;
-        count = checked_add(count as i128, 1)? as u64;
+        let next = checked_add(count as i128, 1)?;
+        count = u64::try_from(next).map_err(|_| Error::Overflow)?;
         let id = count;
 
         // Validate the declared prerequisites and collapse duplicates, so that
@@ -814,7 +822,7 @@ impl ProposalContract {
             let _ = Self::expire_if_due(&env, id, &mut proposal);
             if proposal.is_expired(&env) && proposal.state.deposit_settled() {
                 Self::purge_proposal(&env, id, &proposal);
-                pruned += 1;
+                pruned = pruned.checked_add(1).ok_or(Error::Overflow)?;
             }
         }
         if pruned > 0 {
@@ -847,7 +855,7 @@ impl ProposalContract {
             let _ = Self::expire_if_due(&env, id, &mut proposal);
             if proposal.is_expired(&env) && proposal.state.deposit_settled() {
                 Self::purge_proposal(&env, id, &proposal);
-                pruned += 1;
+                pruned = pruned.checked_add(1).ok_or(Error::Overflow)?;
             }
         }
         if pruned > 0 {
@@ -1274,8 +1282,8 @@ impl ProposalContract {
     ///   would let any (even empty) approval set through, so it fails closed
     ///   with [`Error::InvalidThreshold`] instead of executing;
     /// * the verified approval weight must meet or exceed that threshold,
-    ///   otherwise [`Error::ThresholdNotMet`] (the protocol's
-    ///   insufficient-signers code).
+    ///   otherwise [`Error::QUORUM_NOT_MET`] (the dedicated weighted-quorum
+    ///   code introduced for issue #459).
     ///
     /// The threshold is read on every call, so a threshold raised (or a signer
     /// removed) after a proposal reached `Approved` is honoured at execution.
@@ -1290,7 +1298,7 @@ impl ProposalContract {
             return Err(Error::InvalidThreshold);
         }
         if approval_weight < multisig_threshold {
-            return Err(Error::ThresholdNotMet);
+            return Err(Error::QUORUM_NOT_MET);
         }
         Ok(())
     }
@@ -1314,7 +1322,8 @@ impl ProposalContract {
                 );
             }
             if approved && multisig_client.is_signer(&approver) {
-                approvals = checked_add(approvals as i128, 1)? as u32;
+                let next = checked_add(approvals as i128, 1)?;
+                approvals = u32::try_from(next).map_err(|_| Error::Overflow)?;
                 weight = checked_add(weight, multisig_client.get_signer_weight(&approver) as i128)?;
             }
         }

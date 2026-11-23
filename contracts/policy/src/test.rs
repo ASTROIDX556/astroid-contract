@@ -10,6 +10,31 @@ use crate::{
     RuleTree, TransactionPayload, MAX_POLICY_RULES,
 };
 
+struct DetRng(u64);
+
+impl DetRng {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 { 1 } else { seed })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+
+    fn range(&mut self, low: i128, high: i128) -> i128 {
+        low + (self.below((high - low + 1) as u64) as i128)
+    }
+}
+
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
 /// published during the test (single-topic event = the variant name).
 fn assert_event(env: &Env, variant: &str) {
@@ -4487,6 +4512,174 @@ fn asset_whitelist_mode_toggle_emits_its_own_standardized_topic() {
     p.set_recipient_whitelist_enabled(&owner, &String::from_str(&env, "max_txn"), &true);
     assert_eq!(event_count(&env, "policy", "wl_mode"), 1);
     assert_eq!(event_count(&env, "policy", "awl_mode"), 1);
+}
+
+// --- agent spending request validation hook (issue #523) -------------------
+
+#[test]
+fn validate_agent_spending_request_allows_payload_within_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(
+            &policy_id,
+            &transfer_payload(&asset, &recipient, 999_999)
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 0);
+}
+
+#[test]
+fn validate_agent_spending_request_denies_unwhitelisted_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let approved = Address::generate(&env);
+    let untrusted = Address::generate(&env);
+
+    p.add_recipient_to_whitelist(&owner, &policy_id, &approved);
+    p.set_recipient_whitelist_enabled(&owner, &policy_id, &true);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(
+            &policy_id,
+            &transfer_payload(&asset, &untrusted, 10)
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 1);
+}
+
+#[test]
+fn validate_agent_spending_request_denies_amount_above_maximum() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(
+            &policy_id,
+            &transfer_payload(&asset, &recipient, 1_000_001)
+        ),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 1);
+}
+
+#[test]
+fn validate_agent_spending_request_agrees_with_check_transfer_and_emits_one_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let over = transfer_payload(&asset, &recipient, 1_000_001);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recipient, &over.amount),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 1);
+    assert_eq!(
+        p.try_validate_agent_spending_request(&policy_id, &over),
+        Err(Ok(Error::PolicyDenied))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 2);
+}
+
+#[test]
+fn validate_agent_spending_request_rejects_malformed_amount_and_unknown_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let policy_id = String::from_str(&env, "max_txn");
+    let unknown = String::from_str(&env, "missing");
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        p.try_validate_agent_spending_request(&policy_id, &transfer_payload(&asset, &recipient, 0)),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        p.try_validate_agent_spending_request(&unknown, &transfer_payload(&asset, &recipient, 1)),
+        Err(Ok(Error::NotFound))
+    );
+    assert_eq!(event_count(&env, "policy", "violation"), 0);
+}
+
+#[test]
+fn seeded_policy_verification_agrees_across_evaluation_paths() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let policy_id = String::from_str(&env, "fuzz_policy");
+
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(&env, &id);
+    client.initialize();
+    client.register_policy(
+        &owner,
+        &policy_id,
+        &BytesN::from_array(&env, &[9; 32]),
+        &1_000_000,
+        &Some(allowed.clone()),
+        &None,
+        &0,
+        &None,
+    );
+
+    let mut rng = DetRng::new(0xC0FF_EE00_1234_5678);
+    for _ in 0..24 {
+        let amount = rng.range(1, 1_000_002);
+        let recipient = if rng.below(2) == 0 {
+            allowed.clone()
+        } else {
+            blocked.clone()
+        };
+        let expected = recipient == allowed && amount <= 1_000_000;
+        let payload = TransactionPayload {
+            asset: asset.clone(),
+            recipient: recipient.clone(),
+            amount,
+        };
+
+        let decision = client.evaluate_policy(&policy_id, &payload);
+        assert_eq!(decision.allowed(), expected);
+        assert_eq!(decision.max_transaction_amount, 1_000_000);
+        assert_eq!(
+            client
+                .try_validate_agent_spending_request(&policy_id, &payload)
+                .is_ok(),
+            expected
+        );
+        assert_eq!(
+            client
+                .try_check_transfer(&policy_id, &asset, &recipient, &amount)
+                .is_ok(),
+            expected
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

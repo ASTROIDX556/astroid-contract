@@ -17,6 +17,8 @@ pub mod e2e_agent_spending;
 #[cfg(test)]
 pub mod error_codes;
 #[cfg(test)]
+pub mod escrow_cleanup;
+#[cfg(test)]
 pub mod escrow_integration;
 #[cfg(test)]
 pub mod escrow_lifecycle;
@@ -26,6 +28,8 @@ pub mod gated_fund_flows;
 pub mod interface_compliance;
 #[cfg(test)]
 pub mod multisig_integration;
+#[cfg(test)]
+pub mod policy_composition;
 #[cfg(test)]
 pub mod policy_enforcement;
 #[cfg(test)]
@@ -46,3 +50,9 @@ pub mod registry_upgrade;
 pub mod treasury_transfer_auth;
 #[cfg(test)]
 pub mod treasury_withdrawal_time_lock;
+#[cfg(test)]
+pub mod upgrade_validation;
+#[cfg(test)]
+pub mod wallet_policy_violation_events;
+#[cfg(test)]
+pub mod wallet_registry_upgrade;
