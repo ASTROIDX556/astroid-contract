@@ -1,7 +1,7 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{timelock, ProposalContract, ProposalContractClient, ProposalState, VoteBars};
+use crate::{timelock, ProposalContract, ProposalContractClient, ProposalState, VoteBars, ProposalTiming};
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH, MAX_SIGNERS};
 use astroid_shared::errors::Error;
@@ -99,8 +99,11 @@ fn create_with_grace_and_deps(
         &dep_vec(h, deps),
         &threshold,
         &vec![&h.env],
-        &expires_at,
-        &grace_period,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at,
+            grace_period,
+        },
     )
 }
 
@@ -116,8 +119,11 @@ fn try_create_with_deps(h: &Harness, deps: &[u64]) -> Result<u64, Error> {
             &dep_vec(h, deps),
             &2,
             &vec![&h.env],
-            &0,
-            &0,
+            &ProposalTiming {
+                voting_duration: 0,
+                expires_at: 0,
+                grace_period: 0,
+            },
         )
         .map(|ok| ok.unwrap())
         .map_err(|err| err.unwrap())
@@ -292,8 +298,11 @@ fn proposal_rejects_non_multisig_approvers_and_duplicate_allowlist_entries() {
         &dep_vec(&h, &[]),
         &1,
         &vec![&h.env],
-        &0,
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 0,
+            grace_period: 0,
+        },
     );
     assert_eq!(res, Err(Ok(Error::NotASigner)));
 
@@ -306,8 +315,11 @@ fn proposal_rejects_non_multisig_approvers_and_duplicate_allowlist_entries() {
         &dep_vec(&h, &[]),
         &1,
         &vec![&h.env],
-        &0,
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 0,
+            grace_period: 0,
+        },
     );
     assert_eq!(res, Err(Ok(Error::AlreadyExists)));
 }
@@ -382,8 +394,11 @@ fn create_with_bad_threshold_fails() {
         &dep_vec(&h, &[]),
         &3,
         &vec![&h.env],
-        &5_000,
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 5_000,
+            grace_period: 0,
+        },
     );
     assert_eq!(res, Err(Ok(Error::InvalidThreshold)));
 }
@@ -400,8 +415,11 @@ fn create_with_past_expiry_fails() {
         &dep_vec(&h, &[]),
         &1,
         &vec![&h.env],
-        &500, // in the past (now = 1000)
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 500,
+            grace_period: 0,
+        },
     );
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
 }
@@ -696,8 +714,11 @@ fn test_cancellation_grace_window() {
         &dep_vec(&h, &[]),
         &2,
         &vec![&h.env],
-        &0,
-        &50, // 50 seconds grace period
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 0,
+            grace_period: 50,
+        },
     );
 
     // Fast forward 51 seconds
@@ -717,8 +738,11 @@ fn test_cancellation_grace_window() {
         &dep_vec(&h, &[]),
         &2,
         &vec![&h.env],
-        &0,
-        &50,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 0,
+            grace_period: 50,
+        },
     );
 
     h.env.ledger().set_timestamp(160);
@@ -1486,8 +1510,11 @@ fn create_with_deposit(h: &Harness, threshold: u32, expires_at: u64, token: &Add
                 amount: DEPOSIT,
             }
         ],
-        &expires_at,
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at,
+            grace_period: 0,
+        },
     )
 }
 
