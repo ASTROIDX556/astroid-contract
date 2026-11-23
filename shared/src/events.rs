@@ -19,9 +19,129 @@
 //!
 //! The two layers are emitted together on key state transitions so neither
 //! existing nor new consumers break.
+//!
+//! ## Topic naming convention (Issue #493)
+//!
+//! Every tuple-topic event published by an Astroid contract follows one shape:
+//!
+//! ```text
+//! (category, action)            -- e.g. ("budget", "consumed")
+//! (category, action, subject)   -- e.g. ("org", "register", org_id)
+//! ```
+//!
+//! * `category` is one of the constants in [`topic`] — the noun naming the
+//!   contract domain or resource the event concerns (`budget`, `policy`,
+//!   `proposal`, ...). Contracts never spell a category inline, so a typo can
+//!   no longer split one stream into two.
+//! * `action` is a lower-case `symbol_short!` verb or past participle of at
+//!   most nine characters (`created`, `approved`, `win_roll`, ...).
+//! * `subject`, when present, is the identifier an indexer filters on without
+//!   decoding the payload (an org id, an escrow id).
+//!
+//! Payloads carry identifiers and amounts only — never secrets, signatures or
+//! off-chain configuration. Contracts publish through [`emit`] /
+//! [`emit_for`] (or a named helper below built on them) rather than calling
+//! `env.events().publish` directly, so every event in the protocol goes
+//! through one audited builder.
 
 use crate::types::{AssetAmount, ModuleKind};
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contracttype, symbol_short, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+};
+
+/// Canonical topic categories (Issue #493).
+///
+/// The first topic of every tuple-topic event is one of these symbols. They
+/// are `symbol_short!` constants, so using them costs nothing at runtime and
+/// keeps the on-wire encoding identical to the previous inline spellings.
+pub mod topic {
+    use soroban_sdk::{symbol_short, Symbol};
+
+    /// Registry contract lifecycle (`init`, `setadmin`, `frozen`, ...).
+    pub const REGISTRY: Symbol = symbol_short!("registry");
+    /// Organization records held by the registry.
+    pub const ORG: Symbol = symbol_short!("org");
+    /// Module bindings held by the registry.
+    pub const MODULE: Symbol = symbol_short!("module");
+    /// Role grants held by the registry.
+    pub const ROLE: Symbol = symbol_short!("role");
+    /// Module version table / upgrade lifecycle.
+    pub const VERSION: Symbol = symbol_short!("version");
+    /// Registry administrators.
+    pub const ADMIN: Symbol = symbol_short!("admin");
+    /// Approved Wasm hashes.
+    pub const WASM: Symbol = symbol_short!("wasm");
+    /// Agent wallets.
+    pub const WALLET: Symbol = symbol_short!("wallet");
+    /// Multisig signer set.
+    pub const SIGNER: Symbol = symbol_short!("signer");
+    /// Multisig threshold.
+    pub const THRESHOLD: Symbol = symbol_short!("threshold");
+    /// Time-locked multisig governance changes.
+    pub const GOVCHANGE: Symbol = symbol_short!("govchange");
+    /// Emergency lock.
+    pub const EMERGENCY: Symbol = symbol_short!("emergency");
+    /// Batched multisig calls.
+    pub const BATCH: Symbol = symbol_short!("batch");
+    /// Time-locked operations (multisig delay, treasury queue).
+    pub const TIMELOCK: Symbol = symbol_short!("timelock");
+    /// Proposal lifecycle.
+    pub const PROPOSAL: Symbol = symbol_short!("proposal");
+    /// Treasury custody and configuration.
+    pub const TREASURY: Symbol = symbol_short!("treasury");
+    /// Treasury milestone disbursements.
+    pub const MILESTONE: Symbol = symbol_short!("milestone");
+    /// Budget allocations and spending windows.
+    pub const BUDGET: Symbol = symbol_short!("budget");
+    /// Policy configuration and evaluation.
+    pub const POLICY: Symbol = symbol_short!("policy");
+    /// Escrow lifecycle.
+    pub const ESCROW: Symbol = symbol_short!("escrow");
+    /// Value transfers.
+    pub const TRANSFER: Symbol = symbol_short!("transfer");
+}
+
+/// Publish a standardized `(category, action)` event (Issue #493).
+///
+/// `category` should be one of the [`topic`] constants. This is the single
+/// builder behind every two-topic event in the protocol.
+pub fn emit<D>(env: &Env, category: Symbol, action: Symbol, data: D)
+where
+    D: IntoVal<Env, Val>,
+{
+    env.events().publish((category, action), data);
+}
+
+/// Publish a standardized `(category, action, subject)` event (Issue #493).
+///
+/// The third topic is the identifier subscribers filter on without decoding
+/// the payload (an org id, an escrow id, a proposal id).
+pub fn emit_for<S, D>(env: &Env, category: Symbol, action: Symbol, subject: S, data: D)
+where
+    S: IntoVal<Env, Val>,
+    D: IntoVal<Env, Val>,
+{
+    env.events().publish((category, action, subject), data);
+}
+
+/// Publish a standardized `(category, action, subject, qualifier)` event
+/// (Issue #493) — used where an identifier alone is ambiguous, e.g. a module
+/// binding keyed by `(org, kind)` or a version keyed by `(kind, version)`.
+pub fn emit_for_pair<S, Q, D>(
+    env: &Env,
+    category: Symbol,
+    action: Symbol,
+    subject: S,
+    qualifier: Q,
+    data: D,
+) where
+    S: IntoVal<Env, Val>,
+    Q: IntoVal<Env, Val>,
+    D: IntoVal<Env, Val>,
+{
+    env.events()
+        .publish((category, action, subject, qualifier), data);
+}
 
 /// Typed payload of the upgrade audit trail: who did what to which version of
 /// a module kind, and when. Emitted as part of every upgrade-lifecycle event
@@ -158,6 +278,10 @@ pub enum ContractEvent {
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
     WalletStateChanged { wallet_id: u64, state: Symbol },
+    /// The wallet contract's circuit breaker was tripped by `by`.
+    WalletPaused { by: Address },
+    /// The wallet contract's circuit breaker was reset by `by`.
+    WalletUnpaused { by: Address },
     /// Value was deposited into a wallet's internal balance.
     ///
     /// Distinct from [`ContractEvent::TransferExecuted`]: that reports the token
@@ -423,6 +547,14 @@ pub fn publish(env: &Env, event: ContractEvent) {
         ContractEvent::WalletCreated { wallet_id, owner } => {
             env.events()
                 .publish((Symbol::new(env, "WalletCreated"),), (wallet_id, owner));
+        }
+        ContractEvent::WalletPaused { by } => {
+            env.events()
+                .publish((Symbol::new(env, "WalletPaused"),), by);
+        }
+        ContractEvent::WalletUnpaused { by } => {
+            env.events()
+                .publish((Symbol::new(env, "WalletUnpaused"),), by);
         }
         ContractEvent::WalletStateChanged { wallet_id, state } => {
             env.events().publish(
@@ -715,9 +847,12 @@ pub fn publish(env: &Env, event: ContractEvent) {
 
 /// `TransferExecuted` — topic `("transfer", "executed")`.
 pub fn transfer_executed(env: &Env, from: &Address, to: &Address, asset: &Address, amount: i128) {
-    let topics = (symbol_short!("transfer"), symbol_short!("executed"));
-    env.events()
-        .publish(topics, (from.clone(), to.clone(), asset.clone(), amount));
+    emit(
+        env,
+        topic::TRANSFER,
+        symbol_short!("executed"),
+        (from.clone(), to.clone(), asset.clone(), amount),
+    );
 }
 
 /// Typed payload of the standardized escrow settlement events (Issue #536).
@@ -794,8 +929,11 @@ fn publish_escrow_settlement(
     recipient: &Address,
     amount: i128,
 ) {
-    env.events().publish(
-        (symbol_short!("escrow"), action, escrow_id),
+    emit_for(
+        env,
+        topic::ESCROW,
+        action,
+        escrow_id,
         EscrowSettlement {
             escrow_id,
             recipient: recipient.clone(),
@@ -911,16 +1049,22 @@ pub fn emit_refund(env: &Env, id: u64, recipient: &Address, amount: i128) {
 
 /// `ProposalCreated` — topic `("proposal", "created")`.
 pub fn proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
-    let topics = (symbol_short!("proposal"), symbol_short!("created"));
-    env.events()
-        .publish(topics, (proposal_id, proposer.clone()));
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("created"),
+        (proposal_id, proposer.clone()),
+    );
 }
 
 /// `ProposalApproved` — topic `("proposal", "approved")`.
 pub fn proposal_approved(env: &Env, proposal_id: u64, approver: &Address, approvals: u32) {
-    let topics = (symbol_short!("proposal"), symbol_short!("approved"));
-    env.events()
-        .publish(topics, (proposal_id, approver.clone(), approvals));
+    emit(
+        env,
+        topic::PROPOSAL,
+        symbol_short!("approved"),
+        (proposal_id, approver.clone(), approvals),
+    );
 }
 
 /// `ProposalExecuted` — topic `("proposal", "executed")`.
@@ -929,15 +1073,17 @@ pub fn proposal_approved(env: &Env, proposal_id: u64, approver: &Address, approv
 /// marked executed. The proposal id is the whole payload: execution is
 /// terminal and the id is never reused, so it is also the replay marker.
 pub fn proposal_executed(env: &Env, proposal_id: u64) {
-    let topics = (symbol_short!("proposal"), symbol_short!("executed"));
-    env.events().publish(topics, proposal_id);
+    emit(env, topic::PROPOSAL, symbol_short!("executed"), proposal_id);
 }
 
 /// `BudgetExceeded` — topic `("budget", "exceeded")`.
 pub fn budget_exceeded(env: &Env, budget_id: &String, requested: i128, remaining: i128) {
-    let topics = (symbol_short!("budget"), symbol_short!("exceeded"));
-    env.events()
-        .publish(topics, (budget_id.clone(), requested, remaining));
+    emit(
+        env,
+        topic::BUDGET,
+        symbol_short!("exceeded"),
+        (budget_id.clone(), requested, remaining),
+    );
 }
 
 /// `BudgetExhausted` — topic `("budget", "exhausted")`.
@@ -955,9 +1101,12 @@ pub fn budget_exhausted(
     spent: i128,
     capacity: i128,
 ) {
-    let topics = (symbol_short!("budget"), symbol_short!("exhausted"));
-    env.events()
-        .publish(topics, (budget_id.clone(), token, spent, capacity));
+    emit(
+        env,
+        topic::BUDGET,
+        symbol_short!("exhausted"),
+        (budget_id.clone(), token, spent, capacity),
+    );
 }
 
 /// `BudgetReplenished` — topic `("budget", "replenish")`.
@@ -967,21 +1116,32 @@ pub fn budget_exhausted(
 /// headroom the budget (or per-asset limit, when `token` is `Some`) holds
 /// immediately afterwards.
 pub fn budget_replenished(env: &Env, budget_id: &String, token: Option<Address>, available: i128) {
-    let topics = (symbol_short!("budget"), symbol_short!("replenish"));
-    env.events()
-        .publish(topics, (budget_id.clone(), token, available));
+    emit(
+        env,
+        topic::BUDGET,
+        symbol_short!("replenish"),
+        (budget_id.clone(), token, available),
+    );
 }
 
 /// `PolicyViolation` — topic `("policy", "violation")`.
 pub fn policy_violation(env: &Env, policy_id: &String, reason: Symbol) {
-    let topics = (symbol_short!("policy"), symbol_short!("violation"));
-    env.events().publish(topics, (policy_id.clone(), reason));
+    emit(
+        env,
+        topic::POLICY,
+        symbol_short!("violation"),
+        (policy_id.clone(), reason),
+    );
 }
 
 /// `TreasuryCreated` — topic `("treasury", "created")`.
 pub fn treasury_created(env: &Env, org: &String, admin: &Address) {
-    let topics = (symbol_short!("treasury"), symbol_short!("created"));
-    env.events().publish(topics, (org.clone(), admin.clone()));
+    emit(
+        env,
+        topic::TREASURY,
+        symbol_short!("created"),
+        (org.clone(), admin.clone()),
+    );
 }
 
 /// `AllowanceSet` — topic `("treasury", "allow_set")`.
@@ -999,9 +1159,10 @@ pub fn allowance_set(
     limit: i128,
     expires_at: u64,
 ) {
-    let topics = (symbol_short!("treasury"), symbol_short!("allow_set"));
-    env.events().publish(
-        topics,
+    emit(
+        env,
+        topic::TREASURY,
+        symbol_short!("allow_set"),
         (
             agent.clone(),
             recipient.clone(),
@@ -1025,9 +1186,10 @@ pub fn allowance_consumed(
     asset: &Address,
     amount: i128,
 ) {
-    let topics = (symbol_short!("treasury"), symbol_short!("allow_use"));
-    env.events().publish(
-        topics,
+    emit(
+        env,
+        topic::TREASURY,
+        symbol_short!("allow_use"),
         (
             agent.clone(),
             recipient.clone(),
@@ -1044,9 +1206,10 @@ pub fn allowance_consumed(
 /// contract's `allow_rem` topic and ending with the ledger timestamp
 /// (Issue #222).
 pub fn allowance_removed(env: &Env, agent: &Address, recipient: &Address, asset: &Address) {
-    let topics = (symbol_short!("treasury"), symbol_short!("allow_rem"));
-    env.events().publish(
-        topics,
+    emit(
+        env,
+        topic::TREASURY,
+        symbol_short!("allow_rem"),
         (
             agent.clone(),
             recipient.clone(),
@@ -1065,17 +1228,23 @@ pub fn reason(env: &Env, name: &str) -> Symbol {
 /// `UpgradeProposed` — topic `("version", "proposed")`. Published when an
 /// org owner or admin proposes a version upgrade for a module kind.
 pub fn upgrade_proposed(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
-    let topics = (symbol_short!("version"), symbol_short!("proposed"));
-    env.events()
-        .publish(topics, (kind, version, wasm_hash.clone()));
+    emit(
+        env,
+        topic::VERSION,
+        symbol_short!("proposed"),
+        (kind, version, wasm_hash.clone()),
+    );
 }
 
 /// `UpgradeRejected` — topic `("version", "rejected")`. Published when a
 /// pending upgrade proposal is rejected (or withdrawn by its proposer).
 pub fn upgrade_rejected(env: &Env, kind: ModuleKind, version: u32, wasm_hash: &BytesN<32>) {
-    let topics = (symbol_short!("version"), symbol_short!("rejected"));
-    env.events()
-        .publish(topics, (kind, version, wasm_hash.clone()));
+    emit(
+        env,
+        topic::VERSION,
+        symbol_short!("rejected"),
+        (kind, version, wasm_hash.clone()),
+    );
 }
 
 /// `UpgradeCommitted` — topic `("version", "committed")`. Published when a
@@ -1087,15 +1256,140 @@ pub fn upgrade_committed(
     wasm_hash: &BytesN<32>,
     address: &Address,
 ) {
-    let topics = (symbol_short!("version"), symbol_short!("committed"));
-    env.events()
-        .publish(topics, (kind, version, wasm_hash.clone(), address.clone()));
+    emit(
+        env,
+        topic::VERSION,
+        symbol_short!("committed"),
+        (kind, version, wasm_hash.clone(), address.clone()),
+    );
 }
 
 /// `WalletBatchExecuted` — topic `("wallet", "batch")`.
 pub fn wallet_batch_executed(env: &Env, wallet_id: u64, call_count: u32) {
-    let topics = (symbol_short!("wallet"), symbol_short!("batch"));
-    env.events().publish(topics, (wallet_id, call_count));
+    emit(
+        env,
+        topic::WALLET,
+        symbol_short!("batch"),
+        (wallet_id, call_count),
+    );
+}
+
+/// Topic action of [`budget_window_rolled`].
+pub const BUDGET_WINDOW_ROLLED: Symbol = symbol_short!("win_roll");
+
+/// Typed payload of [`budget_window_rolled`] (Issue #495).
+///
+/// * `budget_id` — the budget whose spending window rolled over;
+/// * `periods` — whole windows settled by this rollover (`> 1` when the
+///   budget sat idle across several windows);
+/// * `previous_spent` — the spend counter of the window that just closed,
+///   reset to zero by the rollover;
+/// * `window_start` / `window_end` — the new active window, half-open
+///   `[window_start, window_end)`;
+/// * `timestamp` — ledger time of the rollover (payload-ends-with-timestamp
+///   convention from Issue #222).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BudgetWindowRollover {
+    pub budget_id: String,
+    pub periods: u64,
+    pub previous_spent: i128,
+    pub window_start: u64,
+    pub window_end: u64,
+    pub timestamp: u64,
+}
+
+/// `BudgetWindowRolled` — topic `("budget", "win_roll")`, data
+/// [`BudgetWindowRollover`] (Issue #495).
+///
+/// Published whenever a recurring budget's spending window lapses and its
+/// counters reset for the new window — lazily, by the first spend or keeper
+/// call that observes the boundary.
+pub fn budget_window_rolled(
+    env: &Env,
+    budget_id: &String,
+    periods: u64,
+    previous_spent: i128,
+    window_start: u64,
+    window_end: u64,
+) {
+    emit(
+        env,
+        topic::BUDGET,
+        BUDGET_WINDOW_ROLLED,
+        BudgetWindowRollover {
+            budget_id: budget_id.clone(),
+            periods,
+            previous_spent,
+            window_start,
+            window_end,
+            timestamp: env.ledger().timestamp(),
+        },
+    );
+}
+
+/// Topic action of [`proposal_state_changed`].
+pub const PROPOSAL_STATE_CHANGED: Symbol = symbol_short!("state");
+
+/// Typed payload of [`proposal_state_changed`] (Issue #497).
+///
+/// `from` / `to` are the `u32` discriminants of the proposal lifecycle enum
+/// (`astroid_interfaces::proposal::ProposalState`), which this crate cannot
+/// name without a dependency cycle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalTransition {
+    pub proposal_id: u64,
+    pub from: u32,
+    pub to: u32,
+    pub timestamp: u64,
+}
+
+/// `ProposalStateChanged` — topic `("proposal", "state", proposal_id)`, data
+/// [`ProposalTransition`] (Issue #497).
+///
+/// Published on every lifecycle transition of a proposal, alongside the
+/// transition-specific event (`approved`, `executed`, ...), so an indexer can
+/// follow the state machine from one stream.
+pub fn proposal_state_changed(env: &Env, proposal_id: u64, from: u32, to: u32) {
+    emit_for(
+        env,
+        topic::PROPOSAL,
+        PROPOSAL_STATE_CHANGED,
+        proposal_id,
+        ProposalTransition {
+            proposal_id,
+            from,
+            to,
+            timestamp: env.ledger().timestamp(),
+        },
+    );
+}
+
+/// Topic action of [`policy_rule_denied`].
+pub const POLICY_RULE_DENIED: Symbol = symbol_short!("rule_deny");
+
+/// `PolicyRuleDenied` — topic `("policy", "rule_deny", policy_id)`, data
+/// `(rule_index, leaf_op, sub_reason)` (Issue #494).
+///
+/// Published when a composite policy rule refuses a transaction, naming which
+/// rule (`u32::MAX` for the policy's single composite tree, otherwise the
+/// rule-stack index), the `u32` discriminant of the leaf that decided it, and
+/// a stable sub-reason symbol.
+pub fn policy_rule_denied(
+    env: &Env,
+    policy_id: &String,
+    rule_index: u32,
+    leaf_op: u32,
+    sub_reason: Symbol,
+) {
+    emit_for(
+        env,
+        topic::POLICY,
+        POLICY_RULE_DENIED,
+        policy_id.clone(),
+        (rule_index, leaf_op, sub_reason),
+    );
 }
 
 // ---------------------------------------------------------------------------

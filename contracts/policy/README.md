@@ -66,6 +66,22 @@ to a maximum depth of 10. A policy has at most one composite rule
 (`add_policy_rule`). The stack combines under the policy's `All` / `Any`
 strategy.
 
+Since Issue #494 the leaves also cover stateful governance checks:
+`RecipientWhitelisted` and `AssetWhitelisted` (membership in the policy's
+recipient / asset allow-lists), `WithinAllowance` (velocity limit: the
+amount fits the current rate-limit window of the `(policy, asset)`
+allowance) and `MinAmount`.
+
+`evaluate_composite_policy(policy_id, payload)` evaluates the composite tree
+and then the rule stack, and returns `CompositeVerdict::Denied(RuleDenial)`
+naming the refusing rule (`source`, `rule_index`) and the **deciding leaf**
+(`leaf`, with a stable `leaf.sub_reason()` such as `rule_velocity` or
+`rule_not_whitelisted`). `check_composite_policy` enforces the same walk and
+returns `POLICY_DENIED`. Every composite refusal publishes
+`("policy", "rule_deny", policy_id)` with `(rule_index, leaf, sub_reason)`.
+Evaluation is deterministic: tree before stack, children in index order,
+short-circuiting combinators.
+
 ## Evaluation flow
 
 `check_transfer(policy_id, asset, recipient, amount)` and the read-only

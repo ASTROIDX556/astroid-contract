@@ -15,8 +15,13 @@
 //!    │          │           │
 //!    ▼          ▼           ▼
 //! Cancelled  Rejected     Failed
-//!             / Expired
+//!             / Expired   / Expired
+//!             / Defeated  / Defeated
 //! ```
+//!
+//! In governance vocabulary: `Pending` is *Active* (open for votes),
+//! `Approved` is *Passed*, `Defeated` is a vote that can no longer pass, and
+//! `Executed` is the completed action.
 //!
 //! ## Deterministic encoding
 //!
@@ -32,6 +37,7 @@
 //! | Execution attempted before `Approved`            | [`Error::ProposalNotApproved`]  |
 //! | Deadline passed before the action ran            | [`Error::ProposalExpired`]      |
 //! | A prerequisite proposal has not executed         | [`Error::PrerequisiteNotMet`]   |
+//! | Approve / execute a defeated proposal            | [`Error::ProposalDefeated`]     |
 
 use astroid_shared::errors::Error;
 use soroban_sdk::{contractclient, contracttype, Env, Vec};
@@ -66,6 +72,10 @@ pub enum ProposalState {
     /// deliberately distinct from [`ProposalState::Executed`] so a dependent
     /// proposal stays blocked rather than inheriting a broken prerequisite.
     Failed = 8,
+    /// The vote can no longer clear its quorum, majority and threshold bars:
+    /// even if every remaining eligible approver voted for it, the tally would
+    /// fall short (Issue #497). Terminal; the deposit is refunded.
+    Defeated = 9,
 }
 
 impl ProposalState {
@@ -97,6 +107,7 @@ impl ProposalState {
                 | ProposalState::Cancelled
                 | ProposalState::Executed
                 | ProposalState::Closed
+                | ProposalState::Defeated
         )
     }
 
@@ -124,13 +135,13 @@ impl ProposalState {
     ///
     /// ```text
     /// Created    → Pending
-    /// Pending    → Approved | Rejected | Cancelled | Expired
-    /// Approved   → Executed  | Failed   | Cancelled | Expired
+    /// Pending    → Approved | Rejected | Cancelled | Expired | Defeated
+    /// Approved   → Executed  | Failed   | Cancelled | Expired | Defeated
     /// Executed   → Closed
     /// ```
     ///
     /// Everything else is refused: a terminal state (`Rejected`,
-    /// `Cancelled`, `Expired`, `Failed`, `Closed`) has no outgoing edges, so
+    /// `Cancelled`, `Expired`, `Failed`, `Defeated`, `Closed`) has no outgoing edges, so
     /// a rejected proposal can never be cancelled (which would double-refund
     /// its deposit), a failed one can never execute, and a closed one can
     /// never be re-opened. `Created → Pending` is reserved for the documented
@@ -145,10 +156,12 @@ impl ProposalState {
                 | (Pending, Rejected)
                 | (Pending, Cancelled)
                 | (Pending, Expired)
+                | (Pending, Defeated)
                 | (Approved, Executed)
                 | (Approved, Failed)
                 | (Approved, Cancelled)
                 | (Approved, Expired)
+                | (Approved, Defeated)
                 | (Executed, Closed)
         )
     }

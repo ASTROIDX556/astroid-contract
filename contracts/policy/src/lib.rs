@@ -106,6 +106,28 @@
 //! the stack again, so the governance team can retire a rule without touching
 //! the remaining ones.
 //!
+//! ## Composite evaluation and sub-reasons (Issue #494)
+//!
+//! Rule leaves cover both static conditions (amount bounds, pinned
+//! recipient/asset, blocklists) and stateful governance checks: whitelist
+//! verification (`RecipientWhitelisted`, `AssetWhitelisted`) and velocity
+//! limits (`WithinAllowance`, which tests the amount against the current
+//! rate-limit window of the `(policy, asset)` allowance). Any of them can be
+//! combined with `And` / `Or` / `Not` in the composite tree or stacked as
+//! independent rules.
+//!
+//! Evaluation is deterministic: the composite tree runs first, then the rule
+//! stack in index order, every combinator short-circuits in child order, and
+//! the only clock is `env.ledger().timestamp()`. When a composite rule fails,
+//! the contract identifies the refusing rule and the **deciding leaf** — the
+//! leaf whose result fixed the outcome — and returns it as a [`RuleDenial`]
+//! from `evaluate_composite_policy`. `check_composite_policy` and
+//! `check_transfer` return the single [`Error::PolicyDenied`] code and publish
+//! the specific sub-reason (`rule_velocity`, `rule_not_whitelisted`, ...) in a
+//! `("policy", "rule_deny", policy_id)` event. Leaves read only the storage
+//! keys they need, and recipient-scoped lookups are cached for the whole
+//! evaluation, so a stack of rules costs at most one read per distinct fact.
+//!
 //! ## Recipient whitelisting
 //!
 //! A policy can additionally own an on-chain *recipient whitelist* — the
@@ -124,7 +146,7 @@
 use astroid_interfaces::{PolicyInterface, UpgradeableInterface};
 use astroid_shared::constants::{SECONDS_PER_DAY, SECONDS_PER_MONTH};
 use astroid_shared::errors::Error;
-use astroid_shared::events::ContractEvent;
+use astroid_shared::events::{self, ContractEvent};
 use astroid_shared::math::{checked_add, checked_sub};
 use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::{
@@ -184,6 +206,41 @@ pub enum RuleOp {
     Or = 6,
     /// Branch: negates the single child rule.
     Not = 7,
+    /// Leaf (Issue #494): the recipient is listed in this policy's recipient
+    /// whitelist directory (`add_recipient_to_whitelist`). Membership is
+    /// tested regardless of the enforcement toggle, so a rule can require
+    /// whitelisting even while the policy-wide gate is still being staged.
+    RecipientWhitelisted = 8,
+    /// Leaf (Issue #494): the asset is listed in this policy's asset
+    /// allow-list (`add_asset_to_whitelist`), regardless of the toggle.
+    AssetWhitelisted = 9,
+    /// Leaf (Issue #494): velocity limit — the amount fits within the
+    /// remaining headroom of the policy's `(policy, asset)` allowance in the
+    /// current rate-limit window (settled lazily, exactly as the allowance
+    /// gate does). An unset allowance passes; a lapsed one fails.
+    WithinAllowance = 10,
+    /// Leaf (Issue #494): transfer amount must be at least `value_i128`.
+    MinAmount = 11,
+}
+
+impl RuleOp {
+    /// Stable sub-reason symbol reported when this leaf decides a composite
+    /// rule denial (Issue #494). Off-chain consumers key on these strings, so
+    /// they are frozen alongside the discriminants.
+    pub fn sub_reason(self) -> &'static str {
+        match self {
+            RuleOp::MaxAmount => "rule_max_amount",
+            RuleOp::AllowedRecipient => "rule_recipient",
+            RuleOp::AllowedAsset => "rule_asset",
+            RuleOp::RecipientBlacklisted => "rule_blacklist",
+            RuleOp::MerchantBlacklisted => "rule_merchant",
+            RuleOp::And | RuleOp::Or | RuleOp::Not => "rule_combinator",
+            RuleOp::RecipientWhitelisted => "rule_not_whitelisted",
+            RuleOp::AssetWhitelisted => "rule_asset_not_listed",
+            RuleOp::WithinAllowance => "rule_velocity",
+            RuleOp::MinAmount => "rule_min_amount",
+        }
+    }
 }
 
 /// A single node in a flattened composite rule tree.
@@ -257,13 +314,35 @@ fn validate_rule_tree(tree: &RuleTree) -> Result<(), Error> {
 
 /// Cache blacklist membership for the recipient while evaluating a policy's
 /// composite rule and rule stack.
+///
+/// Only recipient-scoped facts are cached: one context is shared across every
+/// leg of a multi-asset request (same recipient, different assets), so
+/// asset- and amount-scoped leaves are always evaluated afresh.
 #[derive(Default)]
 struct RuleEvaluationContext {
     recipient_blacklisted: Option<bool>,
     merchant_blacklisted: Option<bool>,
+    recipient_whitelisted: Option<bool>,
 }
 
 impl RuleEvaluationContext {
+    fn recipient_whitelisted(
+        &mut self,
+        env: &Env,
+        policy_id: &String,
+        recipient: &Address,
+    ) -> bool {
+        if let Some(listed) = self.recipient_whitelisted {
+            return listed;
+        }
+        let listed = env.storage().persistent().has(&DataKey::RecipientWhitelist(
+            policy_id.clone(),
+            recipient.clone(),
+        ));
+        self.recipient_whitelisted = Some(listed);
+        listed
+    }
+
     fn recipient_blacklisted(&mut self, env: &Env, recipient: &Address) -> bool {
         if let Some(is_blacklisted) = self.recipient_blacklisted {
             return is_blacklisted;
@@ -289,50 +368,105 @@ impl RuleEvaluationContext {
     }
 }
 
+/// Read-only velocity check behind [`RuleOp::WithinAllowance`]: whether
+/// `amount` fits the `(policy, asset)` allowance headroom in the current
+/// window. Mirrors `consume_allowance` (unset or zero limit passes, lapsed
+/// envelope fails, windows settle lazily) but persists and publishes nothing.
+fn allowance_permits(
+    env: &Env,
+    policy_id: &String,
+    asset: &Address,
+    amount: i128,
+) -> Result<bool, Error> {
+    let mut allowance: AssetAllowance = match env
+        .storage()
+        .persistent()
+        .get(&DataKey::Allowance(policy_id.clone(), asset.clone()))
+    {
+        Some(a) => a,
+        None => return Ok(true),
+    };
+    if allowance.limit == 0 {
+        return Ok(true);
+    }
+    let now = env.ledger().timestamp();
+    if allowance.expires_at != 0 && now >= allowance.expires_at {
+        return Ok(false);
+    }
+    settle_window(&mut allowance, now)?;
+    let headroom = checked_sub(allowance.limit, allowance.spent)?;
+    Ok(amount <= headroom)
+}
+
 /// Evaluate a node in a [`RuleTree`] against `payload`.
+///
+/// Returns the boolean verdict together with the **deciding leaf** — the leaf
+/// whose result fixed this subtree's outcome (Issue #494):
+///
+/// * a leaf decides itself;
+/// * `And` is decided by its first failing child, or by its last child when
+///   every child passes;
+/// * `Or` is decided by its first passing child, or by its last child when
+///   every child fails;
+/// * `Not` is decided by its child.
+///
+/// Children are evaluated in index order and both combinators short-circuit,
+/// so the deciding leaf is a pure function of the tree and the payload.
 ///
 /// `depth` is decremented on every recursive call; returns
 /// `Err(Error::InvalidInput)` when exhausted (stack/gas protection).
 fn evaluate_node(
     env: &Env,
+    policy_id: &String,
     tree: &RuleTree,
     node_idx: u32,
     payload: &TransactionPayload,
     depth: u32,
     context: &mut RuleEvaluationContext,
-) -> Result<bool, Error> {
+) -> Result<(bool, RuleOp), Error> {
     if depth == 0 {
         return Err(Error::InvalidInput);
     }
     let remaining = depth - 1;
     let node = tree.get(node_idx).ok_or(Error::InvalidInput)?;
+    let leaf = |passed: bool| Ok((passed, node.op));
     match node.op {
-        RuleOp::MaxAmount => Ok(payload.amount <= node.value_i128),
-        RuleOp::AllowedRecipient => Ok(payload.recipient == node.value_address),
-        RuleOp::AllowedAsset => Ok(payload.asset == node.value_address),
-        RuleOp::RecipientBlacklisted => Ok(context.recipient_blacklisted(env, &payload.recipient)),
-        RuleOp::MerchantBlacklisted => Ok(context.merchant_blacklisted(env, &payload.recipient)),
-        RuleOp::And => {
-            if node.children_start == node.children_end {
-                return Err(Error::InvalidInput);
-            }
-            for i in node.children_start..node.children_end {
-                if !evaluate_node(env, tree, i, payload, remaining, context)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+        RuleOp::MaxAmount => leaf(payload.amount <= node.value_i128),
+        RuleOp::MinAmount => leaf(payload.amount >= node.value_i128),
+        RuleOp::AllowedRecipient => leaf(payload.recipient == node.value_address),
+        RuleOp::AllowedAsset => leaf(payload.asset == node.value_address),
+        RuleOp::RecipientBlacklisted => {
+            leaf(context.recipient_blacklisted(env, &payload.recipient))
         }
-        RuleOp::Or => {
-            if node.children_start == node.children_end {
+        RuleOp::MerchantBlacklisted => leaf(context.merchant_blacklisted(env, &payload.recipient)),
+        RuleOp::RecipientWhitelisted => {
+            leaf(context.recipient_whitelisted(env, policy_id, &payload.recipient))
+        }
+        RuleOp::AssetWhitelisted => leaf(env.storage().persistent().has(&DataKey::AssetWhitelist(
+            policy_id.clone(),
+            payload.asset.clone(),
+        ))),
+        RuleOp::WithinAllowance => leaf(allowance_permits(
+            env,
+            policy_id,
+            &payload.asset,
+            payload.amount,
+        )?),
+        RuleOp::And | RuleOp::Or => {
+            if node.children_start >= node.children_end {
                 return Err(Error::InvalidInput);
             }
+            // `true` for `Or`: the value that short-circuits the combinator.
+            let short_circuit_on = node.op == RuleOp::Or;
+            let mut decided = (!short_circuit_on, node.op);
             for i in node.children_start..node.children_end {
-                if evaluate_node(env, tree, i, payload, remaining, context)? {
-                    return Ok(true);
+                let child = evaluate_node(env, policy_id, tree, i, payload, remaining, context)?;
+                decided = child;
+                if child.0 == short_circuit_on {
+                    return Ok(child);
                 }
             }
-            Ok(false)
+            Ok(decided)
         }
         RuleOp::Not => {
             // `checked_sub` keeps the range arithmetic panic-free: a crafted
@@ -341,11 +475,59 @@ fn evaluate_node(
             if node.children_end.checked_sub(node.children_start) != Some(1) {
                 return Err(Error::InvalidInput);
             }
-            let result =
-                evaluate_node(env, tree, node.children_start, payload, remaining, context)?;
-            Ok(!result)
+            let (result, decided_by) = evaluate_node(
+                env,
+                policy_id,
+                tree,
+                node.children_start,
+                payload,
+                remaining,
+                context,
+            )?;
+            Ok((!result, decided_by))
         }
     }
+}
+
+/// Which part of a policy's composite configuration refused a transaction
+/// (Issue #494).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RuleSource {
+    /// The single tree registered with `set_composite_rule`.
+    CompositeTree = 0,
+    /// The rule stack registered with `add_policy_rule`.
+    RuleStack = 1,
+}
+
+/// The specific sub-reason behind a composite-rule `POLICY_DENIED`
+/// (Issue #494).
+///
+/// `reason` is [`PolicyDenialReason::CompositeRuleDenied`] or
+/// [`PolicyDenialReason::RuleStackDenied`]; `rule_index` is the stack index of
+/// the refusing rule (`0` for the composite tree); `leaf` is the deciding leaf
+/// (see [`evaluate_node`]) and `leaf.sub_reason()` its stable symbol.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleDenial {
+    pub reason: PolicyDenialReason,
+    pub source: RuleSource,
+    pub rule_index: u32,
+    pub leaf: RuleOp,
+}
+
+/// Outcome of [`PolicyContract::evaluate_composite_policy`] (Issue #494).
+///
+/// A sum type for the same reason as [`PolicyVerdict`]: a `#[contracttype]`
+/// cannot carry an `Option` of a custom contract type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompositeVerdict {
+    /// The composite tree and the whole rule stack passed.
+    Allowed,
+    /// A composite rule refused the transaction; the payload says which.
+    Denied(RuleDenial),
 }
 
 /// Strategy for combining multiple policy rules in the policy rules stack.
@@ -800,8 +982,10 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("registd")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("registd"),
             policy_id,
         );
         Ok(())
@@ -822,8 +1006,10 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rotated")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("rotated"),
             policy_id,
         );
         Ok(())
@@ -845,8 +1031,10 @@ impl PolicyContract {
         // Issue #222 — an enable/disable toggle is a state change an indexer
         // must see: identifiers first, then the ledger timestamp as the final
         // payload field (the standardized event convention).
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("enabled")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("enabled"),
             (policy_id, enabled, env.ledger().timestamp()),
         );
         Ok(())
@@ -866,8 +1054,10 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("stratgy")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("stratgy"),
             (policy_id, strategy as u32),
         );
         Ok(())
@@ -914,8 +1104,10 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id.clone()), &policy);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("timewin")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("timewin"),
             (policy_id, start_time, end_time, window_days),
         );
         Ok(())
@@ -953,8 +1145,10 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &true);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("asset_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("asset_add"),
             (policy_id, asset),
         );
         Ok(())
@@ -973,8 +1167,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("asset_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("asset_rem"),
             (policy_id, asset),
         );
         Ok(())
@@ -995,8 +1191,10 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &());
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("ablk_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("ablk_add"),
             (policy_id, asset),
         );
         Ok(())
@@ -1015,8 +1213,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("ablk_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("ablk_rem"),
             (policy_id, asset),
         );
         Ok(())
@@ -1044,8 +1244,10 @@ impl PolicyContract {
         // Issue #222 — same schema as `set_recipient_whitelist_enabled`'s
         // `wl_mode`, namespaced by the whitelist it toggles, ending with the
         // ledger timestamp.
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("awl_mode")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("awl_mode"),
             (policy_id, enabled, env.ledger().timestamp()),
         );
         Ok(())
@@ -1091,8 +1293,10 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("blk_add"),
             (policy_id, address),
         );
         Ok(())
@@ -1111,8 +1315,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("blk_rem"),
             (policy_id, address),
         );
         Ok(())
@@ -1131,8 +1337,10 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("merch_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("merch_add"),
             (policy_id, merchant_address),
         );
         Ok(())
@@ -1151,8 +1359,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("merch_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("merch_rem"),
             (policy_id, merchant_address),
         );
         Ok(())
@@ -1172,8 +1382,10 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("cat_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("cat_add"),
             (policy_id, category),
         );
         Ok(())
@@ -1192,8 +1404,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("cat_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("cat_rem"),
             (policy_id, category),
         );
         Ok(())
@@ -1214,8 +1428,10 @@ impl PolicyContract {
             return Err(Error::AlreadyExists);
         }
         env.storage().persistent().set(&key, &policy_id);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("blk_add"),
             (policy_id, address),
         );
         Ok(())
@@ -1234,8 +1450,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("blk_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("blk_rem"),
             (policy_id, address),
         );
         Ok(())
@@ -1261,8 +1479,10 @@ impl PolicyContract {
             &DataKey::RecipientWhitelistEnabled(policy_id.clone()),
             &enabled,
         );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("wl_mode")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("wl_mode"),
             (policy_id, enabled),
         );
         Ok(())
@@ -1294,8 +1514,10 @@ impl PolicyContract {
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
         index.push_back(recipient.clone());
         env.storage().persistent().set(&index_key, &index);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("wl_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("wl_add"),
             (policy_id, recipient),
         );
         Ok(())
@@ -1334,8 +1556,10 @@ impl PolicyContract {
         } else {
             env.storage().persistent().set(&index_key, &index);
         }
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("wl_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("wl_rem"),
             (policy_id, recipient),
         );
         Ok(())
@@ -1538,8 +1762,10 @@ impl PolicyContract {
             &DataKey::Allowance(policy_id.clone(), asset.clone()),
             &allowance,
         );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("allow_set")),
+        events::emit(
+            env,
+            events::topic::POLICY,
+            symbol_short!("allow_set"),
             (policy_id, asset, limit),
         );
         Ok(())
@@ -1558,8 +1784,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("allow_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("allow_rem"),
             (policy_id, asset),
         );
         Ok(())
@@ -1664,8 +1892,10 @@ impl PolicyContract {
                 daily_limit,
             },
         );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("agt_limit")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("agt_limit"),
             (policy_id, agent, per_tx_limit, daily_limit),
         );
         Ok(())
@@ -1689,8 +1919,10 @@ impl PolicyContract {
         env.storage()
             .persistent()
             .remove(&DataKey::AgentDailySpend(policy_id.clone(), agent.clone()));
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("agt_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("agt_rem"),
             (policy_id, agent),
         );
         Ok(())
@@ -1764,8 +1996,10 @@ impl PolicyContract {
             &DataKey::AgentDailySpend(policy_id.clone(), agent.clone()),
             &record,
         );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("agt_spend")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("agt_spend"),
             (policy_id, agent, amount, record.spent),
         );
         Ok(remaining)
@@ -1869,8 +2103,10 @@ impl PolicyContract {
         validate_rule_tree(&rule_tree)?;
         let key = DataKey::CompositeRule(policy_id.clone());
         env.storage().persistent().set(&key, &rule_tree);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rule_set")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("rule_set"),
             policy_id,
         );
         Ok(())
@@ -1884,8 +2120,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rule_clr")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("rule_clr"),
             policy_id,
         );
         Ok(())
@@ -1909,24 +2147,122 @@ impl PolicyContract {
         payload: TransactionPayload,
     ) -> Result<bool, Error> {
         let mut context = RuleEvaluationContext::default();
-        Self::evaluate_composite_rule_with_context(&env, &policy_id, &payload, &mut context)
+        Ok(Self::composite_tree_denial(&env, &policy_id, &payload, &mut context)?.is_none())
     }
 
-    fn evaluate_composite_rule_with_context(
+    /// Evaluate the policy's whole composite configuration — the composite
+    /// tree, then the rule stack under the policy's combination strategy —
+    /// and report the specific sub-reason of a refusal (Issue #494).
+    ///
+    /// Deterministic: rules are walked in a fixed order (tree first, then the
+    /// stack by index) and every combinator short-circuits, so the reported
+    /// [`RuleDenial`] — which rule refused and which leaf decided it — is a
+    /// pure function of on-chain state, the ledger time and the payload.
+    ///
+    /// Nothing is persisted. A refusal is a verdict, not an `Err`: it
+    /// publishes one `("policy", "rule_deny", policy_id)` event carrying the
+    /// rule index, leaf and sub-reason. Errors are reserved for a non-positive
+    /// amount ([`Error::InvalidAmount`]), an unknown policy
+    /// ([`Error::NotFound`]) and an unreadable tree ([`Error::InvalidInput`]).
+    pub fn evaluate_composite_policy(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<CompositeVerdict, Error> {
+        require_positive_amount(payload.amount)?;
+        let policy = Self::load(&env, &policy_id)?;
+        let mut context = RuleEvaluationContext::default();
+        match Self::composite_denial(
+            &env,
+            &policy_id,
+            &payload,
+            &mut context,
+            policy.rule_combination_strategy,
+        )? {
+            None => Ok(CompositeVerdict::Allowed),
+            Some(denial) => {
+                Self::report_rule_denial(&env, &policy_id, &denial);
+                Ok(CompositeVerdict::Denied(denial))
+            }
+        }
+    }
+
+    /// Enforce the policy's composite configuration only, returning
+    /// [`Error::PolicyDenied`] when any composite rule fails (Issue #494).
+    ///
+    /// The refusal publishes the `PolicyViolation` event with the deciding
+    /// leaf's sub-reason (e.g. `rule_velocity`, `rule_not_whitelisted`) plus
+    /// the structured `rule_deny` event, so the specific cause is observable
+    /// even though the error code is the single `POLICY_DENIED`. Use
+    /// [`Self::evaluate_composite_policy`] to obtain the sub-reason as a value.
+    pub fn check_composite_policy(
+        env: Env,
+        policy_id: String,
+        payload: TransactionPayload,
+    ) -> Result<(), Error> {
+        match Self::evaluate_composite_policy(env.clone(), policy_id.clone(), payload)? {
+            CompositeVerdict::Allowed => Ok(()),
+            CompositeVerdict::Denied(denial) => {
+                events_policy_violation(&env, &policy_id, denial.leaf.sub_reason());
+                Err(Error::PolicyDenied)
+            }
+        }
+    }
+
+    /// The first composite refusal for `payload`, if any: the composite tree
+    /// first, then the rule stack under `strategy`.
+    fn composite_denial(
         env: &Env,
         policy_id: &String,
         payload: &TransactionPayload,
         context: &mut RuleEvaluationContext,
-    ) -> Result<bool, Error> {
+        strategy: PolicyCombinationStrategy,
+    ) -> Result<Option<RuleDenial>, Error> {
+        if let Some(denial) = Self::composite_tree_denial(env, policy_id, payload, context)? {
+            return Ok(Some(denial));
+        }
+        Self::rule_stack_denial(env, policy_id, payload, context, strategy)
+    }
+
+    /// Evaluate the composite tree (if any). `None` when it passes or none is
+    /// registered (permissive default).
+    fn composite_tree_denial(
+        env: &Env,
+        policy_id: &String,
+        payload: &TransactionPayload,
+        context: &mut RuleEvaluationContext,
+    ) -> Result<Option<RuleDenial>, Error> {
         let key = DataKey::CompositeRule(policy_id.clone());
         let tree: RuleTree = match env.storage().persistent().get(&key) {
             Some(t) => t,
-            None => return Ok(true),
+            None => return Ok(None),
         };
         if tree.is_empty() {
-            return Ok(true);
+            return Ok(None);
         }
-        evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)
+        let (passed, leaf) =
+            evaluate_node(env, policy_id, &tree, 0, payload, MAX_RULE_DEPTH, context)?;
+        Ok(if passed {
+            None
+        } else {
+            Some(RuleDenial {
+                reason: PolicyDenialReason::CompositeRuleDenied,
+                source: RuleSource::CompositeTree,
+                rule_index: 0,
+                leaf,
+            })
+        })
+    }
+
+    /// Publish the structured sub-reason event for a composite refusal.
+    fn report_rule_denial(env: &Env, policy_id: &String, denial: &RuleDenial) {
+        events::policy_rule_denied(
+            env,
+            policy_id,
+            denial.rule_index,
+            denial.leaf as u32,
+            soroban_sdk::Symbol::new(env, denial.leaf.sub_reason()),
+        );
     }
 
     // --- multi-rule composition ---
@@ -1965,8 +2301,10 @@ impl PolicyContract {
         stack.push_back(rule_tree);
         let count = stack.len();
         env.storage().persistent().set(&key, &stack);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rule_add")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("rule_add"),
             (policy_id, count),
         );
         Ok(count)
@@ -1999,8 +2337,10 @@ impl PolicyContract {
         } else {
             env.storage().persistent().set(&key, &stack);
         }
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rule_rem")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("rule_rem"),
             (policy_id, index),
         );
         Ok(())
@@ -2014,8 +2354,10 @@ impl PolicyContract {
             return Err(Error::NotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("rules_clr")),
+        events::emit(
+            &env,
+            events::topic::POLICY,
+            symbol_short!("rules_clr"),
             policy_id,
         );
         Ok(())
@@ -2061,48 +2403,63 @@ impl PolicyContract {
         context: &mut RuleEvaluationContext,
         strategy: PolicyCombinationStrategy,
     ) -> Result<bool, Error> {
+        Ok(Self::rule_stack_denial(env, policy_id, payload, context, strategy)?.is_none())
+    }
+
+    /// Evaluate the rule stack under `strategy`, reporting the refusal.
+    ///
+    /// * `All` — every rule must pass; the first failing rule (stack order)
+    ///   is reported and evaluation stops there.
+    /// * `Any` — one passing rule suffices and stops evaluation; when every
+    ///   rule fails, the **first** rule in stack order is reported. An empty
+    ///   stack is permissive under both strategies.
+    fn rule_stack_denial(
+        env: &Env,
+        policy_id: &String,
+        payload: &TransactionPayload,
+        context: &mut RuleEvaluationContext,
+        strategy: PolicyCombinationStrategy,
+    ) -> Result<Option<RuleDenial>, Error> {
         let stack: RuleStack = env
             .storage()
             .persistent()
             .get(&DataKey::PolicyRules(policy_id.clone()))
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         let count = stack.len();
-
-        match strategy {
-            PolicyCombinationStrategy::All => {
-                // All rules must pass (existing behavior)
-                for i in 0..count {
-                    // `get` bounds-checks the index; a miss means the stack changed
-                    // under us, which storage cannot do mid-invocation — fail closed.
-                    let tree = stack.get(i).ok_or(Error::InvalidInput)?;
-                    if tree.is_empty() {
-                        continue;
-                    }
-                    if !evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+        if count == 0 {
+            return Ok(None);
+        }
+        let deny = |rule_index: u32, leaf: RuleOp| RuleDenial {
+            reason: PolicyDenialReason::RuleStackDenied,
+            source: RuleSource::RuleStack,
+            rule_index,
+            leaf,
+        };
+        let mut first_failure: Option<RuleDenial> = None;
+        for i in 0..count {
+            // `get` bounds-checks the index; a miss means the stack changed
+            // under us, which storage cannot do mid-invocation — fail closed.
+            let tree = stack.get(i).ok_or(Error::InvalidInput)?;
+            if tree.is_empty() {
+                continue;
             }
+            let (passed, leaf) =
+                evaluate_node(env, policy_id, &tree, 0, payload, MAX_RULE_DEPTH, context)?;
+            match strategy {
+                PolicyCombinationStrategy::All if !passed => return Ok(Some(deny(i, leaf))),
+                PolicyCombinationStrategy::Any if passed => return Ok(None),
+                PolicyCombinationStrategy::Any if first_failure.is_none() => {
+                    first_failure = Some(deny(i, leaf));
+                }
+                _ => {}
+            }
+        }
+        match strategy {
+            PolicyCombinationStrategy::All => Ok(None),
+            // Every rule failed (or, defensively, every tree was empty —
+            // registration rejects empty trees — which fails closed).
             PolicyCombinationStrategy::Any => {
-                // At least one rule must pass (new behavior)
-                // If no rules are registered, allow by default
-                if count == 0 {
-                    return Ok(true);
-                }
-                for i in 0..count {
-                    // `get` bounds-checks the index; a miss means the stack changed
-                    // under us, which storage cannot do mid-invocation — fail closed.
-                    let tree = stack.get(i).ok_or(Error::InvalidInput)?;
-                    if tree.is_empty() {
-                        continue;
-                    }
-                    if evaluate_node(env, &tree, 0, payload, MAX_RULE_DEPTH, context)? {
-                        return Ok(true);
-                    }
-                }
-                // No rules passed
-                Ok(false)
+                Ok(Some(first_failure.unwrap_or_else(|| deny(0, RuleOp::Or))))
             }
         }
     }
@@ -2234,8 +2591,10 @@ impl PolicyContract {
             &DataKey::Allowance(allowance.policy_id.clone(), allowance.asset.clone()),
             allowance,
         );
-        env.events().publish(
-            (symbol_short!("policy"), symbol_short!("allow_use")),
+        events::emit(
+            env,
+            events::topic::POLICY,
+            symbol_short!("allow_use"),
             (
                 allowance.policy_id.clone(),
                 allowance.asset.clone(),
@@ -2421,20 +2780,24 @@ impl PolicyContract {
         // from `screen_recipient_rules`, so `RecipientBlacklisted` /
         // `MerchantBlacklisted` leaves reuse them instead of re-reading storage
         // on every node.
-        if !Self::evaluate_composite_rule_with_context(env, policy_id, &payload, context)? {
-            return Ok((None, Some(PolicyDenialReason::CompositeRuleDenied)));
-        }
+        //
         // Multi-rule stack: evaluation respects the policy's combination
         // strategy. For `All` every registered rule must pass; for `Any` at
         // least one must.
-        if !Self::evaluate_policy_rules_with_context(
+        //
+        // A composite refusal publishes its structured sub-reason
+        // (`rule_deny`: rule index + deciding leaf, Issue #494) here, where
+        // the detail is known; the generic `rule_denied` / `rules_denied`
+        // violation is still reported once at the boundary.
+        if let Some(denial) = Self::composite_denial(
             env,
             policy_id,
             &payload,
             context,
             policy.rule_combination_strategy,
         )? {
-            return Ok((None, Some(PolicyDenialReason::RuleStackDenied)));
+            Self::report_rule_denial(env, policy_id, &denial);
+            return Ok((None, Some(denial.reason)));
         }
         Ok((allowance, None))
     }

@@ -3266,3 +3266,23 @@ fn sweep_without_recovery_address_or_with_duplicates_is_refused() {
         Err(Ok(Error::AssetNotAuthorized))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #493 — standardized event emission through shared/events.rs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn freeze_emits_canonical_tuple_and_typed_events() {
+    use astroid_shared::events::topic;
+    let h = setup("vault", 0);
+    h.client.freeze(&h.multisig);
+    let cat: Val = topic::TREASURY.into_val(&h.env);
+    let act: Val = Symbol::new(&h.env, "frozen").into_val(&h.env);
+    let tuple = h.env.events().all().iter().any(|(_, topics, _)| {
+        topics.len() == 2
+            && topics.get(0).unwrap().shallow_eq(&cat)
+            && topics.get(1).unwrap().shallow_eq(&act)
+    });
+    assert!(tuple, "expected (treasury, frozen)");
+    assert_event(&h.env, "TreasuryFrozen");
+}

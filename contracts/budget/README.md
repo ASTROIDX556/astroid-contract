@@ -29,6 +29,10 @@ Budget contract — time-windowed spending limits with rollover, deficit carryfo
 - `get(budget_id)` — full budget record.
 - `get_asset_budget(budget_id, token)` — full per-asset record (settles window first).
 - `rollover_preview(budget_id)` — read-only preview of the next period transition (Issue #313).
+- `sync_window(budget_id)` — permissionless keeper call: settles every lapsed spending window (spend counter reset, boundary re-anchored, parameters untouched) and returns a `WindowStatus` (Issue #495).
+- `window_status(budget_id)` — read-only `WindowStatus` as it would be after settling any lapsed window (Issue #495).
+
+Every spend path first runs the internal `check_and_rollover_window` hook, so a stale window never blocks a legitimate spend and a period boundary is always enforced. Windows are half-open `[window_start, window_start + duration)`: a ledger timestamp exactly equal to the window end belongs to the next window.
 
 ## Invariants
 
@@ -111,6 +115,7 @@ All errors use the shared [`Error`] enum from `astroid-shared` (re-exported as `
 | Budget not yet active (scheduled) | `BudgetNotActive` (45) — `BudgetError` only |
 | Token not registered for per-asset spend | `AssetNotAuthorized` (43) |
 | Duplicate token in batch spend | `InvalidInput` (4) |
+| Window record cannot be rolled over deterministically (unrepresentable window end, negative counter) | `InvalidTimeWindow` (46) |
 
 Budget-specific codes (`BudgetError`) mirror the shared codes where applicable. `BudgetNotActive` (45) is unique to `BudgetError`; it folds to `BudgetExpired` when converted to the shared `Error`.
 
@@ -127,6 +132,7 @@ Budget-specific codes (`BudgetError`) mirror the shared codes where applicable. 
 - `("budget", "set_ast")` — same topic on `set_budget_limit_with_rollover`.
 - `("budget", "ast_roll")` — `(budget_id, token, rollover_bps, max_rollover_cap)` on `set_asset_rollover_config`.
 - `("budget", "ast_spend")` — `(budget_id, token, amount)` on per-asset spend.
+- `("budget", "win_roll")` — `BudgetWindowRollover { budget_id, periods, previous_spent, window_start, window_end, timestamp }` whenever a spending window rolls over (Issue #495).
 - `BudgetUpdated` (canonical `ContractEvent`) — emitted on every state change.
 
 ## Cross-contract Flow
