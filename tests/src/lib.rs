@@ -13,6 +13,8 @@
 //! the treasury so the flow moves real value from deposit to escrow custody.
 
 #[cfg(test)]
+pub mod agent_workflow_e2e;
+#[cfg(test)]
 pub mod e2e_agent_spending;
 #[cfg(test)]
 pub mod error_codes;
@@ -46,6 +48,8 @@ pub mod proposal_to_wallet_execution;
 pub mod registry_batch;
 #[cfg(test)]
 pub mod registry_upgrade;
+#[cfg(test)]
+pub mod registry_wallet_treasury;
 #[cfg(test)]
 pub mod treasury_transfer_auth;
 #[cfg(test)]

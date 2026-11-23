@@ -22,8 +22,11 @@
 //!   `BalanceEntry`, `Map<Address,i128>` checked credit/debit/query, Vec
 //!   deduplication and ledger reconciliation.
 //! - [`validation`] — small guard helpers (positive amounts, time windows, ...).
+//! - [`auth`]        — multi-signature weight aggregation and threshold
+//!   verification shared by the multisig and proposal contracts.
 //! - [`constants`] — protocol-wide constants (time units, storage TTLs, limits).
 
+pub mod auth;
 pub mod balance;
 pub mod constants;
 pub mod errors;

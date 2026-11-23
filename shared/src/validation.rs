@@ -79,9 +79,14 @@ pub fn require_within_amount_bounds(value: i128, min: i128, max: i128) -> Result
 
 /// Verify multi-signer quorum approvals against configured signer weights and threshold.
 ///
+/// This is the slice-based form of the shared threshold helper: the weight
+/// accumulation, duplicate detection, zero-weight handling and comparison all
+/// live in [`crate::auth`], so this function and the contracts that use the
+/// helper directly can never disagree about the same tally.
+///
 /// Validates:
-/// - `signers` and `weights` have equal non-zero length (`Error::InvalidInput`).
 /// - `threshold` is strictly positive (`Error::InvalidThreshold`).
+/// - `signers` and `weights` have equal non-zero length (`Error::InvalidInput`).
 /// - `signers` contains no duplicate addresses (`Error::InvalidInput`).
 /// - `approvals` contains no duplicate signers (`Error::AlreadySigned`).
 /// - Every address in `approvals` is present in `signers` (`Error::NotASigner`).
@@ -93,53 +98,12 @@ pub fn verify_quorum(
     approvals: &[Address],
     threshold: u32,
 ) -> Result<(), Error> {
-    if signers.len() != weights.len() || signers.is_empty() {
-        return Err(Error::InvalidInput);
-    }
-    if threshold == 0 {
-        return Err(Error::InvalidThreshold);
-    }
-
-    for i in 0..signers.len() {
-        for j in (i + 1)..signers.len() {
-            if signers[i] == signers[j] {
-                return Err(Error::InvalidInput);
-            }
-        }
-    }
-
-    for i in 0..approvals.len() {
-        for j in (i + 1)..approvals.len() {
-            if approvals[i] == approvals[j] {
-                return Err(Error::AlreadySigned);
-            }
-        }
-    }
-
-    let mut total_weight: u64 = 0;
-
-    for app in approvals.iter() {
-        let mut found = false;
-        for (idx, signer) in signers.iter().enumerate() {
-            if app == signer {
-                found = true;
-                total_weight = total_weight
-                    .checked_add(weights[idx] as u64)
-                    .ok_or(Error::Overflow)?;
-                if total_weight > u32::MAX as u64 {
-                    return Err(Error::Overflow);
-                }
-                break;
-            }
-        }
-        if !found {
-            return Err(Error::NotASigner);
-        }
-    }
-
-    if total_weight < threshold as u64 {
-        return Err(Error::QUORUM_NOT_MET);
-    }
-
-    Ok(())
+    crate::auth::verify_approvals(
+        signers,
+        weights,
+        approvals,
+        threshold,
+        Error::QUORUM_NOT_MET,
+    )
+    .map(|_| ())
 }
