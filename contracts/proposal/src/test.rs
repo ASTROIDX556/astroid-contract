@@ -1,7 +1,9 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{timelock, ProposalContract, ProposalContractClient, ProposalState, VoteBars, ProposalTiming};
+use crate::{
+    timelock, ProposalContract, ProposalContractClient, ProposalState, ProposalTiming, VoteBars,
+};
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_shared::constants::{MAX_DEPENDENCIES, MAX_PRUNE_BATCH, MAX_SIGNERS};
 use astroid_shared::errors::Error;
