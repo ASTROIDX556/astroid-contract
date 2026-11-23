@@ -2322,8 +2322,8 @@ fn creating_and_freezing_a_wallet_each_report_one_standard_event() {
     let owner = Address::generate(&h.env);
     let id = h.client.create_wallet(&owner);
 
-    // Creation used to emit the same fact twice: once through the legacy
-    // `events::wallet_created` helper and once canonically.
+    // Creation goes through the single `events::wallet_created` builder and
+    // must publish one canonical event, never a legacy tuple too.
     assert_event_data(&h.env, "WalletCreated", 1, (id, owner.clone()));
     assert_no_legacy_wallet_topics(&h.env, &h.contract_id);
 
