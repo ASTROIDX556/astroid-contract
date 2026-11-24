@@ -1278,6 +1278,11 @@ impl EscrowContract {
         Ok(())
     }
 
+    pub fn arbiter(env: Env, id: u64) -> Result<Address, Error> {
+        let escrow = load_escrow(&env, id)?;
+        Ok(escrow.arbiter)
+    }
+
     /// Mark a timed-out escrow `Expired` once its deadline has passed.
     ///
     /// Funds stay in custody until a refund path runs; use
