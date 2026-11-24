@@ -907,7 +907,7 @@ pub fn escrow_created(
             escrow_id,
             sender: sender.clone(),
             recipient: recipient.clone(),
-            arbiter: arbiter.clone(),
+
         },
     );
 }
@@ -922,7 +922,7 @@ pub fn escrow_funded(env: &Env, escrow_id: u64, sender: &Address, amount: i128) 
     );
     publish(
         env,
-        ContractEvent::EscrowFunded {
+        ContractEvent::EscrowRefunded {
             escrow_id,
             sender: sender.clone(),
             amount,

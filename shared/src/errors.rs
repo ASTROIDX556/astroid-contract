@@ -402,8 +402,6 @@ impl Error {
         Error::CircularUpgrade,
         Error::InvalidUpgradeAddress,
         Error::VersionNotMonotonic,
-        Error::InvalidAddress,
-        Error::ModuleAlreadyRegistered,
         // --- Budget (40-47) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
@@ -447,18 +445,16 @@ impl Error {
         Error::ProposalDefeated,
         Error::PrerequisiteNotMet,
         Error::CircularDependencyDetected,
-        // --- Escrow (80-82) ---
+        // --- Escrow (80-82, 86-87) ---
         Error::EscrowExpired,
         Error::TimeLockActive,
         Error::GraceActive,
-        // --- Treasury (83-85) ---
+        Error::EscrowNotExpired,
+        Error::EscrowAlreadySettled,
+        // --- Treasury (83-85, 88-89) ---
         Error::AllowanceExceeded,
         Error::AllowanceExpired,
         Error::TreasuryPaused,
-        // --- Escrow continued (86-87) ---
-        Error::EscrowNotExpired,
-        Error::EscrowAlreadySettled,
-        // --- Treasury continued (88-89) ---
         Error::AllocationLimitExceeded,
         Error::EmergencySweepUnauthorized,
     ];
