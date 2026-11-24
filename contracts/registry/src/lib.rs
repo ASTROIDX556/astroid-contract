@@ -578,7 +578,10 @@ impl RegistryContract {
             return Err(Error::InvalidAddress);
         }
         let key = DataKey::Module(org.clone(), kind);
-        ensure!(!env.storage().persistent().has(&key), Error::ModuleAlreadyRegistered);
+        ensure!(
+            !env.storage().persistent().has(&key),
+            Error::ModuleAlreadyRegistered
+        );
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
         // A (re)registration points at a fresh implementation, so any prior
