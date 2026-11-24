@@ -1206,6 +1206,17 @@ impl RegistryContract {
         Ok(record.address)
     }
 
+    pub fn validate_registry_upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<u32, Error> {
+        let plan = Self::plan_registry_upgrade(&env, &wasm_hash)?;
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistryVersion)
+            .unwrap_or(0);
+        ensure!(plan.to_version > current_version, Error::CircularUpgrade);
+        Ok(plan.to_version)
+    }
+
     pub fn upgrade(env: Env, caller: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
