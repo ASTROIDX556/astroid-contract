@@ -573,12 +573,15 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
-        // Reject zero addresses (all bytes zero) — an invalid contract principal
-        // cannot serve as a module and must be caught before storage is written.
+        // Reject zero addresses or non-contract addresses.
         if !Self::is_contract_address(&address) {
-            return Err(Error::InvalidUpgradeAddress);
+            return Err(Error::InvalidAddress);
         }
         let key = DataKey::Module(org.clone(), kind);
+        ensure!(
+            !env.storage().persistent().has(&key),
+            Error::ModuleAlreadyRegistered
+        );
         env.storage().persistent().set(&key, &address);
         Self::bump(&env, &key);
         // A (re)registration points at a fresh implementation, so any prior
@@ -822,10 +825,11 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         Self::require_admin(&env, &caller)?;
         ensure!(version != 0, Error::InvalidInput);
+        if !Self::is_contract_address(&address) {
+            return Err(Error::InvalidAddress);
+        }
         require_valid_wasm_hash(&env, &wasm_hash)?;
-        // A pair is taken if either layout already holds it. The common case is
-        // a single existence check; the legacy key is only consulted when the
-        // consolidated one is free, so a fresh registration still pays one read.
+        // A pair is taken if either layout already holds it.
         ensure!(
             !env.storage()
                 .persistent()
@@ -834,7 +838,7 @@ impl RegistryContract {
                     .storage()
                     .persistent()
                     .has(&DataKey::Version(kind, version)),
-            Error::AlreadyExists
+            Error::ModuleAlreadyRegistered
         );
         ensure!(
             Self::is_wasm_approved(env.clone(), kind, wasm_hash.clone()),
