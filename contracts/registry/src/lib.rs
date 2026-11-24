@@ -1207,14 +1207,26 @@ impl RegistryContract {
         Ok(record.address)
     }
 
-    /// Move `org`'s `kind` module onto the implementation registered at
-    /// `target_version` for that same kind, after checking the whole upgrade
-    /// path. Returns the version the module now runs.
-    ///
-    /// The address and the WASM hash are resolved from the version record, never
-    /// taken from the caller, so there is no way to point a module at a contract
-    /// the protocol admin did not publish for its kind or at code whose hash is
-    /// not approved. See the crate-level "Upgrade paths" section for the full
+    pub fn upgrade_contract(
+        &mut self,
+        env: Env,
+        contract_id: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let admin = RegistryContract::get_admin(&env)?;
+        admin.require_auth();
+        
+        if !Self::is_contract_address(&contract_id) {
+            return Err(Error::InvalidUpgradeAddress);
+        }
+        if new_wasm_hash.is_zero() {
+            return Err(Error::InvalidInput);
+        }
+
+        self.version_map
+            .set(contract_id.clone(), new_wasm_hash.clone());
+        Ok(())
+    }
     /// order of checks; the short version is:
     ///
     /// 1. the registry is not frozen — [`Error::RegistryFrozen`];

@@ -115,6 +115,14 @@ fn stranger_cannot_transfer_ownership() {
 }
 
 #[test]
+fn test_registry_upgrade_validation_guards() {
+    let (env, client, admin) = setup();
+    let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let res = client.try_upgrade(&admin, &zero_hash);
+    assert!(res.is_err());
+}
+
+#[test]
 fn version_lookup_upgrade_strategy() {
     let (env, client, admin) = setup();
     let v1 = Address::generate(&env);
