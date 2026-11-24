@@ -1207,21 +1207,29 @@ impl RegistryContract {
         Ok(record.address)
     }
 
-    /// Move `org`'s `kind` module onto the implementation registered at
-    /// `target_version` for that same kind, after checking the whole upgrade
-    /// path. Returns the version the module now runs.
-    ///
-    /// The address and the WASM hash are resolved from the version record, never
-    /// taken from the caller, so there is no way to point a module at a contract
-    /// the protocol admin did not publish for its kind or at code whose hash is
-    /// not approved. See the crate-level "Upgrade paths" section for the full
-    /// order of checks; the short version is:
-    ///
-    /// 1. the registry is not frozen — [`Error::RegistryFrozen`];
-    /// 2. `caller` is signed and may manage this `kind` for `org` —
-    ///    [`Error::Unauthorized`] (or [`Error::NotFound`] for an unknown org);
-    /// 3. the module is already registered — [`Error::NotFound`];
-    /// 4. `target_version` is non-zero — [`Error::InvalidInput`];
+    pub fn upgrade(env: Env, caller: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        let plan = Self::plan_registry_upgrade(&env, &wasm_hash)?;
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistryVersion)
+            .unwrap_or(0);
+        ensure!(plan.to_version > current_version, Error::CircularUpgrade);
+        env.storage()
+            .instance()
+            .set(&DataKey::RegistryVersion, &plan.to_version);
+        env.deploy().update_current_contract_wasm(&plan.wasm_hash);
+        events::emit(
+            &env,
+            events::topic::REGISTRY,
+            symbol_short!("upgrade"),
+            (plan.from_version, plan.to_version, plan.wasm_hash),
+        );
+        Ok(())
+    }
     /// 5. `target_version` is strictly newer than the module's current pin —
     ///    [`Error::CircularUpgrade`], which is what stops the path from
     ///    revisiting or reversing;
