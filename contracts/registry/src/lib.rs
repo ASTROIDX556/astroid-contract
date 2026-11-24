@@ -1212,20 +1212,20 @@ impl RegistryContract {
         env: Env,
         contract_id: Address,
         new_wasm_hash: BytesN<32>,
-    ) -> Result<(), RegistryError> {
-        let admin = self.get_admin(&env)?;
+    ) -> Result<(), Error> {
+        let admin = RegistryContract::get_admin(&env)?;
         admin.require_auth();
         
-        if contract_id.is_zero() {
-            return Err(RegistryError::InvalidContractAddress);
+        if !Self::is_contract_address(&contract_id) {
+            return Err(Error::InvalidUpgradeAddress);
         }
         if new_wasm_hash.is_zero() {
-            return Err(RegistryError::InvalidWasmHash);
+            return Err(Error::InvalidInput);
         }
 
         self.version_map
             .set(contract_id.clone(), new_wasm_hash.clone());
-        Ok()
+        Ok(())
     }
     /// order of checks; the short version is:
     ///
