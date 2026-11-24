@@ -2362,7 +2362,6 @@ impl RegistryInterface for RegistryContract {
 // roles; this is the same permission gate `upgrade_module` applies, exposed as
 // a read so a member can decide whether to accept a code-swap request.
 // ---------------------------------------------------------------------------
-#[contractimpl]
 impl UpgradeAuthorizationInterface for RegistryContract {
     fn is_upgrade_authorized(env: Env, org: String, caller: Address, kind: ModuleKind) -> bool {
         Self::can_manage_module(env, org, caller, kind)
