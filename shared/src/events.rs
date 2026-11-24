@@ -49,6 +49,24 @@ use soroban_sdk::{
     contracttype, symbol_short, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
+
+pub fn escrow_funded(env: &Env, escrow_id: u64, sender: &Address, amount: i128) {
+    emit_for(
+        env,
+        topic::ESCROW,
+        symbol_short!("funded"),
+        escrow_id,
+        (sender.clone(), amount),
+    );
+    publish(
+        env,
+        ContractEvent::EscrowRefunded {
+            escrow_id,
+            sender: sender.clone(),
+            amount,
+        },
+    );
+}
 /// Canonical topic categories (Issue #493).
 ///
 /// The first topic of every tuple-topic event is one of these symbols. They
@@ -901,31 +919,67 @@ pub fn escrow_created(
         escrow_id,
         (sender.clone(), recipient.clone(), arbiter.clone()),
     );
+}
+
+pub fn escrow_created_v2(
+    env: &Env,
+    escrow_id: u64,
+    sender: &Address,
+    recipient: &Address,
+    assets: &Vec<AssetAmount>,
+    deadline: u64,
+) {
+    emit_for(
+        env,
+        topic::ESCROW,
+        symbol_short!("created"),
+        escrow_id,
+        (sender.clone(), recipient.clone(), assets.clone(), deadline),
+    );
     publish(
         env,
         ContractEvent::EscrowCreated {
             escrow_id,
             sender: sender.clone(),
             recipient: recipient.clone(),
-
+            assets: assets.clone(),
+            deadline,
         },
     );
 }
 
-pub fn escrow_funded(env: &Env, escrow_id: u64, sender: &Address, amount: i128) {
+pub fn escrow_released(env: &Env, escrow_id: u64, recipient: &Address, assets: &Vec<AssetAmount>) {
     emit_for(
         env,
         topic::ESCROW,
-        symbol_short!("funded"),
+        symbol_short!("released"),
         escrow_id,
-        (sender.clone(), amount),
+        (recipient.clone(), assets.clone()),
+    );
+    publish(
+        env,
+        ContractEvent::EscrowReleased {
+            escrow_id,
+            recipient: recipient.clone(),
+            assets: assets.clone(),
+        },
+    );
+}
+
+pub fn escrow_refunded(env: &Env, escrow_id: u64, sender: &Address, assets: &Vec<AssetAmount>) {
+    emit_for(
+        env,
+        topic::ESCROW,
+        symbol_short!("refunded"),
+        escrow_id,
+        (sender.clone(), assets.clone()),
     );
     publish(
         env,
         ContractEvent::EscrowRefunded {
             escrow_id,
             sender: sender.clone(),
-            amount,
+            assets: assets.clone(),
         },
     );
 }
