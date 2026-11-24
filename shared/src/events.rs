@@ -887,6 +887,43 @@ pub const ESCROW_FUNDS_REFUNDED: Symbol = symbol_short!("fund_ref");
 ///
 /// Published on every path that pays an escrow's held funds out to its
 /// recipient (arbiter release and signature-override release).
+pub fn escrow_created(env: &Env, escrow_id: u64, sender: &Address, recipient: &Address, arbiter: &Address) {
+    emit_for(
+        env,
+        topic::ESCROW,
+        symbol_short!("created"),
+        escrow_id,
+        (sender.clone(), recipient.clone(), arbiter.clone()),
+    );
+    publish(
+        env,
+        ContractEvent::EscrowCreated {
+            escrow_id,
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            arbiter: arbiter.clone(),
+        },
+    );
+}
+
+pub fn escrow_funded(env: &Env, escrow_id: u64, sender: &Address, amount: i128) {
+    emit_for(
+        env,
+        topic::ESCROW,
+        symbol_short!("funded"),
+        escrow_id,
+        (sender.clone(), amount),
+    );
+    publish(
+        env,
+        ContractEvent::EscrowFunded {
+            escrow_id,
+            sender: sender.clone(),
+            amount,
+        },
+    );
+}
+
 pub fn escrow_funds_released(env: &Env, escrow_id: u64, recipient: &Address, amount: i128) {
     publish_escrow_settlement(env, ESCROW_FUNDS_RELEASED, escrow_id, recipient, amount);
 }
