@@ -1332,7 +1332,7 @@ const RETIRED_CODES: [u32; 2] = [25, 26];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 69] = [
+const EXPECTED_CODES: [(Error, u32); 70] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1413,6 +1413,8 @@ const EXPECTED_CODES: [(Error, u32); 69] = [
     (Error::TreasuryPaused, 85),
     (Error::AllocationLimitExceeded, 88),
     (Error::EmergencySweepUnauthorized, 89),
+    // --- Budget rollover (95) ---
+    (Error::BudgetRolloverExceeded, 95),
 ];
 
 #[test]
@@ -1479,6 +1481,36 @@ fn named_budget_and_quorum_codes_are_wire_stable() {
     assert_eq!(Error::QUORUM_NOT_MET.wire_name(), "QUORUM_NOT_MET");
     assert_ne!(Error::QUORUM_NOT_MET, Error::ThresholdNotMet);
     assert_ne!(Error::QUORUM_NOT_MET, Error::InsufficientWeight);
+}
+
+#[test]
+fn budget_rollover_exceeded_has_a_stable_named_code() {
+    // Issue #447: the explicit name and its canonical code are part of the
+    // published ABI. Both error tables must decode the same number, and the
+    // dedicated code must be distinguishable from the general config error.
+    assert_eq!(
+        Error::BUDGET_ROLLOVER_EXCEEDED,
+        Error::BudgetRolloverExceeded
+    );
+    assert_eq!(Error::BUDGET_ROLLOVER_EXCEEDED.code(), 95);
+    assert_eq!(
+        Error::BUDGET_ROLLOVER_EXCEEDED.wire_name(),
+        "BUDGET_ROLLOVER_EXCEEDED"
+    );
+    assert_eq!(
+        BudgetError::BUDGET_ROLLOVER_EXCEEDED,
+        BudgetError::BudgetRolloverExceeded
+    );
+    assert_eq!(BudgetError::BUDGET_ROLLOVER_EXCEEDED.code(), 95);
+    assert_eq!(
+        BudgetError::from(Error::BUDGET_ROLLOVER_EXCEEDED),
+        BudgetError::BudgetRolloverExceeded
+    );
+    assert_eq!(
+        Error::from(BudgetError::BUDGET_ROLLOVER_EXCEEDED),
+        Error::BudgetRolloverExceeded
+    );
+    assert_ne!(Error::BudgetRolloverExceeded, Error::InvalidRolloverConfig);
 }
 
 #[test]

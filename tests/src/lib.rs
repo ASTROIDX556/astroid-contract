@@ -13,6 +13,8 @@
 //! the treasury so the flow moves real value from deposit to escrow custody.
 
 #[cfg(test)]
+pub mod agent_spending_lifecycle;
+#[cfg(test)]
 pub mod agent_workflow_e2e;
 #[cfg(test)]
 pub mod e2e_agent_spending;

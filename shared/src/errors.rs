@@ -366,13 +366,23 @@ pub enum Error {
     /// the organization's multisig nor the treasury owner/admin permitted for
     /// that step (Issue #502). No funds move.
     EmergencySweepUnauthorized = 89,
+
+    // --- Budget rollover (95) ---
+    /// BUDGET_ROLLOVER_EXCEEDED: a budget rollover would settle more periods
+    /// than the protocol's bounded catch-up window permits, or would push the
+    /// accumulated rollover credit past the effective cap in a single
+    /// transition (Issue #447). No period is settled and no credit is written:
+    /// the caller must narrow the gap or reconfigure the budget before trying
+    /// again. Code 95 is the next free slot after the multisig band and is
+    /// never reused.
+    BudgetRolloverExceeded = 95,
 }
 
 impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 69] = [
+    pub const ALL: [Error; 70] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -455,6 +465,8 @@ impl Error {
         // --- Treasury continued (88-89) ---
         Error::AllocationLimitExceeded,
         Error::EmergencySweepUnauthorized,
+        // --- Budget rollover (95) ---
+        Error::BudgetRolloverExceeded,
     ];
 
     /// The `u32` code this variant carries on the wire.
@@ -564,6 +576,8 @@ impl Error {
             Error::TreasuryPaused => "TREASURY_PAUSED",
             Error::AllocationLimitExceeded => "ALLOCATION_LIMIT_EXCEEDED",
             Error::EmergencySweepUnauthorized => "EMERGENCY_SWEEP_UNAUTHORIZED",
+            // --- Budget rollover (95) ---
+            Error::BudgetRolloverExceeded => "BUDGET_ROLLOVER_EXCEEDED",
         }
     }
 }
@@ -621,6 +635,14 @@ impl Error {
     /// consumer can tell a dedicated limit failure from a generic budget refusal.
     #[allow(non_upper_case_globals)]
     pub const BUDGET_LIMIT_EXCEEDED: Error = Error::BudgetLimitExceeded;
+
+    /// BUDGET_ROLLOVER_EXCEEDED (Issue #447): a rollover would settle more
+    /// periods than the catch-up window allows, or would push the accumulated
+    /// credit past the effective cap in one transition. Published as the
+    /// canonical [`Error::BudgetRolloverExceeded`] (95) so both error tables and
+    /// off-chain consumers decode the same explicit code.
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_ROLLOVER_EXCEEDED: Error = Error::BudgetRolloverExceeded;
 
     /// QUORUM_NOT_MET (Issue #459): the multisig's name for a verified quorum
     /// tally below the configured weight threshold. The explicit code is
@@ -705,6 +727,11 @@ pub enum BudgetError {
     /// BUDGET_LIMIT_EXCEEDED: the spend would breach the effective ceiling.
     /// Mirrors [`Error::BudgetLimitExceeded`] (49) exactly (Issue #463).
     BudgetLimitExceeded = 49,
+    /// BUDGET_ROLLOVER_EXCEEDED: a rollover would settle an unreasonable number
+    /// of periods or would carry more credit than the effective cap permits in
+    /// one transition (Issue #447). Mirrors [`Error::BudgetRolloverExceeded`]
+    /// (95) exactly; 95 is the next free slot after the multisig band.
+    BudgetRolloverExceeded = 95,
 }
 
 impl BudgetError {
@@ -712,7 +739,7 @@ impl BudgetError {
     /// declares them. The audit walks this list, so a variant added to (or
     /// removed from) the enum without a matching entry fails
     /// `budget_error_table_is_frozen`.
-    pub const ALL: [BudgetError; 15] = [
+    pub const ALL: [BudgetError; 16] = [
         BudgetError::NotFound,
         BudgetError::Unauthorized,
         BudgetError::InvalidInput,
@@ -728,6 +755,7 @@ impl BudgetError {
         BudgetError::InvalidRolloverConfig,
         BudgetError::BudgetOverflow,
         BudgetError::BudgetLimitExceeded,
+        BudgetError::BudgetRolloverExceeded,
     ];
 
     /// The `u32` code this variant carries on the wire, identical to the value
@@ -758,6 +786,7 @@ impl BudgetError {
             BudgetError::InvalidRolloverConfig => "INVALID_ROLLOVER_CONFIG",
             BudgetError::BudgetOverflow => "BUDGET_OVERFLOW",
             BudgetError::BudgetLimitExceeded => "BUDGET_LIMIT_EXCEEDED",
+            BudgetError::BudgetRolloverExceeded => "BUDGET_ROLLOVER_EXCEEDED",
         }
     }
 
@@ -785,13 +814,19 @@ impl BudgetError {
     /// [`BudgetError::BudgetLimitExceeded`].
     #[allow(non_upper_case_globals)]
     pub const BUDGET_LIMIT_EXCEEDED: BudgetError = BudgetError::BudgetLimitExceeded;
+
+    /// BUDGET_ROLLOVER_EXCEEDED (Issue #447): explicit name for
+    /// [`BudgetError::BudgetRolloverExceeded`].
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_ROLLOVER_EXCEEDED: BudgetError = BudgetError::BudgetRolloverExceeded;
 }
 
 /// Every code the budget-specific [`BudgetError`] table can report, in
 /// declaration order. Kept as a literal so a renumber or a reissued slot is
 /// caught by `budget_error_codes_are_frozen_and_unique` rather than passing
 /// silently.
-pub const BUDGET_ERROR_CODES: [u32; 15] = [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49];
+pub const BUDGET_ERROR_CODES: [u32; 16] =
+    [1, 3, 4, 11, 12, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 95];
 
 impl From<Error> for BudgetError {
     fn from(error: Error) -> Self {
@@ -810,6 +845,7 @@ impl From<Error> for BudgetError {
             Error::InvalidRolloverConfig => Self::InvalidRolloverConfig,
             Error::BudgetOverflow => Self::BudgetOverflow,
             Error::BudgetLimitExceeded => Self::BudgetLimitExceeded,
+            Error::BudgetRolloverExceeded => Self::BudgetRolloverExceeded,
             Error::InvalidState => Self::InvalidInput,
             _ => Self::InvalidInput,
         }
@@ -833,6 +869,7 @@ impl From<BudgetError> for Error {
             BudgetError::InvalidRolloverConfig => Self::InvalidRolloverConfig,
             BudgetError::BudgetOverflow => Self::BudgetOverflow,
             BudgetError::BudgetLimitExceeded => Self::BudgetLimitExceeded,
+            BudgetError::BudgetRolloverExceeded => Self::BudgetRolloverExceeded,
         }
     }
 }

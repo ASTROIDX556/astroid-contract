@@ -29,7 +29,7 @@ use astroid_wallet::WalletContract;
 /// Written out literally rather than derived from [`Error::ALL`], because the
 /// point of this test is to catch the table being renumbered — deriving it
 /// would make that failure impossible to observe.
-const ALL_CODES: [u32; 69] = [
+const ALL_CODES: [u32; 70] = [
     1, 2, 3, 4, 5, 6, // generic / lifecycle
     10, 11, 12, // value / arithmetic
     20, 21, 22, 23, 24, 27, 28, // policy
@@ -39,6 +39,7 @@ const ALL_CODES: [u32; 69] = [
     61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 90, 91, 92, 93, 94, // multisig / approvals
     71, 72, 73, 74, 75, 76, 78, 79, // proposal
     80, 81, 82, 83, 84, 85, 86, 87, 88, 89, // escrow + treasury
+    95, // budget rollover
 ];
 
 /// Codes that were part of an earlier revision and must never come back: a

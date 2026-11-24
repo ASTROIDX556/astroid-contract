@@ -7,7 +7,7 @@ use soroban_sdk::{
 
 use crate::{
     PolicyContract, PolicyContractClient, PolicyDecision, PolicyDenialReason, RuleNode, RuleOp,
-    RuleTree, TransactionPayload, MAX_POLICY_RULES,
+    RuleTree, TransactionPayload, MAX_POLICY_RULES, MAX_WHITELIST_BATCH,
 };
 
 struct DetRng(u64);
@@ -5142,4 +5142,133 @@ fn transfer_dry_run_publishes_rule_deny_sub_reason_event() {
         Some(PolicyDenialReason::CompositeRuleDenied)
     );
     assert_eq!(rule_deny_events(&c.env), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #448: validate policy creation limits and whitelist batches before
+// any policy state is written.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_whitelist_adds_a_valid_list_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    p.add_recipients_to_whitelist(&owner, &pid, &vec![&env, a.clone(), b.clone()]);
+
+    assert_eq!(
+        p.get_recipient_whitelist(&pid),
+        vec![&env, a.clone(), b.clone()]
+    );
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.is_recipient_whitelisted(&pid, &b));
+}
+
+#[test]
+fn batch_whitelist_rejects_empty_oversized_and_duplicate_lists() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let a = Address::generate(&env);
+
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &Vec::new(&env)),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    let mut oversized = Vec::new(&env);
+    for _ in 0..MAX_WHITELIST_BATCH + 1 {
+        oversized.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &oversized),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &vec![&env, a.clone(), a.clone()]),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // No partial state survived any of the refusals.
+    assert_eq!(p.get_recipient_whitelist(&pid), Vec::new(&env));
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+}
+
+#[test]
+fn batch_whitelist_rejects_an_already_listed_recipient_without_partial_writes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &vec![&env, b.clone(), a.clone()]),
+        Err(Ok(Error::AlreadyExists))
+    );
+    assert_eq!(p.get_recipient_whitelist(&pid), vec![&env, a.clone()]);
+    assert!(!p.is_recipient_whitelisted(&pid, &b));
+}
+
+#[test]
+fn batch_whitelist_requires_the_policy_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&stranger, &pid, &vec![&env, Address::generate(&env)]),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn policy_limits_reject_negative_amounts_but_keep_the_zero_sentinel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    assert_eq!(
+        p.try_register_policy(
+            &owner,
+            &String::from_str(&env, "negative"),
+            &BytesN::from_array(&env, &[1; 32]),
+            &-1,
+            &None,
+            &None,
+            &0,
+            &None,
+        ),
+        Err(Ok(Error::InvalidAmount))
+    );
+    let zero = String::from_str(&env, "unlimited");
+    p.register_policy(
+        &owner,
+        &zero,
+        &BytesN::from_array(&env, &[2; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+    assert_eq!(p.get(&zero).max_amount, 0);
+
+    assert_eq!(
+        p.try_rotate_policy(&owner, &zero, &BytesN::from_array(&env, &[3; 32]), &-1,),
+        Err(Ok(Error::InvalidAmount))
+    );
 }
