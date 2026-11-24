@@ -57,14 +57,6 @@ pub fn escrow_funded(env: &Env, escrow_id: u64, sender: &Address, amount: i128) 
         escrow_id,
         (sender.clone(), amount),
     );
-    publish(
-        env,
-        ContractEvent::EscrowRefunded {
-            escrow_id,
-            sender: sender.clone(),
-            amount,
-        },
-    );
 }
 /// Canonical topic categories (Issue #493).
 ///
