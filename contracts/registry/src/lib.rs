@@ -119,7 +119,6 @@
 //! nothing else — no auth, no code swap — so a deployer can confirm a target
 //! advances the registry before asking for the swap.
 
-use astroid_interfaces::upgrade::UpgradeAuthorizationInterface;
 use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
     MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
