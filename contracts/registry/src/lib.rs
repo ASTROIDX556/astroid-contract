@@ -1207,33 +1207,29 @@ impl RegistryContract {
         Ok(record.address)
     }
 
-    pub fn upgrade_contract(
-        &mut self,
-        env: Env,
-        contract_id: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<(), Error> {
-        let admin = RegistryContract::get_admin(&env)?;
-        admin.require_auth();
-        
-        if !Self::is_contract_address(&contract_id) {
-            return Err(Error::InvalidUpgradeAddress);
-        }
-        if new_wasm_hash.is_zero() {
-            return Err(Error::InvalidInput);
-        }
-
-        self.version_map
-            .set(contract_id.clone(), new_wasm_hash.clone());
+    pub fn upgrade(env: Env, caller: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        let plan = Self::plan_registry_upgrade(&env, &wasm_hash)?;
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistryVersion)
+            .unwrap_or(0);
+        ensure!(plan.to_version > current_version, Error::CircularUpgrade);
+        env.storage()
+            .instance()
+            .set(&DataKey::RegistryVersion, &plan.to_version);
+        env.deploy().update_current_contract_wasm(&plan.wasm_hash);
+        events::emit(
+            &env,
+            events::topic::REGISTRY,
+            symbol_short!("upgrade"),
+            (plan.from_version, plan.to_version, plan.wasm_hash),
+        );
         Ok(())
     }
-    /// order of checks; the short version is:
-    ///
-    /// 1. the registry is not frozen — [`Error::RegistryFrozen`];
-    /// 2. `caller` is signed and may manage this `kind` for `org` —
-    ///    [`Error::Unauthorized`] (or [`Error::NotFound`] for an unknown org);
-    /// 3. the module is already registered — [`Error::NotFound`];
-    /// 4. `target_version` is non-zero — [`Error::InvalidInput`];
     /// 5. `target_version` is strictly newer than the module's current pin —
     ///    [`Error::CircularUpgrade`], which is what stops the path from
     ///    revisiting or reversing;
