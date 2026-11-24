@@ -158,6 +158,10 @@ pub enum Error {
     /// to allow callers to differentiate a backwards jump from a cycle onto the
     /// same version.
     VersionNotMonotonic = 34,
+    /// INVALID_ADDRESS: a provided address is a zero address or invalid.
+    InvalidAddress = 35,
+    /// MODULE_ALREADY_REGISTERED: a module identifier is already registered in the registry.
+    ModuleAlreadyRegistered = 36,
 
     // --- Budget (40-49) ---
     /// The spend would breach the budget: the per-asset limit for this token,
@@ -441,18 +445,16 @@ impl Error {
         Error::ProposalDefeated,
         Error::PrerequisiteNotMet,
         Error::CircularDependencyDetected,
-        // --- Escrow (80-82) ---
+        // --- Escrow (80-82, 86-87) ---
         Error::EscrowExpired,
         Error::TimeLockActive,
         Error::GraceActive,
-        // --- Treasury (83-85) ---
+        Error::EscrowNotExpired,
+        Error::EscrowAlreadySettled,
+        // --- Treasury (83-85, 88-89) ---
         Error::AllowanceExceeded,
         Error::AllowanceExpired,
         Error::TreasuryPaused,
-        // --- Escrow continued (86-87) ---
-        Error::EscrowNotExpired,
-        Error::EscrowAlreadySettled,
-        // --- Treasury continued (88-89) ---
         Error::AllocationLimitExceeded,
         Error::EmergencySweepUnauthorized,
     ];
@@ -509,6 +511,8 @@ impl Error {
             Error::CircularUpgrade => "CIRCULAR_UPGRADE",
             Error::InvalidUpgradeAddress => "INVALID_UPGRADE_ADDRESS",
             Error::VersionNotMonotonic => "VERSION_NOT_MONOTONIC",
+            Error::InvalidAddress => "INVALID_ADDRESS",
+            Error::ModuleAlreadyRegistered => "MODULE_ALREADY_REGISTERED",
             // --- Budget (40-47) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
