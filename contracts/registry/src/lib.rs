@@ -131,7 +131,7 @@ use astroid_shared::events::{self, ContractEvent, UpgradeAudit};
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use astroid_shared::validation::{require_non_empty, require_valid_wasm_hash};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Val, Vec,
 };
 
 /// How many of the most recently published `Organization` versions the registry
