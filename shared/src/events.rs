@@ -49,7 +49,6 @@ use soroban_sdk::{
     contracttype, symbol_short, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
-
 pub fn escrow_funded(env: &Env, escrow_id: u64, sender: &Address, amount: i128) {
     emit_for(
         env,
