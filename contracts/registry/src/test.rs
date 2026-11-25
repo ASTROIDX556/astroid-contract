@@ -4167,3 +4167,103 @@ fn interface_check_rejects_a_contract_serving_another_surface() {
         Err(Ok(Error::InvalidUpgradeAddress))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #445: owner-authorized version validation and rollback protection.
+//
+// The pre-flight reads the pin from the registry (never from the caller), so a
+// downgrade cannot be laundered through a forged "current version". A refused
+// step returns a deterministic code and writes/emits nothing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn owner_preflight_accepts_strictly_forward_version_steps() {
+    let h = setup_path();
+
+    // The module was registered by address, so the registry reads its pin as 0
+    // and the first forward step is v2.
+    h.client
+        .validate_version_transition(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    h.client
+        .validate_version_transition(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+
+    assert_event(&h.env, "RegistryUpgradeValidated");
+    let auths = h.env.auths();
+    assert!(
+        auths.iter().any(|(signer, invocation)| {
+            signer == &h.owner
+                && matches!(
+                    &invocation.function,
+                    AuthorizedFunction::Contract((_, function, _))
+                        if function == &Symbol::new(&h.env, "validate_version_transition")
+                )
+        }),
+        "the recorded org owner must authorize the pre-flight"
+    );
+}
+
+#[test]
+fn owner_preflight_rejects_repeat_and_downgrade() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+
+    for target in [1u32, 2, 3] {
+        assert_eq!(
+            h.client.try_validate_version_transition(
+                &h.owner,
+                &h.org,
+                &ModuleKind::Wallet,
+                &target,
+            ),
+            Err(Ok(Error::VersionNotMonotonic))
+        );
+    }
+    assert_eq!(pin(&h), 3);
+    assert_eq!(pointed_at(&h), h.v3);
+}
+
+#[test]
+fn owner_preflight_rejects_zero_and_oversized_jumps() {
+    let h = setup_path();
+    assert_eq!(
+        h.client
+            .try_validate_version_transition(&h.owner, &h.org, &ModuleKind::Wallet, &0,),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        h.client.try_validate_version_transition(
+            &h.owner,
+            &h.org,
+            &ModuleKind::Wallet,
+            &(crate::version::MAX_FORWARD_STEP + 2),
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn stranger_cannot_preflight_a_version_transition() {
+    let h = setup_path();
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_validate_version_transition(&stranger, &h.org, &ModuleKind::Wallet, &2,),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn preflight_on_an_unknown_organization_is_not_found() {
+    let h = setup_path();
+    let missing = String::from_str(&h.env, "missing");
+    assert_eq!(
+        h.client
+            .try_validate_version_transition(&h.owner, &missing, &ModuleKind::Wallet, &2,),
+        Err(Ok(Error::NotFound))
+    );
+}
