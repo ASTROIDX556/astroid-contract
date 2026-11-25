@@ -201,15 +201,8 @@
 //! ([`Error::EmergencySweepUnauthorized`]).
 
 use astroid_interfaces::{PolicyClient, RegistryClient, TreasuryInterface, UpgradeableInterface};
-use astroid_shared::constants::{
-    GOVERNANCE_GRACE_PERIOD, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS,
-    MAX_PAUSE_DURATION, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
-};
 use astroid_shared::errors::Error;
-use astroid_shared::events;
-use astroid_shared::math::{checked_add_u64, safe_add, safe_div, safe_mul, safe_sub};
-use astroid_shared::types::{ModuleKind, Payment, ResourceState};
+use astroid_shared::types::{Payment, ResourceState};
 use astroid_shared::validation::{
     require_non_empty, require_non_negative_amount, require_positive_amount, require_time_reached,
 };

@@ -170,11 +170,6 @@ const MAX_SPEND_ENTRIES: u32 = 10;
 /// register an unbounded amount of work for every transfer check.
 const MAX_POLICY_RULES: u32 = 16;
 
-/// Maximum number of recipients accepted by one whitelist batch call (Issue
-/// #448). Bounds both the validation loop and the number of storage writes a
-/// single invocation can perform.
-pub const MAX_WHITELIST_BATCH: u32 = MAX_SPEND_ENTRIES;
-
 /// A transaction payload submitted for policy evaluation.
 ///
 /// This struct carries the essential fields of a proposed transfer so the
@@ -317,34 +312,6 @@ fn validate_rule_tree(tree: &RuleTree) -> Result<(), Error> {
     Ok(())
 }
 
-/// Validate a whitelist batch before a single storage key is touched (Issue
-/// #448).
-///
-/// - an empty vector is a misconfigured policy — an owner who enables whitelist
-///   mode with no entries would deny every transfer and lock funds;
-/// - more than [`MAX_WHITELIST_BATCH`] entries would make one call unbounded in
-///   both validation and ledger writes;
-/// - a repeated address would inflate the read index and make the directory
-///   disagree with the membership set.
-///
-/// The duplicate scan is quadratic but bounded to ten entries by the size gate,
-/// so a hostile batch cannot turn it into a gas-exhaustion vector.
-fn validate_whitelist_batch(recipients: &Vec<Address>) -> Result<(), Error> {
-    let len = recipients.len();
-    if len == 0 || len > MAX_WHITELIST_BATCH {
-        return Err(Error::InvalidInput);
-    }
-    for i in 0..len {
-        let current = recipients.get(i).ok_or(Error::InvalidInput)?;
-        for other in recipients.iter().skip(i as usize + 1) {
-            if other == current {
-                return Err(Error::AlreadyExists);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Cache blacklist membership for the recipient while evaluating a policy's
 /// composite rule and rule stack.
 ///
@@ -460,7 +427,7 @@ fn evaluate_node(
     if depth == 0 {
         return Err(Error::InvalidInput);
     }
-    let _remaining = depth - 1;
+    let remaining = depth - 1;
     let node = tree.get(node_idx).ok_or(Error::InvalidInput)?;
     let leaf = |passed: bool| Ok((passed, node.op));
     match node.op {
@@ -999,11 +966,6 @@ impl PolicyContract {
     ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&policy_id)?;
-        // Issue #448: a negative transaction limit can never be satisfied, so
-        // reject it at creation time rather than storing a policy that denies
-        // every spend. Zero remains the documented "no per-tx cap" sentinel and
-        // is therefore deliberately accepted.
-        require_non_negative_amount(max_amount)?;
         if env
             .storage()
             .persistent()
@@ -1048,9 +1010,6 @@ impl PolicyContract {
         new_max: i128,
     ) -> Result<(), Error> {
         caller.require_auth();
-        // Issue #448: rotate through the same bound check as creation so a
-        // malformed limit cannot be smuggled in through an update.
-        require_non_negative_amount(new_max)?;
         let mut policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
             return Err(Error::Unauthorized);
@@ -1616,58 +1575,6 @@ impl PolicyContract {
             symbol_short!("wl_add"),
             (policy_id, recipient),
         );
-        Ok(())
-    }
-
-    /// Add several recipients to a policy's whitelist in one atomic call
-    /// (Issue #448).
-    ///
-    /// The whole batch is validated before anything is written: it must be
-    /// non-empty, within [`MAX_WHITELIST_BATCH`] and free of duplicate entries,
-    /// and every existing member is rejected with [`Error::AlreadyExists`].
-    /// A refusal leaves both the membership keys and the read index untouched,
-    /// so a malformed governance transaction cannot leave a half-staged
-    /// whitelist behind. Caller must be the policy owner and must have signed.
-    pub fn add_recipients_to_whitelist(
-        env: Env,
-        caller: Address,
-        policy_id: String,
-        recipients: Vec<Address>,
-    ) -> Result<(), Error> {
-        Self::require_policy_owner(&env, &caller, &policy_id)?;
-        validate_whitelist_batch(&recipients)?;
-
-        // Existing members are checked up front so an already-listed address
-        // aborts the entire batch before any write is made.
-        for recipient in recipients.iter() {
-            if env.storage().persistent().has(&DataKey::RecipientWhitelist(
-                policy_id.clone(),
-                recipient.clone(),
-            )) {
-                return Err(Error::AlreadyExists);
-            }
-        }
-
-        let index_key = DataKey::RecipientWhitelistIndex(policy_id.clone());
-        let mut index: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&index_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        for recipient in recipients.iter() {
-            env.storage().persistent().set(
-                &DataKey::RecipientWhitelist(policy_id.clone(), recipient.clone()),
-                &true,
-            );
-            index.push_back(recipient.clone());
-            events::emit(
-                &env,
-                events::topic::POLICY,
-                symbol_short!("wl_add"),
-                (policy_id.clone(), recipient),
-            );
-        }
-        env.storage().persistent().set(&index_key, &index);
         Ok(())
     }
 
