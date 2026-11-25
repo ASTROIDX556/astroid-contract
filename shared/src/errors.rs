@@ -129,6 +129,13 @@ pub enum Error {
     /// specific error than [`Error::PolicyDenied`] for off-chain consumers
     /// to distinguish policy constraint violations from a disabled/expired policy.
     PolicyConstraintUnmet = 28,
+    /// POLICY_MAX_AMOUNT_EXCEEDED: the amount is above the policy's
+    /// single-transaction ceiling (`Policy::max_amount`), so the composed
+    /// evaluation pipeline (Issue #499) refuses it with a dedicated code rather
+    /// than the generic [`Error::PolicyDenied`]. A ceiling of `0` means no
+    /// ceiling and this code can never be reported. Code 29 keeps the value
+    /// distinct from the broader [`Error::PolicyConstraintUnmet`] (28).
+    PolicyMaxAmountExceeded = 29,
 
     // --- Registry (30-39) ---
     /// The protocol registry is frozen: every mutating registry entrypoint
@@ -158,6 +165,18 @@ pub enum Error {
     /// to allow callers to differentiate a backwards jump from a cycle onto the
     /// same version.
     VersionNotMonotonic = 34,
+    /// INVALID_UPGRADE_PATH: a version registration would not advance the
+    /// module kind's upgrade path — the requested version is at or below the
+    /// latest version already published for that kind, i.e. a duplicate or a
+    /// downgrade. Nothing is written, so the published path stays strictly
+    /// increasing (Issue #500).
+    InvalidUpgradePath = 35,
+    /// VERSION_ALREADY_EXISTS: a version registration would bind a WASM hash
+    /// that is already published for the same module kind. A version record is
+    /// immutable and one implementation hash names exactly one version per
+    /// kind, so the repeat is refused instead of publishing a second alias for
+    /// the same bytecode (Issue #500).
+    VersionAlreadyExists = 36,
 
     // --- Budget (40-49) ---
     /// The spend would breach the budget: the per-asset limit for this token,
@@ -231,6 +250,13 @@ pub enum Error {
     /// [`Error::Unauthorized`] which covers role/ownership checks — this code
     /// indicates the caller did not authenticate at all (missing `require_auth`).
     UnauthorizedWalletAccess = 55,
+    /// UNSUPPORTED_ASSET: the token contract has not been registered as a
+    /// supported asset for this wallet. A wallet registers an asset the first
+    /// time it takes custody of it (a successful `deposit`), and every outbound
+    /// movement requires that registration — so a mis-typed or never-funded
+    /// token is refused with this code instead of reading as a zero balance
+    /// (Issue #496).
+    UnsupportedAsset = 56,
 
     // --- Multisig / approvals (61-69, 70, 90-94) ---
     /// The accumulated approvals are below the configured threshold: too few
@@ -366,13 +392,22 @@ pub enum Error {
     /// the organization's multisig nor the treasury owner/admin permitted for
     /// that step (Issue #502). No funds move.
     EmergencySweepUnauthorized = 89,
+
+    // --- Escrow continuation (95-99) ---
+    /// UNAUTHORIZED_CANCELLATION: an emergency cancellation was attempted by an
+    /// account that is neither the escrow's owner (sender), its arbiter, nor
+    /// the contract admin acting for the organization's multisig (Issue #498).
+    /// The escrow keeps its state and no funds move. Distinct from
+    /// [`Error::Unauthorized`] so an off-chain monitor can tell a rejected
+    /// emergency stop apart from an ordinary role failure.
+    UnauthorizedCancellation = 95,
 }
 
 impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 69] = [
+    pub const ALL: [Error; 74] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -392,12 +427,15 @@ impl Error {
         Error::PolicyCategoryRestricted,
         Error::VelocityLimitExceeded,
         Error::PolicyConstraintUnmet,
+        Error::PolicyMaxAmountExceeded,
         // --- Registry (30-39) ---
         Error::RegistryFrozen,
         Error::ModuleDeprecated,
         Error::CircularUpgrade,
         Error::InvalidUpgradeAddress,
         Error::VersionNotMonotonic,
+        Error::InvalidUpgradePath,
+        Error::VersionAlreadyExists,
         // --- Budget (40-47) ---
         Error::BudgetExceeded,
         Error::BudgetFrozen,
@@ -416,6 +454,7 @@ impl Error {
         Error::InvalidState,
         Error::RateLimitExceeded,
         Error::UnauthorizedWalletAccess,
+        Error::UnsupportedAsset,
         // --- Multisig / approvals (61-69, 70, 90-94) ---
         Error::ThresholdNotMet,
         Error::AlreadySigned,
@@ -455,6 +494,8 @@ impl Error {
         // --- Treasury continued (88-89) ---
         Error::AllocationLimitExceeded,
         Error::EmergencySweepUnauthorized,
+        // --- Escrow continuation (95-99) ---
+        Error::UnauthorizedCancellation,
     ];
 
     /// The `u32` code this variant carries on the wire.
@@ -503,12 +544,15 @@ impl Error {
             Error::PolicyCategoryRestricted => "POLICY_CATEGORY_RESTRICTED",
             Error::VelocityLimitExceeded => "VELOCITY_LIMIT_EXCEEDED",
             Error::PolicyConstraintUnmet => "POLICY_CONSTRAINT_UNMET",
+            Error::PolicyMaxAmountExceeded => "POLICY_MAX_AMOUNT_EXCEEDED",
             // --- Registry (30-39) ---
             Error::RegistryFrozen => "REGISTRY_FROZEN",
             Error::ModuleDeprecated => "MODULE_DEPRECATED",
             Error::CircularUpgrade => "CIRCULAR_UPGRADE",
             Error::InvalidUpgradeAddress => "INVALID_UPGRADE_ADDRESS",
             Error::VersionNotMonotonic => "VERSION_NOT_MONOTONIC",
+            Error::InvalidUpgradePath => "INVALID_UPGRADE_PATH",
+            Error::VersionAlreadyExists => "VERSION_ALREADY_EXISTS",
             // --- Budget (40-47) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
@@ -527,6 +571,7 @@ impl Error {
             Error::InvalidState => "INVALID_STATE",
             Error::RateLimitExceeded => "RATE_LIMIT_EXCEEDED",
             Error::UnauthorizedWalletAccess => "UNAUTHORIZED_WALLET_ACCESS",
+            Error::UnsupportedAsset => "UNSUPPORTED_ASSET",
             // --- Multisig / approvals (61-69, 70, 90-94) ---
             Error::ThresholdNotMet => "THRESHOLD_NOT_MET",
             Error::AlreadySigned => "ALREADY_SIGNED",
@@ -564,6 +609,8 @@ impl Error {
             Error::TreasuryPaused => "TREASURY_PAUSED",
             Error::AllocationLimitExceeded => "ALLOCATION_LIMIT_EXCEEDED",
             Error::EmergencySweepUnauthorized => "EMERGENCY_SWEEP_UNAUTHORIZED",
+            // --- Escrow continuation (95-99) ---
+            Error::UnauthorizedCancellation => "UNAUTHORIZED_CANCELLATION",
         }
     }
 }
