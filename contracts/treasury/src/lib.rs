@@ -1221,7 +1221,6 @@ impl TreasuryContract {
             let asset = Address::generate(&env);
 
             let token_client = token::TokenClient::new(&env, &asset);
-            // Mock/initialize token or test scenario helpers if available
             let custody = env.current_contract_address();
             let _ = token_client;
             let _ = custody;
