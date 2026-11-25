@@ -22,7 +22,7 @@ use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState, ReleaseConditionConfig};
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::{PolicyContract, PolicyContractClient};
-use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
+use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState, ProposalTiming};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
@@ -1073,8 +1073,11 @@ fn proposal_timelock_gates_execution_end_to_end() {
         &vec![&h.env],
         &2,
         &Vec::new(&h.env),
-        &(START + 30 * 86_400),
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: (START + 30 * 86_400),
+            grace_period: 0,
+        },
     );
 
     // Pending before any vote.
