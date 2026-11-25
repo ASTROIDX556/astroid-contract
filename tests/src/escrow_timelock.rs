@@ -1,17 +1,13 @@
-//! Time-locked release verification across contract boundaries (Issue #332).
-//!
-//! The escrow's unit tests cover the full schedule matrix; these scenarios
-//! drive the release paths through *deployed contract boundaries* from outside
-//! the escrow crate, advancing the ledger clock step by step to prove that an
-//! early release fails with the distinct `TimelockNotExpired` code
-//! (`ERR_ESCROW_NOT_READY`) and succeeds only once the configured release time
-//! has passed.
-
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState};
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{token, vec, Address, Env, String, Vec};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token, vec, Address, Env, String, Symbol, Vec,
+};
+
 
 const START: u64 = 1_000;
 
@@ -192,4 +188,56 @@ fn linear_schedule_release_cannot_exceed_the_vested_amount() {
     h.escrow.release(&h.arbiter, &id, &5_000);
     assert_eq!(h.escrow.get(&id).state, EscrowState::Released);
     assert_eq!(balance(&h, &h.recipient), 10_000);
+}
+#[test]
+fn test_escrow_time_lock_and_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let admin = Address::generate(&env);
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &escrow_id);
+    client.initialize(&admin);
+
+    let asset = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    client.approve_token(&admin, &asset);
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let amount: i128 = 10_000;
+
+    token::StellarAssetClient::new(&env, &asset).mint(&sender, &amount);
+
+    let assets = vec![&env, astroid_shared::types::AssetAmount { asset: asset.clone(), amount }];
+    let deadline = 2_000;
+    let grace_period = 0;
+
+    let id = client.create(
+        &sender,
+        &recipient,
+        &arbiter,
+        &assets,
+        &deadline,
+        &grace_period,
+        &String::from_str(&env, "test"),
+        &Vec::new(&env),
+        &0,
+    );
+
+    // Attempt premature refund before deadline
+    let res = client.try_refund(&sender, &id);
+    assert_eq!(res, Err(Ok(Error::TimeLockActive)));
+
+    // Advance ledger timestamp past deadline
+    env.ledger().set_timestamp(2_050);
+
+    // Successful refund after expiration
+    client.refund(&sender, &id);
+
+    let escrow = client.get(&id);
+    assert!(matches!(escrow.state, EscrowState::Refunded));
 }
