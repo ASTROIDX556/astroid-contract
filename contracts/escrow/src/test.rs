@@ -4216,6 +4216,25 @@ mod cleanup_expired_tests {
         assert_eq!(h.client.get(&id).state, EscrowState::Expired);
         assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
     }
+
+    #[test]
+    fn timelock_expiration_guards_release_and_refund() {
+        let h = setup(5_000, 0);
+        let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+        // Before deadline: claim_refund fails with ESCROW_NOT_EXPIRED
+        assert_eq!(
+            h.client.try_claim_refund(&h.sender, &id),
+            Err(Ok(Error::ESCROW_NOT_EXPIRED))
+        );
+
+        // After deadline + grace: release fails with ESCROW_EXPIRED
+        at(&h, START + 100 + GRACE + 1);
+        assert_eq!(
+            h.client.try_release(&h.arbiter, &id, &5_000),
+            Err(Ok(Error::ESCROW_EXPIRED))
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

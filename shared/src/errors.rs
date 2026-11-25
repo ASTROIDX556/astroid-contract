@@ -691,6 +691,36 @@ impl Error {
     #[allow(non_upper_case_globals)]
     pub const BUDGET_ROLLOVER_EXCEEDED: Error = Error::BudgetRolloverExceeded;
 
+    /// BUDGET_EXCEEDED (Issue #455): named constant for [`Error::BudgetLimitExceeded`] (49).
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_EXCEEDED: Error = Error::BudgetLimitExceeded;
+
+    /// INVALID_PERIOD (Issue #455): named constant for an invalid or non-recurring period.
+    #[allow(non_upper_case_globals)]
+    pub const INVALID_PERIOD: Error = Error::InvalidTimeWindow;
+
+    /// PERIOD_NOT_ELAPSED (Issue #455): named constant when a periodic reset or rollover
+    /// is attempted before the window has elapsed.
+    #[allow(non_upper_case_globals)]
+    pub const PERIOD_NOT_ELAPSED: Error = Error::TimelockNotExpired;
+
+    /// POLICY_DENIED (Issue #456): named constant for [`Error::PolicyDenied`] (20).
+    #[allow(non_upper_case_globals)]
+    pub const POLICY_DENIED: Error = Error::PolicyDenied;
+
+    /// UNAUTHORIZED_PRINCIPAL (Issue #456): named constant for an unauthorized principal
+    /// or non-owner attempting a mutating policy update.
+    #[allow(non_upper_case_globals)]
+    pub const UNAUTHORIZED_PRINCIPAL: Error = Error::Unauthorized;
+
+    /// ESCROW_EXPIRED (Issue #458): named constant for [`Error::EscrowExpired`] (80).
+    #[allow(non_upper_case_globals)]
+    pub const ESCROW_EXPIRED: Error = Error::EscrowExpired;
+
+    /// ESCROW_NOT_EXPIRED (Issue #458): named constant for [`Error::EscrowNotExpired`] (86).
+    #[allow(non_upper_case_globals)]
+    pub const ESCROW_NOT_EXPIRED: Error = Error::EscrowNotExpired;
+
     /// QUORUM_NOT_MET (Issue #459): the multisig's name for a verified quorum
     /// tally below the configured weight threshold. The explicit code is
     /// [`Error::QuorumNotMet`] (94), distinct from `THRESHOLD_NOT_MET` (61) and
@@ -866,6 +896,19 @@ impl BudgetError {
     /// [`BudgetError::BudgetRolloverExceeded`].
     #[allow(non_upper_case_globals)]
     pub const BUDGET_ROLLOVER_EXCEEDED: BudgetError = BudgetError::BudgetRolloverExceeded;
+
+    /// BUDGET_EXCEEDED (Issue #455): named constant for [`BudgetError::BudgetLimitExceeded`].
+    #[allow(non_upper_case_globals)]
+    pub const BUDGET_EXCEEDED: BudgetError = BudgetError::BudgetLimitExceeded;
+
+    /// INVALID_PERIOD (Issue #455): named constant for an invalid or non-recurring period.
+    #[allow(non_upper_case_globals)]
+    pub const INVALID_PERIOD: BudgetError = BudgetError::InvalidTimeWindow;
+
+    /// PERIOD_NOT_ELAPSED (Issue #455): named constant when a periodic reset or rollover
+    /// is attempted before the window has elapsed.
+    #[allow(non_upper_case_globals)]
+    pub const PERIOD_NOT_ELAPSED: BudgetError = BudgetError::InvalidInput;
 }
 
 /// Every code the budget-specific [`BudgetError`] table can report, in
@@ -1042,3 +1085,11 @@ impl From<MilestoneError> for Error {
 
 /// Alias for the canonical protocol contract error type [`Error`].
 pub type ContractError = Error;
+
+pub const BUDGET_EXCEEDED: Error = Error::BudgetLimitExceeded;
+pub const INVALID_PERIOD: Error = Error::InvalidTimeWindow;
+pub const PERIOD_NOT_ELAPSED: Error = Error::TimelockNotExpired;
+pub const POLICY_DENIED: Error = Error::PolicyDenied;
+pub const UNAUTHORIZED_PRINCIPAL: Error = Error::Unauthorized;
+pub const ESCROW_EXPIRED: Error = Error::EscrowExpired;
+pub const ESCROW_NOT_EXPIRED: Error = Error::EscrowNotExpired;
