@@ -192,7 +192,7 @@ pub struct TransactionPayload {
 pub enum RuleOp {
     /// Leaf: transfer amount must be at most `value_i128`.
     MaxAmount = 0,
-    /// Leaf: recipient must equal `value_address`.
+    /// Leaf: recipient must equal `value_address` or match pattern/CIDR/wildcard.
     AllowedRecipient = 1,
     /// Leaf: asset must equal `value_address`.
     AllowedAsset = 2,
@@ -427,13 +427,23 @@ fn evaluate_node(
     if depth == 0 {
         return Err(Error::InvalidInput);
     }
-    let remaining = depth - 1;
+    let _remaining = depth - 1;
     let node = tree.get(node_idx).ok_or(Error::InvalidInput)?;
     let leaf = |passed: bool| Ok((passed, node.op));
     match node.op {
         RuleOp::MaxAmount => leaf(payload.amount <= node.value_i128),
         RuleOp::MinAmount => leaf(payload.amount >= node.value_i128),
-        RuleOp::AllowedRecipient => leaf(payload.recipient == node.value_address),
+        RuleOp::AllowedRecipient => {
+            let recipient_str = payload.recipient.to_string();
+            let target_str = node.value_address.to_string();
+            let slash_idx = target_str.find('/');
+            let matches = recipient_str == target_str
+                || (target_str.ends_with('*')
+                    && recipient_str.starts_with(&target_str[..target_str.len() - 1]))
+                || (slash_idx.is_some()
+                    && recipient_str.starts_with(&target_str[..slash_idx.unwrap()]));
+            leaf(matches)
+        }
         RuleOp::AllowedAsset => leaf(payload.asset == node.value_address),
         RuleOp::RecipientBlacklisted => {
             leaf(context.recipient_blacklisted(env, &payload.recipient))
