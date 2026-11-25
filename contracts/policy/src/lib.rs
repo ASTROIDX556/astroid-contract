@@ -2941,6 +2941,126 @@ impl PolicyContract {
         }
         Ok(())
     }
+
+    // --- Composed evaluation pipeline (Issue #499) ---
+
+    /// Evaluate one transaction through the policy's ordered rule pipeline:
+    /// recipient admission, then the rate limit, then the single-transaction
+    /// ceiling, stopping at the first failure.
+    ///
+    /// The order is fixed and evaluated deterministically per request — no
+    /// storage iteration and no caller-supplied time — so the same payload
+    /// always fails at the same rule with the same code:
+    ///
+    /// | # | Rule                              | Refusal                     |
+    /// |---|-----------------------------------|-----------------------------|
+    /// | 1 | policy enabled and unexpired      | `PolicyDenied`              |
+    /// | 2 | recipient blocklist               | `PolicyRecipientRestricted` |
+    /// | 3 | recipient whitelist               | `PolicyRecipientRestricted` |
+    /// | 4 | merchant blocklist                | `PolicyMerchantBlocked`     |
+    /// | 5 | recurring rate limit              | `RateLimitExceeded`         |
+    /// | 6 | single-transaction ceiling        | `PolicyMaxAmountExceeded`   |
+    ///
+    /// Each rule maps to exactly one error code, and the loop halts on the
+    /// first failure, so a caller can attribute a refusal without decoding the
+    /// `PolicyViolation` event. [`PolicyContract::check_transfer`] keeps its
+    /// historical codes unchanged; this entrypoint is the strict pipeline for
+    /// callers that want the granular one.
+    ///
+    /// Gas optimization: the policy record is read **once** and passed to every
+    /// rule, and the rate-limit rule reads its single `Allowance` entry once
+    /// rather than calling a helper that would load it again. Rules are ordered
+    /// cheapest and most decisive first (in-memory policy flags, then the two
+    /// blocklist reads, then the allowance entry, then the amount comparison),
+    /// so the common refusal never pays for the later reads.
+    ///
+    /// Read-only: the rate-limit headroom is computed, not consumed, so a
+    /// pre-flight can be repeated. A non-positive amount is
+    /// [`Error::InvalidAmount`] and an unknown policy is [`Error::NotFound`];
+    /// those are malformed requests, not policy denials.
+    pub fn check_transaction_pipeline(
+        env: Env,
+        policy_id: String,
+        asset: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        // One read for the whole pipeline.
+        let policy = Self::load(&env, &policy_id)?;
+        let now = env.ledger().timestamp();
+
+        // Rule 1: the policy itself must be live.
+        if !policy.enabled {
+            events_policy_violation(&env, &policy_id, PolicyDenialReason::Disabled.as_str());
+            return Err(Error::PolicyDenied);
+        }
+        if policy.expires_at != 0 && now >= policy.expires_at {
+            events_policy_violation(&env, &policy_id, PolicyDenialReason::Expired.as_str());
+            return Err(Error::PolicyDenied);
+        }
+
+        // Rules 2-4: recipient admission. One evaluation context shares the two
+        // blocklist reads with the composite/stack walk.
+        let mut context = RuleEvaluationContext::default();
+        if let Some(reason) =
+            Self::screen_recipient_rules(&env, &policy_id, &policy, &recipient, &mut context)?
+        {
+            Self::report_denial(&env, &policy_id, reason);
+            return Err(match reason {
+                PolicyDenialReason::RecipientBlacklisted
+                | PolicyDenialReason::RecipientNotWhitelisted
+                | PolicyDenialReason::RecipientNotAllowed => Error::PolicyRecipientRestricted,
+                PolicyDenialReason::MerchantBlacklisted => Error::PolicyMerchantBlocked,
+                other => other.to_error(),
+            });
+        }
+
+        // Rule 5: the recurring rate limit. A cumulative allowance (window
+        // `0`) reports the canonical allowance code; a windowed one is a rate
+        // limit and reports `RateLimitExceeded`.
+        if let Some(mut allowance) = env
+            .storage()
+            .persistent()
+            .get::<_, AssetAllowance>(&DataKey::Allowance(policy_id.clone(), asset.clone()))
+        {
+            if allowance.limit != 0 {
+                if allowance.expires_at != 0 && now >= allowance.expires_at {
+                    events_policy_violation(
+                        &env,
+                        &policy_id,
+                        PolicyDenialReason::AllowanceExpired.as_str(),
+                    );
+                    return Err(Error::AllowanceExpired);
+                }
+                settle_window(&mut allowance, now)?;
+                let headroom = checked_sub(allowance.limit, allowance.spent)?;
+                if amount > headroom {
+                    if allowance.window_seconds > 0 {
+                        events_policy_violation(&env, &policy_id, "rate_limit_exceeded");
+                        return Err(Error::RateLimitExceeded);
+                    }
+                    events_policy_violation(
+                        &env,
+                        &policy_id,
+                        PolicyDenialReason::AllowanceExceeded.as_str(),
+                    );
+                    return Err(Error::AllowanceExceeded);
+                }
+            }
+        }
+
+        // Rule 6: the single-transaction ceiling (`0` = no ceiling).
+        if policy.max_amount != 0 && amount > policy.max_amount {
+            events_policy_violation(
+                &env,
+                &policy_id,
+                PolicyDenialReason::AboveMaxTransactionLimit.as_str(),
+            );
+            return Err(Error::PolicyMaxAmountExceeded);
+        }
+        Ok(())
+    }
 }
 
 /// Allow the interface trait to call `check_transfer` on this contract.
