@@ -136,7 +136,8 @@ fn test_allowed_recipient_wildcard_and_prefix_matching() {
     assert!(decision.allowed());
 
     let mut wildcard_tree = soroban_sdk::Vec::new(&env);
-    let wildcard_addr = Address::from_string(&String::from_str(&env, &alloc::format!("{}*", prefix)));
+    let wildcard_addr =
+        Address::from_string(&String::from_str(&env, &alloc::format!("{}*", prefix)));
     wildcard_tree.push_back(crate::RuleNode {
         op: crate::RuleOp::AllowedRecipient,
         value_i128: 0,

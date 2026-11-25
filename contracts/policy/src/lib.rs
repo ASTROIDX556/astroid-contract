@@ -152,7 +152,6 @@ use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::{
     require_non_empty, require_non_negative_amount, require_positive_amount,
 };
-use soroban_sdk::IntoVal;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Map, String, Vec,
 };
