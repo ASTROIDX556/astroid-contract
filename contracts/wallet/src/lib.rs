@@ -846,6 +846,71 @@ impl WalletContract {
         Ok(())
     }
 
+    /// Pay `amount` of `asset` from a wallet with an explicit time-lock check.
+    pub fn transfer_with_timelock(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        scheduled_execution_time: u64,
+    ) -> Result<(), Error> {
+        Self::check_execution_timelock(&env, wallet_id, scheduled_execution_time)?;
+        Self::transfer(env, caller, wallet_id, to, asset, amount)
+    }
+
+    /// Withdraw `amount` of `asset` from a wallet with an explicit time-lock check.
+    pub fn withdraw_with_timelock(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        asset: Address,
+        amount: i128,
+        scheduled_execution_time: u64,
+    ) -> Result<(), Error> {
+        Self::check_execution_timelock(&env, wallet_id, scheduled_execution_time)?;
+        Self::withdraw(env, caller, wallet_id, asset, amount)
+    }
+
+    /// Execute a validated batch of sub-calls with an explicit time-lock check.
+    pub fn batch_execute_with_timelock(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        actions: soroban_sdk::Vec<BatchAction>,
+        scheduled_execution_time: u64,
+    ) -> Result<BatchReceipt, Error> {
+        Self::check_execution_timelock(&env, wallet_id, scheduled_execution_time)?;
+        Self::batch_execute_validated(env, caller, wallet_id, actions)
+    }
+
+    /// Configure scheduled execution timelock for a wallet (Admin or Owner only).
+    pub fn set_timelock(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        unlock_time: u64,
+    ) -> Result<(), Error> {
+        Self::when_not_paused(&env)?;
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        storage::set_timelock(&env, wallet_id, unlock_time);
+        Ok(())
+    }
+
+    /// Read the scheduled execution timelock for a wallet; 0 if unconfigured.
+    pub fn get_timelock(env: Env, wallet_id: u64) -> u64 {
+        storage::read_timelock(&env, wallet_id)
+    }
+
+    /// Clear scheduled execution timelock for a wallet (Admin or Owner only).
+    pub fn clear_timelock(env: Env, caller: Address, wallet_id: u64) -> Result<(), Error> {
+        Self::when_not_paused(&env)?;
+        Self::require_wallet_role(&env, wallet_id, &caller, Role::Admin)?;
+        storage::clear_timelock(&env, wallet_id);
+        Ok(())
+    }
+
     /// Freeze a wallet. Blocks all outbound movement. Freezing is a safety
     /// action, so [`Role::Agent`] is enough - an agent that detects trouble can
     /// stop the bleeding - as is the contract-level emergency admin.
@@ -938,6 +1003,7 @@ impl WalletContract {
         Self::when_not_paused(&env)?;
         let wallet = Self::require_wallet_role(&env, wallet_id, &caller, Role::Agent)?;
         Self::require_active(&wallet)?;
+        Self::check_execution_timelock(&env, wallet_id, 0)?;
 
         if actions.is_empty() {
             return Err(Error::InvalidInput);
@@ -1484,8 +1550,25 @@ impl WalletContract {
         Self::settle_outbound(env, wallet_id, asset, amount, recipient)
     }
 
-    /// Atomic gate hook: policy evaluation immediately followed by budget
-    /// consumption, before any debit. If registry is configured, addresses are resolved dynamically;
+    fn check_execution_timelock(
+        env: &Env,
+        wallet_id: u64,
+        param_timelock: u64,
+    ) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        let effective = if param_timelock > 0 {
+            param_timelock
+        } else {
+            storage::read_timelock(env, wallet_id)
+        };
+        if effective > 0 && now < effective {
+            return Err(Error::TimelockNotExpired);
+        }
+        Ok(())
+    }
+
+    /// Atomic pre-execution hook: policy → budget → velocity, before any
+    /// debit. If registry is configured, addresses are resolved dynamically;
     /// otherwise falls back to instance-wired addresses. A bypassed wallet
     /// skips the policy gate but never the budget or velocity gates.
     ///
@@ -1499,6 +1582,7 @@ impl WalletContract {
         amount: i128,
         caller: &Address,
     ) -> Result<(), Error> {
+        Self::check_execution_timelock(env, wallet_id, 0)?;
         let (policy_addr, budget_addr) = Self::resolve_gates(env)?;
         // Policy gate (skipped when wallet is bypassed).
         if let Some(policy_addr) = policy_addr.as_ref() {

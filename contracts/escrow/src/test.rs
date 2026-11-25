@@ -3901,6 +3901,79 @@ mod claim_refund_tests {
         let res = h.client.try_claim_refund(&h.sender, &id);
         assert_eq!(res, Err(Ok(Error::InvalidState)));
     }
+
+    #[test]
+    fn claim_refund_emits_standard_settlement_refund_event() {
+        use astroid_shared::events::{ESCROW_FUNDS_REFUNDED, ESCROW_FUNDS_RELEASED};
+        let h = setup(6_000, 0);
+        let id = create(&h, &one_asset(&h, 6_000), START + 100, 0);
+
+        at(&h, START + 200);
+        h.client.claim_refund(&h.sender, &id);
+
+        assert_single_settlement(&h, ESCROW_FUNDS_REFUNDED, id, &h.sender, 6_000, START + 200);
+        assert!(settlement_events(&h, ESCROW_FUNDS_RELEASED, id).is_empty());
+    }
+}
+
+#[test]
+fn standard_event_emission_release_and_refund_schemas() {
+    use astroid_shared::events::{EscrowSettlement, ESCROW_FUNDS_REFUNDED, ESCROW_FUNDS_RELEASED};
+
+    let h = setup(8_000, 2_000);
+    let id = create(&h, &two_assets(&h, 8_000, 2_000), START + 500, 0);
+
+    // 1. Release event inspection
+    at(&h, START + 100);
+    h.client.release(&h.arbiter, &id, &10_000);
+
+    let events = h.env.events().all();
+
+    // Check EscrowReleased structured event
+    let has_escrow_released = events.iter().any(|(contract, topics, _)| {
+        contract == h.client.address
+            && topics.contains(&Symbol::new(&h.env, "EscrowReleased").into_val(&h.env))
+    });
+    assert!(has_escrow_released, "ContractEvent::EscrowReleased emitted");
+
+    // Check ("escrow", "fund_rel", id) settlement event
+    let rel_events = settlement_events(&h, ESCROW_FUNDS_RELEASED, id);
+    assert_eq!(rel_events.len(), 1);
+    assert_eq!(
+        rel_events[0],
+        EscrowSettlement {
+            escrow_id: id,
+            recipient: h.recipient.clone(),
+            amount: 10_000,
+            timestamp: START + 100,
+        }
+    );
+
+    // 2. Refund event inspection on second escrow
+    let h2 = setup(4_000, 0);
+    let id2 = create(&h2, &one_asset(&h2, 4_000), START + 200, 0);
+
+    at(&h2, START + 300);
+    h2.client.refund(&h2.sender, &id2);
+
+    let events2 = h2.env.events().all();
+    let has_escrow_refunded = events2.iter().any(|(contract, topics, _)| {
+        contract == h2.client.address
+            && topics.contains(&Symbol::new(&h2.env, "EscrowRefunded").into_val(&h2.env))
+    });
+    assert!(has_escrow_refunded, "ContractEvent::EscrowRefunded emitted");
+
+    let ref_events = settlement_events(&h2, ESCROW_FUNDS_REFUNDED, id2);
+    assert_eq!(ref_events.len(), 1);
+    assert_eq!(
+        ref_events[0],
+        EscrowSettlement {
+            escrow_id: id2,
+            recipient: h2.sender.clone(),
+            amount: 4_000,
+            timestamp: START + 300,
+        }
+    );
 }
 
 /// refund_expired tests (Issue #505)

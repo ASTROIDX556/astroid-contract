@@ -4167,3 +4167,84 @@ fn interface_check_rejects_a_contract_serving_another_surface() {
         Err(Ok(Error::InvalidUpgradeAddress))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #452: wallet module upgrade hook
+// ---------------------------------------------------------------------------
+
+use astroid_interfaces::WalletModuleUpgradeHookInterface;
+
+#[contract]
+pub struct MockWalletUpgradeHook;
+
+#[contractimpl]
+impl astroid_interfaces::WalletModuleUpgradeHookInterface for MockWalletUpgradeHook {
+    fn validate_upgrade_hook(env: Env, module: Address) -> Result<bool, Error> {
+        let invalid: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("invalid"));
+        if let Some(bad) = invalid {
+            if module == bad {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl MockWalletUpgradeHook {
+    pub fn mark_invalid(env: &Env, hook_id: &Address, bad_module: &Address) {
+        env.as_contract(hook_id, || {
+            env.storage()
+                .instance()
+                .set(&soroban_sdk::symbol_short!("invalid"), bad_module);
+        });
+    }
+}
+
+#[test]
+fn wallet_upgrade_hook_admin_auth_and_interface_validation() {
+    let (env, client, admin) = setup();
+    let intruder = Address::generate(&env);
+    let hook_id = env.register_contract(None, MockWalletUpgradeHook);
+
+    // Non-admin cannot configure or remove hook
+    assert_eq!(
+        client.try_set_wallet_upgrade_hook(&intruder, &hook_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_remove_wallet_upgrade_hook(&intruder),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin configures hook
+    client.set_wallet_upgrade_hook(&admin, &hook_id);
+    assert_eq!(client.get_wallet_upgrade_hook(), Some(hook_id.clone()));
+
+    // Valid wallet module registration succeeds
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+
+    let valid_wallet = Address::generate(&env);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &valid_wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), valid_wallet);
+
+    // Mark invalid wallet module address on hook
+    let invalid_wallet = Address::generate(&env);
+    MockWalletUpgradeHook::mark_invalid(&env, &hook_id, &invalid_wallet);
+
+    // Registration of invalid interface rejected with InvalidUpgradeAddress
+    assert_eq!(
+        client.try_register_module(&owner, &org, &ModuleKind::Wallet, &invalid_wallet),
+        Err(Ok(Error::InvalidUpgradeAddress))
+    );
+
+    // Admin removes hook, now registration is unblocked
+    client.remove_wallet_upgrade_hook(&admin);
+    assert_eq!(client.get_wallet_upgrade_hook(), None);
+    client.register_module(&owner, &org, &ModuleKind::Wallet, &invalid_wallet);
+    assert_eq!(client.lookup(&org, &ModuleKind::Wallet), invalid_wallet);
+}

@@ -3225,3 +3225,124 @@ fn unauthorized_caller_cannot_transfer() {
     );
     assert_eq!(h.client.balance(&id, &h.token), 1_000);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #451: wallet execution timelocks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wallet_timelock_immediate_execution_when_unconfigured() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let to = Address::generate(&h.env);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    // No timelock configured (returns 0)
+    assert_eq!(h.client.get_timelock(&id), 0);
+
+    // Immediate transfer execution succeeds without delay
+    h.client.transfer(&owner, &id, &to, &h.token, &200);
+    assert_eq!(h.client.balance(&id, &h.token), 800);
+    assert_eq!(token_balance(&h, &to), 200);
+
+    // Immediate withdraw execution succeeds
+    h.client.withdraw(&owner, &id, &h.token, &300);
+    assert_eq!(h.client.balance(&id, &h.token), 500);
+}
+
+#[test]
+fn wallet_timelock_configuration_and_enforcement() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let stranger = Address::generate(&h.env);
+    let to = Address::generate(&h.env);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let start_time = 1_000;
+    h.env.ledger().with_mut(|l| l.timestamp = start_time);
+    let scheduled = start_time + 500;
+
+    // Unauthorized configuration rejected
+    assert_eq!(
+        h.client.try_set_timelock(&stranger, &id, &scheduled),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_clear_timelock(&stranger, &id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin/Owner configures timelock
+    h.client.set_timelock(&owner, &id, &scheduled);
+    assert_eq!(h.client.get_timelock(&id), scheduled);
+
+    // Premature transfer rejected with Error::TimelockNotExpired
+    assert_eq!(
+        h.client.try_transfer(&owner, &id, &to, &h.token, &200),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+    // Premature withdrawal rejected with Error::TimelockNotExpired
+    assert_eq!(
+        h.client.try_withdraw(&owner, &id, &h.token, &200),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    // Advance timestamp past timelock
+    h.env.ledger().with_mut(|l| l.timestamp = scheduled);
+
+    // Execution succeeds once duration has elapsed
+    h.client.transfer(&owner, &id, &to, &h.token, &200);
+    assert_eq!(h.client.balance(&id, &h.token), 800);
+    assert_eq!(token_balance(&h, &to), 200);
+
+    // Clear timelock restores unconstrained execution
+    h.client.clear_timelock(&owner, &id);
+    assert_eq!(h.client.get_timelock(&id), 0);
+    h.client.withdraw(&owner, &id, &h.token, &200);
+    assert_eq!(h.client.balance(&id, &h.token), 600);
+}
+
+#[test]
+fn wallet_execution_with_parameterized_timelock() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    let to = Address::generate(&h.env);
+    mint(&h, &owner, 2_000);
+    h.client.deposit(&id, &owner, &h.token, &2_000);
+
+    let now = 2_000;
+    h.env.ledger().with_mut(|l| l.timestamp = now);
+    let target_time = now + 600;
+
+    // Parameterized transfer called before scheduled time fails with TimelockNotExpired
+    assert_eq!(
+        h.client
+            .try_transfer_with_timelock(&owner, &id, &to, &h.token, &500, &target_time),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    // Parameterized withdrawal called before scheduled time fails
+    assert_eq!(
+        h.client
+            .try_withdraw_with_timelock(&owner, &id, &h.token, &300, &target_time),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    // Fast-forward ledger timestamp
+    h.env.ledger().with_mut(|l| l.timestamp = target_time);
+
+    // Now succeeds
+    h.client
+        .transfer_with_timelock(&owner, &id, &to, &h.token, &500, &target_time);
+    assert_eq!(h.client.balance(&id, &h.token), 1_500);
+    assert_eq!(token_balance(&h, &to), 500);
+
+    h.client
+        .withdraw_with_timelock(&owner, &id, &h.token, &300, &target_time);
+    assert_eq!(h.client.balance(&id, &h.token), 1_200);
+}

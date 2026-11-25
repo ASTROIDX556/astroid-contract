@@ -123,6 +123,7 @@ use astroid_interfaces::upgrade::UpgradeAuthorizationInterface;
 use astroid_interfaces::{
     BudgetClient, EscrowClient, MultisigClient, PolicyClient, ProposalClient, RegistryClient,
     RegistryInterface, TreasuryClient, UpgradeableInterface, WalletClient,
+    WalletModuleUpgradeHookClient,
 };
 use astroid_shared::constants::{
     MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
@@ -228,6 +229,8 @@ enum DataKey {
     /// [`RegistryContract::upgrade`], and only ever with a value strictly
     /// greater than the one it read.
     RegistryVersion,
+    /// Optional wallet module upgrade hook contract (instance).
+    WalletUpgradeHook,
 }
 
 /// A pending version-upgrade proposal for one [`ModuleKind`]: the `(version,
@@ -586,6 +589,9 @@ impl RegistryContract {
         // cannot serve as a module and must be caught before storage is written.
         if !Self::is_contract_address(&address) {
             return Err(Error::InvalidUpgradeAddress);
+        }
+        if kind == ModuleKind::Wallet {
+            Self::check_wallet_module_hook(&env, &address)?;
         }
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &address);
@@ -1303,6 +1309,9 @@ impl RegistryContract {
         caller.require_auth();
         Self::require_module_permission(&env, &caller, &org, kind)?;
         let plan = Self::plan_upgrade(&env, &org, kind, target_version)?;
+        if kind == ModuleKind::Wallet {
+            Self::check_wallet_module_hook(&env, &plan.address)?;
+        }
 
         // Past this line every check has passed; only writes remain.
         let key = DataKey::Module(org.clone(), kind);
@@ -1388,6 +1397,9 @@ impl RegistryContract {
             .get(&DataKey::Module(org.clone(), kind));
         let existed = current.is_some();
         let plan = Self::resolve_upgrade_target(&env, &org, kind, version, current)?;
+        if kind == ModuleKind::Wallet {
+            Self::check_wallet_module_hook(&env, &plan.address)?;
+        }
 
         let key = DataKey::Module(org.clone(), kind);
         env.storage().persistent().set(&key, &plan.address);
@@ -1859,6 +1871,57 @@ impl RegistryContract {
         }
         env.storage().instance().remove(&DataKey::Multisig);
         Ok(())
+    }
+
+    /// Record the wallet module upgrade hook contract (admin only).
+    pub fn set_wallet_upgrade_hook(env: Env, caller: Address, hook: Address) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        if !Self::is_contract_address(&hook) {
+            return Err(Error::InvalidUpgradeAddress);
+        }
+        let key = DataKey::WalletUpgradeHook;
+        env.storage().instance().set(&key, &hook);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    /// Read the configured wallet module upgrade hook address.
+    pub fn get_wallet_upgrade_hook(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::WalletUpgradeHook)
+    }
+
+    /// Remove the configured wallet module upgrade hook (admin only).
+    pub fn remove_wallet_upgrade_hook(env: Env, caller: Address) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        Self::require_admin(&env, &caller)?;
+        let key = DataKey::WalletUpgradeHook;
+        if env.storage().instance().has(&key) {
+            env.storage().instance().remove(&key);
+        }
+        Ok(())
+    }
+
+    /// Verify that `address` conforms to the wallet module upgrade hook interface.
+    ///
+    /// If an upgrade hook is configured via [`Self::set_wallet_upgrade_hook`],
+    /// invokes the hook's `validate_upgrade_hook` method.
+    pub fn validate_wallet_module_hook(env: Env, address: Address) -> Result<(), Error> {
+        Self::check_wallet_module_hook(&env, &address)
+    }
+
+    fn check_wallet_module_hook(env: &Env, address: &Address) -> Result<(), Error> {
+        if let Some(hook) = Self::get_wallet_upgrade_hook(env.clone()) {
+            let client = WalletModuleUpgradeHookClient::new(env, &hook);
+            match client.try_validate_upgrade_hook(address) {
+                Ok(Ok(true)) => Ok(()),
+                _ => Err(Error::InvalidUpgradeAddress),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     /// Check whether an address is an authorized protocol administrator or the
