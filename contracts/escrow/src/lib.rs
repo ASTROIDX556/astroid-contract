@@ -1210,9 +1210,6 @@ impl EscrowContract {
     /// so the signature path cannot route around a time lock.
     pub fn refund(env: Env, escrow_id: u64) -> Result<(), Error> {
         let mut escrow = load_escrow(&env, escrow_id)?;
-        if escrow.sender != env.current_contract_address() {
-            // Ensure sender authorization for refund if caller is sender, or allow permissionless if conditions match.
-        }
         let sender = escrow.sender.clone();
         sender.require_auth();
         if matches!(escrow.state, EscrowState::Refunded | EscrowState::Closed) {
