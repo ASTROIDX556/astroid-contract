@@ -1,21 +1,10 @@
 #![cfg(test)]
 extern crate std;
 
-use crate::{
-    quorum, BatchApproval, BatchCall, GovernanceChange, MultiSigContract, MultiSigContractClient,
-    QuorumStatus, SignerWeight,
-};
-use astroid_interfaces::ProposalState;
-use astroid_shared::constants::{
-    GOVERNANCE_GRACE_PERIOD, MAX_BATCH_CALLS, MAX_SIGNERS, MAX_TIMELOCK_DELAY, MIN_TIMELOCK_DELAY,
-    THRESHOLD_CHANGE_DELAY_LEDGERS,
-};
+use crate::{validate_multisig_threshold, MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_shared::errors::Error;
-use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events, Ledger};
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, IntoVal, Symbol,
-    TryFromVal, Val, Vec,
-};
+use soroban_sdk::{vec, Address, Env, Vec};
+
 
 /// Minimal stateful contract used as a batch sub-call target: it stores values
 /// keyed by id and exposes a couple of always-failing functions to exercise the
@@ -287,8 +276,6 @@ fn assert_event(env: &Env, category: Symbol, action: Symbol) {
     assert!(found, "expected a matching event to be emitted");
 }
 
-// --- quorum edge cases (threshold verification) ---
-
 #[test]
 fn minimal_quorum_executes_with_proposer_alone() {
     // MIN_THRESHOLD is 1, so the lightest possible configuration lets the
@@ -493,8 +480,6 @@ fn full_capacity_unanimous_quorum_and_one_signer_too_many() {
     assert!(!h.client.is_signer(&extra));
     assert_eq!(h.client.get_signers().len(), MAX_SIGNERS);
 }
-
-// --- timelocked governance ---
 
 #[test]
 fn threshold_change_applies_only_after_the_timelock() {
@@ -828,8 +813,6 @@ fn timelock_delay_is_itself_governed() {
     assert_eq!(pending.eta, pending.proposed_at + longer);
 }
 
-// --- timelocked signer-set changes ---
-
 #[test]
 fn add_and_remove_signer_with_weight() {
     let h = setup(&[1, 1, 1], 2);
@@ -992,8 +975,6 @@ fn governance_events_are_emitted() {
         symbol_short!("cancelled"),
     );
 }
-
-// --- batch execution ---
 
 struct BatchHarness {
     env: Env,
@@ -1323,8 +1304,6 @@ fn batch_execution_uses_signer_weights() {
     assert_eq!(res, Err(Ok(Error::QUORUM_NOT_MET)));
 }
 
-// --- standalone threshold verification ---
-
 #[test]
 fn verify_threshold_accumulates_weight_of_distinct_signers() {
     let h = setup(&[3, 2, 1], 5);
@@ -1421,10 +1400,6 @@ fn weight_views_report_the_configured_weights() {
     assert_eq!(h.client.get_signer_weight(&Address::generate(&h.env)), 0);
     assert_eq!(h.client.get_total_weight(), 6);
 }
-
-// ---------------------------------------------------------------------------
-// Threshold verification against the live signer set (issue #326)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn quorum_met_executes_and_one_short_fails() {
@@ -1579,10 +1554,6 @@ fn signer_set_with_invalid_weights_or_duplicates_is_rejected() {
     assert_eq!(client.get_threshold(), 2);
 }
 
-// ---------------------------------------------------------------------------
-// Issue #280: Threshold voting validation & duplicate vote prevention tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn threshold_voting_duplicate_ballot_rejected_for_multiple_signers() {
     let h = setup(&[2, 3, 4], 7);
@@ -1661,10 +1632,6 @@ fn threshold_voting_exact_boundary_transitions_state() {
     assert_eq!(proposal.approval_weight, 5);
 }
 
-// ---------------------------------------------------------------------------
-// Multisig quorum weight adjustments with timelock protection tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn weight_update_timelock_creation_queuing_premature_failure_and_success() {
     let h = setup(&[2, 2], 3);
@@ -1739,15 +1706,6 @@ fn quorum_modification_proposal_enforces_timelock_delay() {
     h.client.execute(&h.signers[0], &prop_id);
     assert!(h.client.get_proposal(&prop_id).executed);
 }
-
-// ---------------------------------------------------------------------------
-// Threshold verification and approval tracking (issue #290)
-//
-// The quorum primitives live in `crate::quorum`. The cases below pin the three
-// things a quorum must never do — count one key twice, trust a sum it cannot
-// represent, or fire one short of the bar — plus the two events a consumer
-// reads: an approval being recorded, and the threshold actually being met.
-// ---------------------------------------------------------------------------
 
 /// How many events carry the `(category, action)` topic pair.
 fn count_events(env: &Env, category: &str, action: &str) -> u32 {
@@ -2131,10 +2089,6 @@ fn batch_signature_weight_is_checked_and_duplicates_count_once() {
     assert_eq!(count_events(&strict.env, "batch", "quorum"), 0);
 }
 
-// ---------------------------------------------------------------------------
-// Issue #485: Additional edge-case tests for multisig threshold verification
-// ---------------------------------------------------------------------------
-
 /// Threshold equal to total weight: unanimous approval required.
 /// This is the maximal valid threshold configuration.
 #[test]
@@ -2440,8 +2394,6 @@ fn removed_signer_can_be_readded_with_valid_weight() {
     assert_eq!(h.client.get_signer_weight(&new_signer), 3);
 }
 
-// --- Issue #501: batched threshold confirmations ---
-
 fn ba(signer: &Address, proposal_id: u64) -> BatchApproval {
     BatchApproval {
         signer: signer.clone(),
@@ -2663,10 +2615,6 @@ fn batch_emits_a_concise_summary_event() {
     assert_eq!(summaries[0].1, vec![&h.env, p1, p2]);
 }
 
-// ---------------------------------------------------------------------------
-// Weighted quorum verification helper (issue #522)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn verify_weight_covers_insufficient_exact_and_excess_totals() {
     let env = Env::default();
@@ -2743,10 +2691,6 @@ fn verify_proposal_weight_rejects_short_and_accepts_exact_and_excess() {
     assert_eq!(status.remaining, 0);
     assert!(status.met);
 }
-
-// ---------------------------------------------------------------------------
-// Issue #517: proposal creation, voting and execution state machine
-// ---------------------------------------------------------------------------
 
 #[test]
 fn proposal_state_walks_pending_approved_executed() {
@@ -3085,14 +3029,12 @@ fn quorum_shortfall_has_a_dedicated_error_code() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Issue #493 — standardized event emission through shared/events.rs.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn signer_changes_emit_canonical_topics() {
     use astroid_shared::events::topic;
     use soroban_sdk::TryFromVal;
+use astroid_interfaces::ProposalState;
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events, Ledger};
     let h = setup(&[1, 1], 1);
     let newcomer = Address::generate(&h.env);
     h.client.add_signer(&h.signers[0], &newcomer, &3);
@@ -3111,4 +3053,76 @@ fn signer_changes_emit_canonical_topics() {
         })
         .map(|(_, _, data)| <(Address, u32)>::try_from_val(&h.env, &data).unwrap());
     assert_eq!(payload, Some((newcomer, 3)));
+}
+#[test]
+fn test_validate_multisig_threshold_success() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+
+    let signers = vec![&env,
+        SignerWeight { address: s1.clone(), weight: 5 },
+        SignerWeight { address: s2.clone(), weight: 5 },
+    ];
+
+    let approvals = vec![&env, s1.clone(), s2.clone()];
+    let res = validate_multisig_threshold(&env, &signers, &approvals, 10);
+    assert_eq!(res, Ok(10));
+}
+
+#[test]
+fn test_validate_multisig_threshold_duplicate_signer() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+
+    let signers = vec![&env,
+        SignerWeight { address: s1.clone(), weight: 5 },
+    ];
+
+    let approvals = vec![&env, s1.clone(), s1.clone()];
+    let res = validate_multisig_threshold(&env, &signers, &approvals, 5);
+    assert_eq!(res, Err(Error::AlreadySigned));
+}
+
+#[test]
+fn test_validate_multisig_threshold_revoked_signer() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+    let s_revoked = Address::generate(&env);
+
+    let signers = vec![&env,
+        SignerWeight { address: s1.clone(), weight: 5 },
+    ];
+
+    let approvals = vec![&env, s_revoked];
+    let res = validate_multisig_threshold(&env, &signers, &approvals, 5);
+    assert_eq!(res, Err(Error::SignerNotFound));
+}
+
+#[test]
+fn test_validate_multisig_threshold_zero_weight() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+
+    let signers = vec![&env,
+        SignerWeight { address: s1.clone(), weight: 0 },
+    ];
+
+    let approvals = vec![&env, s1.clone()];
+    let res = validate_multisig_threshold(&env, &signers, &approvals, 0);
+    assert_eq!(res, Err(Error::ZeroWeightSigner));
+}
+
+#[test]
+fn test_validate_multisig_threshold_quorum_not_met() {
+    let env = Env::default();
+    let s1 = Address::generate(&env);
+
+    let signers = vec![&env,
+        SignerWeight { address: s1.clone(), weight: 3 },
+    ];
+
+    let approvals = vec![&env, s1.clone()];
+    let res = validate_multisig_threshold(&env, &signers, &approvals, 5);
+    assert_eq!(res, Err(Error::QuorumNotMet));
 }
