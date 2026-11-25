@@ -152,6 +152,7 @@ use astroid_shared::types::AssetAmount;
 use astroid_shared::validation::{
     require_non_empty, require_non_negative_amount, require_positive_amount,
 };
+use soroban_sdk::IntoVal;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Map, String, Vec,
 };
@@ -192,7 +193,7 @@ pub struct TransactionPayload {
 pub enum RuleOp {
     /// Leaf: transfer amount must be at most `value_i128`.
     MaxAmount = 0,
-    /// Leaf: recipient must equal `value_address`.
+    /// Leaf: recipient must equal `value_address` or match pattern/CIDR/wildcard.
     AllowedRecipient = 1,
     /// Leaf: asset must equal `value_address`.
     AllowedAsset = 2,
@@ -433,7 +434,14 @@ fn evaluate_node(
     match node.op {
         RuleOp::MaxAmount => leaf(payload.amount <= node.value_i128),
         RuleOp::MinAmount => leaf(payload.amount >= node.value_i128),
-        RuleOp::AllowedRecipient => leaf(payload.recipient == node.value_address),
+        RuleOp::AllowedRecipient => {
+            let recipient_str = payload.recipient.to_string();
+            let target_str = node.value_address.to_string();
+            let matches = recipient_str == target_str
+                || (target_str.ends_with('*') && recipient_str.starts_with(&target_str[..target_str.len() - 1]))
+                || (target_str.contains('/') && recipient_str.starts_with(&target_str[..target_str.find('/').unwrap()]));
+            leaf(matches)
+        }
         RuleOp::AllowedAsset => leaf(payload.asset == node.value_address),
         RuleOp::RecipientBlacklisted => {
             leaf(context.recipient_blacklisted(env, &payload.recipient))
