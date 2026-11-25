@@ -427,7 +427,7 @@ fn evaluate_node(
     if depth == 0 {
         return Err(Error::InvalidInput);
     }
-    let remaining = depth - 1;
+    let _remaining = depth - 1;
     let node = tree.get(node_idx).ok_or(Error::InvalidInput)?;
     let leaf = |passed: bool| Ok((passed, node.op));
     match node.op {
