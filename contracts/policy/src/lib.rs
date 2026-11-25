@@ -436,9 +436,12 @@ fn evaluate_node(
         RuleOp::AllowedRecipient => {
             let recipient_str = payload.recipient.to_string();
             let target_str = node.value_address.to_string();
+            let slash_idx = target_str.find('/');
             let matches = recipient_str == target_str
-                || (target_str.ends_with('*') && recipient_str.starts_with(&target_str[..target_str.len() - 1]))
-                || (target_str.contains('/') && recipient_str.starts_with(&target_str[..target_str.find('/').unwrap()]));
+                || (target_str.ends_with('*')
+                    && recipient_str.starts_with(&target_str[..target_str.len() - 1]))
+                || (slash_idx.is_some()
+                    && recipient_str.starts_with(&target_str[..slash_idx.unwrap()]));
             leaf(matches)
         }
         RuleOp::AllowedAsset => leaf(payload.asset == node.value_address),
