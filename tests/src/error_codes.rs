@@ -215,9 +215,10 @@ fn a_wallet_refusal_reaches_the_caller_as_its_canonical_code() {
     // A malformed amount.
     let res = wallet.try_deposit(&wid, &owner, &token, &0);
     assert_eq!(code_of(res), Error::InvalidAmount.code());
-    // An exhausted balance.
+    // A token the wallet has never taken custody of is an unregistered asset
+    // (Issue #496), reported as its own code rather than a zero balance.
     let res = wallet.try_withdraw(&owner, &wid, &token, &1);
-    assert_eq!(code_of(res), Error::InsufficientFunds.code());
+    assert_eq!(code_of(res), Error::UnsupportedAsset.code());
 }
 
 #[test]
