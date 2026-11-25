@@ -4421,3 +4421,61 @@ fn rollover_with_carry_resets_spend_and_banks_credit() {
     assert_eq!(status.remaining, 1_600);
     assert_eq!(h.client.get(&bid).rollover_credit, 600);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #447: bounded rollover catch-up with a dedicated deterministic error.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rollover_refuses_an_unbounded_number_of_elapsed_periods() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    let beyond = 1_000 + (crate::MAX_ROLLOVER_PERIODS as u64 + 1) * WEEK;
+    h.env.ledger().set_timestamp(beyond);
+
+    // Both the preview and the write path report the same named code — a
+    // preview cannot claim a rollover the write path would refuse.
+    assert_eq!(
+        h.client.try_rollover_preview(&id(&h.env, "eng")),
+        Err(Ok(Error::BUDGET_ROLLOVER_EXCEEDED))
+    );
+    assert_eq!(
+        h.client.try_rollover(&h.owner, &id(&h.env, "eng")),
+        Err(Ok(Error::BUDGET_ROLLOVER_EXCEEDED))
+    );
+
+    // Nothing was settled: the whole invocation reverted atomically.
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.spent, 0);
+    assert_eq!(b.rollover_credit, 0);
+    assert_eq!(b.window_start, 1_000);
+}
+
+#[test]
+fn rollover_at_the_bounded_number_of_periods_is_allowed() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, false);
+    let at_bound = 1_000 + crate::MAX_ROLLOVER_PERIODS as u64 * WEEK;
+    h.env.ledger().set_timestamp(at_bound);
+
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+    let b: Budget = h.client.get(&id(&h.env, "eng"));
+    assert_eq!(b.rollover_credit, 0);
+    assert_eq!(b.window_start, at_bound);
+}
+
+#[test]
+fn budget_rollover_exceeded_is_wire_stable_from_the_budget_contract() {
+    let h = setup();
+    allocate(&h, "eng", 1_000, Period::Weekly, true);
+    h.env
+        .ledger()
+        .set_timestamp(1_000 + (crate::MAX_ROLLOVER_PERIODS as u64 + 1) * WEEK);
+    let result = h.client.try_rollover(&h.owner, &id(&h.env, "eng"));
+    let code = match result {
+        Err(Ok(e)) => e.code(),
+        other => panic!("expected a contract error, got {other:?}"),
+    };
+    assert_eq!(code, Error::BUDGET_ROLLOVER_EXCEEDED.code());
+    assert_eq!(code, BudgetError::BUDGET_ROLLOVER_EXCEEDED.code());
+}
