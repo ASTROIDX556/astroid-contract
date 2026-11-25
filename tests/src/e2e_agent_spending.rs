@@ -34,33 +34,33 @@ use soroban_sdk::{
     token, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
-const START: u64 = 1_000;
+pub const START: u64 = 1_000;
 /// The treasury hard-codes the policy id `"active"` on every spend gate.
-const POLICY_ID: &str = "active";
-const BUDGET_ID: &str = "agent-daily";
-const ORG: &str = "acme";
+pub const POLICY_ID: &str = "active";
+pub const BUDGET_ID: &str = "agent-daily";
+pub const ORG: &str = "acme";
 
 /// All eight contracts deployed into one `Env`, wired like the real protocol.
-struct Harness<'a> {
-    env: Env,
-    registry: RegistryContractClient<'a>,
-    treasury: TreasuryContractClient<'a>,
-    budget: BudgetContractClient<'a>,
-    policy: PolicyContractClient<'a>,
-    wallet: WalletContractClient<'a>,
-    escrow: EscrowContractClient<'a>,
+pub struct Harness<'a> {
+    pub env: Env,
+    pub registry: RegistryContractClient<'a>,
+    pub treasury: TreasuryContractClient<'a>,
+    pub budget: BudgetContractClient<'a>,
+    pub policy: PolicyContractClient<'a>,
+    pub wallet: WalletContractClient<'a>,
+    pub escrow: EscrowContractClient<'a>,
     /// Address standing in for the multisig/proposal governance layer.
-    multisig: Address,
-    admin: Address,
-    org_owner: Address,
-    agent: Address,
-    recipient: Address,
-    asset: Address,
+    pub multisig: Address,
+    pub admin: Address,
+    pub org_owner: Address,
+    pub agent: Address,
+    pub recipient: Address,
+    pub asset: Address,
 }
 
 /// Deploy every workspace contract in dependency order, register the org's
 /// module addresses with the registry, and fund the treasury.
-fn setup() -> Harness<'static> {
+pub fn setup() -> Harness<'static> {
     setup_with_timelock(0)
 }
 
@@ -215,23 +215,23 @@ fn setup_with_timelock(timelock: u64) -> Harness<'static> {
     }
 }
 
-fn token_balance(h: &Harness, who: &Address) -> i128 {
+pub fn token_balance(h: &Harness, who: &Address) -> i128 {
     token::TokenClient::new(&h.env, &h.asset).balance(who)
 }
 
-fn string(h: &Harness, s: &str) -> String {
+pub fn string(h: &Harness, s: &str) -> String {
     String::from_str(&h.env, s)
 }
 
 /// Wire the policy contract into the treasury so every treasury withdrawal
 /// is policy-gated through the org-wide `"active"` policy id.
-fn wire_policy(h: &Harness) {
+pub fn wire_policy(h: &Harness) {
     h.treasury.set_policy(&h.admin, &h.policy.address);
 }
 
 /// Register the org-wide `"active"` policy: at most `max_amount` per spend,
 /// only in `asset`, and — when `recipient_only` is set — only to `recipient`.
-fn register_active_policy(h: &Harness, max_amount: i128, recipient_only: bool) {
+pub fn register_active_policy(h: &Harness, max_amount: i128, recipient_only: bool) {
     h.policy.register_policy(
         &h.admin,
         &string(h, POLICY_ID),
@@ -254,7 +254,7 @@ fn register_active_policy(h: &Harness, max_amount: i128, recipient_only: bool) {
 /// No policy is registered when this helper runs, so the treasury funding
 /// withdrawal is ungated — the policy gate is switched on afterwards for the
 /// agent-facing spends each test cares about.
-fn fund_agent_wallet(h: &Harness, amount: i128) -> u64 {
+pub fn fund_agent_wallet(h: &Harness, amount: i128) -> u64 {
     let wallet_id = h.wallet.create_wallet(&h.org_owner);
     h.wallet
         .grant_role(&h.org_owner, &wallet_id, &h.agent, &Role::Agent);

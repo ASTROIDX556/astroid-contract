@@ -138,6 +138,8 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Vec,
 };
 
+mod version;
+
 /// How many of the most recently published `Organization` versions the registry
 /// scans when resolving an upgrade hash to the version that published it (see
 /// [`RegistryContract::plan_registry_upgrade`]).
@@ -1477,6 +1479,46 @@ impl RegistryContract {
         Self::check_frozen(&env)?;
         require_non_empty(&org)?;
         Ok(Self::plan_upgrade(&env, &org, kind, target_version)?.address)
+    }
+
+    /// Owner-gated pre-flight that validates a version transition and publishes
+    /// the decision as a registry upgrade event (Issue #445).
+    ///
+    /// Unlike [`Self::validate_upgrade`], which is an anonymous read-only
+    /// resolver, this entrypoint is the explicit administrative check: the
+    /// caller must be the recorded organization owner (or the protocol admin)
+    /// and must have signed. The current version is read from the registry's
+    /// own pin rather than supplied by the caller, so a caller cannot claim a
+    /// forward step while asking to validate a rollback. On success it emits
+    /// [`events::ContractEvent::RegistryUpgradeValidated`] with the resolved
+    /// `from_version`, the requested `to_version` and the acting account; a
+    /// refusal writes nothing and emits nothing, because Soroban reverts the
+    /// whole invocation.
+    ///
+    /// | Condition                                   | Error                  |
+    /// |---------------------------------------------|------------------------|
+    /// | the registry is frozen                      | `RegistryFrozen`       |
+    /// | the caller is not the org owner/admin       | `Unauthorized`         |
+    /// | the organization or module is unknown       | `NotFound`             |
+    /// | `target_version` is zero or too far forward | `InvalidInput`         |
+    /// | the target is at or behind the pin          | `VersionNotMonotonic`  |
+    pub fn validate_version_transition(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        target_version: u32,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        require_non_empty(&org)?;
+        caller.require_auth();
+        Self::require_root_owner(&env, &caller, &org)?;
+
+        let from_version = Self::get_module_version(env.clone(), org.clone(), kind)?;
+        version::validate_upgrade_step(from_version, target_version)?;
+
+        events::registry_upgrade_validated(&env, org, kind, from_version, target_version, caller);
+        Ok(())
     }
 
     /// The version `org`'s `kind` module is currently pinned to.
