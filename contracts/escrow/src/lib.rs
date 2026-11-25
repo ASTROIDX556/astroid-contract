@@ -1208,6 +1208,40 @@ impl EscrowContract {
     /// A schedule-backed escrow refuses an early override release with the
     /// same [`Error::EscrowLocked`] code the arbiter path uses (Issue #315, #332),
     /// so the signature path cannot route around a time lock.
+    pub fn refund(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let mut escrow = load_escrow(&env, escrow_id)?;
+        if escrow.sender != env.current_contract_address() {
+            // Ensure sender authorization for refund if caller is sender, or allow permissionless if conditions match.
+        }
+        let sender = escrow.sender.clone();
+        sender.require_auth();
+        if matches!(escrow.state, EscrowState::Refunded | EscrowState::Closed) {
+            return Err(Error::InvalidState);
+        }
+        let now = env.ledger().timestamp();
+        let grace = Self::grace_end(&escrow)?;
+        if now < grace {
+            return Err(Error::TimeLockActive);
+        }
+        if escrow.refund_window > 0 {
+            let window_close = checked_add(grace, escrow.refund_window)?;
+            if now >= window_close {
+                return Err(Error::EscrowExpired);
+            }
+        }
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, escrow_id, &escrow);
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        Self::transfer_all(&env, &escrow, &escrow.sender, remaining)?;
+        events::emit(
+            &env,
+            events::topic::ESCROW,
+            symbol_short!("refund"),
+            (escrow_id, escrow.sender.clone(), remaining),
+        );
+        Ok(())
+    }
+
     pub fn override_release(
         env: Env,
         id: u64,
