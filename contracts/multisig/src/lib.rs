@@ -99,7 +99,7 @@ pub use storage::{
     SignerWeight,
 };
 
-pub use quorum::QuorumStatus;
+pub use quorum::{QuorumStatus, validate_threshold_approval, validate_multisig_threshold};
 
 #[contract]
 pub struct MultiSigContract;

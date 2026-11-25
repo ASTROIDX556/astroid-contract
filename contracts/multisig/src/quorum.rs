@@ -181,6 +181,63 @@ pub fn accumulate_selected(
 /// progress, `Error::QUORUM_NOT_MET` for signature-verified quorums) when the
 /// aggregate falls below the threshold. A sum that cannot be represented as
 /// `u32` surfaces as [`Error::Overflow`] before any comparison is made.
+pub fn verify_threshold(
+    signers: &Vec<SignerWeight>,
+    is_selected: &dyn Fn(&SignerWeight) -> bool,
+    threshold: u32,
+    total_weight: u32,
+    shortfall: Error,
+) -> Result<QuorumStatus, Error> {
+    verify_weight(signers, is_selected, threshold, total_weight, shortfall)
+}
+
+/// Validates multisig threshold approvals by checking signer weights, duplicate signers,
+/// revoked/missing keys, and quorum requirements, returning the total approved weight.
+pub fn validate_multisig_threshold(
+    env: &Env,
+    signers: &Vec<SignerWeight>,
+    approvals: &Vec<Address>,
+    threshold: u32,
+) -> Result<u32, Error> {
+    let mut total_approved: u32 = 0;
+    let mut seen = std::vec::Vec::new();
+
+    for approver in approvals.iter() {
+        let mut found = false;
+        let mut signer_weight = 0u32;
+        for sw in signers.iter() {
+            if sw.address == approver {
+                found = true;
+                signer_weight = sw.weight;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::SignerNotFound);
+        }
+
+        if signer_weight == 0 {
+            return Err(Error::ZeroWeightSigner);
+        }
+
+        if seen.contains(&approver) {
+            return Err(Error::AlreadySigned);
+        }
+        seen.push(approver);
+
+        total_approved = total_approved
+            .checked_add(signer_weight)
+            .ok_or(Error::Overflow)?;
+    }
+
+    if total_approved < threshold {
+        return Err(Error::QuorumNotMet);
+    }
+
+    Ok(total_approved)
+}
+
 pub fn verify_weight(
     signers: &Vec<SignerWeight>,
     is_selected: &dyn Fn(&SignerWeight) -> bool,
