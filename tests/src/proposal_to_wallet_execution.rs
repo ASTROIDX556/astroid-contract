@@ -38,7 +38,9 @@ use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient};
 use astroid_multisig::{BatchCall, MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::{PolicyContract, PolicyContractClient};
-use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState, VoteBars};
+use astroid_proposal::{
+    ProposalContract, ProposalContractClient, ProposalState, ProposalTiming, VoteBars,
+};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
@@ -305,8 +307,11 @@ fn submit_proposal(h: &Harness) -> u64 {
         &vec![&h.env],
         &2,
         &deposit,
-        &0u64,
-        &0u64,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 0,
+            grace_period: 0,
+        },
     );
     // The stake left the proposer and is now escrowed by the contract.
     assert_eq!(token_balance(h, &h.org_owner), 0);
@@ -542,7 +547,7 @@ fn governance_can_suspend_and_restore_the_execution_path() {
     // that can switch it off. An outsider cannot.
     let policy_id = string(&h, POLICY_ID);
     let res = h.policy.try_set_enabled(&h.admin, &policy_id, &false);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(res, Err(Ok(Error::PolicyUnauthorizedSigner)));
     h.policy
         .set_enabled(&h.multisig.address, &policy_id, &false);
     assert!(!h.policy.get(&policy_id).enabled);

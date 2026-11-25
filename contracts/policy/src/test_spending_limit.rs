@@ -154,18 +154,18 @@ fn only_the_policy_owner_can_configure_or_record() {
     assert_eq!(
         t.policy
             .try_set_agent_spend_limit(&stranger, &t.id(), &t.agent, &PER_TX, &DAILY),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     t.limit(PER_TX, DAILY);
     assert_eq!(
         t.policy
             .try_record_agent_spend(&stranger, &t.id(), &t.agent, &10),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         t.policy
             .try_remove_agent_spend_limit(&stranger, &t.id(), &t.agent),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(t.spent(), 0);
 }

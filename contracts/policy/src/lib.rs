@@ -644,20 +644,20 @@ impl PolicyDenialReason {
     pub fn to_error(self) -> Error {
         match self {
             PolicyDenialReason::Disabled
-            | PolicyDenialReason::Expired
             | PolicyDenialReason::RecipientNotWhitelisted
-            | PolicyDenialReason::AboveMaxTransactionLimit
             | PolicyDenialReason::RecipientNotAllowed
             | PolicyDenialReason::AssetNotAllowed
             | PolicyDenialReason::AssetBlacklisted
             | PolicyDenialReason::CompositeRuleDenied
             | PolicyDenialReason::RuleStackDenied
             | PolicyDenialReason::OutsideTransferWindow => Error::PolicyDenied,
+            PolicyDenialReason::Expired => Error::PolicyExpired,
             PolicyDenialReason::RecipientBlacklisted => Error::PolicyRecipientRestricted,
             PolicyDenialReason::MerchantBlacklisted => Error::PolicyMerchantBlocked,
             PolicyDenialReason::AssetNotWhitelisted => Error::AssetNotAuthorized,
             PolicyDenialReason::AllowanceExceeded => Error::AllowanceExceeded,
             PolicyDenialReason::AllowanceExpired => Error::AllowanceExpired,
+            PolicyDenialReason::AboveMaxTransactionLimit => Error::PolicyConstraintUnmet,
         }
     }
 
@@ -1043,7 +1043,7 @@ impl PolicyContract {
         require_non_negative_amount(new_max)?;
         let mut policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         policy.config_hash = new_hash;
         policy.max_amount = new_max;
@@ -1069,7 +1069,7 @@ impl PolicyContract {
         caller.require_auth();
         let mut policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         policy.enabled = enabled;
         env.storage()
@@ -1098,7 +1098,7 @@ impl PolicyContract {
         caller.require_auth();
         let mut policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         policy.rule_combination_strategy = strategy;
         env.storage()
@@ -1192,7 +1192,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::AssetWhitelist(policy_id.clone(), asset.clone());
         if env.storage().persistent().has(&key) {
@@ -1218,7 +1218,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::AssetWhitelist(policy_id.clone(), asset.clone());
         if !env.storage().persistent().has(&key) {
@@ -1299,7 +1299,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::AssetWhitelistEnabled(policy_id.clone());
         env.storage().persistent().set(&key, &enabled);
@@ -1396,7 +1396,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::MerchantBlacklist(merchant_address.clone());
         if env.storage().persistent().has(&key) {
@@ -1422,7 +1422,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::MerchantBlacklist(merchant_address.clone());
         if !env.storage().persistent().has(&key) {
@@ -1448,7 +1448,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         require_non_empty(&category)?;
         let key = DataKey::CategoryBlacklist(category.clone());
@@ -1475,7 +1475,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::CategoryBlacklist(category.clone());
         if !env.storage().persistent().has(&key) {
@@ -1503,7 +1503,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::Blacklist(address.clone());
         if env.storage().persistent().has(&key) {
@@ -1529,7 +1529,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::Blacklist(address.clone());
         if !env.storage().persistent().has(&key) {
@@ -1919,7 +1919,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::Allowance(policy_id.clone(), asset.clone());
         if !env.storage().persistent().has(&key) {
@@ -2244,7 +2244,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         validate_rule_tree(&rule_tree)?;
         let key = DataKey::CompositeRule(policy_id.clone());
@@ -2263,7 +2263,7 @@ impl PolicyContract {
         caller.require_auth();
         let policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         let key = DataKey::CompositeRule(policy_id.clone());
         if !env.storage().persistent().has(&key) {
@@ -2633,7 +2633,7 @@ impl PolicyContract {
     fn require_policy_owner(env: &Env, caller: &Address, policy_id: &String) -> Result<(), Error> {
         caller.require_auth();
         if Self::load(env, policy_id)?.owner != *caller {
-            return Err(Error::Unauthorized);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         Ok(())
     }
