@@ -7,7 +7,7 @@ use soroban_sdk::{
 
 use crate::{
     PolicyContract, PolicyContractClient, PolicyDecision, PolicyDenialReason, RuleNode, RuleOp,
-    RuleTree, TransactionPayload, MAX_POLICY_RULES,
+    RuleTree, TransactionPayload, MAX_POLICY_RULES, MAX_WHITELIST_BATCH,
 };
 
 struct DetRng(u64);
@@ -5145,4 +5145,275 @@ fn transfer_dry_run_publishes_rule_deny_sub_reason_event() {
         Some(PolicyDenialReason::CompositeRuleDenied)
     );
     assert_eq!(rule_deny_events(&c.env), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #499: composed policy evaluation pipeline
+// ---------------------------------------------------------------------------
+
+/// A policy named `pipeline` with a 1 000 ceiling and no other gates, plus its
+/// owner. The client is returned so a test can compose the pipeline itself.
+fn pipeline_setup<'a>(env: &Env) -> (PolicyContractClient<'a>, Address, String) {
+    let id = env.register_contract(None, PolicyContract);
+    let client = PolicyContractClient::new(env, &id);
+    client.initialize();
+    let owner = Address::generate(env);
+    let policy_id = String::from_str(env, "pipeline");
+    client.register_policy(
+        &owner,
+        &policy_id,
+        &BytesN::from_array(env, &[7; 32]),
+        &1_000,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+    (client, owner, policy_id)
+}
+
+#[test]
+fn pipeline_single_rule_success_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _owner, policy_id) = pipeline_setup(&env);
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Only the ceiling is configured, and the spend is inside it.
+    assert_eq!(
+        client.check_transaction_pipeline(&policy_id, &asset, &recipient, &1_000),
+        ()
+    );
+}
+
+#[test]
+fn pipeline_chains_rules_in_order_and_halts_on_the_first_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, owner, policy_id) = pipeline_setup(&env);
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Compose three rules: a recipient whitelist, a rate limit and the ceiling.
+    client.set_recipient_whitelist_enabled(&owner, &policy_id, &true);
+    client.set_recurring_allowance(&owner, &policy_id, &asset, &100, &3_600, &0);
+
+    // 1. The whitelist is the first rule, so it is what refuses — even though
+    //    the rate limit and the ceiling would also refuse.
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &5_000),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+
+    // 2. Admit the recipient: the rate limit becomes the first failing rule.
+    client.add_recipient_to_whitelist(&owner, &policy_id, &recipient);
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &5_000),
+        Err(Ok(Error::RateLimitExceeded))
+    );
+
+    // 3. Raise the rate limit: the ceiling is now the first failing rule.
+    client.set_recurring_allowance(&owner, &policy_id, &asset, &10_000, &3_600, &0);
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &5_000),
+        Err(Ok(Error::PolicyMaxAmountExceeded))
+    );
+
+    // 4. A request inside every rule is admitted.
+    assert_eq!(
+        client.check_transaction_pipeline(&policy_id, &asset, &recipient, &500),
+        ()
+    );
+}
+
+#[test]
+fn pipeline_reports_each_failure_with_its_own_code() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, owner, policy_id) = pipeline_setup(&env);
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Recipient blocklist -> POLICY_RECIPIENT_RESTRICTED.
+    client.add_blacklist(&owner, &policy_id, &recipient);
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &10),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+    client.remove_blacklist(&owner, &policy_id, &recipient);
+
+    // Merchant blocklist -> POLICY_MERCHANT_BLOCKED.
+    client.add_merchant_blacklist(&owner, &policy_id, &recipient);
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &10),
+        Err(Ok(Error::PolicyMerchantBlocked))
+    );
+    client.remove_merchant_blacklist(&owner, &policy_id, &recipient);
+
+    // A lapsed allowance -> ALLOWANCE_EXPIRED.
+    client.set_recurring_allowance(&owner, &policy_id, &asset, &100, &3_600, &50);
+    env.ledger().with_mut(|l| l.timestamp = 51);
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &10),
+        Err(Ok(Error::AllowanceExpired))
+    );
+
+    // The ceiling -> POLICY_MAX_AMOUNT_EXCEEDED.
+    let (client, _owner, policy_id) = pipeline_setup(&env);
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &1_001),
+        Err(Ok(Error::PolicyMaxAmountExceeded))
+    );
+
+    // A non-positive amount is malformed input, not a policy denial.
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn pipeline_refuses_a_disabled_policy_before_any_other_rule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, owner, policy_id) = pipeline_setup(&env);
+    let asset = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.set_recipient_whitelist_enabled(&owner, &policy_id, &true);
+    client.set_enabled(&owner, &policy_id, &false);
+
+    assert_eq!(
+        client.try_check_transaction_pipeline(&policy_id, &asset, &recipient, &10),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #448: validate policy creation limits and whitelist batches before
+// any policy state is written.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_whitelist_adds_a_valid_list_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    p.add_recipients_to_whitelist(&owner, &pid, &vec![&env, a.clone(), b.clone()]);
+
+    assert_eq!(
+        p.get_recipient_whitelist(&pid),
+        vec![&env, a.clone(), b.clone()]
+    );
+    assert!(p.is_recipient_whitelisted(&pid, &a));
+    assert!(p.is_recipient_whitelisted(&pid, &b));
+}
+
+#[test]
+fn batch_whitelist_rejects_empty_oversized_and_duplicate_lists() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let a = Address::generate(&env);
+
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &Vec::new(&env)),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    let mut oversized = Vec::new(&env);
+    for _ in 0..MAX_WHITELIST_BATCH + 1 {
+        oversized.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &oversized),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &vec![&env, a.clone(), a.clone()]),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // No partial state survived any of the refusals.
+    assert_eq!(p.get_recipient_whitelist(&pid), Vec::new(&env));
+    assert!(!p.is_recipient_whitelisted(&pid, &a));
+}
+
+#[test]
+fn batch_whitelist_rejects_an_already_listed_recipient_without_partial_writes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    p.add_recipient_to_whitelist(&owner, &pid, &a);
+
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&owner, &pid, &vec![&env, b.clone(), a.clone()]),
+        Err(Ok(Error::AlreadyExists))
+    );
+    assert_eq!(p.get_recipient_whitelist(&pid), vec![&env, a.clone()]);
+    assert!(!p.is_recipient_whitelisted(&pid, &b));
+}
+
+#[test]
+fn batch_whitelist_requires_the_policy_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let pid = String::from_str(&env, "max_txn");
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        p.try_add_recipients_to_whitelist(&stranger, &pid, &vec![&env, Address::generate(&env)]),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn policy_limits_reject_negative_amounts_but_keep_the_zero_sentinel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+
+    assert_eq!(
+        p.try_register_policy(
+            &owner,
+            &String::from_str(&env, "negative"),
+            &BytesN::from_array(&env, &[1; 32]),
+            &-1,
+            &None,
+            &None,
+            &0,
+            &None,
+        ),
+        Err(Ok(Error::InvalidAmount))
+    );
+    let zero = String::from_str(&env, "unlimited");
+    p.register_policy(
+        &owner,
+        &zero,
+        &BytesN::from_array(&env, &[2; 32]),
+        &0,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+    assert_eq!(p.get(&zero).max_amount, 0);
+
+    assert_eq!(
+        p.try_rotate_policy(&owner, &zero, &BytesN::from_array(&env, &[3; 32]), &-1,),
+        Err(Ok(Error::InvalidAmount))
+    );
 }

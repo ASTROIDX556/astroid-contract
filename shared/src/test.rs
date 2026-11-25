@@ -1332,7 +1332,7 @@ const RETIRED_CODES: [u32; 0] = [];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 71] = [
+const EXPECTED_CODES: [(Error, u32); 75] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
@@ -1354,12 +1354,15 @@ const EXPECTED_CODES: [(Error, u32); 71] = [
     (Error::PolicyUnauthorizedSigner, 26),
     (Error::VelocityLimitExceeded, 27),
     (Error::PolicyConstraintUnmet, 28),
+    (Error::PolicyMaxAmountExceeded, 29),
     // --- Registry (30-39) ---
     (Error::RegistryFrozen, 30),
     (Error::ModuleDeprecated, 31),
     (Error::CircularUpgrade, 32),
     (Error::InvalidUpgradeAddress, 33),
     (Error::VersionNotMonotonic, 34),
+    (Error::InvalidUpgradePath, 35),
+    (Error::VersionAlreadyExists, 36),
     // --- Budget (40-47) ---
     (Error::BudgetExceeded, 40),
     (Error::BudgetFrozen, 41),
@@ -1378,6 +1381,7 @@ const EXPECTED_CODES: [(Error, u32); 71] = [
     (Error::InvalidState, 53),
     (Error::RateLimitExceeded, 54),
     (Error::UnauthorizedWalletAccess, 55),
+    (Error::UnsupportedAsset, 56),
     // --- Multisig / approvals (61-69, 70, 90-93) ---
     (Error::ThresholdNotMet, 61),
     (Error::AlreadySigned, 62),
@@ -1415,6 +1419,10 @@ const EXPECTED_CODES: [(Error, u32); 71] = [
     (Error::TreasuryPaused, 85),
     (Error::AllocationLimitExceeded, 88),
     (Error::EmergencySweepUnauthorized, 89),
+    // --- Escrow continuation (95-99) ---
+    (Error::UnauthorizedCancellation, 95),
+    // --- Budget rollover (96) ---
+    (Error::BudgetRolloverExceeded, 96),
 ];
 
 #[test]
@@ -1484,6 +1492,36 @@ fn named_budget_and_quorum_codes_are_wire_stable() {
 }
 
 #[test]
+fn budget_rollover_exceeded_has_a_stable_named_code() {
+    // Issue #447: the explicit name and its canonical code are part of the
+    // published ABI. Both error tables must decode the same number, and the
+    // dedicated code must be distinguishable from the general config error.
+    assert_eq!(
+        Error::BUDGET_ROLLOVER_EXCEEDED,
+        Error::BudgetRolloverExceeded
+    );
+    assert_eq!(Error::BUDGET_ROLLOVER_EXCEEDED.code(), 96);
+    assert_eq!(
+        Error::BUDGET_ROLLOVER_EXCEEDED.wire_name(),
+        "BUDGET_ROLLOVER_EXCEEDED"
+    );
+    assert_eq!(
+        BudgetError::BUDGET_ROLLOVER_EXCEEDED,
+        BudgetError::BudgetRolloverExceeded
+    );
+    assert_eq!(BudgetError::BUDGET_ROLLOVER_EXCEEDED.code(), 96);
+    assert_eq!(
+        BudgetError::from(Error::BUDGET_ROLLOVER_EXCEEDED),
+        BudgetError::BudgetRolloverExceeded
+    );
+    assert_eq!(
+        Error::from(BudgetError::BUDGET_ROLLOVER_EXCEEDED),
+        Error::BudgetRolloverExceeded
+    );
+    assert_ne!(Error::BudgetRolloverExceeded, Error::InvalidRolloverConfig);
+}
+
+#[test]
 fn error_codes_are_unique_and_never_overlap() {
     for (i, variant) in Error::ALL.iter().enumerate() {
         let code = variant.code();
@@ -1508,18 +1546,19 @@ fn error_code_bands_are_ascending() {
     // Each contract's band is declared ascending, so a variant dropped into the
     // wrong block — the usual symptom of an accidental renumber — shows up as
     // a non-ascending band rather than passing silently.
-    let bands: [(u32, u32); 11] = [
+    let bands: [(u32, u32); 12] = [
         (1, 6),
         (10, 12),
         (20, 29),
         (30, 39),
         (40, 49),
-        (50, 55),
+        (50, 56),
         (60, 70),
         (71, 79),
         (80, 87),
         (88, 89),
         (90, 94),
+        (95, 95),
     ];
     for (low, high) in bands {
         let mut previous: Option<u32> = None;
@@ -1566,7 +1605,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let wallet = Error::ALL
         .iter()
-        .filter(|e| (50..56).contains(&e.code()))
+        .filter(|e| (50..57).contains(&e.code()))
         .count();
     let multisig = Error::ALL
         .iter()
@@ -1578,7 +1617,7 @@ fn error_domains_do_not_overlap() {
         .count();
     let escrow = Error::ALL
         .iter()
-        .filter(|e| matches!(e.code(), 80..=82 | 86..=87))
+        .filter(|e| matches!(e.code(), 80..=82 | 86..=87 | 95))
         .count();
     let treasury = Error::ALL
         .iter()
@@ -1589,14 +1628,14 @@ fn error_domains_do_not_overlap() {
         .filter(|e| (20..30).contains(&e.code()))
         .count();
 
-    assert_eq!(registry, 5, "registry band 30-39");
+    assert_eq!(registry, 7, "registry band 30-39");
     assert_eq!(budget, 9, "budget band 40-49");
-    assert_eq!(wallet, 6, "wallet band 50-55");
+    assert_eq!(wallet, 7, "wallet band 50-56");
     assert_eq!(multisig, 15, "multisig bands 61-70 and 90-94");
     assert_eq!(proposal, 8, "proposal band 71-79");
-    assert_eq!(escrow, 5, "escrow band 80-82 and 86-87");
+    assert_eq!(escrow, 6, "escrow band 80-82, 86-87 and 95");
     assert_eq!(treasury, 5, "treasury bands 83-85 and 88-89");
-    assert_eq!(policy, 9, "policy band 20-29");
+    assert_eq!(policy, 8, "policy band 20-29");
 }
 
 #[test]

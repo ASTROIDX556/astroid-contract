@@ -768,7 +768,20 @@ impl WalletContract {
             &amount,
         );
         Self::credit(&env, wallet_id, &asset, amount)?;
-        events::wallet_funded(&env, wallet_id, &from, &asset, amount);
+        // A token the wallet has taken custody of is a supported asset from
+        // then on: the successful transfer above is the proof that it is a real
+        // token contract, so registration is implicit and needs no separate
+        // admin step (Issue #496).
+        storage::mark_asset_supported(&env, wallet_id, &asset);
+        events::publish(
+            &env,
+            events::ContractEvent::WalletFunded {
+                wallet_id,
+                from,
+                asset,
+                amount,
+            },
+        );
         Ok(())
     }
 
@@ -1256,6 +1269,15 @@ impl WalletContract {
     /// Read a wallet's owner + state.
     pub fn get_wallet(env: Env, wallet_id: u64) -> Result<WalletData, Error> {
         Self::load_wallet(&env, wallet_id)
+    }
+
+    /// Whether `asset` is a registered (supported) token of `wallet_id`.
+    ///
+    /// Registration happens when the wallet first takes custody of the asset,
+    /// so this answers "has this wallet ever held this token?" — the same
+    /// question every outbound movement asks before moving value (Issue #496).
+    pub fn is_asset_supported(env: Env, wallet_id: u64, asset: Address) -> bool {
+        storage::is_asset_supported(&env, wallet_id, &asset)
     }
 
     /// Read a wallet's internal balance for an asset (0 if none recorded).
@@ -1814,9 +1836,11 @@ impl WalletContract {
     /// Both the wallet's tracked balance for `asset` and the contract's real
     /// SAC custody must cover `amount` before anything changes:
     ///
-    /// * the tracked read comes first, so an uninitialized (never-funded)
-    ///   `(wallet, asset)` pair answers [`Error::InsufficientFunds`] exactly
-    ///   like a short balance;
+    /// * asset registration first, so a token the wallet never took custody of
+    ///   answers [`Error::UnsupportedAsset`] rather than reading as a zero
+    ///   balance (Issue #496);
+    /// * then the tracked read, so a registered but short `(wallet, asset)`
+    ///   pair answers [`Error::InsufficientFunds`];
     /// * the custody read second, so a ledger that drifted above the tokens
     ///   actually on hand cannot overdraw custody — a condition the token
     ///   call would otherwise surface as a raw host trap instead of a code.
@@ -1825,6 +1849,16 @@ impl WalletContract {
     /// tracked entry costs one read and one write per movement instead of
     /// the two reads a separate check-then-debit pass needed. A zero or
     /// negative amount is refused with [`Error::InvalidAmount`].
+    ///
+    /// Asset registration is checked first (Issue #496): an asset the wallet has
+    /// never taken custody of is [`Error::UnsupportedAsset`], which is a
+    /// different failure from "you hold none of a real asset"
+    /// ([`Error::InsufficientFunds`]). After that the interaction order is
+    /// check-effects-interactions: the tracked balance and the real custody are
+    /// verified, the tracked balance is debited, and only then is the token
+    /// called — so a token contract that tries to re-enter cannot observe a
+    /// half-applied spend, and the wallet's own re-entrancy lock
+    /// ([`storage::acquire_lock`]) refuses the re-entrant call outright.
     fn settle_outbound(
         env: &Env,
         wallet_id: u64,
@@ -1833,6 +1867,10 @@ impl WalletContract {
         to: &Address,
     ) -> Result<(), Error> {
         require_positive_amount(amount)?;
+        ensure!(
+            storage::is_asset_supported(env, wallet_id, asset),
+            Error::UnsupportedAsset
+        );
         let tracked = storage::read_balance(env, wallet_id, asset);
         validate_sufficient_balance(tracked, amount)?;
         let custody = Self::sac_balance(env, asset)?;
