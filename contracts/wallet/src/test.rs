@@ -2757,19 +2757,20 @@ fn multi_token_balances_are_tracked_per_wallet_and_asset() {
     assert_eq!(h.client.custody_balance(&token_b), 900);
 }
 
-/// An outgoing spend is refused with `InsufficientFunds` when the wallet has
-/// no tracked balance for the asset — the uninitialized-pair case.
+/// An outgoing spend for an asset the wallet never registered is refused with
+/// `UnsupportedAsset` (Issue #496), before any balance is read.
 #[test]
-fn transfer_of_an_untracked_asset_fails_with_insufficient_funds() {
+fn transfer_of_an_untracked_asset_fails_with_unsupported_asset() {
     let h = setup();
     let token_b = second_asset(&h);
     let (owner, id) = funded_wallet(&h, 400);
     let recipient = Address::generate(&h.env);
 
-    // The wallet has never seen asset B.
+    // The wallet has never seen asset B, so it is not a registered asset.
+    assert!(!h.client.is_asset_supported(&id, &token_b));
     assert_eq!(h.client.balance(&id, &token_b), 0);
     let res = h.client.try_transfer(&owner, &id, &recipient, &token_b, &1);
-    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+    assert_eq!(res, Err(Ok(Error::UnsupportedAsset)));
     assert_eq!(token_balance(&h, &recipient), 0);
 }
 
@@ -2829,9 +2830,10 @@ fn withdrawal_refused_without_sufficient_multi_token_funds() {
     let token_b = second_asset(&h);
     let (owner, id) = funded_wallet(&h, 800);
 
-    // Asset B was never deposited: the tracked read refuses first.
+    // Asset B was never deposited, so it is not a registered asset: the
+    // registration guard refuses before any balance is read (Issue #496).
     let res = h.client.try_withdraw(&owner, &id, &token_b, &50);
-    assert_eq!(res, Err(Ok(Error::InsufficientFunds)));
+    assert_eq!(res, Err(Ok(Error::UnsupportedAsset)));
 
     // Over the tracked balance of asset A: same code, nothing moves.
     let res = h.client.try_withdraw(&owner, &id, &h.token, &801);
@@ -3115,4 +3117,111 @@ fn wallet_events_use_canonical_builders() {
         })
         .map(|(_, _, data)| Address::try_from_val(&h.env, &data).unwrap());
     assert_eq!(by, Some(h.admin.clone()));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #496: multi-asset balance tracking and disbursement auth guards
+// ---------------------------------------------------------------------------
+
+/// A second, independent SAC token contract for multi-asset tests.
+fn second_token(h: &Harness) -> Address {
+    let token_admin = Address::generate(&h.env);
+    h.env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address()
+}
+
+#[test]
+fn balances_are_tracked_across_two_token_contracts() {
+    let h = setup();
+    let other = second_token(&h);
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    token::StellarAssetClient::new(&h.env, &other).mint(&owner, &700);
+
+    h.client.deposit(&id, &owner, &h.token, &400);
+    h.client.deposit(&id, &owner, &other, &700);
+
+    // One (token contract, wallet) entry per asset: neither balance bleeds into
+    // the other.
+    assert_eq!(h.client.balance(&id, &h.token), 400);
+    assert_eq!(h.client.balance(&id, &other), 700);
+    assert!(h.client.is_asset_supported(&id, &h.token));
+    assert!(h.client.is_asset_supported(&id, &other));
+
+    // Spending the second asset leaves the first untouched.
+    h.client.transfer(&owner, &id, &recipient, &other, &250);
+    assert_eq!(h.client.balance(&id, &other), 450);
+    assert_eq!(h.client.balance(&id, &h.token), 400);
+    assert_eq!(
+        token::TokenClient::new(&h.env, &other).balance(&recipient),
+        250
+    );
+}
+
+#[test]
+fn transfer_rejects_an_unregistered_asset() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    // A real token contract the wallet never took custody of is not a supported
+    // asset — refused with its own code, not read as a zero balance.
+    let unregistered = second_token(&h);
+    assert!(!h.client.is_asset_supported(&id, &unregistered));
+    assert_eq!(
+        h.client
+            .try_transfer(&owner, &id, &recipient, &unregistered, &10),
+        Err(Ok(Error::UnsupportedAsset))
+    );
+    // The registered asset still moves.
+    h.client.transfer(&owner, &id, &recipient, &h.token, &10);
+}
+
+#[test]
+fn transfer_rejects_an_insufficient_balance() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &100);
+
+    assert_eq!(
+        h.client
+            .try_transfer(&owner, &id, &recipient, &h.token, &101),
+        Err(Ok(Error::InsufficientFunds))
+    );
+    // Nothing moved and the tracked balance is unchanged.
+    assert_eq!(h.client.balance(&id, &h.token), 100);
+    assert_eq!(token_balance(&h, &recipient), 0);
+}
+
+#[test]
+fn unauthorized_caller_cannot_transfer() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    // A signed caller without a role on this wallet is refused, and the
+    // disbursement never reaches the token contract.
+    assert_eq!(
+        h.client
+            .try_transfer(&stranger, &id, &recipient, &h.token, &10),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        h.client.try_withdraw(&stranger, &id, &h.token, &10),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.balance(&id, &h.token), 1_000);
 }

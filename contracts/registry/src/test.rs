@@ -9,7 +9,8 @@ use astroid_shared::errors::Error;
 use astroid_shared::types::{ModuleId, ModuleInfo, ModuleKind};
 use soroban_sdk::testutils::{storage::Persistent as _, Address as _, AuthorizedFunction, Ledger};
 use soroban_sdk::{
-    symbol_short, testutils::Events, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    contract, contractimpl, symbol_short, testutils::Events, vec, Address, BytesN, Env, IntoVal,
+    String, Symbol, Val, Vec,
 };
 
 /// Assert that the canonical `ContractEvent` with the given variant symbol was
@@ -2659,7 +2660,7 @@ fn an_upgrade_cannot_repeat_the_version_it_already_runs() {
     assert_eq!(
         h.client
             .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::VersionNotMonotonic))
+        Err(Ok(Error::InvalidUpgradePath))
     );
     assert_eq!(pointed_at(&h), h.v2);
     assert_eq!(pin(&h), 2);
@@ -2678,12 +2679,12 @@ fn an_upgrade_cannot_walk_back_to_an_earlier_version() {
         assert_eq!(
             h.client
                 .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &behind),
-            Err(Ok(Error::VersionNotMonotonic))
+            Err(Ok(Error::InvalidUpgradePath))
         );
         assert_eq!(
             h.client
                 .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &behind),
-            Err(Ok(Error::VersionNotMonotonic))
+            Err(Ok(Error::InvalidUpgradePath))
         );
     }
     assert_eq!(pointed_at(&h), h.v3);
@@ -2856,8 +2857,8 @@ fn validation_predicts_every_refusal_of_the_write_path() {
     let cases = [
         (0u32, Error::InvalidInput),
         (99, Error::NotFound),
-        (2, Error::VersionNotMonotonic),
-        (1, Error::VersionNotMonotonic),
+        (2, Error::InvalidUpgradePath),
+        (1, Error::InvalidUpgradePath),
     ];
     for (version, expected) in cases {
         assert_eq!(
@@ -3250,7 +3251,7 @@ fn versioned_registration_refuses_the_version_the_module_already_runs() {
     assert_eq!(
         h.client
             .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::VersionNotMonotonic))
+        Err(Ok(Error::InvalidUpgradePath))
     );
     assert_eq!(pointed_at(&h), h.v2);
     assert_eq!(pin(&h), 2);
@@ -3269,7 +3270,7 @@ fn versioned_registration_cannot_walk_backwards() {
     assert_eq!(
         h.client
             .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::VersionNotMonotonic))
+        Err(Ok(Error::InvalidUpgradePath))
     );
     assert_eq!(pointed_at(&h), h.v3);
     assert_eq!(pin(&h), 3);
@@ -3386,7 +3387,7 @@ fn versioned_registration_agrees_with_the_upgrade_validation() {
     assert_eq!(
         h.client
             .try_validate_upgrade(&h.org, &ModuleKind::Wallet, &2),
-        Err(Ok(Error::VersionNotMonotonic))
+        Err(Ok(Error::InvalidUpgradePath))
     );
 }
 
@@ -3780,9 +3781,11 @@ fn latest_verified_walk_is_bounded() {
 
     assert_eq!(client.try_get_latest_verified(&k), Err(Ok(Error::NotFound)));
 
-    // A verified version inside the window is found.
+    // A verified version inside the window is found. Its bytecode is its own:
+    // one hash names one version per kind (Issue #500).
     let near = impl_address(&env);
-    client.register_version(&admin, &k, &(far - 1), &near, &good);
+    let near_hash = approved_hash(&env, &client, &admin, k, 3);
+    client.register_version(&admin, &k, &(far - 1), &near, &near_hash);
     assert_eq!(client.get_latest_verified(&k), (far - 1, near));
 }
 
@@ -4000,4 +4003,275 @@ fn org_registration_emits_canonical_category_action_subject_topics() {
             && Address::try_from_val(&env, &data).ok() == Some(owner.clone())
     });
     assert!(found, "expected (org, register, org_id) -> owner");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #500: upgrade path validation, version checks and interface verification
+// ---------------------------------------------------------------------------
+
+/// A contract that serves the wallet surface (`is_paused`), i.e. what a version
+/// bound to [`ModuleKind::Wallet`] is expected to implement.
+#[contract]
+pub struct WalletSurface;
+
+#[contractimpl]
+impl WalletSurface {
+    pub fn is_paused(_env: Env) -> bool {
+        false
+    }
+}
+
+/// A contract that serves the registry surface (`verify_owner`), i.e. what a
+/// version bound to [`ModuleKind::Organization`] is expected to implement.
+#[contract]
+pub struct RegistrySurface;
+
+#[contractimpl]
+impl RegistrySurface {
+    pub fn verify_owner(_env: Env, _org: String, _owner: Address) -> Result<bool, Error> {
+        Ok(false)
+    }
+}
+
+/// A contract that serves none of the interface surfaces. Publishing it as a
+/// wallet version must be refused by the interface probe.
+#[contract]
+pub struct UnrelatedSurface;
+
+#[contractimpl]
+impl UnrelatedSurface {
+    pub fn unrelated(_env: Env) -> u32 {
+        7
+    }
+}
+
+/// A valid upgrade path registers and then moves: a version published strictly
+/// forward of the kind's latest is accepted, and the module follows it.
+#[test]
+fn valid_upgrade_path_registers_successfully() {
+    let h = setup_path();
+    // v4 is ahead of the latest published version (3) and carries fresh bytecode.
+    let h4 = approved_hash(&h.env, &h.client, &h.admin, ModuleKind::Wallet, 4);
+    let v4 = impl_address(&h.env);
+    h.client
+        .register_version(&h.admin, &ModuleKind::Wallet, &4, &v4, &h4);
+    assert_eq!(h.client.get_latest(&ModuleKind::Wallet), v4);
+
+    assert_eq!(
+        h.client
+            .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &4),
+        4
+    );
+    assert_eq!(pointed_at(&h), v4);
+    assert_eq!(pin(&h), 4);
+}
+
+/// Two versions of one kind may not bind the same WASM hash: the reverse index
+/// makes the duplicate a single-read refusal with its own code.
+#[test]
+fn duplicate_version_hash_is_rejected() {
+    let (env, client, admin) = setup();
+    let hash = approved_hash(&env, &client, &admin, ModuleKind::Treasury, 11);
+    let v1 = impl_address(&env);
+    client.register_version(&admin, &ModuleKind::Treasury, &1, &v1, &hash);
+
+    let v2 = impl_address(&env);
+    assert_eq!(
+        client.try_register_version(&admin, &ModuleKind::Treasury, &2, &v2, &hash),
+        Err(Ok(Error::VersionAlreadyExists))
+    );
+    // The original record is untouched, and no second version was published.
+    assert_eq!(client.get_version(&ModuleKind::Treasury, &1), v1);
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Treasury, &2),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+/// A module upgrade that does not advance the module's upgrade path — a repeat
+/// of the version it runs, or a downgrade — is refused with
+/// INVALID_UPGRADE_PATH and leaves the module untouched.
+#[test]
+fn downgrade_version_registration_is_rejected() {
+    let h = setup_path();
+    // Move the module to v3, then try to stay there or walk back to 1 and 2.
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+
+    for behind in [3u32, 2, 1] {
+        assert_eq!(
+            h.client
+                .try_register_module_version(&h.owner, &h.org, &ModuleKind::Wallet, &behind),
+            Err(Ok(Error::InvalidUpgradePath)),
+            "register_module_version({behind})"
+        );
+        assert_eq!(
+            h.client
+                .try_upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &behind),
+            Err(Ok(Error::InvalidUpgradePath)),
+            "upgrade_module({behind})"
+        );
+    }
+    assert_eq!(pointed_at(&h), h.v3);
+    assert_eq!(pin(&h), 3);
+}
+
+/// Only the protocol admin may add to the version upgrade map.
+#[test]
+fn unauthorized_caller_cannot_modify_upgrade_map() {
+    let (env, client, admin) = setup();
+    let org = String::from_str(&env, "acme");
+    let owner = Address::generate(&env);
+    client.register_org(&admin, &org, &owner);
+    let hash = approved_hash(&env, &client, &admin, ModuleKind::Escrow, 21);
+
+    // The organization's owner is authorized over its module records, but the
+    // version map itself is protocol-admin only.
+    assert_eq!(
+        client.try_register_version(&owner, &ModuleKind::Escrow, &1, &impl_address(&env), &hash),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_get_version(&ModuleKind::Escrow, &1),
+        Err(Ok(Error::NotFound))
+    );
+    // And the admin path still works.
+    client.register_version(&admin, &ModuleKind::Escrow, &1, &impl_address(&env), &hash);
+}
+
+/// A deployed contract that serves the expected interface passes the check.
+#[test]
+fn interface_check_accepts_a_contract_serving_the_expected_surface() {
+    let (env, client, _admin) = setup();
+    let wallet = env.register_contract(None, WalletSurface);
+    assert_eq!(
+        client.verify_module_interface(&ModuleKind::Wallet, &wallet),
+        ()
+    );
+
+    let registry = env.register_contract(None, RegistrySurface);
+    assert_eq!(
+        client.verify_module_interface(&ModuleKind::Organization, &registry),
+        ()
+    );
+}
+
+/// A contract that does not serve the expected interface is rejected with
+/// INVALID_UPGRADE_PATH, and an account address with INVALID_UPGRADE_ADDRESS.
+#[test]
+fn interface_check_rejects_a_contract_serving_another_surface() {
+    let (env, client, _admin) = setup();
+    let unrelated = env.register_contract(None, UnrelatedSurface);
+    assert_eq!(
+        client.try_verify_module_interface(&ModuleKind::Wallet, &unrelated),
+        Err(Ok(Error::InvalidUpgradePath))
+    );
+    assert_eq!(
+        client.try_verify_module_interface(&ModuleKind::Escrow, &unrelated),
+        Err(Ok(Error::InvalidUpgradePath))
+    );
+    assert_eq!(
+        client.try_verify_module_interface(&ModuleKind::Wallet, &account_address(&env)),
+        Err(Ok(Error::InvalidUpgradeAddress))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #445: owner-authorized version validation and rollback protection.
+//
+// The pre-flight reads the pin from the registry (never from the caller), so a
+// downgrade cannot be laundered through a forged "current version". A refused
+// step returns a deterministic code and writes/emits nothing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn owner_preflight_accepts_strictly_forward_version_steps() {
+    let h = setup_path();
+
+    // The module was registered by address, so the registry reads its pin as 0
+    // and the first forward step is v2.
+    h.client
+        .validate_version_transition(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &2);
+    h.client
+        .validate_version_transition(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+
+    assert_event(&h.env, "RegistryUpgradeValidated");
+    let auths = h.env.auths();
+    assert!(
+        auths.iter().any(|(signer, invocation)| {
+            signer == &h.owner
+                && matches!(
+                    &invocation.function,
+                    AuthorizedFunction::Contract((_, function, _))
+                        if function == &Symbol::new(&h.env, "validate_version_transition")
+                )
+        }),
+        "the recorded org owner must authorize the pre-flight"
+    );
+}
+
+#[test]
+fn owner_preflight_rejects_repeat_and_downgrade() {
+    let h = setup_path();
+    h.client
+        .upgrade_module(&h.owner, &h.org, &ModuleKind::Wallet, &3);
+
+    for target in [1u32, 2, 3] {
+        assert_eq!(
+            h.client.try_validate_version_transition(
+                &h.owner,
+                &h.org,
+                &ModuleKind::Wallet,
+                &target,
+            ),
+            Err(Ok(Error::VersionNotMonotonic))
+        );
+    }
+    assert_eq!(pin(&h), 3);
+    assert_eq!(pointed_at(&h), h.v3);
+}
+
+#[test]
+fn owner_preflight_rejects_zero_and_oversized_jumps() {
+    let h = setup_path();
+    assert_eq!(
+        h.client
+            .try_validate_version_transition(&h.owner, &h.org, &ModuleKind::Wallet, &0,),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        h.client.try_validate_version_transition(
+            &h.owner,
+            &h.org,
+            &ModuleKind::Wallet,
+            &(crate::version::MAX_FORWARD_STEP + 2),
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn stranger_cannot_preflight_a_version_transition() {
+    let h = setup_path();
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_validate_version_transition(&stranger, &h.org, &ModuleKind::Wallet, &2,),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(pin(&h), 0);
+}
+
+#[test]
+fn preflight_on_an_unknown_organization_is_not_found() {
+    let h = setup_path();
+    let missing = String::from_str(&h.env, "missing");
+    assert_eq!(
+        h.client
+            .try_validate_version_transition(&h.owner, &missing, &ModuleKind::Wallet, &2,),
+        Err(Ok(Error::NotFound))
+    );
 }

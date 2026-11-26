@@ -274,6 +274,21 @@ pub enum ContractEvent {
         to_version: u32,
         wasm_hash: BytesN<32>,
     },
+    /// An organization owner (or the protocol admin) pre-flighted a module
+    /// version transition through the registry's validated upgrade path
+    /// (Issue #445).
+    ///
+    /// `from_version` is the pin read from the registry, never a caller-supplied
+    /// value, and `to_version` is strictly greater — the event is the audit
+    /// trail that a proposed step was checked for monotonicity and found sound.
+    /// A refused step emits nothing: the invocation reverts atomically.
+    RegistryUpgradeValidated {
+        org: String,
+        kind: ModuleKind,
+        from_version: u32,
+        to_version: u32,
+        actor: Address,
+    },
     /// A wallet was created.
     WalletCreated { wallet_id: u64, owner: Address },
     /// A wallet changed lifecycle state (`state` is e.g. `frozen`/`paused`/...).
@@ -542,6 +557,18 @@ pub fn publish(env: &Env, event: ContractEvent) {
             env.events().publish(
                 (Symbol::new(env, "RegistryUpgraded"),),
                 (from_version, to_version, wasm_hash),
+            );
+        }
+        ContractEvent::RegistryUpgradeValidated {
+            org,
+            kind,
+            from_version,
+            to_version,
+            actor,
+        } => {
+            env.events().publish(
+                (Symbol::new(env, "RegistryUpgradeValidated"),),
+                (org, kind, from_version, to_version, actor),
             );
         }
         ContractEvent::WalletCreated { wallet_id, owner } => {
@@ -1145,6 +1172,29 @@ pub fn upgrade_committed(
         topic::VERSION,
         symbol_short!("committed"),
         (kind, version, wasm_hash.clone(), address.clone()),
+    );
+}
+
+/// `RegistryUpgradeValidated` — the structured event for an owner-authorized
+/// monotonic version pre-flight (Issue #445). Published alongside the canonical
+/// single-topic form so indexers using either schema see the same decision.
+pub fn registry_upgrade_validated(
+    env: &Env,
+    org: String,
+    kind: ModuleKind,
+    from_version: u32,
+    to_version: u32,
+    actor: Address,
+) {
+    publish(
+        env,
+        ContractEvent::RegistryUpgradeValidated {
+            org,
+            kind,
+            from_version,
+            to_version,
+            actor,
+        },
     );
 }
 

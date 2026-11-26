@@ -45,7 +45,19 @@ pub(crate) enum DataKey {
     /// Wallet record: id -> WalletData.
     Wallet(u64),
     /// Per-wallet, per-asset balance: (id, asset) -> i128.
+    ///
+    /// Keyed by the token contract address and the wallet, where the wallet is
+    /// the on-chain identity of its owner/organization ([`DataKey::Wallet`]
+    /// records which owner it belongs to). One entry per (token, owner) pair, so
+    /// a wallet tracks any number of distinct assets independently.
     Balance(u64, Address),
+    /// Whether the token contract is a registered asset of the wallet:
+    /// (id, asset) -> true. Written when the wallet first takes custody of the
+    /// asset (a successful [`crate::WalletContract::deposit`]), and required by
+    /// every outbound movement, so an unregistered/mis-typed token contract is
+    /// refused with [`Error::UnsupportedAsset`] instead of reading as a zero
+    /// balance (Issue #496).
+    SupportedAsset(u64, Address),
     /// Org-wide Policy contract consulted before every outbound movement
     /// (instance).
     Policy,
@@ -115,6 +127,22 @@ pub(crate) fn store_wallet(env: &Env, id: u64, data: &WalletData) {
 
 pub(crate) fn bump_wallet(env: &Env, id: u64) {
     bump_persistent(env, &DataKey::Wallet(id));
+}
+
+/// Whether `asset` is registered as a supported token of wallet `id`.
+pub(crate) fn is_asset_supported(env: &Env, id: u64, asset: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::SupportedAsset(id, asset.clone()))
+}
+
+/// Register `asset` as a supported token of wallet `id`. Idempotent: the first
+/// deposit of an asset registers it, later deposits leave the entry alone.
+pub(crate) fn mark_asset_supported(env: &Env, id: u64, asset: &Address) {
+    let key = DataKey::SupportedAsset(id, asset.clone());
+    if !env.storage().persistent().has(&key) {
+        set_persistent(env, &key, &true);
+    }
 }
 
 /// Tracked balance of `asset` held for wallet `id`; `0` when never funded.

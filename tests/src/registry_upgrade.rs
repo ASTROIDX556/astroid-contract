@@ -351,11 +351,16 @@ fn a_self_upgrade_record_naming_an_account_is_refused() {
         &h.env,
         "GAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSH7S",
     ));
+    // Its own fresh, approved bytecode hash: one hash names one version per
+    // kind, so the record under test is rejected for its address, not its hash.
+    let fresh = hash(&h.env, 44);
     h.registry
-        .register_version(&h.admin, &ModuleKind::Organization, &4, &bogus, &h.v1);
+        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &fresh);
+    h.registry
+        .register_version(&h.admin, &ModuleKind::Organization, &4, &bogus, &fresh);
 
     assert_eq!(
-        h.planner.try_plan(&h.registry.address, &h.v1),
+        h.planner.try_plan(&h.registry.address, &fresh),
         Err(Ok(Error::InvalidInput))
     );
 }

@@ -118,6 +118,7 @@
 //! | Invalid rollover configuration                               | [`Error::InvalidRolloverConfig`] | 47 |
 //! | Checked arithmetic in a spend/fund/allocate path overflowed  | [`Error::BUDGET_OVERFLOW`]     | 48 |
 //! | Spend/consume would breach the effective ceiling            | [`Error::BUDGET_LIMIT_EXCEEDED`] | 49 |
+//! | Rollover would settle more than `MAX_ROLLOVER_PERIODS`      | [`Error::BUDGET_ROLLOVER_EXCEEDED`] | 95 |
 //! | Other checked arithmetic would overflow `i128`              | [`Error::Overflow`]            | 11 |
 //! | Caller is not the budget owner                              | [`Error::Unauthorized`]        | 3  |
 //! | Budget is frozen / archived                                 | [`Error::BudgetFrozen`] / [`Error::BudgetArchived`] | 41 / 42 |
@@ -138,6 +139,13 @@ use astroid_shared::validation::{
 };
 use astroid_shared::{constants, events};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+
+/// The largest number of whole periods a single rollover may settle (Issue
+/// #447). A budget left dormant far longer than any protocol window would
+/// otherwise force a catch-up over an unbounded number of periods; the rollover
+/// is refused with [`Error::BUDGET_ROLLOVER_EXCEEDED`] instead, so a caller must
+/// reconfigure the window or settle in bounded steps.
+pub const MAX_ROLLOVER_PERIODS: u64 = 1024;
 
 /// Reset period for a recurring budget. `None` means one-shot (no auto-reset).
 ///
@@ -1413,6 +1421,13 @@ impl BudgetContract {
         let elapsed = now.saturating_sub(budget.window_start);
         // Whole periods to settle. `window` is non-zero, so this is >= 1.
         let periods = (elapsed / window) as i128;
+        // Bounded catch-up (Issue #447). Refuse an unbounded gap with a
+        // dedicated, deterministic code rather than walking an arbitrary number
+        // of periods or silently clamping the accumulated allowance. Because
+        // this runs before any write, the whole invocation reverts atomically.
+        if periods > MAX_ROLLOVER_PERIODS as i128 {
+            return Err(Error::BUDGET_ROLLOVER_EXCEEDED);
+        }
 
         // The current period's remainder, plus one full base limit for every
         // further period that came and went entirely untouched. `leftover`
