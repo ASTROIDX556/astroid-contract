@@ -170,6 +170,11 @@ const MAX_SPEND_ENTRIES: u32 = 10;
 /// register an unbounded amount of work for every transfer check.
 const MAX_POLICY_RULES: u32 = 16;
 
+/// Maximum number of recipients accepted by one whitelist batch call (Issue
+/// #448). Bounds both the validation loop and the number of storage writes a
+/// single invocation can perform.
+pub const MAX_WHITELIST_BATCH: u32 = MAX_SPEND_ENTRIES;
+
 /// A transaction payload submitted for policy evaluation.
 ///
 /// This struct carries the essential fields of a proposed transfer so the
@@ -307,6 +312,34 @@ fn validate_rule_tree(tree: &RuleTree) -> Result<(), Error> {
         };
         if bad_children {
             return Err(Error::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
+/// Validate a whitelist batch before a single storage key is touched (Issue
+/// #448).
+///
+/// - an empty vector is a misconfigured policy — an owner who enables whitelist
+///   mode with no entries would deny every transfer and lock funds;
+/// - more than [`MAX_WHITELIST_BATCH`] entries would make one call unbounded in
+///   both validation and ledger writes;
+/// - a repeated address would inflate the read index and make the directory
+///   disagree with the membership set.
+///
+/// The duplicate scan is quadratic but bounded to ten entries by the size gate,
+/// so a hostile batch cannot turn it into a gas-exhaustion vector.
+fn validate_whitelist_batch(recipients: &Vec<Address>) -> Result<(), Error> {
+    let len = recipients.len();
+    if len == 0 || len > MAX_WHITELIST_BATCH {
+        return Err(Error::InvalidInput);
+    }
+    for i in 0..len {
+        let current = recipients.get(i).ok_or(Error::InvalidInput)?;
+        for other in recipients.iter().skip(i as usize + 1) {
+            if other == current {
+                return Err(Error::AlreadyExists);
+            }
         }
     }
     Ok(())
@@ -956,6 +989,11 @@ impl PolicyContract {
     ) -> Result<(), Error> {
         owner.require_auth();
         require_non_empty(&policy_id)?;
+        // Issue #448: a negative transaction limit can never be satisfied, so
+        // reject it at creation time rather than storing a policy that denies
+        // every spend. Zero remains the documented "no per-tx cap" sentinel and
+        // is therefore deliberately accepted.
+        require_non_negative_amount(max_amount)?;
         if env
             .storage()
             .persistent()
@@ -1000,6 +1038,9 @@ impl PolicyContract {
         new_max: i128,
     ) -> Result<(), Error> {
         caller.require_auth();
+        // Issue #448: rotate through the same bound check as creation so a
+        // malformed limit cannot be smuggled in through an update.
+        require_non_negative_amount(new_max)?;
         let mut policy = Self::load(&env, &policy_id)?;
         if policy.owner != caller {
             return Err(Error::Unauthorized);
@@ -1565,6 +1606,58 @@ impl PolicyContract {
             symbol_short!("wl_add"),
             (policy_id, recipient),
         );
+        Ok(())
+    }
+
+    /// Add several recipients to a policy's whitelist in one atomic call
+    /// (Issue #448).
+    ///
+    /// The whole batch is validated before anything is written: it must be
+    /// non-empty, within [`MAX_WHITELIST_BATCH`] and free of duplicate entries,
+    /// and every existing member is rejected with [`Error::AlreadyExists`].
+    /// A refusal leaves both the membership keys and the read index untouched,
+    /// so a malformed governance transaction cannot leave a half-staged
+    /// whitelist behind. Caller must be the policy owner and must have signed.
+    pub fn add_recipients_to_whitelist(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        recipients: Vec<Address>,
+    ) -> Result<(), Error> {
+        Self::require_policy_owner(&env, &caller, &policy_id)?;
+        validate_whitelist_batch(&recipients)?;
+
+        // Existing members are checked up front so an already-listed address
+        // aborts the entire batch before any write is made.
+        for recipient in recipients.iter() {
+            if env.storage().persistent().has(&DataKey::RecipientWhitelist(
+                policy_id.clone(),
+                recipient.clone(),
+            )) {
+                return Err(Error::AlreadyExists);
+            }
+        }
+
+        let index_key = DataKey::RecipientWhitelistIndex(policy_id.clone());
+        let mut index: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for recipient in recipients.iter() {
+            env.storage().persistent().set(
+                &DataKey::RecipientWhitelist(policy_id.clone(), recipient.clone()),
+                &true,
+            );
+            index.push_back(recipient.clone());
+            events::emit(
+                &env,
+                events::topic::POLICY,
+                symbol_short!("wl_add"),
+                (policy_id.clone(), recipient),
+            );
+        }
+        env.storage().persistent().set(&index_key, &index);
         Ok(())
     }
 
@@ -2938,6 +3031,126 @@ impl PolicyContract {
         if let Some(reason) = decision.reason() {
             Self::report_denial(&env, &policy_id, reason);
             return Err(Error::PolicyDenied);
+        }
+        Ok(())
+    }
+
+    // --- Composed evaluation pipeline (Issue #499) ---
+
+    /// Evaluate one transaction through the policy's ordered rule pipeline:
+    /// recipient admission, then the rate limit, then the single-transaction
+    /// ceiling, stopping at the first failure.
+    ///
+    /// The order is fixed and evaluated deterministically per request — no
+    /// storage iteration and no caller-supplied time — so the same payload
+    /// always fails at the same rule with the same code:
+    ///
+    /// | # | Rule                              | Refusal                     |
+    /// |---|-----------------------------------|-----------------------------|
+    /// | 1 | policy enabled and unexpired      | `PolicyDenied`              |
+    /// | 2 | recipient blocklist               | `PolicyRecipientRestricted` |
+    /// | 3 | recipient whitelist               | `PolicyRecipientRestricted` |
+    /// | 4 | merchant blocklist                | `PolicyMerchantBlocked`     |
+    /// | 5 | recurring rate limit              | `RateLimitExceeded`         |
+    /// | 6 | single-transaction ceiling        | `PolicyMaxAmountExceeded`   |
+    ///
+    /// Each rule maps to exactly one error code, and the loop halts on the
+    /// first failure, so a caller can attribute a refusal without decoding the
+    /// `PolicyViolation` event. [`PolicyContract::check_transfer`] keeps its
+    /// historical codes unchanged; this entrypoint is the strict pipeline for
+    /// callers that want the granular one.
+    ///
+    /// Gas optimization: the policy record is read **once** and passed to every
+    /// rule, and the rate-limit rule reads its single `Allowance` entry once
+    /// rather than calling a helper that would load it again. Rules are ordered
+    /// cheapest and most decisive first (in-memory policy flags, then the two
+    /// blocklist reads, then the allowance entry, then the amount comparison),
+    /// so the common refusal never pays for the later reads.
+    ///
+    /// Read-only: the rate-limit headroom is computed, not consumed, so a
+    /// pre-flight can be repeated. A non-positive amount is
+    /// [`Error::InvalidAmount`] and an unknown policy is [`Error::NotFound`];
+    /// those are malformed requests, not policy denials.
+    pub fn check_transaction_pipeline(
+        env: Env,
+        policy_id: String,
+        asset: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_positive_amount(amount)?;
+        // One read for the whole pipeline.
+        let policy = Self::load(&env, &policy_id)?;
+        let now = env.ledger().timestamp();
+
+        // Rule 1: the policy itself must be live.
+        if !policy.enabled {
+            events_policy_violation(&env, &policy_id, PolicyDenialReason::Disabled.as_str());
+            return Err(Error::PolicyDenied);
+        }
+        if policy.expires_at != 0 && now >= policy.expires_at {
+            events_policy_violation(&env, &policy_id, PolicyDenialReason::Expired.as_str());
+            return Err(Error::PolicyDenied);
+        }
+
+        // Rules 2-4: recipient admission. One evaluation context shares the two
+        // blocklist reads with the composite/stack walk.
+        let mut context = RuleEvaluationContext::default();
+        if let Some(reason) =
+            Self::screen_recipient_rules(&env, &policy_id, &policy, &recipient, &mut context)?
+        {
+            Self::report_denial(&env, &policy_id, reason);
+            return Err(match reason {
+                PolicyDenialReason::RecipientBlacklisted
+                | PolicyDenialReason::RecipientNotWhitelisted
+                | PolicyDenialReason::RecipientNotAllowed => Error::PolicyRecipientRestricted,
+                PolicyDenialReason::MerchantBlacklisted => Error::PolicyMerchantBlocked,
+                other => other.to_error(),
+            });
+        }
+
+        // Rule 5: the recurring rate limit. A cumulative allowance (window
+        // `0`) reports the canonical allowance code; a windowed one is a rate
+        // limit and reports `RateLimitExceeded`.
+        if let Some(mut allowance) = env
+            .storage()
+            .persistent()
+            .get::<_, AssetAllowance>(&DataKey::Allowance(policy_id.clone(), asset.clone()))
+        {
+            if allowance.limit != 0 {
+                if allowance.expires_at != 0 && now >= allowance.expires_at {
+                    events_policy_violation(
+                        &env,
+                        &policy_id,
+                        PolicyDenialReason::AllowanceExpired.as_str(),
+                    );
+                    return Err(Error::AllowanceExpired);
+                }
+                settle_window(&mut allowance, now)?;
+                let headroom = checked_sub(allowance.limit, allowance.spent)?;
+                if amount > headroom {
+                    if allowance.window_seconds > 0 {
+                        events_policy_violation(&env, &policy_id, "rate_limit_exceeded");
+                        return Err(Error::RateLimitExceeded);
+                    }
+                    events_policy_violation(
+                        &env,
+                        &policy_id,
+                        PolicyDenialReason::AllowanceExceeded.as_str(),
+                    );
+                    return Err(Error::AllowanceExceeded);
+                }
+            }
+        }
+
+        // Rule 6: the single-transaction ceiling (`0` = no ceiling).
+        if policy.max_amount != 0 && amount > policy.max_amount {
+            events_policy_violation(
+                &env,
+                &policy_id,
+                PolicyDenialReason::AboveMaxTransactionLimit.as_str(),
+            );
+            return Err(Error::PolicyMaxAmountExceeded);
         }
         Ok(())
     }

@@ -54,7 +54,7 @@
 //! | `caller` holds a role that reaches this `kind`      | `Unauthorized`         |
 //! | the module is already registered                    | `NotFound`             |
 //! | `target_version` is non-zero                        | `InvalidInput`         |
-//! | `target_version` is newer than the module's pin     | `CircularUpgrade`      |
+//! | `target_version` is newer than the module's pin     | `InvalidUpgradePath`   |
 //! | the target version exists                           | `NotFound`             |
 //! | the target is bound to a WASM hash                  | `InvalidInput`         |
 //! | that hash is still approved for this `kind`         | `Unauthorized`         |
@@ -105,7 +105,7 @@
 //! | the hash is approved for `Organization`          | `Unauthorized`     |
 //! | an `Organization` version has been published     | `NotFound`         |
 //! | some published version carries this exact hash   | `NotFound`         |
-//! | that version is strictly newer than the running  | `CircularUpgrade`  |
+//! | that version is strictly newer than the running  | `InvalidUpgradePath` |
 //! | its record names a contract, not an account      | `InvalidInput`     |
 //!
 //! Resolution runs newest-version-first, so the version a hash maps to is the
@@ -120,7 +120,10 @@
 //! advances the registry before asking for the swap.
 
 use astroid_interfaces::upgrade::UpgradeAuthorizationInterface;
-use astroid_interfaces::{RegistryInterface, UpgradeableInterface};
+use astroid_interfaces::{
+    BudgetClient, EscrowClient, MultisigClient, PolicyClient, ProposalClient, RegistryClient,
+    RegistryInterface, TreasuryClient, UpgradeableInterface, WalletClient,
+};
 use astroid_shared::constants::{
     MAX_APPROVERS, MAX_REGISTRY_BATCH, MAX_UPGRADE_AUDIT_ENTRIES, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_LIFETIME_THRESHOLD, UPGRADE_PROPOSAL_EXPIRY,
@@ -133,6 +136,8 @@ use astroid_shared::validation::{require_non_empty, require_valid_wasm_hash};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Vec,
 };
+
+mod version;
 
 /// How many of the most recently published `Organization` versions the registry
 /// scans when resolving an upgrade hash to the version that published it (see
@@ -196,6 +201,12 @@ enum DataKey {
     /// hash. Replaces the former `Version` + `VersionWasm` pair; `Version` is
     /// retained as the legacy layout (see [`RegistryContract::read_version`]).
     VersionRecord(ModuleKind, u32),
+    /// Reverse index over the upgrade map: (kind, wasm hash) -> version. Makes
+    /// the "is this bytecode already published for this kind?" question one
+    /// read instead of a walk over every version, which is what lets
+    /// [`RegistryContract::register_version`] refuse a duplicate hash with
+    /// [`Error::VersionAlreadyExists`] without a scan (Issue #500).
+    VersionHash(ModuleKind, BytesN<32>),
     /// Latest known version number for a kind.
     LatestVersion(ModuleKind),
     /// Emergency freeze status (instance).
@@ -806,10 +817,24 @@ impl RegistryContract {
     /// Checks, in order: the registry is not frozen ([`Error::RegistryFrozen`]);
     /// `caller` is the protocol admin and signed ([`Error::Unauthorized`]);
     /// `version` is non-zero ([`Error::InvalidInput`]); the pair is not already
-    /// registered ([`Error::AlreadyExists`]); `wasm_hash` is approved for `kind`
-    /// via [`Self::add_approved_wasm`] ([`Error::Unauthorized`], the same code
-    /// the upgrade gate reports for unapproved code). Nothing is written unless
-    /// every check passes.
+    /// registered ([`Error::AlreadyExists`]); `wasm_hash` is not already bound
+    /// to another version of this kind ([`Error::VersionAlreadyExists`]);
+    /// `wasm_hash` is approved for `kind` via [`Self::add_approved_wasm`]
+    /// ([`Error::Unauthorized`], the same code the upgrade gate reports for
+    /// unapproved code). Nothing is written unless every check passes.
+    ///
+    /// The hash check keeps the map one-to-one — one implementation, one version
+    /// per kind — so "resolve this hash to a version" (what
+    /// [`Self::plan_registry_upgrade`] does for the registry's own code) can
+    /// never be ambiguous. It is answered by [`DataKey::VersionHash`], a single
+    /// persistent read, rather than a scan of the version table (Issue #500).
+    ///
+    /// Publishing a version *below* the kind's latest one stays legal: backfilling
+    /// a skipped number does not move [`DataKey::LatestVersion`] and is how a
+    /// deployment recovers from a gap. Ordering is enforced on the module path
+    /// instead — [`Self::upgrade_module`] and [`Self::register_module_version`]
+    /// refuse a target that is not newer than the module's pin with
+    /// [`Error::InvalidUpgradePath`].
     ///
     /// Version records are immutable: a published version can never be
     /// repointed at different code, so a consumer pinned to it keeps getting
@@ -840,6 +865,20 @@ impl RegistryContract {
                     .has(&DataKey::Version(kind, version)),
             Error::ModuleAlreadyRegistered
         );
+        let lkey = DataKey::LatestVersion(kind);
+        let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
+        // Publishing a version *below* `latest` is legal and useful (backfilling
+        // a skipped number), which is why ordering is enforced on the module
+        // path — `upgrade_module` / `register_module_version` — against the
+        // module's own pin, not here.
+        // One implementation hash names one version per kind, so a second
+        // version binding the same bytecode is refused rather than published as
+        // an alias. Answered by the reverse index: one read, no table scan.
+        let hkey = DataKey::VersionHash(kind, wasm_hash.clone());
+        ensure!(
+            !env.storage().persistent().has(&hkey),
+            Error::VersionAlreadyExists
+        );
         ensure!(
             Self::is_wasm_approved(env.clone(), kind, wasm_hash.clone()),
             Error::Unauthorized
@@ -855,9 +894,9 @@ impl RegistryContract {
             },
         );
         Self::bump(&env, &vkey);
+        env.storage().persistent().set(&hkey, &version);
+        Self::bump(&env, &hkey);
 
-        let lkey = DataKey::LatestVersion(kind);
-        let latest: u32 = env.storage().persistent().get(&lkey).unwrap_or(0);
         if version > latest {
             env.storage().persistent().set(&lkey, &version);
             Self::bump(&env, &lkey);
@@ -1036,6 +1075,14 @@ impl RegistryContract {
         // Re-validate everything the proposal asserted at propose time; the
         // world may have moved underneath it while it was pending.
         require_valid_wasm_hash(&env, &proposal.wasm_hash)?;
+        // One implementation hash names one version per kind, exactly as
+        // `register_version` enforces: a commit must not publish bytecode the
+        // map already carries under a different version (Issue #500).
+        let hkey = DataKey::VersionHash(kind, proposal.wasm_hash.clone());
+        ensure!(
+            !env.storage().persistent().has(&hkey),
+            Error::VersionAlreadyExists
+        );
         ensure!(proposal.version != 0, Error::InvalidInput);
         ensure!(
             Self::is_contract_address(&proposal.address),
@@ -1058,6 +1105,8 @@ impl RegistryContract {
         let akey = DataKey::ApprovedWasm(kind, proposal.wasm_hash.clone());
         env.storage().persistent().set(&akey, &true);
         Self::bump(&env, &akey);
+        env.storage().persistent().set(&hkey, &proposal.version);
+        Self::bump(&env, &hkey);
         env.storage().persistent().remove(&pkey);
 
         let version = proposal.version;
@@ -1227,8 +1276,8 @@ impl RegistryContract {
     /// 3. the module is already registered — [`Error::NotFound`];
     /// 4. `target_version` is non-zero — [`Error::InvalidInput`];
     /// 5. `target_version` is strictly newer than the module's current pin —
-    ///    [`Error::CircularUpgrade`], which is what stops the path from
-    ///    revisiting or reversing;
+    ///    [`Error::InvalidUpgradePath`], which is what stops the path from
+    ///    revisiting or reversing (Issue #500);
     /// 6. the target version exists for this kind — [`Error::NotFound`];
     /// 7. the target is bound to a WASM hash — [`Error::InvalidInput`] for a
     ///    version published before hashes were bound, so there is nothing to
@@ -1311,8 +1360,8 @@ impl RegistryContract {
     /// path monotonic even when it is driven through registration:
     ///
     /// - `version` is non-zero and strictly newer than the module's existing pin
-    ///   — [`Error::CircularUpgrade`] for a version the module has already left,
-    ///   or for the one it already runs;
+    ///   — [`Error::InvalidUpgradePath`] for a version the module has already
+    ///   left, or for the one it already runs (Issue #500);
     /// - the target version exists for this `kind` — [`Error::NotFound`];
     /// - the target is bound to a WASM hash — [`Error::InvalidInput`];
     /// - that hash is still approved for this `kind` — [`Error::Unauthorized`];
@@ -1424,6 +1473,46 @@ impl RegistryContract {
         Ok(Self::plan_upgrade(&env, &org, kind, target_version)?.address)
     }
 
+    /// Owner-gated pre-flight that validates a version transition and publishes
+    /// the decision as a registry upgrade event (Issue #445).
+    ///
+    /// Unlike [`Self::validate_upgrade`], which is an anonymous read-only
+    /// resolver, this entrypoint is the explicit administrative check: the
+    /// caller must be the recorded organization owner (or the protocol admin)
+    /// and must have signed. The current version is read from the registry's
+    /// own pin rather than supplied by the caller, so a caller cannot claim a
+    /// forward step while asking to validate a rollback. On success it emits
+    /// [`events::ContractEvent::RegistryUpgradeValidated`] with the resolved
+    /// `from_version`, the requested `to_version` and the acting account; a
+    /// refusal writes nothing and emits nothing, because Soroban reverts the
+    /// whole invocation.
+    ///
+    /// | Condition                                   | Error                  |
+    /// |---------------------------------------------|------------------------|
+    /// | the registry is frozen                      | `RegistryFrozen`       |
+    /// | the caller is not the org owner/admin       | `Unauthorized`         |
+    /// | the organization or module is unknown       | `NotFound`             |
+    /// | `target_version` is zero or too far forward | `InvalidInput`         |
+    /// | the target is at or behind the pin          | `VersionNotMonotonic`  |
+    pub fn validate_version_transition(
+        env: Env,
+        caller: Address,
+        org: String,
+        kind: ModuleKind,
+        target_version: u32,
+    ) -> Result<(), Error> {
+        Self::check_frozen(&env)?;
+        require_non_empty(&org)?;
+        caller.require_auth();
+        Self::require_root_owner(&env, &caller, &org)?;
+
+        let from_version = Self::get_module_version(env.clone(), org.clone(), kind)?;
+        version::validate_upgrade_step(from_version, target_version)?;
+
+        events::registry_upgrade_validated(&env, org, kind, from_version, target_version, caller);
+        Ok(())
+    }
+
     /// The version `org`'s `kind` module is currently pinned to.
     ///
     /// `0` means the module is registered by address and has never been moved by
@@ -1481,6 +1570,75 @@ impl RegistryContract {
     /// code during an incident would be the one contract nobody could repair.
     pub fn validate_registry_upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<u32, Error> {
         Ok(Self::plan_registry_upgrade(&env, &wasm_hash)?.to_version)
+    }
+
+    /// Verify that `address` serves the interface expected of `kind`
+    /// (Issue #500).
+    ///
+    /// The implementation registry publishes *what* code a version runs; this
+    /// answers whether that code is actually the kind of module it claims to be,
+    /// so a Wallet version can never be bound to a contract that only speaks the
+    /// Escrow surface. The probe is made through the strongly-typed
+    /// [`astroid_interfaces`] clients — one generated `#[contractclient]` per
+    /// trait — rather than by comparing a hand-rolled selector list, so the
+    /// check is compile-time tied to the same signatures cross-contract callers
+    /// use:
+    ///
+    /// | `kind`         | Client             | Probed entrypoint  |
+    /// |----------------|--------------------|--------------------|
+    /// | `Wallet`       | `WalletClient`     | `is_paused`        |
+    /// | `Treasury`     | `TreasuryClient`   | `is_paused`        |
+    /// | `Multisig`     | `MultisigClient`   | `is_signer`        |
+    /// | `Proposal`     | `ProposalClient`   | `state`            |
+    /// | `Policy`       | `PolicyClient`     | `check_transfer`   |
+    /// | `Budget`       | `BudgetClient`     | `remaining`        |
+    /// | `Escrow`       | `EscrowClient`     | `escrow_count`     |
+    /// | `Organization` | `RegistryClient`   | `verify_owner`     |
+    ///
+    /// Only the existence of the entrypoint is being established: a decoded
+    /// answer — including a contract-level error such as `NotFound` for the
+    /// probe id — proves the address serves the interface, while a host-level
+    /// failure (`try_*` returning `Err`) means it does not, and is reported as
+    /// [`Error::InvalidUpgradePath`]. Nothing is written and no auth is needed,
+    /// so a deployer can run it before [`Self::register_version`] or
+    /// [`Self::upgrade_module`].
+    ///
+    /// The write paths deliberately do not call it: the registry must keep
+    /// accepting the address-only registrations existing deployments hold (and
+    /// their `VersionRecord`s can name contracts the caller cannot call from
+    /// here), so the interface check is an explicit pre-flight step rather than
+    /// an implicit gate.
+    pub fn verify_module_interface(
+        env: Env,
+        kind: ModuleKind,
+        address: Address,
+    ) -> Result<(), Error> {
+        ensure!(
+            Self::is_contract_address(&address),
+            Error::InvalidUpgradeAddress
+        );
+        // Any contract address will do as the probe's address argument; the
+        // registry itself is always a valid, always-present choice.
+        let probe = env.current_contract_address();
+        let id = String::from_str(&env, "probe");
+        let answered = match kind {
+            ModuleKind::Wallet => WalletClient::new(&env, &address).try_is_paused().is_ok(),
+            ModuleKind::Treasury => TreasuryClient::new(&env, &address).try_is_paused().is_ok(),
+            ModuleKind::Multisig => MultisigClient::new(&env, &address)
+                .try_is_signer(&probe)
+                .is_ok(),
+            ModuleKind::Proposal => ProposalClient::new(&env, &address).try_state(&0u64).is_ok(),
+            ModuleKind::Policy => PolicyClient::new(&env, &address)
+                .try_check_transfer(&id, &probe, &probe, &0i128)
+                .is_ok(),
+            ModuleKind::Budget => BudgetClient::new(&env, &address).try_remaining(&id).is_ok(),
+            ModuleKind::Escrow => EscrowClient::new(&env, &address).try_escrow_count().is_ok(),
+            ModuleKind::Organization => RegistryClient::new(&env, &address)
+                .try_verify_owner(&id, &probe)
+                .is_ok(),
+        };
+        ensure!(answered, Error::InvalidUpgradePath);
+        Ok(())
     }
 
     /// Look up the latest implementation address for a kind.
@@ -1959,14 +2117,19 @@ impl RegistryContract {
         // that makes an upgrade path acyclic: a module can never re-enter a
         // version it has already left, and never move backwards onto one. An
         // unpinned module (0) is at the start of its path, so any version is
-        // forward of it. Use VERSION_NOT_MONOTONIC to distinguish a backwards
-        // jump from a cycle onto the same version (CircularUpgrade).
+        // forward of it. A backwards jump or a repeat is INVALID_UPGRADE_PATH;
+        // CircularUpgrade is reserved for a target that resolves to the very
+        // contract the module already runs.
         let from_version: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::ModuleVersion(org.clone(), kind))
             .unwrap_or(0);
-        ensure!(target_version > from_version, Error::VersionNotMonotonic);
+        // A downgrade — or a repeat of the version the module already runs —
+        // does not advance the upgrade path, and is reported with the dedicated
+        // INVALID_UPGRADE_PATH code so deployment tooling can stop walking
+        // rather than retry (Issue #500).
+        ensure!(target_version > from_version, Error::InvalidUpgradePath);
 
         // Existence, then integrity: the target must be a published version of
         // *this* kind, bound to code that is still approved for it.
@@ -2027,7 +2190,7 @@ impl RegistryContract {
     /// that code" means v7, and a registry already on v8 is refusing a downgrade
     /// either way. Searching the whole published range — rather than stopping
     /// at the running version — is what lets a refused downgrade be reported as
-    /// [`Error::CircularUpgrade`] instead of being mistaken for code the
+    /// [`Error::InvalidUpgradePath`] instead of being mistaken for code the
     /// registry has never published, which is the distinction deployment tooling
     /// walks an upgrade path with.
     fn plan_registry_upgrade(
@@ -2073,7 +2236,10 @@ impl RegistryContract {
         // left and never move backwards onto one, no matter how long the
         // superseded code stays approved. A registry that predates the key reads
         // as `0` and so accepts any published version as its first step.
-        ensure!(to_version > from_version, Error::CircularUpgrade);
+        // Same ordering rule as `plan_upgrade`: the version path only ever
+        // advances. A repeat or a downgrade reports INVALID_UPGRADE_PATH
+        // (Issue #500).
+        ensure!(to_version > from_version, Error::InvalidUpgradePath);
 
         // The published record has to name a contract, not an account. A
         // `Organization` version is a deployment of this contract, and a record
@@ -2398,7 +2564,7 @@ impl UpgradeableInterface for RegistryContract {
     /// 2. `wasm_hash` is carried by a published `Organization` version, and that
     ///    version is strictly newer than the one this contract runs —
     ///    [`Error::NotFound`] for code the upgrade map does not publish,
-    ///    [`Error::CircularUpgrade`] for a downgrade or a no-op, and
+    ///    [`Error::InvalidUpgradePath`] for a downgrade or a no-op, and
     ///    [`Error::InvalidInput`] for a published record that names an account
     ///    rather than a contract. This is the registry's own version upgrade map
     ///    validation, and it is the gate that does not exist for anyone else:

@@ -29,16 +29,17 @@ use astroid_wallet::WalletContract;
 /// Written out literally rather than derived from [`Error::ALL`], because the
 /// point of this test is to catch the table being renumbered — deriving it
 /// would make that failure impossible to observe.
-const ALL_CODES: [u32; 69] = [
+const ALL_CODES: [u32; 75] = [
     1, 2, 3, 4, 5, 6, // generic / lifecycle
     10, 11, 12, // value / arithmetic
-    20, 21, 22, 23, 24, 27, 28, // policy
-    30, 31, 32, 33, 34, // registry
+    20, 21, 22, 23, 24, 27, 28, 29, // policy
+    30, 31, 32, 33, 34, 35, 36, // registry
     40, 41, 42, 43, 44, 46, 47, 48, 49, // budget
-    50, 51, 52, 53, 54, 55, // wallet
+    50, 51, 52, 53, 54, 55, 56, // wallet
     61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 90, 91, 92, 93, 94, // multisig / approvals
     71, 72, 73, 74, 75, 76, 78, 79, // proposal
     80, 81, 82, 83, 84, 85, 86, 87, 88, 89, // escrow + treasury
+    95, 96, // escrow continuation + budget rollover
 ];
 
 /// Codes that were part of an earlier revision and must never come back: a
@@ -214,9 +215,10 @@ fn a_wallet_refusal_reaches_the_caller_as_its_canonical_code() {
     // A malformed amount.
     let res = wallet.try_deposit(&wid, &owner, &token, &0);
     assert_eq!(code_of(res), Error::InvalidAmount.code());
-    // An exhausted balance.
+    // A token the wallet has never taken custody of is an unregistered asset
+    // (Issue #496), reported as its own code rather than a zero balance.
     let res = wallet.try_withdraw(&owner, &wid, &token, &1);
-    assert_eq!(code_of(res), Error::InsufficientFunds.code());
+    assert_eq!(code_of(res), Error::UnsupportedAsset.code());
 }
 
 #[test]

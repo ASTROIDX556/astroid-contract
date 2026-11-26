@@ -4243,3 +4243,153 @@ fn token_approval_emits_canonical_topics() {
         .map(|(_, _, data)| Address::try_from_val(&h.env, &data).unwrap());
     assert_eq!(token, Some(h.asset_a.clone()));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #498: time-lock enforcement and emergency cancellation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn early_release_is_rejected_before_the_deadline() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    // Still inside the time lock: the beneficiary cannot withdraw, and the
+    // funds stay in custody.
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &5_000),
+        Err(Ok(Error::TimeLockActive))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 0);
+}
+
+#[test]
+fn release_succeeds_once_the_ledger_reaches_the_deadline() {
+    let h = setup(5_000, 0);
+    let id = h.client.create_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &one_asset(&h, 5_000),
+        &(START + 100),
+        &String::from_str(&h.env, "payment"),
+    );
+
+    // One second before maturity the release is still locked.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 99);
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::TimeLockActive))
+    );
+
+    // At the deadline the beneficiary's claim pays out in full.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert_eq!(h.client.claim(&h.recipient, &id), 5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+}
+
+#[test]
+fn emergency_cancel_by_admin_after_grace_returns_funds_to_the_source() {
+    let h = setup(5_000, 2_000);
+    let id = create(&h, &two_assets(&h, 5_000, 2_000), START + 100, GRACE);
+
+    // Deadline + grace has fully elapsed.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 100 + GRACE);
+    h.client.emergency_cancel(&h.admin, &id);
+
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.asset_b, &h.sender), 2_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 0);
+    assert_eq!(balance(&h, &h.asset_b, &h.client.address), 0);
+}
+
+#[test]
+fn emergency_cancel_before_the_grace_period_expires_is_refused() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    // The grace period has not elapsed: ESCROW_NOT_EXPIRED.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 100 + GRACE - 1);
+    assert_eq!(
+        h.client.try_emergency_cancel(&h.admin, &id),
+        Err(Ok(Error::EscrowNotExpired))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn unauthorized_emergency_cancel_is_refused() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+    let intruder = Address::generate(&h.env);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 100 + GRACE);
+    assert_eq!(
+        h.client.try_emergency_cancel(&intruder, &id),
+        Err(Ok(Error::UnauthorizedCancellation))
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Funded);
+    assert_eq!(balance(&h, &h.asset_a, &h.client.address), 5_000);
+}
+
+#[test]
+fn cancel_after_release_is_rejected() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    // The arbiter releases before the deadline: the escrow is terminal.
+    h.client.release(&h.arbiter, &id, &5_000);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 100 + GRACE);
+    assert_eq!(
+        h.client.try_emergency_cancel(&h.admin, &id),
+        Err(Ok(Error::EscrowAlreadySettled))
+    );
+    // The pre-deadline cancel path refuses a settled escrow too.
+    assert_eq!(
+        h.client.try_cancel(&h.sender, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 0);
+}
+
+#[test]
+fn withdraw_after_cancellation_is_rejected() {
+    let h = setup(5_000, 0);
+    let id = create(&h, &one_asset(&h, 5_000), START + 100, GRACE);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp = START + 100 + GRACE);
+    h.client.emergency_cancel(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+
+    // The beneficiary can no longer withdraw or claim the refunded funds.
+    assert_eq!(
+        h.client.try_withdraw(&h.recipient, &id, &1_000),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        h.client.try_claim(&h.recipient, &id),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(balance(&h, &h.asset_a, &h.sender), 5_000);
+}

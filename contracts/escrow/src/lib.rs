@@ -1563,6 +1563,83 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Emergency cancellation (Issue #498): return the escrow's remaining funds
+    /// to the source treasury (its `sender`) once the dispute window is over.
+    ///
+    /// This is the privileged stop for an escrow whose counterparty has gone
+    /// dark: unlike [`Self::cancel`], it is **not** a pre-deadline exit, and
+    /// unlike [`Self::reclaim`], the sender is not the only caller. It is
+    /// callable only by the escrow's owner (`sender`), its `arbiter`, or the
+    /// contract admin acting for the organization's multisig, and only once
+    /// `deadline + grace_period` has fully elapsed on the ledger clock.
+    ///
+    /// Checks, in order:
+    ///
+    /// 1. `caller` signed and is one of the authorized roles —
+    ///    [`Error::UnauthorizedCancellation`] otherwise (a distinct code from the
+    ///    generic [`Error::Unauthorized`] so an emergency stop refused for lack
+    ///    of authority is attributable);
+    /// 2. the escrow is not already terminal — a released, refunded or closed
+    ///    escrow is [`Error::EscrowAlreadySettled`], so no cancellation can
+    ///    follow a successful release;
+    /// 3. the ledger timestamp is at or past `deadline + grace_period` —
+    ///    [`Error::EscrowNotExpired`] while the window is still open;
+    /// 4. milestone escrows are excluded ([`Error::InvalidState`]): their
+    ///    remaining balance must settle through the milestone-aware path.
+    ///
+    /// On success the remaining `funded_amount - released_amount` is paid back
+    /// to `sender`, the state becomes [`EscrowState::Refunded`] and
+    /// `EscrowRefunded` is published. The explicit state machine is what makes
+    /// the two invariants hold: `withdraw`/`claim` require `Funded`, so nothing
+    /// can be withdrawn after cancellation, and this entrypoint refuses every
+    /// terminal state, so nothing can be cancelled after a release.
+    pub fn emergency_cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        Self::reject_milestone_settlement(&env, id)?;
+        let mut escrow = load_escrow(&env, id)?;
+
+        // Only a live escrow can be cancelled; a terminal one has already paid
+        // out (Released) or returned its funds (Refunded/Closed).
+        if !matches!(escrow.state, EscrowState::Created | EscrowState::Funded) {
+            return Err(Error::EscrowAlreadySettled);
+        }
+
+        // Owner (sender), arbiter, or the contract admin representing the
+        // organization's multisig.
+        let admin = Self::load_admin(&env)?;
+        let authorized = escrow.sender == caller || escrow.arbiter == caller || admin == caller;
+        if !authorized {
+            return Err(Error::UnauthorizedCancellation);
+        }
+
+        // The grace period after the deadline must have fully elapsed.
+        let grace_end = Self::grace_end(&escrow)?;
+        if env.ledger().timestamp() < grace_end {
+            return Err(Error::EscrowNotExpired);
+        }
+
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        // Effects before interaction: record the terminal state first, so a
+        // re-entrant call through the token contract finds a settled escrow.
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+        Self::transfer_all(&env, &escrow, &escrow.sender, remaining)?;
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
+        events::escrow_funds_refunded(&env, id, &escrow.sender, remaining);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("em_cancel")),
+            (id, caller),
+        );
+        Ok(())
+    }
+
     /// Reclaim the escrowed funds to the sender after the grace period has fully
     /// elapsed without counterparty fulfillment. Only the `sender` may reclaim,
     /// and only once `now >= deadline + grace_period`. This is the post-dispute
