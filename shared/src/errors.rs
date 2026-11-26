@@ -60,6 +60,7 @@ pub enum Error {
     /// the required authorization. This is the single role-check code for the
     /// whole protocol: only the owner may spend a budget, only the admin may
     /// register a module, only a listed approver may act on a proposal.
+    #[allow(dead_code)]
     Unauthorized = 3,
     /// An argument failed validation: a malformed parameter, an empty
     /// identifier, a structurally invalid rule tree or recipient list, or a
