@@ -497,6 +497,8 @@ enum DataKey {
     /// Issue #502 — designated secure recovery address paid by the
     /// emergency sweep (instance).
     RecoveryAddress,
+    /// Cached live custody balance for asset (temporary storage).
+    CachedBalance(Address),
 }
 
 #[contract]
@@ -838,6 +840,7 @@ impl TreasuryContract {
         // path that mutates either.
         let balance = h.total_in;
         Self::store_asset_balance(&env, &asset, balance);
+        Self::invalidate_cached_balance(&env, &asset);
         events::emit(
             &env,
             events::topic::TREASURY,
@@ -1547,6 +1550,7 @@ impl TreasuryContract {
         if safe_sub(before, token_client.balance(&custody))? != total {
             return Err(Error::InvalidState);
         }
+        Self::invalidate_cached_balance(env, asset);
 
         // A single summary event keeps the log concise; the per-recipient moves
         // are already observable as the asset contract's own transfer events.
@@ -2038,6 +2042,25 @@ impl TreasuryContract {
         Ok(report)
     }
 
+    /// Read the cached balance for an asset, if present in temporary storage.
+    pub fn get_cached_balance(env: Env, asset: Address) -> Option<i128> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::CachedBalance(asset))
+    }
+
+    /// Invalidate the temporary cached balance for an asset.
+    pub fn invalidate_balance_cache(env: Env, asset: Address) -> Result<(), Error> {
+        Self::invalidate_cached_balance(&env, &asset);
+        Ok(())
+    }
+
+    /// Read live balance bypassing and refreshing any temporary cache entry.
+    pub fn refresh_balance(env: Env, asset: Address) -> Result<i128, Error> {
+        Self::invalidate_cached_balance(&env, &asset);
+        Self::read_token_balance(&env, &asset)
+    }
+
     /// Number of token contracts currently on the whitelist.
     pub fn approved_asset_count(env: Env) -> u32 {
         Self::approved_count(&env)
@@ -2110,11 +2133,23 @@ impl TreasuryContract {
             .unwrap_or(false)
     }
 
+    fn invalidate_cached_balance(env: &Env, asset: &Address) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::CachedBalance(asset.clone()));
+    }
+
     fn read_token_balance(env: &Env, asset: &Address) -> Result<i128, Error> {
         if !Self::is_asset_approved(env, asset) {
             return Err(Error::AssetNotAuthorized);
         }
-        Ok(token::TokenClient::new(env, asset).balance(&env.current_contract_address()))
+        let key = DataKey::CachedBalance(asset.clone());
+        if let Some(cached) = env.storage().temporary().get::<_, i128>(&key) {
+            return Ok(cached);
+        }
+        let bal = token::TokenClient::new(env, asset).balance(&env.current_contract_address());
+        env.storage().temporary().set(&key, &bal);
+        Ok(bal)
     }
 
     /// Reject any routing through a token contract that governance has not
@@ -2146,6 +2181,7 @@ impl TreasuryContract {
         if safe_sub(before, token_client.balance(&custody))? != amount {
             return Err(Error::InvalidState);
         }
+        Self::invalidate_cached_balance(env, asset);
         Ok(())
     }
 

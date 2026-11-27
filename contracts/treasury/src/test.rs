@@ -3286,3 +3286,43 @@ fn freeze_emits_canonical_tuple_and_typed_events() {
     assert!(tuple, "expected (treasury, frozen)");
     assert_event(&h.env, "TreasuryFrozen");
 }
+
+#[test]
+fn token_balance_caching_and_invalidation_lifecycle() {
+    let h = setup("vault", 5_000);
+    h.client.deposit(&h.admin, &h.asset, &2_000);
+
+    // Initial cache state is empty
+    assert_eq!(h.client.get_cached_balance(&h.asset), None);
+
+    // Query balance caches the token balance
+    let bal = h.client.balance(&h.asset);
+    assert_eq!(bal, 2_000);
+    assert_eq!(h.client.get_cached_balance(&h.asset), Some(2_000));
+
+    // Consecutive read hits the cache
+    let bal2 = h.client.balance(&h.asset);
+    assert_eq!(bal2, 2_000);
+
+    // Outbound transfer invalidates the cache immediately
+    let recipient = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &500);
+    assert_eq!(h.client.get_cached_balance(&h.asset), None);
+
+    // Next balance query repopulates the cache with the new balance
+    assert_eq!(h.client.balance(&h.asset), 1_500);
+    assert_eq!(h.client.get_cached_balance(&h.asset), Some(1_500));
+
+    // Inbound deposit also invalidates the cache
+    h.client.deposit(&h.admin, &h.asset, &500);
+    assert_eq!(h.client.get_cached_balance(&h.asset), None);
+
+    // Refresh balance explicitly repopulates cache with fresh ledger state
+    let refreshed = h.client.refresh_balance(&h.asset);
+    assert_eq!(refreshed, 2_000);
+    assert_eq!(h.client.get_cached_balance(&h.asset), Some(2_000));
+
+    // Manual invalidation works
+    h.client.invalidate_balance_cache(&h.asset);
+    assert_eq!(h.client.get_cached_balance(&h.asset), None);
+}
