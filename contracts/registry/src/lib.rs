@@ -1273,29 +1273,6 @@ impl RegistryContract {
         Ok(plan.to_version)
     }
 
-    pub fn upgrade(env: Env, caller: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
-        Self::check_frozen(&env)?;
-        Self::require_admin(&env, &caller)?;
-        caller.require_auth();
-        let plan = Self::plan_registry_upgrade(&env, &wasm_hash)?;
-        let current_version: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RegistryVersion)
-            .unwrap_or(0);
-        ensure!(plan.to_version > current_version, Error::CircularUpgrade);
-        env.storage()
-            .instance()
-            .set(&DataKey::RegistryVersion, &plan.to_version);
-        env.deploy().update_current_contract_wasm(&plan.wasm_hash);
-        events::emit(
-            &env,
-            events::topic::REGISTRY,
-            symbol_short!("upgrade"),
-            (plan.from_version, plan.to_version, plan.wasm_hash),
-        );
-        Ok(())
-    }
     /// 5. `target_version` is strictly newer than the module's current pin —
     ///    [`Error::InvalidUpgradePath`], which is what stops the path from
     ///    revisiting or reversing (Issue #500);
@@ -1572,31 +1549,6 @@ impl RegistryContract {
             .instance()
             .get(&DataKey::RegistryVersion)
             .unwrap_or(0)
-    }
-
-    /// Run every check [`Self::upgrade`] would run against the version upgrade
-    /// map and return the version this registry would move to, writing nothing.
-    ///
-    /// The registry is its own upgrade map, so this is the dry run a deployer
-    /// wants before asking for the code swap: it answers whether `wasm_hash` is
-    /// code the registry has actually published for [`ModuleKind::Organization`],
-    /// and whether the version carrying it is still ahead of the one running.
-    /// The checks, and the codes they report, are the write path's, so a
-    /// successful validation predicts a successful upgrade and a refusal carries
-    /// the code the upgrade would have reported.
-    ///
-    /// Read-only and auth-free, like [`Self::validate_upgrade`]: it moves no
-    /// code, records no version and needs no signature, and the only ledger
-    /// writes it can cause are the TTL extensions any read of a version record
-    /// already pays for. It does not stand in for the authorization gate —
-    /// whether the caller is the recorded upgrade admin and the hash is still
-    /// approved is settled by the signature [`Self::upgrade`] collects, not here.
-    ///
-    /// Not gated on the freeze flag, and neither is [`Self::upgrade`]: the freeze
-    /// stops org-scoped writes, and a registry that could not replace its own
-    /// code during an incident would be the one contract nobody could repair.
-    pub fn validate_registry_upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<u32, Error> {
-        Ok(Self::plan_registry_upgrade(&env, &wasm_hash)?.to_version)
     }
 
     /// Verify that `address` serves the interface expected of `kind`
