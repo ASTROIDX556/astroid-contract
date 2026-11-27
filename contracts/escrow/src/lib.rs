@@ -467,7 +467,7 @@ impl EscrowContract {
         let escrow = Escrow {
             sender: sender.clone(),
             recipient: recipient.clone(),
-            arbiter,
+            arbiter: arbiter.clone(),
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline,
@@ -636,7 +636,7 @@ impl EscrowContract {
         let escrow = Escrow {
             sender: sender.clone(),
             recipient: recipient.clone(),
-            arbiter,
+            arbiter: arbiter.clone(),
             assets: assets.clone(),
             state: EscrowState::Funded,
             deadline: unlock_time,
