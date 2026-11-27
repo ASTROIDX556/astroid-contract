@@ -499,6 +499,29 @@ enum DataKey {
     RecoveryAddress,
     /// Cached live custody balance for asset (temporary storage).
     CachedBalance(Address),
+    /// Stored balance snapshot for verification (persistent).
+    BalanceSnapshot(u64),
+    /// Counter for assigning snapshot IDs (instance).
+    SnapshotCounter,
+}
+
+/// One asset's entry in a balance snapshot.
+#[contracttype]
+#[derive(Clone)]
+pub struct BalanceSnapshotItem {
+    pub asset: Address,
+    pub balance: i128,
+    pub recorded: i128,
+    pub liability: i128,
+}
+
+/// A point-in-time snapshot of treasury holdings for reconciliation.
+#[contracttype]
+#[derive(Clone)]
+pub struct BalanceSnapshot {
+    pub id: u64,
+    pub created_at: u64,
+    pub items: Vec<BalanceSnapshotItem>,
 }
 
 #[contract]
@@ -1130,6 +1153,105 @@ impl TreasuryContract {
     /// Total of `asset` currently reserved across every category.
     pub fn reserved(env: Env, asset: Address) -> i128 {
         Self::reserved_of(&env, &asset)
+    }
+
+    /// Create a balance snapshot for verification and reconciliation.
+    pub fn create_balance_snapshot(
+        env: Env,
+        caller: Address,
+        assets: Vec<Address>,
+        liabilities: Vec<i128>,
+    ) -> Result<u64, Error> {
+        let t = Self::load(&env)?;
+        let is_multisig = matches!(&t.multisig, Some(m) if m == &caller);
+        if !is_multisig && t.admin != caller {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        if assets.len() != liabilities.len()
+            || assets.is_empty()
+            || assets.len() > MAX_TREASURY_ASSETS
+        {
+            return Err(Error::InvalidInput);
+        }
+
+        let custody = env.current_contract_address();
+        let mut items = Vec::new(&env);
+        for i in 0..assets.len() {
+            let asset = assets.get_unchecked(i);
+            let liability = liabilities.get_unchecked(i);
+            require_non_negative_amount(liability)?;
+            Self::require_approved_asset(&env, &asset)?;
+
+            let token_client = token::TokenClient::new(&env, &asset);
+            let balance = token_client.balance(&custody);
+            let recorded = Self::load_asset_balance(&env, &asset);
+
+            items.push_back(BalanceSnapshotItem {
+                asset: asset.clone(),
+                balance,
+                recorded,
+                liability,
+            });
+        }
+
+        let id = Self::next_snapshot_id(&env);
+        let snapshot = BalanceSnapshot {
+            id,
+            created_at: env.ledger().timestamp(),
+            items,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::BalanceSnapshot(id), &snapshot);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BalanceSnapshot(id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::treasury_balance_snapshot_created(&env, id, snapshot.created_at);
+        Ok(id)
+    }
+
+    /// Verify a balance snapshot against live holdings, detecting any discrepancies.
+    pub fn verify_balance_snapshot(env: Env, snapshot_id: u64) -> Result<bool, Error> {
+        let snapshot: BalanceSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BalanceSnapshot(snapshot_id))
+            .ok_or(Error::NotFound)?;
+
+        let custody = env.current_contract_address();
+        let mut all_valid = true;
+
+        for i in 0..snapshot.items.len() {
+            let item = snapshot.items.get_unchecked(i);
+            let token_client = token::TokenClient::new(&env, &item.asset);
+            let live_balance = token_client.balance(&custody);
+
+            if live_balance != item.balance || live_balance < item.liability {
+                all_valid = false;
+                events::treasury_reconciliation_discrepancy(
+                    &env,
+                    snapshot_id,
+                    &item.asset,
+                    live_balance,
+                    item.recorded,
+                    item.liability,
+                );
+            }
+        }
+
+        events::treasury_balance_snapshot_verified(&env, snapshot_id, all_valid);
+        Ok(all_valid)
+    }
+
+    /// Read a recorded balance snapshot.
+    pub fn balance_snapshot(env: Env, snapshot_id: u64) -> Result<BalanceSnapshot, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BalanceSnapshot(snapshot_id))
+            .ok_or(Error::NotFound)
     }
 
     /// Designate the secure recovery address the emergency sweep pays.
@@ -2220,6 +2342,26 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    fn load_asset_balance(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetBalance(asset.clone()))
+            .unwrap_or(0)
+    }
+
+    fn next_snapshot_id(env: &Env) -> u64 {
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SnapshotCounter)
+            .unwrap_or(0);
+        let next = id + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::SnapshotCounter, &next);
+        next
     }
 
     fn store_approved_count(env: &Env, count: u32) {

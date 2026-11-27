@@ -96,6 +96,61 @@ fn setup<'a>() -> T<'a> {
     }
 }
 
+#[test]
+fn test_allowed_recipient_wildcard_and_prefix_matching() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let policy = PolicyContractClient::new(&env, &id);
+    policy.initialize();
+
+    let policy_id = String::from_str(&env, "wildcard-policy");
+    policy.register_policy(
+        &owner,
+        &policy_id,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &10_000,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+
+    let target = Address::generate(&env);
+    let target_str = target.to_string();
+    let prefix = target_str.slice(0..10);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(crate::RuleNode {
+        op: crate::RuleOp::AllowedRecipient,
+        value_i128: 0,
+        value_address: target.clone(),
+        children_start: 0,
+        children_end: 0,
+    });
+    policy.set_composite_rule(&owner, &policy_id, &tree);
+
+    let asset = Address::generate(&env);
+    let decision = policy.evaluate_policy(&policy_id, &asset, &target, &500);
+    assert!(decision.allowed());
+
+    let mut wildcard_tree = soroban_sdk::Vec::new(&env);
+    let wildcard_addr =
+        Address::from_string(&String::from_str(&env, &alloc::format!("{}*", prefix)));
+    wildcard_tree.push_back(crate::RuleNode {
+        op: crate::RuleOp::AllowedRecipient,
+        value_i128: 0,
+        value_address: wildcard_addr,
+        children_start: 0,
+        children_end: 0,
+    });
+    policy.set_composite_rule(&owner, &policy_id, &wildcard_tree);
+
+    let decision_wildcard = policy.evaluate_policy(&policy_id, &asset, &target, &500);
+    assert!(decision_wildcard.allowed());
+}
+
 // --- configuration ---------------------------------------------------------
 
 #[test]
