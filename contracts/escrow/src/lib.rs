@@ -483,22 +483,8 @@ impl EscrowContract {
         };
         store_escrow(&env, id, &escrow);
 
-        events::emit(
-            &env,
-            events::topic::ESCROW,
-            symbol_short!("funded"),
-            (id, sender.clone(), recipient.clone(), assets.clone()),
-        );
-        events::publish(
-            &env,
-            ContractEvent::EscrowCreated {
-                escrow_id: id,
-                sender,
-                recipient,
-                assets,
-                deadline,
-            },
-        );
+        events::escrow_created(&env, id, &sender, &recipient, &arbiter);
+        events::escrow_funded(&env, id, &sender, funded_amount);
         Ok(id)
     }
 
@@ -666,12 +652,8 @@ impl EscrowContract {
         };
         store_escrow(&env, id, &escrow);
 
-        events::emit(
-            &env,
-            events::topic::ESCROW,
-            symbol_short!("funded"),
-            (id, sender.clone(), recipient.clone(), assets.clone()),
-        );
+        events::escrow_created(&env, id, &sender, &recipient, &arbiter);
+        events::escrow_funded(&env, id, &sender, funded_amount);
         events::emit(
             &env,
             events::topic::ESCROW,
@@ -683,16 +665,6 @@ impl EscrowContract {
                 assets.clone(),
                 unlock_time,
             ),
-        );
-        events::publish(
-            &env,
-            ContractEvent::EscrowCreated {
-                escrow_id: id,
-                sender,
-                recipient,
-                assets,
-                deadline: unlock_time,
-            },
         );
         Ok(id)
     }
@@ -1304,6 +1276,11 @@ impl EscrowContract {
             (id, nonce),
         );
         Ok(())
+    }
+
+    pub fn arbiter(env: Env, id: u64) -> Result<Address, Error> {
+        let escrow = load_escrow(&env, id)?;
+        Ok(escrow.arbiter)
     }
 
     /// Mark a timed-out escrow `Expired` once its deadline has passed.
