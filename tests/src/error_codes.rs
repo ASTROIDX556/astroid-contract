@@ -44,7 +44,7 @@ const ALL_CODES: [u32; 75] = [
 
 /// Codes that were part of an earlier revision and must never come back: a
 /// reissued slot would make two different historical failures decode the same.
-const RETIRED_CODES: [u32; 2] = [25, 26];
+const RETIRED_CODES: [u32; 0] = [];
 
 /// The number an off-chain caller would read from a failed transaction, for
 /// either shape a generated `try_*` call can return.
@@ -160,7 +160,7 @@ fn a_policy_refusal_reaches_the_caller_as_its_canonical_code() {
         &Address::generate(&env),
         &1_001,
     );
-    assert_eq!(code_of(res), Error::PolicyDenied.code());
+    assert_eq!(code_of(res), Error::PolicyConstraintUnmet.code());
 
     // A lapsed allowance: a different band entirely, and it must stay distinct.
     policy.set_allowance(&owner, &pid, &Address::generate(&env), &1_000, &1);

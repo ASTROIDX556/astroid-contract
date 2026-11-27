@@ -22,7 +22,7 @@ use astroid_interfaces::{
 };
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_policy::PolicyContract;
-use astroid_proposal::ProposalContract;
+use astroid_proposal::{ProposalContract, ProposalTiming};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState, WalletData};
@@ -238,8 +238,11 @@ fn proposal_serves_the_proposal_interface() {
         &vec![&env],
         &1,
         &vec![&env],
-        &0,
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: 0,
+            grace_period: 0,
+        },
     );
     assert_eq!(proposal.state(&pid), ProposalState::Pending);
     assert!(!proposal.is_expired(&pid));

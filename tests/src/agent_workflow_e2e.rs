@@ -313,7 +313,7 @@ fn constrained_spending_is_refused_without_moving_value() {
     let res = h
         .treasury
         .try_withdraw(&h.admin, &h.asset, &h.recipient, &(POLICY_CAP + 1));
-    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
+    assert_eq!(res, Err(Ok(Error::PolicyConstraintUnmet)));
 
     // 2. A recipient the policy does not allow is refused as well.
     let stranger = Address::generate(&h.env);

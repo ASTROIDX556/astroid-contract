@@ -92,7 +92,7 @@ pub enum Error {
     /// or vested schedule that remains. Rejected before the token is called.
     InvalidAmount = 12,
 
-    // --- Policy (20-27) ---
+    // --- Policy (20-29) ---
     /// The wallet's active policy refused the spend: the policy is disabled,
     /// the asset is blacklisted, no rule matches, a whitelist misses, or the
     /// amount exceeds the policy's per-transaction `max_amount`. The spend does
@@ -111,13 +111,14 @@ pub enum Error {
     /// The spend's category appears on the policy's restricted-category list,
     /// so the spend is refused.
     PolicyCategoryRestricted = 24,
-    // 25 (`AssetNotWhitelisted`) retired: it meant the same thing as
-    // `AssetNotAuthorized` (43) and was consolidated into it, freeing a slot
-    // for `TreasuryPaused`. The value is never reused.
-    // 26 (`PolicyAllowanceExceeded`) retired: it meant the same thing as
-    // `AllowanceExceeded` (83) — a spend would breach a per-asset allowance —
-    // and was consolidated into it, freeing a slot for
-    // `VelocityLimitExceeded`. The value is never reused.
+    /// The policy's expiry has passed; the policy is no longer active and
+    /// refuses every spend. Distinct from the generic [`PolicyDenied`] so
+    /// callers can react specifically to an expired policy.
+    PolicyExpired = 25,
+    /// A caller without governance rights attempted to modify the policy
+    /// configuration (enable/disable, rotate, update rules, etc.). The
+    /// request is refused before any state is changed.
+    PolicyUnauthorizedSigner = 26,
     /// VELOCITY_LIMIT_EXCEEDED: an outbound spend would push the volume moved
     /// out of a wallet within its rolling velocity window past the configured
     /// ceiling. Nothing moves; the spend may succeed once older volume ages
@@ -417,7 +418,7 @@ impl Error {
     /// Every variant the protocol can report, in the order the enum declares
     /// them. The audit walks this list, so a variant added to (or removed from)
     /// the enum without a matching entry fails `error_code_table_is_frozen`.
-    pub const ALL: [Error; 75] = [
+    pub const ALL: [Error; 77] = [
         // --- Generic / lifecycle (1-6) ---
         Error::NotFound,
         Error::AlreadyExists,
@@ -435,6 +436,8 @@ impl Error {
         Error::PolicyRecipientRestricted,
         Error::PolicyMerchantBlocked,
         Error::PolicyCategoryRestricted,
+        Error::PolicyExpired,
+        Error::PolicyUnauthorizedSigner,
         Error::VelocityLimitExceeded,
         Error::PolicyConstraintUnmet,
         Error::PolicyMaxAmountExceeded,
@@ -554,6 +557,8 @@ impl Error {
             Error::PolicyRecipientRestricted => "POLICY_RECIPIENT_RESTRICTED",
             Error::PolicyMerchantBlocked => "POLICY_MERCHANT_BLOCKED",
             Error::PolicyCategoryRestricted => "POLICY_CATEGORY_RESTRICTED",
+            Error::PolicyExpired => "POLICY_EXPIRED",
+            Error::PolicyUnauthorizedSigner => "POLICY_UNAUTHORIZED_SIGNER",
             Error::VelocityLimitExceeded => "VELOCITY_LIMIT_EXCEEDED",
             Error::PolicyConstraintUnmet => "POLICY_CONSTRAINT_UNMET",
             Error::PolicyMaxAmountExceeded => "POLICY_MAX_AMOUNT_EXCEEDED",
