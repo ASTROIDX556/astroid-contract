@@ -1208,7 +1208,6 @@ impl EscrowContract {
     /// A schedule-backed escrow refuses an early override release with the
     /// same [`Error::EscrowLocked`] code the arbiter path uses (Issue #315, #332),
     /// so the signature path cannot route around a time lock.
-
     pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
         caller.require_auth();
         let mut escrow = load_escrow(&env, id)?;
