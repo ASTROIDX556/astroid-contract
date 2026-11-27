@@ -227,6 +227,7 @@ pub fn accumulate_selected(
 /// progress, `Error::QUORUM_NOT_MET` for signature-verified quorums) when the
 /// aggregate falls below the threshold. A sum that cannot be represented as
 /// `u32` surfaces as [`Error::Overflow`] before any comparison is made.
+#[allow(dead_code)]
 pub fn verify_threshold(
     signers: &Vec<SignerWeight>,
     is_selected: &dyn Fn(&SignerWeight) -> bool,

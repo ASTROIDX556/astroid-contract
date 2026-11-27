@@ -97,7 +97,7 @@ fn setup<'a>() -> T<'a> {
 }
 
 #[test]
-fn test_allowed_recipient_wildcard_and_prefix_matching() {
+fn test_allowed_recipient_exact_match() {
     let env = Env::default();
     env.mock_all_auths();
     let owner = Address::generate(&env);
@@ -105,7 +105,7 @@ fn test_allowed_recipient_wildcard_and_prefix_matching() {
     let policy = PolicyContractClient::new(&env, &id);
     policy.initialize();
 
-    let policy_id = String::from_str(&env, "wildcard-policy");
+    let policy_id = String::from_str(&env, "recipient-policy");
     policy.register_policy(
         &owner,
         &policy_id,
@@ -118,8 +118,7 @@ fn test_allowed_recipient_wildcard_and_prefix_matching() {
     );
 
     let target = Address::generate(&env);
-    let target_str = target.to_string();
-    let prefix = target_str.slice(0..10);
+    let other = Address::generate(&env);
 
     let mut tree = soroban_sdk::Vec::new(&env);
     tree.push_back(crate::RuleNode {
@@ -132,23 +131,21 @@ fn test_allowed_recipient_wildcard_and_prefix_matching() {
     policy.set_composite_rule(&owner, &policy_id, &tree);
 
     let asset = Address::generate(&env);
-    let decision = policy.evaluate_policy(&policy_id, &asset, &target, &500);
+    let payload_ok = crate::TransactionPayload {
+        asset: asset.clone(),
+        recipient: target.clone(),
+        amount: 500,
+    };
+    let decision = policy.evaluate_policy(&policy_id, &payload_ok);
     assert!(decision.allowed());
 
-    let mut wildcard_tree = soroban_sdk::Vec::new(&env);
-    let wildcard_addr =
-        Address::from_string(&String::from_str(&env, &alloc::format!("{}*", prefix)));
-    wildcard_tree.push_back(crate::RuleNode {
-        op: crate::RuleOp::AllowedRecipient,
-        value_i128: 0,
-        value_address: wildcard_addr,
-        children_start: 0,
-        children_end: 0,
-    });
-    policy.set_composite_rule(&owner, &policy_id, &wildcard_tree);
-
-    let decision_wildcard = policy.evaluate_policy(&policy_id, &asset, &target, &500);
-    assert!(decision_wildcard.allowed());
+    let payload_deny = crate::TransactionPayload {
+        asset: asset.clone(),
+        recipient: other.clone(),
+        amount: 500,
+    };
+    let decision_deny = policy.evaluate_policy(&policy_id, &payload_deny);
+    assert!(!decision_deny.allowed());
 }
 
 // --- configuration ---------------------------------------------------------
