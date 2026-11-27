@@ -1332,7 +1332,7 @@ const RETIRED_CODES: [u32; 0] = [];
 /// audit record: it is deliberately *not* derived from the enum, because a
 /// table derived from the thing it is meant to police cannot detect a
 /// renumbering.
-const EXPECTED_CODES: [(Error, u32); 75] = [
+const EXPECTED_CODES: [(Error, u32); 77] = [
     // --- Generic / lifecycle (1-6) ---
     (Error::NotFound, 1),
     (Error::AlreadyExists, 2),
