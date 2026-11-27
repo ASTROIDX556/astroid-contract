@@ -1208,6 +1208,59 @@ impl EscrowContract {
     /// A schedule-backed escrow refuses an early override release with the
     /// same [`Error::EscrowLocked`] code the arbiter path uses (Issue #315, #332),
     /// so the signature path cannot route around a time lock.
+    pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = load_escrow(&env, id)?;
+        Self::reject_milestone_settlement(&env, id)?;
+        if escrow.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::TimeLockActive);
+        }
+        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
+            return Err(Error::GraceActive);
+        }
+        Self::require_refund_window_open(&env, &escrow)?;
+
+        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
+        escrow.state = EscrowState::Refunded;
+        store_escrow(&env, id, &escrow);
+
+        if remaining > 0 {
+            for a in escrow.assets.iter() {
+                let return_amount =
+                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
+                if return_amount > 0 {
+                    token::TokenClient::new(&env, &a.asset).transfer(
+                        &env.current_contract_address(),
+                        &escrow.sender,
+                        &return_amount,
+                    );
+                }
+            }
+        }
+        events::publish(
+            &env,
+            ContractEvent::EscrowRefunded {
+                escrow_id: id,
+                sender: escrow.sender.clone(),
+                assets: escrow.assets.clone(),
+            },
+        );
+        events::escrow_funds_refunded(&env, id, &escrow.sender, remaining);
+        events::emit(
+            &env,
+            events::topic::ESCROW,
+            symbol_short!("refunded"),
+            (id, caller),
+        );
+        Ok(())
+    }
+
     pub fn override_release(
         env: Env,
         id: u64,
@@ -1377,70 +1430,6 @@ impl EscrowContract {
             events::topic::ESCROW,
             symbol_short!("clean_exp"),
             (id, escrow.sender.clone()),
-        );
-        Ok(())
-    }
-
-    /// Refund remaining funds back to the sender once the escrow has timed out.
-    ///
-    /// Only the stored `sender` may refund. Timing uses the ledger clock:
-    /// before `deadline` the call fails with [`Error::TimeLockActive`], during
-    /// `[deadline, deadline + grace_period)` with [`Error::GraceActive`]; from
-    /// `deadline + grace_period` onward (inclusive) the refund is permitted —
-    /// the same instant at which `release` starts failing with
-    /// [`Error::EscrowExpired`], so the two paths never overlap.
-    pub fn refund(env: Env, caller: Address, id: u64) -> Result<(), Error> {
-        caller.require_auth();
-        let mut escrow = load_escrow(&env, id)?;
-        Self::reject_milestone_settlement(&env, id)?;
-        if escrow.sender != caller {
-            return Err(Error::Unauthorized);
-        }
-        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
-            return Err(Error::InvalidState);
-        }
-        if env.ledger().timestamp() < escrow.deadline {
-            // Before the fulfillment deadline the escrow is still live.
-            return Err(Error::TimeLockActive);
-        }
-        if env.ledger().timestamp() < Self::grace_end(&escrow)? {
-            // During the grace window the counterparty may still fulfill, so funds
-            // may not yet be reclaimed via refund. Use `reclaim` after grace expiry.
-            return Err(Error::GraceActive);
-        }
-        Self::require_refund_window_open(&env, &escrow)?;
-
-        let remaining = checked_sub(escrow.funded_amount, escrow.released_amount)?;
-        escrow.state = EscrowState::Refunded;
-        store_escrow(&env, id, &escrow);
-
-        if remaining > 0 {
-            for a in escrow.assets.iter() {
-                let return_amount =
-                    checked_div(checked_mul(a.amount, remaining)?, escrow.funded_amount)?;
-                if return_amount > 0 {
-                    token::TokenClient::new(&env, &a.asset).transfer(
-                        &env.current_contract_address(),
-                        &escrow.sender,
-                        &return_amount,
-                    );
-                }
-            }
-        }
-        events::publish(
-            &env,
-            ContractEvent::EscrowRefunded {
-                escrow_id: id,
-                sender: escrow.sender.clone(),
-                assets: escrow.assets.clone(),
-            },
-        );
-        events::escrow_funds_refunded(&env, id, &escrow.sender, remaining);
-        events::emit(
-            &env,
-            events::topic::ESCROW,
-            symbol_short!("refunded"),
-            (id, caller),
         );
         Ok(())
     }
