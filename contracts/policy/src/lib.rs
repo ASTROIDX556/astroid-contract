@@ -2486,7 +2486,7 @@ impl PolicyContract {
     fn require_policy_owner(env: &Env, caller: &Address, policy_id: &String) -> Result<(), Error> {
         caller.require_auth();
         if Self::load(env, policy_id)?.owner != *caller {
-            return Err(Error::PolicyUnauthorizedSigner);
+            return Err(Error::UNAUTHORIZED_PRINCIPAL);
         }
         Ok(())
     }
