@@ -3,6 +3,7 @@ extern crate std;
 
 use crate::{validate_multisig_threshold, MultiSigContract, MultiSigContractClient, SignerWeight};
 use astroid_shared::errors::Error;
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction};
 use soroban_sdk::{vec, Address, Env, Vec};
 
 /// Minimal stateful contract used as a batch sub-call target: it stores values
@@ -3128,7 +3129,7 @@ fn test_validate_multisig_threshold_zero_weight() {
 
     let approvals = vec![&env, s1.clone()];
     let res = validate_multisig_threshold(&env, &signers, &approvals, 0);
-    assert_eq!(res, Err(Error::ZeroWeightSigner));
+    assert_eq!(res, Err(Error::InvalidSignerWeight));
 }
 
 #[test]
