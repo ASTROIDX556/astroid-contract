@@ -178,6 +178,10 @@ pub enum Error {
     /// kind, so the repeat is refused instead of publishing a second alias for
     /// the same bytecode (Issue #500).
     VersionAlreadyExists = 36,
+    /// INVALID_ADDRESS: a provided address is a zero address or invalid.
+    InvalidAddress = 37,
+    /// MODULE_ALREADY_REGISTERED: a module identifier is already registered in the registry.
+    ModuleAlreadyRegistered = 38,
 
     // --- Budget (40-49) ---
     /// The spend would breach the budget: the per-asset limit for this token,
@@ -491,18 +495,16 @@ impl Error {
         Error::ProposalDefeated,
         Error::PrerequisiteNotMet,
         Error::CircularDependencyDetected,
-        // --- Escrow (80-82) ---
+        // --- Escrow (80-82, 86-87) ---
         Error::EscrowExpired,
         Error::TimeLockActive,
         Error::GraceActive,
-        // --- Treasury (83-85) ---
+        Error::EscrowNotExpired,
+        Error::EscrowAlreadySettled,
+        // --- Treasury (83-85, 88-89) ---
         Error::AllowanceExceeded,
         Error::AllowanceExpired,
         Error::TreasuryPaused,
-        // --- Escrow continued (86-87) ---
-        Error::EscrowNotExpired,
-        Error::EscrowAlreadySettled,
-        // --- Treasury continued (88-89) ---
         Error::AllocationLimitExceeded,
         Error::EmergencySweepUnauthorized,
         // --- Escrow continuation (95-99) ---
@@ -566,6 +568,8 @@ impl Error {
             Error::VersionNotMonotonic => "VERSION_NOT_MONOTONIC",
             Error::InvalidUpgradePath => "INVALID_UPGRADE_PATH",
             Error::VersionAlreadyExists => "VERSION_ALREADY_EXISTS",
+            Error::InvalidAddress => "INVALID_ADDRESS",
+            Error::ModuleAlreadyRegistered => "MODULE_ALREADY_REGISTERED",
             // --- Budget (40-47) ---
             Error::BudgetExceeded => "BUDGET_EXCEEDED",
             Error::BudgetFrozen => "BUDGET_FROZEN",
