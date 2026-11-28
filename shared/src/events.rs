@@ -1004,6 +1004,7 @@ pub fn escrow_refunded(env: &Env, escrow_id: u64, sender: &Address, assets: &Vec
 
 pub fn escrow_funds_released(env: &Env, escrow_id: u64, recipient: &Address, amount: i128) {
     publish_escrow_settlement(env, ESCROW_FUNDS_RELEASED, escrow_id, recipient, amount);
+    emit_release(env, escrow_id, recipient, amount);
 }
 
 /// `EscrowFundsRefunded` — topic `("escrow", "fund_ref", escrow_id)`, data
@@ -1014,6 +1015,7 @@ pub fn escrow_funds_released(env: &Env, escrow_id: u64, recipient: &Address, amo
 /// reclaim).
 pub fn escrow_funds_refunded(env: &Env, escrow_id: u64, recipient: &Address, amount: i128) {
     publish_escrow_settlement(env, ESCROW_FUNDS_REFUNDED, escrow_id, recipient, amount);
+    emit_refund(env, escrow_id, recipient, amount);
 }
 
 /// `EscrowExpired` — topic `("EscrowExpired",)`, data [`EscrowExpiration`].
@@ -1052,6 +1054,110 @@ fn publish_escrow_settlement(
             recipient: recipient.clone(),
             amount,
             timestamp: env.ledger().timestamp(),
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Standardized event schemas across treasury and escrow (Issue #457)
+// ---------------------------------------------------------------------------
+
+/// Standardized deposit event payload (Issue #457).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandardDepositEvent {
+    pub from: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub balance: i128,
+    pub timestamp: u64,
+}
+
+/// Standardized withdrawal event payload (Issue #457).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandardWithdrawEvent {
+    pub to: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub balance: i128,
+    pub timestamp: u64,
+}
+
+/// Standardized release event payload (Issue #457).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandardReleaseEvent {
+    pub id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Standardized refund event payload (Issue #457).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandardRefundEvent {
+    pub id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Standardized deposit event emission (Issue #457).
+pub fn emit_deposit(env: &Env, from: &Address, asset: &Address, amount: i128, balance: i128) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("deposit"),),
+        StandardDepositEvent {
+            from: from.clone(),
+            asset: asset.clone(),
+            amount,
+            balance,
+            timestamp,
+        },
+    );
+}
+
+/// Standardized withdrawal event emission (Issue #457).
+pub fn emit_withdraw(env: &Env, to: &Address, asset: &Address, amount: i128, balance: i128) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("withdraw"),),
+        StandardWithdrawEvent {
+            to: to.clone(),
+            asset: asset.clone(),
+            amount,
+            balance,
+            timestamp,
+        },
+    );
+}
+
+/// Standardized release event emission (Issue #457).
+pub fn emit_release(env: &Env, id: u64, recipient: &Address, amount: i128) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("release"),),
+        StandardReleaseEvent {
+            id,
+            recipient: recipient.clone(),
+            amount,
+            timestamp,
+        },
+    );
+}
+
+/// Standardized refund event emission (Issue #457).
+pub fn emit_refund(env: &Env, id: u64, recipient: &Address, amount: i128) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("refund"),),
+        StandardRefundEvent {
+            id,
+            recipient: recipient.clone(),
+            amount,
+            timestamp,
         },
     );
 }

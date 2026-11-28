@@ -53,6 +53,18 @@ pub trait UpgradeAuthorizationInterface {
     fn is_upgrade_authorized(env: Env, org: String, caller: Address, kind: ModuleKind) -> bool;
 }
 
+/// Wallet module upgrade hook interface.
+///
+/// Implemented by contracts that validate wallet module upgrades or act as
+/// upgrade hooks before a wallet module is registered or upgraded in the registry.
+#[contractclient(name = "WalletModuleUpgradeHookClient")]
+pub trait WalletModuleUpgradeHookInterface {
+    /// Validate the proposed wallet module address.
+    ///
+    /// Return `true` if valid, `false` or error if incompatible/malformed.
+    fn validate_upgrade_hook(env: Env, module: Address) -> Result<bool, Error>;
+}
+
 /// Instance-storage key for the upgrade authority. Namespaced under its own
 /// type so it can never collide with a contract's own `DataKey`.
 #[contracttype]
