@@ -286,26 +286,26 @@ fn unauthorized_principals_fail_mutating_calls_with_unauthorized_principal() {
 
     assert_eq!(
         managed.try_set_enabled(&stranger, &pid(&env), &false),
-        Err(Ok(Error::UNAUTHORIZED_PRINCIPAL))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         managed.try_add_asset_to_whitelist(&stranger, &pid(&env), &asset),
-        Err(Ok(Error::UNAUTHORIZED_PRINCIPAL))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         managed.try_remove_asset_from_whitelist(&stranger, &pid(&env), &asset),
-        Err(Ok(Error::UNAUTHORIZED_PRINCIPAL))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         managed.try_set_asset_whitelist_enabled(&stranger, &pid(&env), &true),
-        Err(Ok(Error::UNAUTHORIZED_PRINCIPAL))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         managed.try_add_to_blocklist(&stranger, &pid(&env), &asset),
-        Err(Ok(Error::UNAUTHORIZED_PRINCIPAL))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
     assert_eq!(
         managed.try_remove_from_blocklist(&stranger, &pid(&env), &asset),
-        Err(Ok(Error::UNAUTHORIZED_PRINCIPAL))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
 }
