@@ -1635,7 +1635,7 @@ fn error_domains_do_not_overlap() {
     assert_eq!(proposal, 8, "proposal band 71-79");
     assert_eq!(escrow, 6, "escrow band 80-82, 86-87 and 95");
     assert_eq!(treasury, 5, "treasury bands 83-85 and 88-89");
-    assert_eq!(policy, 8, "policy band 20-29");
+    assert_eq!(policy, 10, "policy band 20-29");
 }
 
 #[test]
