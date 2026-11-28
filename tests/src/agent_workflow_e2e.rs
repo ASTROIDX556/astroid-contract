@@ -74,7 +74,7 @@ impl<'a> Harness<'a> {
             .events()
             .all()
             .iter()
-            .any(|(_, topics, _)| topics.contains(topic.clone()) && topics.contains(tag.clone()))
+            .any(|(_, topics, _)| topics.contains(topic) && topics.contains(tag))
     }
 
     /// Register the org-wide `"active"` policy: at most `POLICY_CAP` per

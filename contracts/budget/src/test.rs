@@ -4430,7 +4430,7 @@ fn rollover_with_carry_resets_spend_and_banks_credit() {
 fn rollover_refuses_an_unbounded_number_of_elapsed_periods() {
     let h = setup();
     allocate(&h, "eng", 1_000, Period::Weekly, true);
-    let beyond = 1_000 + (crate::MAX_ROLLOVER_PERIODS as u64 + 1) * WEEK;
+    let beyond = 1_000 + (crate::MAX_ROLLOVER_PERIODS + 1) * WEEK;
     h.env.ledger().set_timestamp(beyond);
 
     // Both the preview and the write path report the same named code — a
@@ -4455,7 +4455,7 @@ fn rollover_refuses_an_unbounded_number_of_elapsed_periods() {
 fn rollover_at_the_bounded_number_of_periods_is_allowed() {
     let h = setup();
     allocate(&h, "eng", 1_000, Period::Weekly, false);
-    let at_bound = 1_000 + crate::MAX_ROLLOVER_PERIODS as u64 * WEEK;
+    let at_bound = 1_000 + crate::MAX_ROLLOVER_PERIODS * WEEK;
     h.env.ledger().set_timestamp(at_bound);
 
     assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
@@ -4470,7 +4470,7 @@ fn budget_rollover_exceeded_is_wire_stable_from_the_budget_contract() {
     allocate(&h, "eng", 1_000, Period::Weekly, true);
     h.env
         .ledger()
-        .set_timestamp(1_000 + (crate::MAX_ROLLOVER_PERIODS as u64 + 1) * WEEK);
+        .set_timestamp(1_000 + (crate::MAX_ROLLOVER_PERIODS + 1) * WEEK);
     let result = h.client.try_rollover(&h.owner, &id(&h.env, "eng"));
     let code = match result {
         Err(Ok(e)) => e.code(),
