@@ -5375,7 +5375,7 @@ fn batch_whitelist_requires_the_policy_owner() {
     let stranger = Address::generate(&env);
     assert_eq!(
         p.try_add_recipients_to_whitelist(&stranger, &pid, &vec![&env, Address::generate(&env)]),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(Error::PolicyUnauthorizedSigner))
     );
 }
 
