@@ -3930,9 +3930,9 @@ fn standard_event_emission_release_and_refund_schemas() {
     let events = h.env.events().all();
 
     // Check EscrowReleased structured event
+    let released_topic: soroban_sdk::Val = Symbol::new(&h.env, "EscrowReleased").into_val(&h.env);
     let has_escrow_released = events.iter().any(|(contract, topics, _)| {
-        contract == h.client.address
-            && topics.contains(&Symbol::new(&h.env, "EscrowReleased").into_val(&h.env))
+        contract == h.client.address && topics.contains(released_topic)
     });
     assert!(has_escrow_released, "ContractEvent::EscrowReleased emitted");
 
@@ -3957,9 +3957,9 @@ fn standard_event_emission_release_and_refund_schemas() {
     h2.client.refund(&h2.sender, &id2);
 
     let events2 = h2.env.events().all();
+    let refunded_topic: soroban_sdk::Val = Symbol::new(&h2.env, "EscrowRefunded").into_val(&h2.env);
     let has_escrow_refunded = events2.iter().any(|(contract, topics, _)| {
-        contract == h2.client.address
-            && topics.contains(&Symbol::new(&h2.env, "EscrowRefunded").into_val(&h2.env))
+        contract == h2.client.address && topics.contains(refunded_topic)
     });
     assert!(has_escrow_refunded, "ContractEvent::EscrowRefunded emitted");
 
