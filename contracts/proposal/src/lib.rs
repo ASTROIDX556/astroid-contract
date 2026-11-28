@@ -212,7 +212,31 @@ pub struct Proposal {
     /// approved.
     pub approved_at: u64,
     pub deposit: Vec<AssetAmount>,
+    /// Voting duration in seconds after `created_at`; the voting window closes
+    /// at `created_at + voting_duration`. Overridden by `expires_at` if
+    /// `expires_at != 0`. A `0` duration means the voting window is
+    /// unbounded; expiry is then solely determined by `expires_at`.
+    pub voting_duration: u64,
+    /// Deadline after which the approval window is closed. `0` means never
+    /// expires. Takes precedence over `voting_duration`-derived expiry.
     pub expires_at: u64,
+    /// Grace period in seconds after `created_at` during which the proposer
+    /// may cancel the proposal. `0` means no grace period limit.
+    pub grace_period: u64,
+}
+
+/// Configuration for proposal timing parameters.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalTiming {
+    /// Voting duration in seconds after `created_at`. `0` means unbounded;
+    /// expiry is then solely determined by `expires_at`.
+    pub voting_duration: u64,
+    /// Deadline after which the approval window is closed. `0` means never
+    /// expires. Takes precedence over `voting_duration`-derived expiry.
+    pub expires_at: u64,
+    /// Grace period in seconds after `created_at` during which the proposer
+    /// may cancel the proposal. `0` means no grace period limit.
     pub grace_period: u64,
 }
 
@@ -443,6 +467,12 @@ impl ProposalContract {
     /// case of the same check. Because every edge strictly decreases the id,
     /// no sequence of edges can return to its starting proposal, so the graph
     /// is a DAG by construction and no traversal is needed.
+    ///
+    /// **Voting duration and expiry.** `voting_duration` seconds after creation
+    /// the proposal's voting window closes (unless `expires_at` is set, which
+    /// takes precedence). A `0` duration means the voting window is
+    /// unbounded; expiry is then solely determined by `expires_at`. The
+    /// `grace_period` limits proposer-initiated cancellation after creation.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         env: Env,
@@ -454,8 +484,7 @@ impl ProposalContract {
         dependencies: Vec<u64>,
         threshold: u32,
         deposit: Vec<AssetAmount>,
-        expires_at: u64,
-        grace_period: u64,
+        timing: ProposalTiming,
     ) -> Result<u64, Error> {
         proposer.require_auth();
         require_non_empty(&org)?;
@@ -496,7 +525,7 @@ impl ProposalContract {
                 &dep.amount,
             );
         }
-        if expires_at != 0 && expires_at <= env.ledger().timestamp() {
+        if timing.expires_at != 0 && timing.expires_at <= env.ledger().timestamp() {
             return Err(Error::InvalidInput);
         }
 
@@ -544,8 +573,9 @@ impl ProposalContract {
             state: ProposalState::Pending,
             created_at: env.ledger().timestamp(),
             approved_at: 0,
-            expires_at,
-            grace_period,
+            voting_duration: timing.voting_duration,
+            expires_at: timing.expires_at,
+            grace_period: timing.grace_period,
         };
         env.storage()
             .persistent()

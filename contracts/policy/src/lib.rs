@@ -644,20 +644,20 @@ impl PolicyDenialReason {
     pub fn to_error(self) -> Error {
         match self {
             PolicyDenialReason::Disabled
-            | PolicyDenialReason::Expired
             | PolicyDenialReason::RecipientNotWhitelisted
-            | PolicyDenialReason::AboveMaxTransactionLimit
             | PolicyDenialReason::RecipientNotAllowed
             | PolicyDenialReason::AssetNotAllowed
             | PolicyDenialReason::AssetBlacklisted
             | PolicyDenialReason::CompositeRuleDenied
             | PolicyDenialReason::RuleStackDenied
             | PolicyDenialReason::OutsideTransferWindow => Error::PolicyDenied,
+            PolicyDenialReason::Expired => Error::PolicyExpired,
             PolicyDenialReason::RecipientBlacklisted => Error::PolicyRecipientRestricted,
             PolicyDenialReason::MerchantBlacklisted => Error::PolicyMerchantBlocked,
             PolicyDenialReason::AssetNotWhitelisted => Error::AssetNotAuthorized,
             PolicyDenialReason::AllowanceExceeded => Error::AllowanceExceeded,
             PolicyDenialReason::AllowanceExpired => Error::AllowanceExpired,
+            PolicyDenialReason::AboveMaxTransactionLimit => Error::PolicyConstraintUnmet,
         }
     }
 
@@ -2576,7 +2576,7 @@ impl PolicyContract {
     fn require_policy_owner(env: &Env, caller: &Address, policy_id: &String) -> Result<(), Error> {
         caller.require_auth();
         if Self::load(env, policy_id)?.owner != *caller {
-            return Err(Error::UNAUTHORIZED_PRINCIPAL);
+            return Err(Error::PolicyUnauthorizedSigner);
         }
         Ok(())
     }

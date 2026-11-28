@@ -269,7 +269,7 @@ fn over_cap_treasury_funding_is_denied_before_reaching_the_wallet() {
     let res = h
         .treasury
         .try_withdraw(&h.admin, &h.asset, &h.org_owner, &(CAP + 1));
-    assert_eq!(res, Err(Ok(Error::PolicyDenied)));
+    assert_eq!(res, Err(Ok(Error::PolicyConstraintUnmet)));
     assert_eq!(h.ledger(), before);
 }
 

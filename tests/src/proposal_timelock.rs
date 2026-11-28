@@ -14,7 +14,7 @@
 //! transaction.
 
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
+use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState, ProposalTiming};
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -100,8 +100,11 @@ fn create(h: &Harness, deposit: i128) -> u64 {
         &vec![&h.env],
         &2,
         &deposit,
-        &(START + 100_000),
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: START + 100_000,
+            grace_period: 0,
+        },
     )
 }
 
@@ -291,8 +294,11 @@ fn a_timelocked_proposal_still_chains_behind_its_prerequisite_after_maturity() {
         &vec![&h.env, first],
         &2,
         &vec![&h.env],
-        &(START + 100_000),
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: START + 100_000,
+            grace_period: 0,
+        },
     );
 
     // Both reach their threshold on the same ledger, so both mature together.

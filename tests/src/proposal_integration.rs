@@ -18,7 +18,7 @@
 //! must agree with the entrypoint in every case.
 
 use astroid_multisig::{MultiSigContract, MultiSigContractClient, SignerWeight};
-use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
+use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState, ProposalTiming};
 use astroid_shared::constants::THRESHOLD_CHANGE_DELAY_LEDGERS;
 use astroid_shared::errors::Error;
 use astroid_shared::types::AssetAmount;
@@ -119,8 +119,11 @@ fn create(h: &Harness, allow_list_threshold: u32) -> u64 {
         &vec![&h.env],
         &allow_list_threshold,
         &deposit,
-        &(START + 1_000_000),
-        &0,
+        &ProposalTiming {
+            voting_duration: 0,
+            expires_at: START + 1_000_000,
+            grace_period: 0,
+        },
     )
 }
 

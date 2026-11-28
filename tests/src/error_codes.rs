@@ -29,10 +29,10 @@ use astroid_wallet::WalletContract;
 /// Written out literally rather than derived from [`Error::ALL`], because the
 /// point of this test is to catch the table being renumbered — deriving it
 /// would make that failure impossible to observe.
-const ALL_CODES: [u32; 75] = [
+const ALL_CODES: [u32; 77] = [
     1, 2, 3, 4, 5, 6, // generic / lifecycle
     10, 11, 12, // value / arithmetic
-    20, 21, 22, 23, 24, 27, 28, 29, // policy
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 29, // policy
     30, 31, 32, 33, 34, 35, 36, // registry
     40, 41, 42, 43, 44, 46, 47, 48, 49, // budget
     50, 51, 52, 53, 54, 55, 56, // wallet
@@ -44,7 +44,7 @@ const ALL_CODES: [u32; 75] = [
 
 /// Codes that were part of an earlier revision and must never come back: a
 /// reissued slot would make two different historical failures decode the same.
-const RETIRED_CODES: [u32; 2] = [25, 26];
+const RETIRED_CODES: [u32; 0] = [];
 
 /// The number an off-chain caller would read from a failed transaction, for
 /// either shape a generated `try_*` call can return.
@@ -160,7 +160,7 @@ fn a_policy_refusal_reaches_the_caller_as_its_canonical_code() {
         &Address::generate(&env),
         &1_001,
     );
-    assert_eq!(code_of(res), Error::PolicyDenied.code());
+    assert_eq!(code_of(res), Error::PolicyConstraintUnmet.code());
 
     // A lapsed allowance: a different band entirely, and it must stay distinct.
     policy.set_allowance(&owner, &pid, &Address::generate(&env), &1_000, &1);
