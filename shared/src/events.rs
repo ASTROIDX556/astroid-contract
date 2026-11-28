@@ -1581,6 +1581,41 @@ pub fn treasury_emergency_sweep(
     );
 }
 
+/// `BalanceSnapshotCreated` — topic `("treasury", "snap_new")`, data `(id, created_at)`.
+pub fn treasury_balance_snapshot_created(env: &Env, id: u64, created_at: u64) {
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("snap_new")),
+        (id, created_at),
+    );
+}
+
+/// `BalanceSnapshotVerified` — topic `("treasury", "snap_ok")`, data `(id, all_valid)`.
+pub fn treasury_balance_snapshot_verified(env: &Env, id: u64, all_valid: bool) {
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("snap_ok")),
+        (id, all_valid),
+    );
+}
+
+/// `ReconciliationDiscrepancy` — topic `("treasury", "discrepancy", asset)`, data `(id, balance, recorded, liability)`.
+pub fn treasury_reconciliation_discrepancy(
+    env: &Env,
+    id: u64,
+    asset: &Address,
+    balance: i128,
+    recorded: i128,
+    liability: i128,
+) {
+    env.events().publish(
+        (
+            symbol_short!("treasury"),
+            symbol_short!("snap_diff"),
+            asset.clone(),
+        ),
+        (id, balance, recorded, liability),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Deposit tracking (Issue #520)
 // ---------------------------------------------------------------------------

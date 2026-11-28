@@ -96,6 +96,58 @@ fn setup<'a>() -> T<'a> {
     }
 }
 
+#[test]
+fn test_allowed_recipient_exact_match() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let policy = PolicyContractClient::new(&env, &id);
+    policy.initialize();
+
+    let policy_id = String::from_str(&env, "recipient-policy");
+    policy.register_policy(
+        &owner,
+        &policy_id,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &10_000,
+        &None,
+        &None,
+        &0,
+        &None,
+    );
+
+    let target = Address::generate(&env);
+    let other = Address::generate(&env);
+
+    let mut tree = soroban_sdk::Vec::new(&env);
+    tree.push_back(crate::RuleNode {
+        op: crate::RuleOp::AllowedRecipient,
+        value_i128: 0,
+        value_address: target.clone(),
+        children_start: 0,
+        children_end: 0,
+    });
+    policy.set_composite_rule(&owner, &policy_id, &tree);
+
+    let asset = Address::generate(&env);
+    let payload_ok = crate::TransactionPayload {
+        asset: asset.clone(),
+        recipient: target.clone(),
+        amount: 500,
+    };
+    let decision = policy.evaluate_policy(&policy_id, &payload_ok);
+    assert!(decision.allowed());
+
+    let payload_deny = crate::TransactionPayload {
+        asset: asset.clone(),
+        recipient: other.clone(),
+        amount: 500,
+    };
+    let decision_deny = policy.evaluate_policy(&policy_id, &payload_deny);
+    assert!(!decision_deny.allowed());
+}
+
 // --- configuration ---------------------------------------------------------
 
 #[test]
